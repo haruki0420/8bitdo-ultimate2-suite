@@ -507,15 +507,18 @@ struct Bt2Header {
 2. **Step 2: マクロステップデータ書込 (`Write`)**
    - `cmd = 0x0103`
    - `subcmd = (gamepad_mode << 8) | slot`
-   - `offset = macro_idx << 12`
+   - `offset = (macro_idx << 12) + chunk_index * chunk_size`（`chunk_index` はパケットごとに進む）
    - `total_len = align32(max_steps * 10)`
-   - ペイロード: `max_steps * 10` バイト＋32B アライメント用ゼロパディング（最大 64 バイト単位または交渉済みチャンクサイズで分割送信・`Send_CustomCmdPacket` 準拠で各チャンクヘッダ `CRC-16/MODBUS (0xA001)` 付与）
+   - `chunk_size` は BLE 64B / USB HID 32B（または交渉済みチャンクサイズ）。最終チャンクは 32B アライン長
+   - ペイロード: `max_steps * 10` バイト＋32B アライメント用ゼロパディング（BLE 64B / USB HID 32B または交渉済みサイズで分割送信・`Send_CustomCmdPacket` 準拠で各チャンクヘッダ `CRC-16/MODBUS (0xA001)` 付与）
 3. **Step 3: 2768B コンフィグ内のマクロ管理ヘッダ更新**
    - `max_steps`, `key_map`, `cycles_num`, `interval_ms`, `filename`, `total_cnt`, `flag` 等を `0x68C + slot * 0xD8` に反映し、`ANSI_CRC_16_sh` を再計算する。
    - 部分書込 (`cmd = 0x0001, subcmd = 0x0000, offset = 0x68C + slot * 0xD8, len = 0xD8, total_len = 0x0AD0`) または全体書込を送信する。
 4. **Step 4: 不揮発メモリへのコミット (`Save`)**
    - **BLE**: `cmd = 0x0006, subcmd = 0x0067, offset = 0, len = 0, total_len = 0`
    - **USB**: `cmd = 0x0006, subcmd = 0x0123, offset = 0, len = 0, total_len = 0`
+
+> ACK は各コマンド送信後の transport `wait_ack` で待つ。`Save` は仕様書に 3 秒タイムアウトの記載がある。`Erase` / `Write` / `Header` の個別タイムアウトは仕様書に記載がないため、実装の `wait_ack` 既定値とリトライ方針を確認する。
 
 #### マクロ読み出し手順
 

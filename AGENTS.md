@@ -60,9 +60,9 @@
 2. **構造体の未知・予約バイト保全**:
    - 2768 バイト構造体を編集する際は必ず元のバイトバッファを保持した上で変更箇所だけ上書きし、`ANSI_CRC_16_sh` を再計算してから書き込むこと。
 3. **マクロ Flash 書き込み順序**:
-   - 必ず `Erase (0x0104)` → `Write (0x0103, 64B チャンク, 32B アライン長)` → `Macro ヘッダ更新 (0x0001)` → `Save (0x0006)` の順序を守ること。
+   - 必ず `Erase (0x0104)` → `Write (0x0103, BLE 64B / USB HID 32B（または交渉済みチャンクサイズ）, 最終チャンクは 32B アライン長)` → `Macro ヘッダ更新 (0x0001)` → `Save (0x0006)` の順序を守ること。
 4. **OTA（ファームウェア更新）の安全性**:
-   - `enterBoot 0x000C` → `"8bt"` へ再接続 → `readPID 0x0008` → `readVersionInBoot 0x0005` の前提を確認し、`readPID` の結果から `gamepad_type` を判定すること。
+   - `enterBoot 0x000C` → BLE Boot は `"8bt"` へ再接続 → `readPID 0x0008`、USB Boot は `[0x00,0x05]` framing → `readPID cmd=0x0000/subcmd=0x0008` の前提を確認し、`readPID` の結果から `gamepad_type` を判定すること。`readVersionInBoot 0x0005` の offset `0x01017040` は type 1 用で、非 type 1 は推測せず `docs/PROTOCOL_SPEC.md` / Issue を確認して停止すること。
    - `EraseFlash 0x0004` の ACK を待ってから `WriteFirmware 0x0003` を送り、失敗時は再接続だけで済ませず、全セクタ消去・再書き込みで復旧すること。
    - 実機テスト前に必ずモックトランスポートで全パケット列・CRC・チャンク境界・リトライ動作をユニットテストで検証すること。
 5. **クリーンなコミット管理**:
@@ -74,10 +74,10 @@
 
 `main` へマージする前に、**著者とも他のレビュアーとも別セッション**のレビュアーが PR の差分を読み、マージ可否を判定すること。「マージ可」が出るまでマージしない。修正を push したら新しい head SHA で再レビューする。
 
-- **Tier 1**: レビュアー 1 名。**振る舞いを変えない変更のみ**（コメント・整形・通常 docs（規範仕様・ゲート/プロセス文書を除く、最大 Tier 2）・純粋なテスト追加）。純粋なテスト追加は 1〜2 件の故障注入を PR またはレビューコメントに記録する。write-path / Flash / OTA / backup / セキュリティ境界 / review-gate script を検証するテストは Tier 3。
+- **Tier 1**: レビュアー 1 名。**振る舞いを変えない変更のみ**（Tier 3 パス以外のコメント・整形、通常 docs（規範仕様・ゲート/プロセス文書を除く。これらは Tier 1 にはしない＝最低 Tier 2、安全-critical は Tier 3）、純粋なテスト追加）。純粋なテスト追加は 1〜2 件の故障注入を PR またはレビューコメントに記録する。Tier 3 パスのコメント・整形は §2 A1/A2。write-path / Flash / OTA / backup / CRC / golden vector / mock transport / safety-critical test vector / セキュリティ境界 / review-gate script を検証するテストは Tier 3。
 - **Tier 2**: レビュアー 2 名（仕様検収 + 実装/回帰）。
 - **Tier 3**: レビュアー 2 名 + 別セッションの敵対的パス（計 3 セッション）。
-- 判定・パス別トリガー・故障リストの正本は **[docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)**。**チェックリスト項目、コントリビューター手順、required check、status コマンド、安全手順を変える PR は、docs パスでも Tier 3**。**デバイス書き込みのバイト・順序・タイミング・エラー処理、write-path に影響する依存更新、またはそれを検証するテスト/mock/golden vector を変える PR も Tier 3**。**セキュリティ境界 / review-gate script を検証するテストの変更・削除も Tier 3**。降格できるのは REVIEW_TIERS §2 のダウングレード制限の例外のみ。
+- 判定・パス別トリガー・故障リストの正本は **[docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)**。**チェックリスト項目、コントリビューター手順、required check、status コマンド、安全手順を変える PR は、docs パスでも Tier 3**。**デバイス書き込みのバイト・順序・タイミング・エラー処理、write-path に影響する依存更新、またはそれを検証するテスト/mock/golden vector を変える PR も Tier 3**。**セキュリティ境界 / review-gate script を検証するテストの変更・削除も Tier 3**。**認証/認可、暗号/署名検証、secret の扱い、trust-boundary の入力検証、権限変更、およびそれらに影響する依存更新も Tier 3**。降格できるのは REVIEW_TIERS §2 のダウングレード制限の例外のみ。
 - Tier 定義・パス別トリガー・レビュアー数・quorum・故障リスト最低数・チェックリスト・required check・ruleset・status コマンド・ゲート手順の変更は Tier 3（自己修正ルール）。
 - コードのリファクタは Tier 1 にしない。実機書き込み・Flash・OTA・セキュリティに触れるコードは、差分が小さくても Tier 3。
 - Tier 2/3 は全レビュアーが同じ SHA で「マージ可」を出した後、リードレビュアーが `scripts/post-review-status.sh` で `review-gate` の commit status を投稿する。Tier 1 はレビュアー本人が投稿する。check run でも gate は満たせるが、本手順は commit status を使う。

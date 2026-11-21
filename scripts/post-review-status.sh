@@ -37,6 +37,25 @@ if ! [[ "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   exit 2
 fi
 
+post_status() {
+  local state=$1
+  local description=$2
+  gh api --method POST "repos/$REPO/statuses/$REVIEWED_SHA" \
+    -f state="$state" \
+    -f context=review-gate \
+    -f description="$description" \
+    -f target_url="https://github.com/$REPO/pull/$PR"
+}
+
+post_audit_failure() {
+  local description="Tier ${TIER} audit failed for ${REVIEWED_SHA:0:7}"
+  if ! post_status failure "$description"; then
+    echo "error: could not post review-gate=failure for $REVIEWED_SHA" >&2
+    echo "manual action required: post review-gate=failure before merging" >&2
+    return 1
+  fi
+}
+
 current=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)
 if [ "$current" != "$REVIEWED_SHA" ]; then
   echo "head moved: reviewed=$REVIEWED_SHA current=$current" >&2
@@ -52,33 +71,62 @@ fi
 # declared Tier or quorum; those are procedural checks recorded in the PR.
 # Tier 1: the reviewer posts. Tier 2/3: the lead reviewer posts only after all
 # reviewers have approved this exact SHA.
-gh api --method POST "repos/$REPO/statuses/$REVIEWED_SHA" \
-  -f state="$STATE" \
-  -f context=review-gate \
-  -f description="$description" \
-  -f target_url="https://github.com/$REPO/pull/$PR"
+post_status "$STATE" "$description"
 
-# Audit is mandatory. If it cannot run, fail closed after posting rather than
-# reporting success without evidence.
-if ! gh api "repos/$REPO/commits/$REVIEWED_SHA/statuses" \
-  --jq '[.[] | {context, state, description, creator: .creator.login, created_at}]'; then
-  echo "error: post-audit of commit statuses failed; verify manually before merging" >&2
+# The audit is an assertion, not a print. If the latest status/check run is
+# missing or does not match the posted state, post review-gate=failure and
+# exit non-zero so a stale success cannot satisfy the gate.
+expected_state=$STATE
+status_state=""
+check_state=""
+check_app=""
+check_app_id=""
+check_started=""
+check_completed=""
+audit_failed=0
+audit_suspicious=0
+
+if ! status_state=$(gh api --paginate --slurp "repos/$REPO/commits/$REVIEWED_SHA/statuses" \
+  --jq 'flatten | [.[] | select(.context == "review-gate")] | if length == 0 then "MISSING" else .[0].state end'); then
+  echo "error: could not audit review-gate commit statuses" >&2
+  audit_failed=1
+elif [ "$status_state" != "$expected_state" ]; then
+  echo "error: latest review-gate commit status is '$status_state', expected '$expected_state'" >&2
+  audit_failed=1
+fi
+
+if ! check_line=$(gh api --paginate --slurp "repos/$REPO/commits/$REVIEWED_SHA/check-runs?filter=all" \
+  --jq '([.[] | .check_runs[]] | [.[] | select(.name == "review-gate")] | if length == 0 then "NONE||||" else (sort_by(.started_at // .completed_at // "") | last | [(.conclusion // "MISSING"), (.app.slug // ""), ((.app.id // "") | tostring), (.started_at // ""), (.completed_at // "")] | join("|")) end)'); then
+  echo "error: could not audit review-gate check runs" >&2
+  audit_failed=1
+else
+  IFS='|' read -r check_state check_app check_app_id check_started check_completed <<< "$check_line"
+  case "$check_state" in
+    NONE|success) ;;
+    skipped|neutral)
+      echo "warning: latest review-gate check run conclusion is '$check_state'; GitHub accepts it but it is suspicious" >&2
+      audit_suspicious=1
+      ;;
+    *)
+      echo "error: latest review-gate check run conclusion is '$check_state', expected success, skipped, neutral, or no check run" >&2
+      audit_failed=1
+      ;;
+  esac
+fi
+
+if [ "$audit_failed" -ne 0 ]; then
+  if ! post_audit_failure; then
+    exit 1
+  fi
+  echo "review-gate audit failed for $REVIEWED_SHA; posted review-gate=failure" >&2
   exit 1
 fi
 
-# A review-gate check run is gate-satisfying because the ruleset has no
-# integration_id. Audit all check runs (filter=all), not only the latest.
-if ! gh api "repos/$REPO/commits/$REVIEWED_SHA/check-runs?filter=all" \
-  --jq '[.check_runs[] | {name, status, conclusion, details_url}]'; then
-  echo "error: post-audit of check runs failed; verify manually before merging" >&2
-  exit 1
+echo "review-gate audit OK: status=$status_state check_run=$check_state app=${check_app:-none} app_id=${check_app_id:-none} started=${check_started:-none} completed=${check_completed:-none} sha=$REVIEWED_SHA"
+if [ "$audit_suspicious" -ne 0 ]; then
+  echo "warning: review-gate check run conclusion is '$check_state'; inspect app/source before merging" >&2
 fi
 
-# Manual regression matrix (temporary mock `gh` on PATH, no network;
-# verified 2026-11-21):
-#   scripts/post-review-status.sh 1 <40hex> 9       -> 2 (invalid tier)
-#   scripts/post-review-status.sh 1 bad 1           -> 2 (invalid SHA)
-#   MOCK_HEAD=<other-sha> scripts/... 1 <40hex> 1   -> 1 (head mismatch)
-#   scripts/post-review-status.sh 1 <40hex> 1       -> 0 (success)
-#   scripts/post-review-status.sh 1 <40hex> 1 failure -> 0 (failure state)
-#   MOCK_AUDIT_FAIL=1 scripts/... 1 <40hex> 1       -> 1 (fail closed)
+# Regression tests: scripts/test-post-review-status.sh (mock gh, no network).
+# Covers success + empty check-runs, empty statuses, latest status failure,
+# check-run failure, head mismatch, invalid tier, status API failure, skipped.

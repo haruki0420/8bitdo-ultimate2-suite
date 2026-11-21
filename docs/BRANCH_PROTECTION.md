@@ -85,7 +85,7 @@ scripts/post-review-status.sh <PR> <reviewed-sha> <1|2|3>
 scripts/post-review-status.sh <PR> <reviewed-sha> <1|2|3> failure
 ```
 
-スクリプトは Tier 引数（1/2/3）を検証します。PR の宣言 Tier と quorum は検証しないため（手続き）、呼び出し側が PR の宣言 Tier を渡してください。投稿直前に head SHA を固定し、投稿後に全 status と check run（`filter=all`）を監査します。監査が失敗した場合、スクリプトは非 0 で終了します。
+スクリプトは Tier 引数（1/2/3）を検証します。PR の宣言 Tier と quorum は検証しないため（手続き）、呼び出し側が PR の宣言 Tier を渡してください。投稿直前に head SHA を固定し、投稿後に全 status と check run（`filter=all`）を監査します。最新 status / check run が期待状態でない、または監査 API が失敗した場合、スクリプトは `review-gate=failure` を投稿して非 0 で終了します。
 
 > `review-gate` は **required status check** です。commit status（`scripts/post-review-status.sh`）または同じ context の check run で満たされます。ruleset に `integration_id` が無いため、どちらも gate-satisfying です。
 
@@ -96,20 +96,20 @@ REPO=haruki0420/8bitdo-ultimate2-suite
 SHA=<reviewed-sha>
 
 # 全 commit status（新しい順）。context ごとの最新だけを見ない。
-gh api "repos/$REPO/commits/$SHA/statuses" \
-  --jq '[.[] | {context, state, description, creator: .creator.login, created_at}]'
+gh api --paginate --slurp "repos/$REPO/commits/$SHA/statuses" \
+  --jq 'flatten | [.[] | {context, state, description, creator: .creator.login, created_at}]'
 
 # check run（gate-satisfying。filter=all で latest 以外も監査）
-gh api "repos/$REPO/commits/$SHA/check-runs?filter=all" \
-  --jq '[.check_runs[] | {name, status, conclusion, details_url}]'
+gh api --paginate --slurp "repos/$REPO/commits/$SHA/check-runs?filter=all" \
+  --jq '[.[] | .check_runs[] | {name, status, conclusion, app: .app.slug, app_id: .app.id, started_at, completed_at, details_url}]'
 
 # PR の rollup
 gh pr view <PR> --repo "$REPO" --json statusCheckRollup
 ```
 
 - `GET /commits/{sha}/status` は **context ごとの最新 status のみ** を返し、`creator` が `null` になることがあります。監査には `GET /commits/{sha}/statuses`（全 status、新しい順）を使ってください。
-- `review-gate` の commit status は最新のものが有効です。過去の `failure` が `success` で上書きされていないか、`created_at` と `creator` を確認してください。check run も context `review-gate` の成功した run を確認してください。
-- check run も `review-gate` を満たす gate-satisfying な signal です。`commits/$SHA/statuses` と `commits/$SHA/check-runs?filter=all` の **両方** を監査し、context `review-gate` の成功を確認してください。`GET /commits/{sha}/check-runs` は既定で `filter=latest` なので、failure-overwrite を監査するときは `?filter=all` を使います。同じリポジトリの PR ワークフローが `checks: write` で passing な `review-gate` check run を作れるため、これは `integration_id` を trusted app に固定するまで documented bypass です。
+- `review-gate` の commit status は最新のものが有効です。過去の `failure` が `success` で上書きされていないか、`created_at` と `creator` を確認してください。check run も context `review-gate` の最新状態を確認してください。
+- check run も `review-gate` を満たす gate-satisfying な signal です。`commits/$SHA/statuses` と `commits/$SHA/check-runs?filter=all` の **両方** を監査し、context `review-gate` の最新状態を確認してください。GitHub の required check は `success` / `skipped` / `neutral` を受け入れます。`skipped` / `neutral` は suspicious として `app.slug` / `app.id` / `started_at` / `completed_at` を確認してください。`failure` / `cancelled` / `timed_out` / `action_required` / conclusion なしは anomaly です。`GET /commits/{sha}/check-runs` は既定で `filter=latest` なので、failure-overwrite を監査するときは `?filter=all` を使います。同じリポジトリの PR ワークフローが `checks: write` で passing な `review-gate` check run を作れるため、これは `integration_id` を trusted app に固定するまで documented bypass です。
 
 ## セキュリティ上の限界
 
