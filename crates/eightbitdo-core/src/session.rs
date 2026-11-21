@@ -1878,6 +1878,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_response_with_matching_crc_is_accepted() {
+        let mock = MockTransport::new();
+        let payload = [0x11u8, 0x22, 0x33, 0x44];
+        let header = CustomHeader::new(commands::cmd::READ_VERSION, 0, 4, 0).with_payload(&payload);
+        assert_ne!(header.crc16, 0, "the fixture must carry a non-zero CRC");
+        mock.push_response(&header, &payload);
+
+        let session = Session::new(&mock);
+        let version = session.read_version().await.unwrap();
+        assert_eq!(version.raw, payload);
+    }
+
+    #[tokio::test]
+    async fn read_config_chunk_with_bad_crc_is_rejected() {
+        let config = sample_config();
+        let bytes = config.as_bytes();
+        let mock = MockTransport::new();
+        push_config_envelope_chunks(&mock, &bytes[..142], 142);
+
+        // Second chunk flips one payload bit but keeps its crc16.
+        let mut payload = bytes[142..284].to_vec();
+        payload[3] ^= 0x80;
+        let header = envelope_header(commands::cmd::READ_CONFIG, CONFIG_SIZE as u32, 142, 142)
+            .with_payload(&bytes[142..284]);
+        mock.push_response(&header, &payload);
+
+        let session = Session::new(&mock);
+        let result = session.read_config_snapshot().await;
+        assert!(
+            matches!(result, Err(Error::UnexpectedResponse(ref message)) if message.contains("crc16")),
+            "unexpected result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn oversized_wait_is_rejected_without_panicking() {
         let mock = MockTransport::new();
         let session = Session::new(&mock);
@@ -1917,6 +1952,63 @@ mod tests {
             deadline_after(Duration::MAX),
             Err(Error::InvalidTimeout(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn drop_mid_pipeline_marks_resync_and_next_read_drains() {
+        // Cancelling while the 3rd config chunk is in flight keeps the
+        // partially filled exchange classified as Resync, the next read
+        // drains the leftover chunks first, and the drain's quiescence resets
+        // the classification to CallerCancelled.
+        let transport = ResyncTransport::new();
+        let session = Session::new(&transport).with_timeout(Duration::from_secs(60));
+
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(10), session.read_config_snapshot()).await;
+        assert!(cancelled.is_err(), "the read must be cancelled mid-flight");
+        assert!(session.needs_resync.load(Ordering::SeqCst));
+        assert_eq!(
+            session.dropped_operation.load(Ordering::SeqCst),
+            DroppedOperation::Resync as u8
+        );
+
+        let config = sample_config();
+        transport.set_fresh_config(build_fresh_config_frames(&config));
+        let snapshot = session.read_config_snapshot().await.unwrap();
+        assert_eq!(
+            transport.pending_before_first_config_send(),
+            Some(0),
+            "the stale frame must be drained before the next ReadConfig send"
+        );
+        assert_eq!(snapshot.config.as_bytes(), config.as_bytes());
+        assert_eq!(
+            session.dropped_operation.load(Ordering::SeqCst),
+            DroppedOperation::CallerCancelled as u8,
+            "a quiesced drain resets the classification"
+        );
+    }
+
+    #[test]
+    fn acknowledge_cancellation_does_not_clear_resync_after_timeout() {
+        // After a timeout the response may still arrive, so an explicit
+        // acknowledgement must not suppress the resync.
+        let session = Session::new(MockTransport::new());
+        session.needs_resync.store(true, Ordering::SeqCst);
+        session
+            .dropped_operation
+            .store(DroppedOperation::Resync as u8, Ordering::SeqCst);
+        session.acknowledge_cancelled_operation();
+        assert!(
+            session.needs_resync.load(Ordering::SeqCst),
+            "a Resync mark must survive acknowledgement"
+        );
+
+        // A default session (CallerCancelled) may clear it, which is what the
+        // CLI does on Ctrl-C / `monitor stop`.
+        let plain = Session::new(MockTransport::new());
+        plain.needs_resync.store(true, Ordering::SeqCst);
+        plain.acknowledge_cancelled_operation();
+        assert!(!plain.needs_resync.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

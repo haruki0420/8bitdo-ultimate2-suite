@@ -489,6 +489,22 @@ mod tests {
     }
 
     #[test]
+    fn checked_deadline_rejects_unschedulable_timeouts() {
+        assert!(checked_deadline(Duration::ZERO).is_ok());
+        assert!(checked_deadline(Duration::from_secs(10)).is_ok());
+        // `--scan-timeout` / `--timeout` accept any u64; these must become
+        // errors, not `Instant::add` panics.
+        assert!(matches!(
+            checked_deadline(Duration::MAX),
+            Err(Error::InvalidTimeout(_))
+        ));
+        assert!(matches!(
+            checked_deadline(crate::session::MAX_WAIT + Duration::from_nanos(1)),
+            Err(Error::InvalidTimeout(_))
+        ));
+    }
+
+    #[test]
     fn address_normalization_ignores_separators_and_case() {
         assert_eq!(
             normalize_address("AA:BB:CC:DD:EE:FF"),
