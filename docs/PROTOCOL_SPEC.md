@@ -213,7 +213,7 @@ Windows の `FindHid` / `enum_hid` は `HidD_GetPreparsedData` + `HidP_GetCaps` 
 - `ReadVersion` の要求には **4 バイトのダミーペイロード**が必要である。公式 `getVersionChannel`（0x2c7a0）はチャネル `+0x34 = 4`, `+0x40 = 4`（`total_len`）, `+0x44 = 4`（`chunk_len`）, `+0x50 = gamepadVersion` を設定し、`Generate_CustomDataCmd`（0x27620）は `+0x50` の 4 バイトを要求へコピーする。`gamepadVersion` は初回 0 初期化である。
 - その結果、正しい要求は 21B になる（CRC は 4 バイトのゼロに対して計算され `0x2400`）。実機で送信・応答とも確認済み:
   ```text
-  04 0B 00 00 04 00 00 24 04 00 00 00 40 70 01 01 00 00 00 00
+  04 0B 00 00 00 04 00 00 24 04 00 00 00 40 70 01 01 00 00 00 00
   ```
   - 内訳: `04` + `cmd=0x000B` + `subcmd=0` + `chunk_len=4` + `crc16=0x2400` + `total_len=4` + `offset=0x01017040` + 4B ゼロ。
 - `ReadConfig` の最初の応答は `chunk_len=0`, `total_len=0x0AD0`, `crc16=0xFFFF` の ready ACK である:
