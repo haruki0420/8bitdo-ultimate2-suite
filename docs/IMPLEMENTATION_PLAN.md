@@ -164,7 +164,7 @@ Track C: モバイル
 | --- | --- |
 | Phase 1 | 完了。ただし実機で ReadVersion の 4B ペイロード、ReadConfig の `chunk_len = 0x0AD0`、1 要求 = 1 チャンク、最終 142B パディングを補正した |
 | Phase 2a | 進行中。実機で ReadVersion **200 (0xC8)**、2768B dump（SHA-256 `1dca47fa...59c600`）、20ms keepalive **128.9 秒**を確認 |
-| レビュー | Phase 2a は **Tier 2**（仕様検収 + 実装・回帰）。Phase 2b 以降の書き込みは **Tier 3**（3 セッション） |
+| レビュー | Phase 2a は **Tier 3**（3 セッション）。`crates/eightbitdo-core/**` の session/backup と mock transport を含むため。Phase 2b 以降の書き込みも **Tier 3**（3 セッション） |
 
 ### Phase 1: `eightbitdo-protocol`（純粋プロトコル＆バイナリ層）
 - **ゴール**: 実機なしで全パケット・CRC・2768B 構造体・10B マクロのエンコード／デコードを単体テストで検証する。
@@ -183,10 +183,10 @@ Track C: モバイル
   - BLE `"80ND"` スキャン、`FF10` + `FF11` 優先 / `FF13` フォールバック、`peripheral.mtu()` の読み取り（MTU ネゴシエーション自体は OS/BlueZ 任せ）
   - `Session`: operation lock（keepalive とコマンドの直列化）、ReadVersion（4B ダミーペイロード + `cmd=0x0004` エンベロープ）、ReadConfig（`chunk_len = total_len = 0x0AD0`、1 要求 = 1 チャンク、142B、最終チャンク切り詰め）、入力レポート
   - CLI: `scan` / `info` / `config dump` / `backup` / `monitor` / `keepalive` / **`session`**
-  - `session`: 1 接続、`0x0007` enable + 20ms `0x0003` keepalive + 受信ドレイン、operation lock でコマンド中は keepalive を停止、`info` / `config dump` / `backup` / `monitor` / `monitor stop` / `status` / `help` / `quit`。`monitor` 自身も 20ms `0x0003` を送り、その間は keepalive が止まる（monitor が keepalive を兼ねる）。`monitor stop` 後は keepalive が自動再開。連続失敗 3 回または `Disconnected` で degraded 停止し、自動再接続しない
+  - `session`: 1 接続、`0x0007` enable + 20ms `0x0003` keepalive + 受信ドレイン、operation lock でコマンド中は keepalive を停止、`info` / `config dump` / `backup` / `monitor` / `monitor stop` / `status` / `help` / `quit`。`monitor` 自身も 20ms `0x0003` を送り、その間は keepalive が止まる（monitor が keepalive を兼ねる）。`monitor stop` 後は keepalive が自動再開。トップレベルの `monitor` も同じ 20ms `0x0003` ポーリングを共有し、終了時に `0x0007` disable → 切断する。なお `monitor --count N` は公式 `ReadKeysAndJoy` と同様に投げっぱなしのため、応答がない場合は Ctrl-C まで無期限に待機する。`status` は `monitor sent` / `monitor received` を表示し、終了時のロック待ち・切断はタイムアウト付きで有界にする。連続失敗 3 回または `Disconnected` で degraded 停止し、自動再接続しない
   - `session` は将来のデーモン化（常駐プロセス）への布石。1 回の Profile 長押しで複数操作を完結させる
   - docs: `FF13` 実機観測、`cmd=0x0004` エンベロープ、ReadConfig の `chunk_len`、keepalive 設計
-- **完了条件**: 1 回の Profile で `session` 内の `info` → `backup` → `monitor` が通り、Tier 2 レビューと CI 4/4 を満たすこと。
+- **完了条件**: 1 回の Profile で `session` 内の `info` → `backup` → `monitor` が通り、Tier 3 レビューと CI 4/4 を満たすこと。
 - **状態**: 進行中。
 
 ### Phase 2b: BLE マクロ読み書き（本命）
@@ -234,7 +234,7 @@ Track C: モバイル
 
 ### Phase 3: `eightbitdo-gui`（デスクトップ ネイティブ GUI：Linux / macOS / Windows）
 - **技術**: `egui` (`eframe`)、Pure Rust。Node.js / WebView / Electron / Tauri は使わない。
-- **Phase 3a（read-only GUI、Phase 2a 後）**: 接続パネル、デバイス情報、ライブ入力、設定ビューア、バックアップ。Tier 2。
+- **Phase 3a（read-only GUI、Phase 2a 後）**: 接続パネル、デバイス情報、ライブ入力、設定ビューア、バックアップ。Tier 2（`crates/eightbitdo-core/**` の `session` 変更を伴う場合は Tier 3）。
 - **Phase 3b（マクロエディタ、Phase 2b 後）**: タイムライン / テーブル、リアルタイム録音、1ms、8bit スティック、トリガー、JSON/TOML。Tier 3。
 - **Phase 3c（OTA 画面、Phase 2c 後）**: バージョン確認、進捗、復旧モード。Tier 3。
 - **Phase 3d（設定タブ、Phase 2d 後）**: プロファイル、リマップ、デッドゾーン、振動、6 軸、RGB。Tier 3。
@@ -256,7 +256,7 @@ Track C: モバイル
 
 ### 5.3 クリティカルパス
 
-1. Phase 2a `session` 完了 → Tier 2 レビュー → マージ
+1. Phase 2a `session` 完了 → Tier 3 レビュー → マージ
 2. Phase 2b マクロ書き込み → Tier 3 レビュー → マージ
 3. Phase 2c BLE OTA → Tier 3 レビュー → マージ
 4. Phase 2d 設定書き込み → Tier 3 レビュー → マージ

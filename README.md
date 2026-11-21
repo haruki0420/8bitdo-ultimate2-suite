@@ -48,9 +48,13 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 - [x] 公式アプリ（Android v2.01 / Windows v1.38）の通信プロトコル・バイナリ構造・OTA シーケンスの解析完了
 - [x] 完全仕様書・実装計画書・AI 引き継ぎドキュメント作成
 - [x] Phase 1: `eightbitdo-protocol`（Rust プロトコル・構造体・CRC・マクロ、単体テスト 74 件 + doc test 4 件）
-- [ ] Phase 2: `eightbitdo-core` + `eightbitdo-cli`（BLE / USB 実機通信＆検証）
+- [ ] Phase 2: `eightbitdo-core` + `eightbitdo-cli`（BLE 実機通信＆検証）
+  - [ ] Phase 2a: 読み取り専用 core / CLI / `session`
+  - [ ] Phase 2b: マクロ読み書き
+  - [ ] Phase 2c: BLE OTA（Linux）
+  - [ ] Phase 2d: 設定書き込み
 - [ ] Phase 3: `eightbitdo-gui`（デスクトップネイティブ GUI）
-- [ ] Phase 4: BLE OTA / USB ファームウェアアップデーター
+- [ ] Phase 4: USB OTA（保留）
 - [ ] Phase 5: `eightbitdo-uniffi` + iOS (SwiftUI) / Android (Jetpack Compose) アプリ
 
 ---
