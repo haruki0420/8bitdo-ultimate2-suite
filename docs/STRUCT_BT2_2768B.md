@@ -124,6 +124,11 @@ struct Bt2Header {
   - Android `writeBT2*`（`libadvancelib.so`）および Windows `_ANSI_CRC_16_UltimateBT2@2768`（`8BitDoAdvance.dll`）は、いずれも **`+0x00C..+0x00F` をゼロクリアしないまま** `ansi_crc16_sh(&buf[0..0x0AD0])` を全 2768 バイトに対して計算し、戻り値を `u32` として `+0x00C..+0x00F` に上書き格納している。
   - したがって公式ツールが書き込んだバッファを再読み込みした場合、`+0x00C` 自身も含めて計算されていた過去の値に依存するため、読み出し時の検証用自己整合 CRC としては機能しない場合がある。新規バッファ生成時および書き戻し時は公式仕様に合わせて全 2768 バイトで計算し `+0x00C` に格納すること（なお部分書込コマンド `getBT2_WriteRumble` 等は部分領域のみを送信するため、`+0x00C` はメモリ上でのみ更新され全体書込や `WriteUltimateBT2Name` 時に反映される）。
 
+> **実機観測・未確定（2026-11-21）**:
+> - Ultimate 2 Bluetooth から取得した 2768B バッファでは `slot_flags = [0x20200911, 0x20200911, 0xFFFFFFFF]`、`crc16` は stored `0x2C55` / in-place 再計算 `0x6A05` だった。
+> - `slot_flags` は `1` / `0` ではなく大きな非 0 値である。公式 `deleteCurslot` は `slot_flags[slot]` に `0` を書き、`copyConfig` は値をコピーするだけであるため、有効判定は「非 0」である可能性がある。`1 = 有効 / 0 = 空` は単純化であり、実機での正確な意味は未確定である。
+> - stored CRC と in-place 再計算が一致しないのは、上記のとおり公式 `ANSI_CRC_16_sh` が既存 CRC フィールドを含めて再計算する方式上、直ちに破損を意味しない。CLI はこの 2 値を情報表示するだけにしている。
+
 ### 2.2 `gamepad_mode` (`+0x010..+0x011`, `u16`)
 
 `Ultimate2AdvanceUI$GAMEPAD_MODE_SWIFT` の enum 序数値：
@@ -150,6 +155,8 @@ struct Bt2Header {
 | `2` | `CONFIG_SLOT_SWIFT_3` | スロット 3（プロファイル 3） |
 | `3` | `CONFIG_SLOT_SWIFT_MAX` | スロット数上限マーカー |
 | `4` | `CONFIG_SLOT_SWIFT_NONE` | スロット未選択 / 削除状態（オフ状態） |
+
+> **実機観測・未確定（2026-11-21）**: Ultimate 2 Bluetooth で `cur_slot = 6` を観測した。enum の `0..=2` / `4` の範囲外であり、意味は未確定である。CLI は `0..=2` を `profile N`、`4` を `none`、それ以外を `unknown (6)` のように表示する。`deleteCurslot` が `cur_slot = 4` を書くことは解析済みだが、実機で 6 が観測される理由（別状態・未初期化・ファームウェア固有値など）は断定できない。
 
 ---
 

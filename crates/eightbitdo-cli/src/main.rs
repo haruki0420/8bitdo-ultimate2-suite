@@ -249,6 +249,10 @@ fn json_summary(snapshot: &ConfigSnapshot, sha256: &str) -> serde_json::Value {
         .map(|slot| snapshot.config.profile_name(*slot))
         .collect();
 
+    // The official ANSI_CRC_16_sh is recomputed in place over a buffer that
+    // still contains the stored CRC field. A device-read buffer therefore
+    // does not have to satisfy `crc_in_place == crc_stored`; both values are
+    // informational.
     json!({
         "size": CONFIG_SIZE,
         "sha256": sha256,
@@ -256,10 +260,22 @@ fn json_summary(snapshot: &ConfigSnapshot, sha256: &str) -> serde_json::Value {
         "gamepad_mode": snapshot.config.gamepad_mode_raw(),
         "slot_flags": snapshot.config.slot_flags(),
         "profile_names": profile_names,
-        "stored_crc": snapshot.stored_crc,
-        "computed_crc": snapshot.computed_crc,
-        "crc_valid": snapshot.crc_valid,
+        "crc_stored": snapshot.stored_crc,
+        "crc_in_place": snapshot.computed_crc,
     })
+}
+
+fn cur_slot_label(raw: u16) -> String {
+    match Slot::from_index(raw as usize) {
+        Some(slot) => format!("{raw} (profile {})", slot.number()),
+        None if raw == 4 => format!("{raw} (none)"),
+        None => format!("unknown ({raw})"),
+    }
+}
+
+fn format_slot_flags(flags: [u32; 3]) -> String {
+    let values: Vec<String> = flags.iter().map(|flag| format!("0x{flag:08X}")).collect();
+    format!("[{}]", values.join(", "))
 }
 
 fn print_config_summary(snapshot: &ConfigSnapshot, sha256: &str) {
@@ -267,16 +283,7 @@ fn print_config_summary(snapshot: &ConfigSnapshot, sha256: &str) {
         .config
         .gamepad_mode()
         .map_or_else(|| "unknown".to_string(), |mode| format!("{mode:?}"));
-    let cur_slot = snapshot.config.cur_slot().map_or_else(
-        || format!("{} (none)", snapshot.config.cur_slot_raw()),
-        |slot| {
-            format!(
-                "{} (profile {})",
-                snapshot.config.cur_slot_raw(),
-                slot.number()
-            )
-        },
-    );
+    let cur_slot = cur_slot_label(snapshot.config.cur_slot_raw());
 
     println!("config size: {CONFIG_SIZE} bytes");
     println!("sha256: {sha256}");
@@ -285,7 +292,11 @@ fn print_config_summary(snapshot: &ConfigSnapshot, sha256: &str) {
         "gamepad_mode: {} ({mode})",
         snapshot.config.gamepad_mode_raw()
     );
-    println!("slot_flags: {:?}", snapshot.config.slot_flags());
+    println!(
+        "slot_flags: {}",
+        format_slot_flags(snapshot.config.slot_flags())
+    );
+    println!("  note: non-zero may mean enabled; 1/0 is a simplification (unconfirmed)");
     println!(
         "profile_names: {:?}",
         Slot::ALL
@@ -294,22 +305,12 @@ fn print_config_summary(snapshot: &ConfigSnapshot, sha256: &str) {
             .collect::<Vec<_>>()
     );
 
-    if snapshot.crc_valid {
-        println!(
-            "crc: stored=0x{:04X} computed=0x{:04X} OK",
-            snapshot.stored_crc, snapshot.computed_crc
-        );
-    } else {
-        println!(
-            "crc: stored=0x{:04X} computed=0x{:04X} MISMATCH",
-            snapshot.stored_crc, snapshot.computed_crc
-        );
-        eprintln!(
-            "warning: configuration CRC mismatch (stored 0x{:04X}, computed 0x{:04X}); \
-             the dump may be incomplete or the stored value may not be self-consistent",
-            snapshot.stored_crc, snapshot.computed_crc
-        );
-    }
+    // Informational only: the official in-place recomputation includes the
+    // stored CRC field, so a mismatch is not by itself a corruption signal.
+    println!(
+        "crc: stored=0x{:04X} in_place=0x{:04X} (informational)",
+        snapshot.stored_crc, snapshot.computed_crc
+    );
 }
 
 async fn monitor(options: &BleOptions, count: Option<u64>) -> Result<(), Error> {
@@ -509,6 +510,7 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
+    use eightbitdo_protocol::config_bt2::Bt2Config;
     use eightbitdo_protocol::header::CustomHeader;
 
     use super::*;
@@ -621,5 +623,38 @@ mod tests {
             assert_eq!(header.total_len, 0x0C);
             assert_eq!(header.offset, 0x0C);
         }
+    }
+
+    #[test]
+    fn cur_slot_labels_cover_profiles_none_and_unknown() {
+        assert_eq!(cur_slot_label(0), "0 (profile 1)");
+        assert_eq!(cur_slot_label(1), "1 (profile 2)");
+        assert_eq!(cur_slot_label(2), "2 (profile 3)");
+        assert_eq!(cur_slot_label(4), "4 (none)");
+        assert_eq!(cur_slot_label(6), "unknown (6)");
+    }
+
+    #[test]
+    fn slot_flags_render_as_hex() {
+        assert_eq!(
+            format_slot_flags([0x2020_0911, 0x2020_0911, 0xFFFF_FFFF]),
+            "[0x20200911, 0x20200911, 0xFFFFFFFF]"
+        );
+    }
+
+    #[test]
+    fn summary_json_uses_informational_crc_fields() {
+        let snapshot = ConfigSnapshot {
+            config: Bt2Config::zeroed(),
+            stored_crc: 0x2C55,
+            computed_crc: 0x6A05,
+            crc_valid: false,
+        };
+        let summary = json_summary(&snapshot, "abc");
+        assert_eq!(summary["crc_stored"], 0x2C55);
+        assert_eq!(summary["crc_in_place"], 0x6A05);
+        assert!(summary.get("crc_valid").is_none());
+        assert!(summary.get("stored_crc").is_none());
+        assert!(summary.get("computed_crc").is_none());
     }
 }
