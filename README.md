@@ -43,7 +43,7 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 
 ## 現在のステータス
 
-- `main` は **PR + CI + 独立レビュー（SHA 紐づきの `review-gate` status）** で保護します。ruleset は PR #1 のマージ前に有効化・検証します。詳細は [CONTRIBUTING.md](CONTRIBUTING.md) と [docs/BRANCH_PROTECTION.md](docs/BRANCH_PROTECTION.md) を参照してください。
+- `main` は **PR + CI + 独立レビュー（SHA 紐づきの `review-gate` status）** で保護済みです（`main-protection`, id `27785806`, 2026-11-21 検証）。詳細は [CONTRIBUTING.md](CONTRIBUTING.md) と [docs/BRANCH_PROTECTION.md](docs/BRANCH_PROTECTION.md) を参照してください。
 - [x] 公式アプリ（Android v2.01 / Windows v1.38）の通信プロトコル・バイナリ構造・OTA シーケンスの解析完了
 - [x] 完全仕様書・実装計画書・AI 引き継ぎドキュメント作成
 - [x] Phase 1: `eightbitdo-protocol`（Rust プロトコル・構造体・CRC・マクロ、単体テスト 74 件 + doc test 4 件）

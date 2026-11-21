@@ -4,7 +4,7 @@
 
 ## 1. `main` の保護
 
-`main` には [docs/BRANCH_PROTECTION.md](docs/BRANCH_PROTECTION.md) の ruleset を適用します（PR #1 のマージ前に有効化・検証）。
+`main` には [docs/BRANCH_PROTECTION.md](docs/BRANCH_PROTECTION.md) の `main-protection` ruleset（id `27785806`）を適用済みです（2026-11-21 検証）。
 
 - `main` への直接 push 禁止（Pull Request 必須）
 - 必須 CI: `fmt` / `clippy` / `test` / `msrv`
@@ -27,7 +27,7 @@
    ```sh
    cargo fmt --all -- --check
    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-   cargo clippy -p eightbitdo-protocol --no-default-features --locked -- -D warnings
+   cargo clippy -p eightbitdo-protocol --no-default-features --all-targets --locked -- -D warnings
    cargo test --workspace --locked
    cargo test --workspace --all-features --locked
    cargo test -p eightbitdo-protocol --no-default-features --locked
@@ -35,7 +35,7 @@
    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
    rustup toolchain install 1.85.0
    cargo +1.85.0 check --workspace --all-targets --all-features --locked
-   cargo +1.85.0 check -p eightbitdo-protocol --no-default-features --locked
+   cargo +1.85.0 check -p eightbitdo-protocol --no-default-features --all-targets --locked
    ```
 
 5. PR を作成する。
@@ -43,7 +43,9 @@
 7. **著者以外**のレビュアー（別セッションの AI エージェント、または人間）が差分をレビューする。
 8. レビュアーが PR にレビューを投稿し、**レビューした head SHA** に `review-gate` status を付ける。
 
-   ```sh
+   ```bash
+   set -euo pipefail
+
    REPO=haruki0420/8bitdo-ultimate2-suite
    PR=123
    REVIEWED_SHA=<レビューした head SHA>
@@ -65,7 +67,7 @@
 
 9. すべてのレビューコメントを解決し、squash merge する。
 
-> `reviewed` ラベルは任意の目視用マーカーであり、マージ条件ではありません。必須なのは SHA に紐づく `review-gate` status です。
+> `reviewed` ラベルは任意の目視用マーカーであり、マージ条件ではありません（ラベル説明も "Optional visual marker; not a merge gate"）。必須なのは SHA に紐づく `review-gate` status です。
 
 ## 3. 独立レビューの観点
 
@@ -90,6 +92,7 @@
 - 身元まで強制する場合は、2 人目のレビュアーアカウントまたはマシンユーザーを追加し、required approvals を 1 に上げる。
 - または、信頼できる GitHub App の `integration_id` で `review-gate` の expected source を固定する。
 - GitHub Actions の bot 承認は required approvals にカウントされない。
+- **fork PR**: status の投稿には base リポジトリの `statuses: write` が必要なため、外部レビュアーは付けられません。メンテナが代行してください。fork の workflow token は read-only ですが、fork PR は CI ワークフローの挙動を変更できるため、CI も security boundary ではありません。
 
 ## 5. コミットメッセージ
 
