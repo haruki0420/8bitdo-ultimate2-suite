@@ -31,7 +31,7 @@
    cargo test --workspace --locked
    cargo test --workspace --all-features --locked
    cargo test -p eightbitdo-protocol --no-default-features --locked
-   cargo check -p eightbitdo-protocol --no-default-features --locked
+   cargo check -p eightbitdo-protocol --no-default-features --all-targets --locked
    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
    rustup toolchain install 1.85.0
    cargo +1.85.0 check --workspace --all-targets --all-features --locked
@@ -48,6 +48,7 @@
 
    REPO=haruki0420/8bitdo-ultimate2-suite
    PR=123
+   TIER=2
    REVIEWED_SHA=<レビューした head SHA>
 
    current=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)
@@ -59,11 +60,11 @@
    gh api --method POST "repos/$REPO/statuses/$REVIEWED_SHA" \
      -f state=success \
      -f context=review-gate \
-     -f description="Independent review of ${REVIEWED_SHA:0:7}" \
+     -f description="Tier ${TIER} review of ${REVIEWED_SHA:0:7}" \
      -f target_url="https://github.com/$REPO/pull/$PR"
    ```
 
-   修正が必要な場合は `state=failure` で同じ context に status を付け、修正後に新しい SHA へ `success` を付ける。`docs/BRANCH_PROTECTION.md` に確認コマンドと監査方法があります。
+   修正が必要な場合は `state=failure` で同じ context に status を付け、修正後に新しい SHA へ `success` を付ける。[docs/BRANCH_PROTECTION.md](docs/BRANCH_PROTECTION.md) に確認コマンドと監査方法があります。
 
 9. すべてのレビューコメントを解決し、squash merge する。
 
@@ -71,18 +72,19 @@
 
 ## 3. レビュー Tier と観点
 
-レビューの深さはリスクで変えます。詳細は **[docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)** を参照してください。
+Tier の判定・パス別トリガー・故障リストの詳細は **[docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)** を参照してください。ここでは要約だけを示します。
 
-| Tier | 対象 | レビュー |
-| --- | --- | --- |
-| **1** | 通常の docs、コメント、整形、振る舞いを変えないリファクタ、テスト追加のみ | 1 本。diff + テスト + リンク/コマンド |
-| **2** | 通常のコード、プロトコルのデータ構造・コマンドビルダー、CI/ツール（ゲート本体を除く）、プロセス文書 | 2 本（仕様検収 + 実装/回帰）。変更ファイル + 呼び出し側 |
-| **3** | 実機書き込み / Flash / OTA / CRC / オフセット / フレーミング / レビューゲート / リリース / 大規模な混合差分 | 2 本 + 敵対的パス。関連ファイル全体 + モック + 故障リスト 10 件以上 |
+- **Tier 1**: コメント・整形、通常の docs、純粋なテスト追加。レビュアー 1 名。
+- **Tier 2**: 通常のコード（書き込み経路を除く）、読み取り系ビルダー、プロセス文書、依存・ツールチェーン、リファクタ、テスト変更。レビュアー 2 名（仕様検収 + 実装/回帰）。
+- **Tier 3**: 実機書き込み / Flash / OTA / backup-restore / CRC / offset / framing / マクロ step / セキュリティ / ゲート実装 / リリース。レビュアー 2 名 + 別セッションの敵対的パス。
 
 - 行数ではなく **触った領域** で判定する。10 行の CRC 変更は Tier 3、1000 行の README 整形は Tier 1。
+- コードのリファクタは Tier 1 にしない。テストの変更・削除は Tier 2。実機書き込み・Flash・OTA・セキュリティは小さくても Tier 3。
 - 混合 PR は最大 Tier。著者が提案し、レビュアーは昇格できる（降格は不可）。
-- `AGENTS.md` / `CONTRIBUTING.md` / `docs/BRANCH_PROTECTION.md` / `.github/**` は docs でも Tier 2 以上。
-- Tier 2/3 は「故障 → 検出したテスト」の表を PR に残す。
+- **プロセス文書は Tier 2、ゲートの実装（workflow / ruleset / status）は Tier 3。**
+- Tier 2/3 は **全レビュアーが同じ head SHA で「マージ可」** を出すまでマージしない。1 名でも要修正なら status を付けない。
+- リードレビュアーが全員の判定を確認してから `review-gate` status を付ける。判定が割れたら Tier を上げるか 3 本目を追加する。
+- Tier 2/3 は「故障 → 検出方法 → 結果 → 残存リスク」を PR に残す。件数はコードの下限であり、docs のノルマではない。
 - **「マージ可」が出るまでマージしない。** 修正を push したら新しい SHA で再レビューする。
 
 レビュアーは「作者の意図」ではなく、**仕様書と実装の一致** を確認します。

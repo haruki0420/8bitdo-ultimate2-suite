@@ -104,14 +104,15 @@ gh pr view <PR> --repo "$REPO" --json mergeStateStatus,statusCheckRollup
 
 ## `review-gate` status の付け方
 
-レビューした SHA を固定し、投稿直前に head が動いていないことを確認します。
+レビューした SHA を固定し、投稿直前に head が動いていないことを確認します。Tier 2/3 では、**全レビュアーが同じ SHA で「マージ可」** を出したことを確認してから付けます。1 名でも要修正なら `success` を付けません。
 
 ```bash
 set -euo pipefail
 
 REPO=haruki0420/8bitdo-ultimate2-suite
-PR="${1:?usage: post-review-status.sh <pr-number> <reviewed-sha>}"
-REVIEWED_SHA="${2:?usage: post-review-status.sh <pr-number> <reviewed-sha>}"
+PR="${1:?usage: post-review-status.sh <pr-number> <reviewed-sha> <tier>}"
+REVIEWED_SHA="${2:?usage: post-review-status.sh <pr-number> <reviewed-sha> <tier>}"
+TIER="${3:?usage: post-review-status.sh <pr-number> <reviewed-sha> <tier>}"
 
 current=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)
 if [ "$current" != "$REVIEWED_SHA" ]; then
@@ -122,12 +123,12 @@ fi
 gh api --method POST "repos/$REPO/statuses/$REVIEWED_SHA" \
   -f state=success \
   -f context=review-gate \
-  -f description="Independent review of $(printf '%s' "$REVIEWED_SHA" | cut -c1-7)" \
+  -f description="Tier ${TIER} review of $(printf '%s' "$REVIEWED_SHA" | cut -c1-7)" \
   -f target_url="https://github.com/$REPO/pull/$PR"
 
-# 監査: 最新 status と投稿者を確認
+# 監査: 最新 status・description・投稿者を確認
 gh api "repos/$REPO/commits/$REVIEWED_SHA/status" \
-  --jq '{state, statuses: [.statuses[] | {context, state, creator}]}'
+  --jq '{state, statuses: [.statuses[] | {context, state, description, creator}]}'
 ```
 
 修正が必要な場合は `state=failure` で同じ context に status を付けます。同じ SHA への最新 status が有効になるため、**レビュアーは自分の status が上書きされていないか確認してください**。
