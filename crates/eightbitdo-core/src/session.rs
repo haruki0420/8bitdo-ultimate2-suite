@@ -7,6 +7,7 @@
 //! Every operation in this module is read-only except
 //! [`Session::set_report_enable`], which toggles the realtime input stream.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use eightbitdo_protocol::commands;
@@ -60,6 +61,7 @@ pub struct ConfigSnapshot {
 pub struct Session<T: Transport> {
     transport: T,
     timeout: Duration,
+    needs_resync: AtomicBool,
 }
 
 impl<T: Transport> Session<T> {
@@ -69,6 +71,7 @@ impl<T: Transport> Session<T> {
         Self {
             transport,
             timeout: DEFAULT_TIMEOUT,
+            needs_resync: AtomicBool::new(false),
         }
     }
 
@@ -94,6 +97,19 @@ impl<T: Transport> Session<T> {
         self.transport
     }
 
+    async fn prepare_read(&self) {
+        if self.needs_resync.swap(false, Ordering::SeqCst) {
+            self.drain_pending().await;
+        }
+    }
+
+    /// Discard frames left over from a timed-out or failed read.
+    async fn drain_pending(&self) {
+        while let Ok(Ok(_frame)) =
+            tokio::time::timeout(Duration::from_millis(1), self.transport.recv()).await
+        {}
+    }
+
     /// Read the firmware version (`cmd 0x000B`).
     ///
     /// The `0x600F` request carries a 4-byte zero payload and declares
@@ -110,18 +126,26 @@ impl<T: Transport> Session<T> {
     /// mismatched envelope or a range outside the declared transfer, or a
     /// transport error.
     pub async fn read_version(&self) -> Result<VersionInfo, Error> {
+        self.prepare_read().await;
         self.transport
             .send(&commands::read_version().encode_ble(PacketKind::App)?)
             .await?;
 
-        let raw = self
-            .read_transfer(
+        let raw = match self
+            .read_transfer_inner(
                 commands::cmd::READ_VERSION,
                 commands::VERSION_RESPONSE_LEN,
                 self.timeout,
                 self.timeout,
             )
-            .await?;
+            .await
+        {
+            Ok(raw) => raw,
+            Err(error) => {
+                self.needs_resync.store(true, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
 
         let text = longest_printable_run(&raw);
         Ok(VersionInfo { raw, text })
@@ -202,8 +226,9 @@ impl<T: Transport> Session<T> {
 
     /// Wait up to `wait` for the next realtime input report.
     ///
-    /// Frames whose command is not `0x0003` are skipped. A timeout returns
-    /// `Ok(None)`; a closed transport returns [`Error::Disconnected`].
+    /// Accepts both a direct `cmd=0x0003` frame and the `0x600F` envelope
+    /// (`cmd=0x0004, subcmd=0x0003`). Other frames are skipped. A timeout
+    /// returns `Ok(None)`; a closed transport returns [`Error::Disconnected`].
     ///
     /// # Errors
     ///
@@ -258,6 +283,23 @@ impl<T: Transport> Session<T> {
     /// a mismatched envelope or an out-of-range chunk, or a transport/protocol
     /// error.
     pub async fn read_transfer(
+        &self,
+        cmd: u16,
+        expected_len: usize,
+        per_frame_timeout: Duration,
+        total_timeout: Duration,
+    ) -> Result<Vec<u8>, Error> {
+        self.prepare_read().await;
+        let result = self
+            .read_transfer_inner(cmd, expected_len, per_frame_timeout, total_timeout)
+            .await;
+        if result.is_err() {
+            self.needs_resync.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    async fn read_transfer_inner(
         &self,
         cmd: u16,
         expected_len: usize,
@@ -320,6 +362,22 @@ impl<T: Transport> Session<T> {
     /// wait expires, [`Error::UnexpectedResponse`] for a mismatched envelope,
     /// offset, `total_len` or range, or a transport/protocol error.
     pub async fn read_config_chunks(
+        &self,
+        expected_len: usize,
+        per_frame_timeout: Duration,
+        total_timeout: Duration,
+    ) -> Result<Vec<u8>, Error> {
+        self.prepare_read().await;
+        let result = self
+            .read_config_chunks_inner(expected_len, per_frame_timeout, total_timeout)
+            .await;
+        if result.is_err() {
+            self.needs_resync.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    async fn read_config_chunks_inner(
         &self,
         expected_len: usize,
         per_frame_timeout: Duration,
@@ -417,19 +475,24 @@ impl<T: Transport> Session<T> {
         if response.cmd != commands::cmd::RESPONSE {
             return Ok(None);
         }
+
+        // Input reports may arrive while a read is in progress because the
+        // session enables notifications. They are unrelated to the request.
+        if response.subcmd == commands::cmd::INPUT {
+            return Ok(None);
+        }
+
+        // Payload-less acknowledgement / "ready" frame. Check this before
+        // comparing subcmd so 0x0007 ACKs and other control ACKs are skipped.
+        if response.chunk_len == 0 {
+            return Ok(None);
+        }
+
         if response.subcmd != request_cmd {
             return Err(Error::UnexpectedResponse(format!(
                 "response envelope subcmd 0x{:04X} does not match request cmd 0x{request_cmd:04X}",
                 response.subcmd
             )));
-        }
-
-        // Payload-less acknowledgement / "ready" frame. The device does not
-        // carry data when chunk_len is zero; total_len may be 0 (ReadVersion
-        // ACK) or the full transfer size (ReadConfig ready ACK). Skip it and
-        // keep waiting for the data frame(s).
-        if response.chunk_len == 0 {
-            return Ok(None);
         }
         if response.total_len as usize != expected_len {
             return Err(Error::UnexpectedResponse(format!(
@@ -531,6 +594,7 @@ fn longest_printable_run(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -737,6 +801,52 @@ mod tests {
             200
         );
         assert!(version.text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_version_skips_input_and_report_enable_ack() {
+        let mock = MockTransport::new();
+        let input = envelope_header(commands::cmd::INPUT, 0x0C, 0x0C, 12);
+        mock.push_response(&input, &[0u8; 12]);
+        let enable_ack =
+            CustomHeader::new(commands::cmd::RESPONSE, commands::cmd::REPORT_ENABLE, 0, 0);
+        mock.push_response(&enable_ack, &[]);
+        let data = envelope_header(
+            commands::cmd::READ_VERSION,
+            commands::VERSION_REQUEST_LEN,
+            0,
+            4,
+        );
+        mock.push_response(&data, &[0x11, 0x22, 0x33, 0x44]);
+
+        let session = Session::new(&mock);
+        let version = session.read_version().await.unwrap();
+        assert_eq!(version.raw, [0x11, 0x22, 0x33, 0x44]);
+    }
+
+    #[tokio::test]
+    async fn config_chunks_skip_interleaved_input_reports() {
+        let config = sample_config();
+        let bytes = config.as_bytes();
+        let mock = MockTransport::new();
+        for (index, chunk) in bytes.chunks(142).enumerate() {
+            if index == 5 {
+                let input = envelope_header(commands::cmd::INPUT, 0x0C, 0x0C, 12);
+                mock.push_response(&input, &[0u8; 12]);
+            }
+            let offset = (index * 142) as u32;
+            let header = envelope_header(
+                commands::cmd::READ_CONFIG,
+                CONFIG_SIZE as u32,
+                offset,
+                chunk.len() as u16,
+            );
+            mock.push_response(&header, chunk);
+        }
+
+        let session = Session::new(&mock);
+        let snapshot = session.read_config_snapshot().await.unwrap();
+        assert_eq!(snapshot.config.as_bytes(), bytes);
     }
 
     #[tokio::test]
@@ -1079,6 +1189,107 @@ mod tests {
         async fn disconnect(&self) -> Result<(), Error> {
             Ok(())
         }
+    }
+
+    struct ResyncTransport {
+        incoming: Mutex<VecDeque<Vec<u8>>>,
+        fresh_config: Mutex<Vec<Vec<u8>>>,
+        sent: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl ResyncTransport {
+        fn new() -> Self {
+            Self {
+                incoming: Mutex::new(VecDeque::new()),
+                fresh_config: Mutex::new(Vec::new()),
+                sent: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn push_stale(&self, frame: Vec<u8>) {
+            self.incoming.lock().unwrap().push_back(frame);
+        }
+
+        fn set_fresh_config(&self, frames: Vec<Vec<u8>>) {
+            *self.fresh_config.lock().unwrap() = frames;
+        }
+    }
+
+    #[async_trait]
+    impl Transport for ResyncTransport {
+        async fn send(&self, data: &[u8]) -> Result<(), Error> {
+            self.sent.lock().unwrap().push(data.to_vec());
+            if let Some(header_bytes) = data.get(1..) {
+                if let Ok(header) = CustomHeader::parse(header_bytes) {
+                    if header.cmd == commands::cmd::READ_CONFIG {
+                        let fresh = std::mem::take(&mut *self.fresh_config.lock().unwrap());
+                        if !fresh.is_empty() {
+                            let mut incoming = self.incoming.lock().unwrap();
+                            incoming.clear();
+                            incoming.extend(fresh);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        async fn recv(&self) -> Result<Vec<u8>, Error> {
+            if let Some(frame) = self.incoming.lock().unwrap().pop_front() {
+                return Ok(frame);
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Err(Error::Disconnected)
+        }
+
+        fn mtu(&self) -> u16 {
+            64
+        }
+
+        async fn disconnect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn resync_discards_stale_config_chunk_before_next_read() {
+        let transport = ResyncTransport::new();
+        let session = Session::new(&transport).with_timeout(Duration::from_millis(20));
+
+        // Force a timeout so the session records that a resync is needed.
+        assert!(session.read_version().await.is_err());
+
+        let stale = CustomHeader::new(
+            commands::cmd::RESPONSE,
+            commands::cmd::READ_CONFIG,
+            CONFIG_SIZE as u32,
+            0,
+        )
+        .with_payload(&[0xAA; 142]);
+        let mut stale_frame = stale.to_bytes().to_vec();
+        stale_frame.extend_from_slice(&[0xAA; 142]);
+        transport.push_stale(stale_frame);
+
+        let config = sample_config();
+        let mut fresh = Vec::new();
+        for (index, chunk) in config.as_bytes().chunks(142).enumerate() {
+            let offset = (index * 142) as u32;
+            let header = CustomHeader::new(
+                commands::cmd::RESPONSE,
+                commands::cmd::READ_CONFIG,
+                CONFIG_SIZE as u32,
+                offset,
+            )
+            .with_payload(chunk);
+            let mut frame = header.to_bytes().to_vec();
+            frame.extend_from_slice(chunk);
+            fresh.push(frame);
+        }
+        transport.set_fresh_config(fresh);
+
+        let snapshot = session.read_config_snapshot().await.unwrap();
+        assert_eq!(snapshot.config.as_bytes(), config.as_bytes());
+        assert_ne!(&snapshot.config.as_bytes()[..8], &[0xAA; 8]);
     }
 
     #[tokio::test]

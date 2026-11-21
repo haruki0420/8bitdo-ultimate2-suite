@@ -84,6 +84,7 @@ pub struct BleTransport {
     characteristic: Characteristic,
     write_type: WriteType,
     mtu: u16,
+    write_timeout: Duration,
     name: Option<String>,
     verbose: bool,
     rx: Mutex<mpsc::Receiver<Vec<u8>>>,
@@ -135,15 +136,26 @@ impl BleTransport {
             return Err(ble_error(error));
         }
 
-        let service = peripheral
+        let service = match peripheral
             .services()
             .into_iter()
             .find(|service| service.uuid == APP_SERVICE_UUID)
-            .ok_or_else(|| {
-                Error::Ble(format!("App Mode service {APP_SERVICE_UUID} was not found"))
-            })?;
-        let characteristic =
-            choose_characteristic(&service.characteristics).ok_or(Error::CharacteristicNotFound)?;
+        {
+            Some(service) => service,
+            None => {
+                let _ = peripheral.disconnect().await;
+                return Err(Error::Ble(format!(
+                    "App Mode service {APP_SERVICE_UUID} was not found"
+                )));
+            }
+        };
+        let characteristic = match choose_characteristic(&service.characteristics) {
+            Some(characteristic) => characteristic,
+            None => {
+                let _ = peripheral.disconnect().await;
+                return Err(Error::CharacteristicNotFound);
+            }
+        };
         let write_type = if characteristic.properties.contains(CharPropFlags::WRITE) {
             WriteType::WithResponse
         } else {
@@ -194,6 +206,10 @@ impl BleTransport {
             characteristic,
             write_type,
             mtu,
+            // Reuse the connection timeout as the upper bound for one GATT
+            // write so Ctrl-C/shutdown can never wait forever on a wedged BLE
+            // stack.
+            write_timeout: options.connect_timeout,
             name,
             verbose,
             rx: Mutex::new(rx),
@@ -227,10 +243,25 @@ impl Transport for BleTransport {
         if self.verbose {
             eprintln!("tx {} bytes: {}", data.len(), hex_dump(data));
         }
-        self.peripheral
-            .write(&self.characteristic, data, self.write_type)
-            .await
-            .map_err(ble_error)
+        let max_frame = usize::from(self.mtu.saturating_sub(3));
+        if data.len() > max_frame {
+            return Err(Error::Ble(format!(
+                "frame is {} bytes but the negotiated MTU {} allows at most {}",
+                data.len(),
+                self.mtu,
+                max_frame
+            )));
+        }
+        let write = self
+            .peripheral
+            .write(&self.characteristic, data, self.write_type);
+        match tokio::time::timeout(self.write_timeout, write).await {
+            Ok(result) => result.map_err(ble_error),
+            Err(_) => Err(Error::Ble(format!(
+                "BLE write timed out after {:.1}s",
+                self.write_timeout.as_secs_f64()
+            ))),
+        }
     }
 
     async fn recv(&self) -> Result<Vec<u8>, Error> {
