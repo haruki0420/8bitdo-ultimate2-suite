@@ -371,7 +371,17 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 /// True when both metadata entries describe the same file.
 ///
 /// Unix compares `(device, inode)`, which also catches hard links whose paths
-/// differ. Other platforms cannot tell hard links apart from paths alone.
+/// differ. Other platforms cannot tell hard links apart from paths alone:
+/// Windows file identity (volume serial + file index) is not implemented here.
+///
+/// This is not a gap for the backup output check. A case-insensitive alias such
+/// as `Backup.bin` versus `backup.bin` only needs the post-write revalidation:
+/// once the raw file exists, `OutputPathKey::real` canonicalizes both spellings
+/// to the same path, and `OutputPathKey::existing` gives both names the same
+/// metadata, so `validate_output_paths` still rejects the pair. Hard-link
+/// detection stays Unix-only; on Windows the raw and JSON names would have to
+/// be different links to the same file, which the operator would have to create
+/// explicitly.
 #[cfg(unix)]
 fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -424,16 +434,21 @@ fn ensure_regular_target(path: &Path) -> Result<(), Error> {
         }
     };
     let file_type = metadata.file_type();
-    let mut regular = file_type.is_file();
+    // On Unix `is_file()` alone accepts FIFOs, sockets and device nodes, so
+    // they are excluded explicitly. Windows has no equivalent special files to
+    // reject here; a directory is the only non-file `rename` target that
+    // `FileType::is_file` reports as false.
     #[cfg(unix)]
-    {
+    let regular = {
         use std::os::unix::fs::FileTypeExt as _;
-        regular = regular
+        file_type.is_file()
             && !file_type.is_fifo()
             && !file_type.is_socket()
             && !file_type.is_block_device()
-            && !file_type.is_char_device();
-    }
+            && !file_type.is_char_device()
+    };
+    #[cfg(not(unix))]
+    let regular = file_type.is_file();
     if regular {
         Ok(())
     } else {
@@ -515,10 +530,12 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), Error> {
         let mode = replaced_mode.unwrap_or(0o600);
         // Best effort: FAT/exFAT, NFS mounts and some emulated platforms
         // accept the write but reject chmod. The file was created with
-        // `mode(0o600)` above, so a failed adjustment leaves the backup
+        // `mode(0o600)` above, so a failed adjustment leaves a new backup
         // private instead of failing the whole export. When an existing mode
-        // cannot be preserved, the result is narrower than before, never
-        // wider.
+        // cannot be preserved, the file stays at 0600: narrower than the
+        // default but possibly wider than a replaced file whose mode was more
+        // restrictive (0400). Failing the export would lose the backup, so
+        // that trade-off is reported as a warning.
         if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(mode)) {
             eprintln!(
                 "warning: cannot set the mode of {} to {mode:o}: {error}; continuing",
@@ -614,6 +631,15 @@ async fn dump_config(
 /// does, canonicalization / metadata resolve both names to the same entry and
 /// this second check rejects the pair before the JSON rename can replace the
 /// 2768-byte raw backup.
+///
+/// This recheck is also what catches a case-insensitive alias on Windows,
+/// where [`same_file`] is always false (file identity is Unix-only): the
+/// canonical path and `symlink_metadata` of the existing raw file still see the
+/// alias.
+///
+/// It is a consistency check for accidental aliases, not a security boundary:
+/// an attacker who can write to the output directory can still race the check
+/// (TOCTOU / concurrent rename) before the JSON file is written.
 fn write_raw_and_revalidate(raw: &Path, json: Option<&Path>, bytes: &[u8]) -> Result<(), Error> {
     write_raw_and_revalidate_with(raw, json, bytes, || {})
 }
@@ -631,12 +657,16 @@ fn write_raw_and_revalidate_with(
     before_recheck: impl FnOnce(),
 ) -> Result<(), Error> {
     write_atomic(raw, bytes)?;
+    before_recheck();
+    validate_output_paths(Some(raw), json)?;
+    // Only report success once the recheck above has accepted the pair; on a
+    // rejected alias the raw file exists, but the requested backup as a whole
+    // did not complete.
     println!(
         "wrote raw configuration: {} ({CONFIG_SIZE} bytes)",
         raw.display()
     );
-    before_recheck();
-    validate_output_paths(Some(raw), json)
+    Ok(())
 }
 
 /// Write the optional raw/JSON files and return the SHA-256 hex digest.
@@ -1903,6 +1933,10 @@ where
 
     // Bytes of this line beyond the limit: counted, not stored.
     let mut overflow = 0usize;
+    // True while the only overflow byte is a single `\r` that may be the CR of
+    // a CRLF whose `\n` arrives in the next chunk. Such a byte belongs to the
+    // line ending and must not count against MAX_SESSION_LINE_BYTES.
+    let mut overflow_is_only_cr = false;
     loop {
         let buffer = reader.fill_buf().await?;
         if buffer.is_empty() {
@@ -1911,18 +1945,42 @@ where
             return finish_session_line(pending, overflow, false);
         }
 
-        let end = buffer
-            .iter()
-            .position(|&byte| matches!(byte, b'\n' | b'\0'))
-            .unwrap_or(buffer.len());
-        let cut = end < buffer.len() && buffer[end] == b'\0';
+        let newline = buffer.iter().position(|&byte| byte == b'\n');
+        let nul = buffer.iter().position(|&byte| byte == b'\0');
+        let (end, cut) = match (newline, nul) {
+            (Some(newline), Some(nul)) if nul < newline => (nul, true),
+            (Some(newline), _) => (newline, false),
+            (None, Some(nul)) => (nul, true),
+            (None, None) => (buffer.len(), false),
+        };
         let consumed = end + usize::from(end < buffer.len());
+        // A `\r` immediately before the `\n` is part of the line ending, so it
+        // must not count against MAX_SESSION_LINE_BYTES.
+        let content_end = if !cut && end > 0 && buffer[end - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
 
         let room = MAX_SESSION_LINE_BYTES.saturating_sub(pending.len());
-        let accepted = room.min(end);
+        let accepted = room.min(content_end);
         pending.extend_from_slice(&buffer[..accepted]);
-        overflow += end - accepted;
+        let dropped = &buffer[accepted..content_end];
+        if !dropped.is_empty() {
+            overflow += dropped.len();
+            overflow_is_only_cr = overflow == 1 && dropped == b"\r";
+        }
         reader.consume(consumed);
+
+        if !cut && end == 0 {
+            // The CR of a CRLF was consumed by the previous chunk: it is
+            // already in `pending`, or it was the only overflow byte.
+            if overflow == 0 && pending.last() == Some(&b'\r') {
+                pending.pop();
+            } else if overflow_is_only_cr {
+                overflow -= 1;
+            }
+        }
 
         // A NUL (possibly a long paste) or a newline ends the line.
         if cut || consumed > end {
@@ -3949,6 +4007,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn raw_write_is_revalidated_before_the_json_file() {
         // B-2 regression: on a case-insensitive filesystem `Backup.bin` and
@@ -3956,7 +4015,8 @@ mod tests {
         // same entry after the raw write. The second check runs while the raw
         // file exists and must reject the pair. Linux cannot make a
         // case-insensitive alias, so the seam creates a hard link at the JSON
-        // path between the write and the recheck.
+        // path between the write and the recheck; hard links need Unix inode
+        // identity to be detected (`same_file`).
         let dir = scratch_dir("outputs-recheck");
         let raw = dir.join("backup.bin");
         let json = dir.join("backup.json");
@@ -3970,6 +4030,44 @@ mod tests {
         // The JSON path was never given a JSON summary; it is still the raw
         // bytes via the alias, so the backup was not replaced.
         assert_eq!(std::fs::read(&json).unwrap(), b"raw backup");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn raw_write_revalidation_rejects_a_case_insensitive_alias() {
+        // B-2 regression for the platform that motivated the recheck. Before
+        // the raw file exists the pair looks distinct; after the write,
+        // `OutputPathKey::real` canonicalizes both spellings to the same entry.
+        // On Windows `same_file` is always false, so this test exercises the
+        // canonical-path/metadata half of the check.
+        let dir = scratch_dir("outputs-case");
+        let raw = dir.join("Backup.bin");
+        let json = dir.join("backup.BIN");
+
+        // APFS can be formatted case-sensitive and Windows can mark a
+        // directory case-sensitive, so only run the behavioural half where the
+        // filesystem actually folds case.
+        let probe = dir.join("CaseProbe");
+        std::fs::write(&probe, b"probe").unwrap();
+        if !dir.join("caseprobe").exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        assert!(
+            validate_output_paths(Some(&raw), Some(&json)).is_ok(),
+            "the pre-write check cannot see the alias before the raw file exists"
+        );
+
+        let err = write_raw_and_revalidate(&raw, Some(&json), b"raw backup").unwrap_err();
+        assert!(is_invalid_input(&err), "unexpected error: {err:?}");
+        assert_eq!(std::fs::read(&raw).unwrap(), b"raw backup");
+        assert_eq!(
+            std::fs::read(&json).unwrap(),
+            b"raw backup",
+            "the JSON path still reaches the raw bytes; the backup was not replaced"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4154,6 +4252,48 @@ mod tests {
             },
             "the next prompt must see a clean line after an over-long one"
         );
+    }
+
+    #[tokio::test]
+    async fn repl_reader_does_not_count_crlf_toward_the_line_limit() {
+        // M-1 regression: a line of exactly MAX_SESSION_LINE_BYTES characters
+        // followed by CRLF is not too long; the `\r` belongs to the ending.
+        // The capacities cover the CR and LF arriving in the same chunk
+        // (default), in separate chunks, and with the CR as the only overflow
+        // byte.
+        for capacity in [8 * 1024, MAX_SESSION_LINE_BYTES, MAX_SESSION_LINE_BYTES + 1] {
+            let mut input = vec![b'a'; MAX_SESSION_LINE_BYTES];
+            input.extend_from_slice(b"\r\n");
+            let mut reader =
+                tokio::io::BufReader::with_capacity(capacity, std::io::Cursor::new(input));
+            let mut pending = Vec::new();
+
+            let read = read_session_line(&mut reader, &mut pending).await.unwrap();
+            assert_eq!(
+                read,
+                LineRead::Line {
+                    text: "a".repeat(MAX_SESSION_LINE_BYTES),
+                    cut: false
+                },
+                "CRLF must not count against the limit (buffer capacity {capacity})"
+            );
+            assert!(pending.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn repl_reader_still_rejects_one_byte_over_the_limit_with_crlf() {
+        let mut input = vec![b'a'; MAX_SESSION_LINE_BYTES + 1];
+        input.extend_from_slice(b"\r\n");
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input));
+        let mut pending = Vec::new();
+
+        assert_eq!(
+            read_session_line(&mut reader, &mut pending).await.unwrap(),
+            LineRead::TooLong { discarded: 1 },
+            "one content byte over the limit must still be reported, without the CR"
+        );
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]

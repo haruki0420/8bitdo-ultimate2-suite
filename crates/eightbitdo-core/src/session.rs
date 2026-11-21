@@ -45,9 +45,11 @@ pub const MAX_INPUT_DRAIN_FRAMES: usize = 16;
 /// Malformed frames [`Session::try_next_input`] skips before it gives up.
 ///
 /// One corrupt notification must not end a keepalive or monitor loop, so
-/// decode failures are skipped; this many *in a row* means the link is
-/// delivering garbage, and the call fails with a protocol error instead of
-/// spinning until the caller's timeout.
+/// decode failures are skipped; this many *in a row within one call* means the
+/// link is delivering garbage, and the call fails with a protocol error instead
+/// of spinning until the caller's timeout. An idle return (timeout or frame
+/// budget) between calls starts a new run, so sparse corruption never
+/// accumulates into a failure across calls.
 pub const MAX_CONSECUTIVE_DECODE_FAILURES: usize = 8;
 
 /// Overall time budget for discarding stale frames during resync.
@@ -486,6 +488,9 @@ impl<T: Transport> Session<T> {
     /// frame or a normal idle return in between end the call with a protocol
     /// error, so a link that keeps delivering garbage still fails instead of
     /// spinning, while sparse corruption does not accumulate across calls.
+    /// The run is counted *within one call*: an idle / deadline return clears
+    /// it, so eight malformed frames separated by a stall are not eight
+    /// consecutive frames (see [`MAX_CONSECUTIVE_DECODE_FAILURES`]).
     ///
     /// The call is bounded in three ways so a caller that drains the input
     /// queue in a loop cannot hold the session lock forever: the `wait`
@@ -501,16 +506,25 @@ impl<T: Transport> Session<T> {
     /// after [`MAX_CONSECUTIVE_DECODE_FAILURES`] malformed frames without a
     /// usable frame or idle return in between, or another transport error.
     /// Malformed frames below that limit are skipped, not returned.
+    ///
+    /// A protocol error also marks the session for resync. The garbage may be
+    /// followed by a stale read response (for example a `ReadVersion` reply to
+    /// an earlier `info`), and the next read must drain it instead of accepting
+    /// it as the answer to its own request.
     pub async fn try_next_input(&self, wait: Duration) -> Result<Option<InputReport>, Error> {
         // An abandoned input poll leaves at most one realtime report behind,
         // which every read path skips, so it never marks the session for
-        // resync (see `ResyncGuard`).
-        let _guard = ResyncGuard::new(&self.needs_resync, &self.in_flight, InFlight::Input);
+        // resync (see `ResyncGuard`). A protocol error is different: it is
+        // recorded below, because the frames after the garbage are unknown.
+        let mut guard = ResyncGuard::new(&self.needs_resync, &self.in_flight, InFlight::Input);
         let deadline = deadline_after(wait)?;
         for _ in 0..MAX_INPUT_DRAIN_FRAMES {
             let now = Instant::now();
             if now >= deadline {
                 self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
+                // M-4 boundary: this is an idle return. Even if the drain
+                // above consumes one more malformed frame, the run ends here;
+                // the cap counts back-to-back frames within one call only.
                 self.clear_decode_failures();
                 return Ok(None);
             }
@@ -524,6 +538,9 @@ impl<T: Transport> Session<T> {
                 Ok(result) => result?,
                 Err(_) => {
                     self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
+                    // Same M-4 boundary as the deadline branch: a per-frame
+                    // timeout is an idle gap, so the next call starts a new
+                    // malformed run.
                     self.clear_decode_failures();
                     return Ok(None);
                 }
@@ -533,6 +550,7 @@ impl<T: Transport> Session<T> {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     if self.record_decode_failure() {
+                        guard.fail();
                         return Err(Error::Protocol(error));
                     }
                     continue;
@@ -549,6 +567,7 @@ impl<T: Transport> Session<T> {
             }
             let Ok(report) = InputReport::from_bytes(payload) else {
                 if self.record_decode_failure() {
+                    guard.fail();
                     return Err(Error::Protocol(eightbitdo_protocol::Error::InvalidLength {
                         expected: eightbitdo_protocol::input_report::INPUT_REPORT_SIZE,
                         actual: payload.len(),
@@ -563,7 +582,8 @@ impl<T: Transport> Session<T> {
         }
 
         // Frame budget spent: discard at most one more queued frame so the
-        // next call starts with a fresh frame instead of the backlog.
+        // next call starts with a fresh frame instead of the backlog. This is
+        // an idle return as well, so the malformed run does not carry over.
         self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
         self.clear_decode_failures();
         Ok(None)
@@ -2164,6 +2184,10 @@ mod tests {
 
     #[tokio::test]
     async fn try_next_input_fails_after_repeated_malformed_frames() {
+        // All eight frames are queued back-to-back, so they are consecutive
+        // within this one call. A stall between them would end the run and the
+        // call would return Ok(None) instead (M-4 boundary; see
+        // `seven_malformed_frames_then_idle_then_one_more_do_not_fail`).
         let mock = MockTransport::new();
         for _ in 0..MAX_CONSECUTIVE_DECODE_FAILURES {
             mock.push_incoming(&[0xEE; 5]);
@@ -2178,6 +2202,125 @@ mod tests {
         assert_eq!(
             session.skipped_frames(),
             MAX_CONSECUTIVE_DECODE_FAILURES as u64
+        );
+        assert!(
+            session.needs_resync.load(Ordering::SeqCst),
+            "M-3: a protocol error from the input path must mark the session for resync"
+        );
+    }
+
+    /// Transport that keeps queueing frames and appends a fresh ReadVersion
+    /// response when the request is sent, like a device answering on demand.
+    struct StaleVersionAfterNoiseTransport {
+        incoming: Mutex<VecDeque<Vec<u8>>>,
+        fresh_version: Mutex<Option<Vec<u8>>>,
+        pending_before_first_version_send: Mutex<Option<usize>>,
+    }
+
+    impl StaleVersionAfterNoiseTransport {
+        fn new() -> Self {
+            Self {
+                incoming: Mutex::new(VecDeque::new()),
+                fresh_version: Mutex::new(None),
+                pending_before_first_version_send: Mutex::new(None),
+            }
+        }
+
+        fn push_incoming(&self, frame: Vec<u8>) {
+            self.incoming.lock().unwrap().push_back(frame);
+        }
+
+        fn set_fresh_version(&self, frame: Vec<u8>) {
+            *self.fresh_version.lock().unwrap() = Some(frame);
+        }
+
+        fn pending_before_first_version_send(&self) -> Option<usize> {
+            *self.pending_before_first_version_send.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl Transport for StaleVersionAfterNoiseTransport {
+        async fn send(&self, data: &[u8]) -> Result<(), Error> {
+            if let Some(header_bytes) = data.get(1..) {
+                if let Ok(header) = CustomHeader::parse(header_bytes) {
+                    if header.cmd == commands::cmd::READ_VERSION {
+                        let fresh = self.fresh_version.lock().unwrap().take();
+                        if let Some(fresh) = fresh {
+                            let mut incoming = self.incoming.lock().unwrap();
+                            let mut recorded =
+                                self.pending_before_first_version_send.lock().unwrap();
+                            if recorded.is_none() {
+                                *recorded = Some(incoming.len());
+                            }
+                            incoming.push_back(fresh);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        async fn recv(&self) -> Result<Vec<u8>, Error> {
+            if let Some(frame) = self.incoming.lock().unwrap().pop_front() {
+                return Ok(frame);
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Err(Error::Disconnected)
+        }
+
+        fn mtu(&self) -> u16 {
+            64
+        }
+
+        async fn disconnect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn protocol_error_from_input_poll_discards_a_stale_version_response() {
+        // M-3 regression: after MAX_CONSECUTIVE_DECODE_FAILURES malformed
+        // frames, the trailing stale ReadVersion answer must not be accepted by
+        // the next `info` read as its own response.
+        let transport = StaleVersionAfterNoiseTransport::new();
+        for _ in 0..MAX_CONSECUTIVE_DECODE_FAILURES {
+            transport.push_incoming(vec![0xEE; 5]);
+        }
+        let stale = CustomHeader::new(commands::cmd::READ_VERSION, 0, 4, 0).with_payload(b"old!");
+        let mut stale_frame = stale.to_bytes().to_vec();
+        stale_frame.extend_from_slice(b"old!");
+        transport.push_incoming(stale_frame);
+
+        let session = Session::new(&transport).with_timeout(Duration::from_millis(200));
+        let result = session.try_next_input(Duration::from_millis(200)).await;
+        assert!(
+            matches!(result, Err(Error::Protocol(_))),
+            "the malformed run must fail, got {result:?}"
+        );
+        assert!(
+            session.needs_resync.load(Ordering::SeqCst),
+            "the stale ReadVersion response is still queued"
+        );
+
+        let fresh = CustomHeader::new(commands::cmd::READ_VERSION, 0, 4, 0).with_payload(b"new!");
+        let mut fresh_frame = fresh.to_bytes().to_vec();
+        fresh_frame.extend_from_slice(b"new!");
+        transport.set_fresh_version(fresh_frame);
+
+        let version = session.read_version().await.unwrap();
+        assert_eq!(
+            transport.pending_before_first_version_send(),
+            Some(0),
+            "the stale response must be drained before the ReadVersion send"
+        );
+        assert_eq!(
+            version.raw, b"new!",
+            "read_version must return the fresh answer, not the stale one"
+        );
+        assert!(
+            !session.needs_resync.load(Ordering::SeqCst),
+            "a quiesced drain clears the mark"
         );
     }
 
@@ -2241,6 +2384,49 @@ mod tests {
         assert_eq!(
             session.skipped_frames(),
             MAX_CONSECUTIVE_DECODE_FAILURES as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn seven_malformed_frames_then_idle_then_one_more_do_not_fail() {
+        // M-4 boundary: the cap counts back-to-back frames within one call.
+        // Seven malformed frames, an idle gap, and the eighth in the next call
+        // must not add up to a protocol error (and the eighth must not be
+        // silently eaten by the first call's deadline drain).
+        let mut scripted = Vec::new();
+        for _ in 0..MAX_CONSECUTIVE_DECODE_FAILURES - 1 {
+            scripted.push(ScriptedFrame::Data(vec![0xEE; 5]));
+        }
+        // Main wait and opportunistic drain of the first call.
+        scripted.push(ScriptedFrame::Stall);
+        scripted.push(ScriptedFrame::Stall);
+        // The eighth malformed frame arrives after the idle gap.
+        scripted.push(ScriptedFrame::Data(vec![0xEE; 5]));
+        scripted.push(ScriptedFrame::Stall);
+
+        let transport = ScriptedTransport::new(scripted);
+        let session = Session::new(&transport).with_timeout(Duration::from_millis(20));
+
+        for call in 0..2 {
+            let result = session.try_next_input(Duration::from_millis(50)).await;
+            assert!(
+                matches!(result, Ok(None)),
+                "call {call} must end idle, not fail: {result:?}"
+            );
+            assert_eq!(
+                session.consecutive_decode_failures.load(Ordering::Relaxed),
+                0,
+                "call {call} must start a new run after the idle gap"
+            );
+        }
+        assert_eq!(
+            session.skipped_frames(),
+            MAX_CONSECUTIVE_DECODE_FAILURES as u64,
+            "the eighth malformed frame must be counted in the second run, not hidden"
+        );
+        assert!(
+            !session.needs_resync.load(Ordering::SeqCst),
+            "an idle return from the input path is not a resync condition"
         );
     }
 
