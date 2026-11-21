@@ -22,6 +22,8 @@
 
 `review-gate` は **commit status** です。PR の head SHA に `success` を付けると満たされます。新しいコミットを push すると SHA が変わり、status が無いため自動的にマージできなくなります。
 
+レビューの深度（Tier 1〜3）と故障リストの要件は **[docs/REVIEW_TIERS.md](REVIEW_TIERS.md)** を参照してください。
+
 ## 作成・更新コマンド
 
 新規作成は `POST`、既存 ruleset の更新は `PUT` を使います。以下は id `27785806` を更新する例です。

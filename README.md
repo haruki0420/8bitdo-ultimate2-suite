@@ -38,6 +38,7 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 | **[AGENTS.md](AGENTS.md)** | AI エージェント／開発者向け引き継ぎガイド（[CLAUDE.md](CLAUDE.md) からも参照） |
 | **[CONTRIBUTING.md](CONTRIBUTING.md)** | ブランチ運用、必須 CI、独立レビュー（SHA 紐づきの `review-gate` status）の手順 |
 | **[docs/BRANCH_PROTECTION.md](docs/BRANCH_PROTECTION.md)** | `main` の ruleset 設定、`review-gate` status の付け方、ゲートの限界 |
+| **[docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)** | リスクに応じた独立レビューの Tier 1〜3、レビュアーの役割、故障リストの書き方 |
 
 ---
 
