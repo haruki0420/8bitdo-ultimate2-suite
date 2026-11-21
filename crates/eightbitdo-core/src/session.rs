@@ -12,7 +12,7 @@
 //! `drain budget exhausted`) instead of risking a stale frame being mistaken
 //! for the new response.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use eightbitdo_protocol::commands;
@@ -107,13 +107,15 @@ enum DrainOutcome {
 /// its future is dropped before completion.
 struct ResyncGuard<'a> {
     needs_resync: &'a AtomicBool,
+    dropped_operation: &'a AtomicU8,
     armed: bool,
 }
 
 impl<'a> ResyncGuard<'a> {
-    fn new(needs_resync: &'a AtomicBool) -> Self {
+    fn new(needs_resync: &'a AtomicBool, dropped_operation: &'a AtomicU8) -> Self {
         Self {
             needs_resync,
+            dropped_operation,
             armed: true,
         }
     }
@@ -126,6 +128,8 @@ impl<'a> ResyncGuard<'a> {
 impl Drop for ResyncGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
+            self.dropped_operation
+                .store(DroppedOperation::Resync as u8, Ordering::SeqCst);
             self.needs_resync.store(true, Ordering::SeqCst);
         }
     }
@@ -160,6 +164,25 @@ pub struct ConfigSnapshot {
     pub crc_valid: bool,
 }
 
+/// How a session treats a future that was dropped part-way through an
+/// operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DroppedOperation {
+    /// The drop was caused by the caller's own cancel path (Ctrl-C, `stop`).
+    ///
+    /// Nothing was left half-sent and the session state is consistent, so the
+    /// session may issue the next request without a resync. This is the
+    /// default; an interrupted transfer simply re-requests from its first
+    /// chunk.
+    #[default]
+    CallerCancelled,
+    /// The drop interrupted a transfer whose response is still expected.
+    ///
+    /// The next read first drains stale frames and fails closed if the drain
+    /// budget runs out.
+    Resync,
+}
+
 /// A read-only App Mode session over a [`Transport`].
 ///
 /// The transport is consumed and can be recovered with
@@ -168,6 +191,7 @@ pub struct Session<T: Transport> {
     transport: T,
     timeout: Duration,
     needs_resync: AtomicBool,
+    dropped_operation: AtomicU8,
 }
 
 impl<T: Transport> Session<T> {
@@ -178,6 +202,7 @@ impl<T: Transport> Session<T> {
             transport,
             timeout: DEFAULT_TIMEOUT,
             needs_resync: AtomicBool::new(false),
+            dropped_operation: AtomicU8::new(DroppedOperation::CallerCancelled as u8),
         }
     }
 
@@ -218,6 +243,24 @@ impl<T: Transport> Session<T> {
         self.prepare_read().await
     }
 
+    /// Cancel any mark left by a dropped operation.
+    ///
+    /// Call this when a front end cancelled an operation mid-flight for its
+    /// own reasons (Ctrl-C, `monitor stop`) and nothing else is pending on the
+    /// wire. The session then issues the next request immediately instead of
+    /// spending up to [`MAX_DRAIN_DURATION`] discarding frames that may
+    /// already contain the start of its response.
+    ///
+    /// It only clears a [`DroppedOperation::CallerCancelled`] mark: a mark
+    /// left by a timeout or by an aborted task whose frame may still be
+    /// written (`DroppedOperation::Resync`) always keeps its resync.
+    pub fn acknowledge_cancelled_operation(&self) {
+        if self.dropped_operation.load(Ordering::SeqCst) == DroppedOperation::CallerCancelled as u8
+        {
+            self.needs_resync.store(false, Ordering::SeqCst);
+        }
+    }
+
     /// Clear the resync flag, failing closed when the drain budget runs out.
     ///
     /// If stale frames may still be queued, the flag stays set so the next
@@ -226,7 +269,11 @@ impl<T: Transport> Session<T> {
     async fn prepare_read(&self) -> Result<(), Error> {
         if self.needs_resync.load(Ordering::SeqCst) {
             match self.drain_pending(DrainPolicy::RESYNC).await {
-                Ok(DrainOutcome::Quiesced) => self.needs_resync.store(false, Ordering::SeqCst),
+                Ok(DrainOutcome::Quiesced) => {
+                    self.dropped_operation
+                        .store(DroppedOperation::CallerCancelled as u8, Ordering::SeqCst);
+                    self.needs_resync.store(false, Ordering::SeqCst);
+                }
                 Ok(DrainOutcome::Exhausted) => {
                     return Err(Error::UnexpectedResponse(
                         "drain budget exhausted while discarding stale frames; \
@@ -282,7 +329,7 @@ impl<T: Transport> Session<T> {
     /// declared transfer, or a transport error.
     pub async fn read_version(&self) -> Result<VersionInfo, Error> {
         self.prepare_read().await?;
-        let mut guard = ResyncGuard::new(&self.needs_resync);
+        let mut guard = ResyncGuard::new(&self.needs_resync, &self.dropped_operation);
         self.transport
             .send(&commands::read_version().encode_ble(PacketKind::App)?)
             .await?;
@@ -463,7 +510,7 @@ impl<T: Transport> Session<T> {
         per_frame_timeout: Duration,
         total_timeout: Duration,
     ) -> Result<Vec<u8>, Error> {
-        let mut guard = ResyncGuard::new(&self.needs_resync);
+        let mut guard = ResyncGuard::new(&self.needs_resync, &self.dropped_operation);
         let raw = self
             .read_transfer_inner(cmd, expected_len, per_frame_timeout, total_timeout)
             .await?;
@@ -545,7 +592,7 @@ impl<T: Transport> Session<T> {
             )));
         }
         self.prepare_read().await?;
-        let mut guard = ResyncGuard::new(&self.needs_resync);
+        let mut guard = ResyncGuard::new(&self.needs_resync, &self.dropped_operation);
         let raw = self
             .read_config_chunks_inner(expected_len, per_frame_timeout, total_timeout)
             .await?;
