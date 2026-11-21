@@ -85,7 +85,7 @@ scripts/post-review-status.sh <PR> <reviewed-sha> <1|2|3>
 scripts/post-review-status.sh <PR> <reviewed-sha> <1|2|3> failure
 ```
 
-スクリプトは Tier を検証し、投稿直前に head SHA を固定し、投稿後に全 status と check run を監査します。
+スクリプトは Tier 引数（1/2/3）を検証します。PR の宣言 Tier と quorum は検証しないため（手続き）、呼び出し側が PR の宣言 Tier を渡してください。投稿直前に head SHA を固定し、投稿後に全 status と check run を監査します。
 
 > `review-gate` は **commit status** です。同じ名前の check run が成功していても、commit status の `success` が無ければゲートは満たされません。
 

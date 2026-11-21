@@ -74,10 +74,10 @@
 
 `main` へマージする前に、**著者とも他のレビュアーとも別セッション**のレビュアーが PR の差分を読み、マージ可否を判定すること。「マージ可」が出るまでマージしない。修正を push したら新しい head SHA で再レビューする。
 
-- **Tier 1**: レビュアー 1 名。**振る舞いを変えない変更のみ**（コメント・整形・通常 docs・純粋なテスト追加）。純粋なテスト追加は 1〜2 件の故障注入を PR またはレビューコメントに記録する。write-path / Flash / OTA / backup を検証するテストは Tier 3。
+- **Tier 1**: レビュアー 1 名。**振る舞いを変えない変更のみ**（コメント・整形・通常 docs・純粋なテスト追加）。純粋なテスト追加は 1〜2 件の故障注入を PR またはレビューコメントに記録する。write-path / Flash / OTA / backup / セキュリティ境界 / review-gate script を検証するテストは Tier 3。
 - **Tier 2**: レビュアー 2 名（仕様検収 + 実装/回帰）。
 - **Tier 3**: レビュアー 2 名 + 別セッションの敵対的パス（計 3 セッション）。
-- 判定・パス別トリガー・故障リストの正本は **[docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)**。**チェックリスト項目、コントリビューター手順、required check、status コマンド、安全手順を変える PR は、docs パスでも Tier 3**。**デバイス書き込みのバイト・順序・タイミング・エラー処理、またはそれを検証するテスト/mock/golden vector を変える PR も Tier 3**。
+- 判定・パス別トリガー・故障リストの正本は **[docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)**。**チェックリスト項目、コントリビューター手順、required check、status コマンド、安全手順を変える PR は、docs パスでも Tier 3**。**デバイス書き込みのバイト・順序・タイミング・エラー処理、write-path に影響する依存更新、またはそれを検証するテスト/mock/golden vector を変える PR も Tier 3**。**セキュリティ境界 / review-gate script を検証するテストの変更・削除も Tier 3**。降格できるのは REVIEW_TIERS §2 のダウングレード制限の例外のみ。
 - Tier 定義・パス別トリガー・レビュアー数・quorum・故障リスト最低数・チェックリスト・required check・ruleset・status コマンド・ゲート手順の変更は Tier 3（自己修正ルール）。
 - コードのリファクタは Tier 1 にしない。実機書き込み・Flash・OTA・セキュリティに触れるコードは、差分が小さくても Tier 3。
 - Tier 2/3 は全レビュアーが同じ SHA で「マージ可」を出した後、リードレビュアーが `scripts/post-review-status.sh` で `review-gate` status を付ける。Tier 1 はレビュアー本人が付ける。

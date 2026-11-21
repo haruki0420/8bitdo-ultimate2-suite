@@ -6,44 +6,44 @@
 
 該当する **最大 Tier のみ** チェックしてください。判定・パス別トリガー・故障リストの正本は `docs/REVIEW_TIERS.md` です（テンプレートファイルからは `../docs/REVIEW_TIERS.md`、PR 本文では `docs/REVIEW_TIERS.md`）。このテンプレートは実チェックリストの写しであり、矛盾した場合は REVIEW_TIERS を優先します。
 
-- [ ] **Tier 1**（レビュアー 1 名。振る舞いを変えない変更のみ。write-path / Flash / OTA / backup を検証するテストを除く）
+- [ ] **Tier 1**（レビュアー 1 名。振る舞いを変えない変更のみ。write-path / Flash / OTA / backup / セキュリティ境界 / review-gate script を検証するテストを除く）
 - [ ] **Tier 2**（レビュアー 2 名: 仕様検収 + 実装/回帰）
 - [ ] **Tier 3**（レビュアー 2 名 + 別セッションの敵対的パス）
+
+> 規範仕様（`PROTOCOL_SPEC` / `STRUCT` / `IMPLEMENTATION_PLAN`）・ゲート文書・プロセス文書は Tier 1 にしない（最大 Tier 2）。
 
 判定理由:
 
 <!-- 例: config_bt2.rs と commands.rs の書き込み経路を変更するため Tier 3 -->
 
-> チェックリスト項目、コントリビューター手順、required check、status コマンド、安全手順を変える PR は、docs パスでも Tier 3。デバイス書き込みのバイト・順序・タイミング・エラー処理、またはそれを検証するテスト/mock/golden vector を変える PR も Tier 3。
+> チェックリスト項目、コントリビューター手順、required check、status コマンド、安全手順を変える PR は、docs パスでも Tier 3。デバイス書き込みのバイト・順序・タイミング・エラー処理、write-path に影響する依存更新、またはそれを検証するテスト/mock/golden vector を変える PR も Tier 3。セキュリティ境界 / review-gate script を検証するテストの変更・削除も Tier 3。
 
 ## 故障リスト（Tier 1 の純粋なテスト追加 / Tier 2 / Tier 3）
 
 - Tier 1 で **振る舞いを変えない docs/コメント/整形のみ** の場合に限り、このセクションを削除できます。
 - Tier 1 の **純粋なテスト追加** は削除できません。下の「Tier 1 故障注入記録」を記入してください。
-- **write-path / Flash / OTA / backup を検証するテスト** は Tier 1 ではなく Tier 3 です。
+- **write-path / Flash / OTA / backup / セキュリティ境界 / review-gate script を検証するテスト** は Tier 1 ではなく Tier 3 です。
 - Tier 2/3 は削除できません。
 
 件数: コード 3〜5（Tier 2）/ 10+（Tier 3）、docs/ゲートは検出方法 3〜5 / 5+。混合 PR は両方を満たします。各項目に「故障 / 検出方法 / 結果 / 残存リスク / 証跡」を記録し、未検出は残存リスクと Issue/PR を書いてください。
 
-<!-- 記入例（例の行は削除して、自分の故障に置き換えてください）:
-| CRC の多項式を取り違える | CRC テストベクタ | 検出 | なし | `crc::tests::...` |
--->
+> 記入例: 故障「CRC の多項式を取り違える」/ 検出方法「CRC テストベクタ」/ 結果「検出」/ 残存リスク「なし」/ 証跡「crc::tests::...」
 
 | 故障 | 検出方法（テスト / コマンド / 目視） | 結果 | 残存リスク | 証跡 |
 | --- | --- | --- | --- | --- |
-| 例: CRC の多項式を取り違える | CRC テストベクタ | 検出 | なし | `crc::tests::...` |
 
 ### Tier 1 故障注入記録（純粋なテスト追加のみ）
 
 Tier 1 の純粋なテスト追加では、レビュアーが 1〜2 件の故障を注入し、追加テストが落ちることを確認して記録します。この表は純粋なテスト追加では削除できません。振る舞いを変えない docs/コメント/整形のみの Tier 1 は、故障リストとこの記録を削除できます。Tier 2/3 では「N/A（Tier 1 ではない）」と記入してください。
 
+> 記入例: 注入「境界値を 1 つずらす」/ 検出したテスト「追加した境界値テスト」/ 結果「検出」/ 証跡「テスト名 / コマンド出力」
+
 | 注入した故障 | 検出したテスト | 結果 | 証跡 |
 | --- | --- | --- | --- |
-| 例: 境界値を 1 つずらす | 追加した境界値テスト | 検出 | テスト名 / コマンド出力 |
 
 ## 独立レビュー
 
-各レビュアーは、他のレビュアーの判定を見る前に、同じ diff / head SHA に対して自分の行とレビューコメントを書きます。リードレビュアーは行を代筆せず、全員のコメント URL と SHA を確認して status を付けます。判定欄はレビュアーが記入するまで空のままにしてください。
+各レビュアーは、他のレビュアーの判定を見る前に、同じ diff / head SHA に対して自分の行とレビューコメントを書きます。リードレビュアーは行を代筆せず、全員のコメント URL と SHA を確認して status を付けます。判定欄はレビュアーが記入するまで空のままにしてください。PR 本文を編集できないレビュアーは、役割 / レビューした SHA / 判定を含む standalone review comment を投稿してください。リードレビュアーはその URL を表に記録しますが、判定を代筆しません。
 
 | 役割 | レビュアー（セッション ID / 氏名） | レビューした SHA | レビューコメント URL | 判定（マージ可 / 要修正） |
 | --- | --- | --- | --- | --- |
@@ -56,7 +56,8 @@ Tier 1 の純粋なテスト追加では、レビュアーが 1〜2 件の故障
 - [ ] Tier 2/3 のレビュアー同士も別セッションである
 - [ ] 全レビュアーが **同じ head SHA** で「マージ可」を出した（Tier 3 で割れた場合は 4 名目の adjudicator を追加し、blocker の撤回または adjudication 理由を記録した）
 - [ ] Tier 1 はレビュアー本人、Tier 2/3 はリードレビュアーが `scripts/post-review-status.sh` で `review-gate` status を付けた（description に Tier と SHA）
-- [ ] Tier 3 パスを Tier 1/2 に下げた場合、`git diff -w --exit-code` が空または `cargo fmt` のみである証跡を記録した
+- [ ] Tier 3 パスを Tier 1/2 に下げた場合、整形のみ（`git diff -w --exit-code` が空 / `cargo fmt` のみ）またはコードコメントのみの証跡を記録した（規範仕様・ゲート・プロセス文書は Tier 2 まで）
+- [ ] 故障リスト / Tier 1 故障注入記録に `例:` 行が残っていない
 - [ ] レビューコメントをすべて解決した
 - [ ] **この head SHA で Tier を再評価した**
 
@@ -83,7 +84,7 @@ Tier 3 は以下のサブセクションを削除しないでください。Tier
 
 #### A. 共通証跡
 
-- [ ] 故障リストの各項目に証跡（テスト名 / コマンド出力 / URL）を記録した
+- [ ] 故障リストの各項目に証跡（テスト名 / コマンド出力 / URL / 目視メモ / 該当箇所の引用 / file:line）を記録した
 - [ ] 実機書き込みを含む場合: 2768B 設定のバックアップ path と SHA-256 を記録した: `path=... sha256=...`
 - [ ] 実機書き込みを含む場合: マクロ 4×3（`slot 0..2` × `macro_idx 0..3`）のバックアップ path と SHA-256 を記録した: `path=... sha256=...`
 - [ ] 復元テストまたは文書化された復元手順を確認し、結果を記録した: `result=...`
@@ -98,10 +99,12 @@ Tier 3 は以下のサブセクションを削除しないでください。Tier
 
 - [ ] モックトランスポートでパケット列・CRC・チャンク境界・リトライを検証した
 - [ ] 4KB セクタ境界、10 秒 erase タイムアウト、erase ACK 待ち、64B 固定チャンク（最終チャンクを含む）を確認した
-- [ ] OTA 前提: `enterBoot 0x000C`（subcmd `0x0067`）→ `"8bt"` 再接続 → `readPID 0x0008`（subcmd `0x0067`, `total_len 2`）→ `readVersionInBoot 0x0005`（subcmd `0x0067`, `total_len 4`, type 1 offset `0x01017040`）を確認した
-- [ ] OTA 書込: `EraseFlash 0x0004`（`total_len=0x1000`, ACK 待ち）→ `WriteFirmware 0x0003`（`total_len=header[8]`, 64B 固定、CRC-16/MODBUS 付き）→ `WriteVersion 0x00C4`（`total_len=header[8]`, 24B ヘッダ / 3s）→ `WriteFirmwareVersion 0x0002`（type 1: `0x01017040` / それ以外: `0x08014034`, 4B + CRC16）→ `gamepad_type != 1` のときのみ `WriteAPPID`（`0x0801401C`, 12B + CRC16）→ `JumpApp 0x0006`（`0x01018000`）の順序を確認した
+- [ ] OTA 前提: `enterBoot 0x000C`（subcmd `0x0067`）→ `"8bt"` 再接続 → `readPID 0x0008`（subcmd `0x0067`, `total_len 2`）→ `readVersionInBoot 0x0005`（subcmd `0x0067`, `total_len 4`, offset `0x01017040` [gamepad_type == 1]）を確認した
+- [ ] OTA 書込: `EraseFlash 0x0004`（`total_len=0x1000`, ACK 待ち）→ `WriteFirmware 0x0003`（`total_len=header[8]`, 64B 固定、CRC-16/MODBUS 付き）→ `WriteVersion 0x00C4`（`total_len=header[8]`, 24B ヘッダ / 3s）→ `WriteFirmwareVersion 0x0002`（type 1: `0x01017040` / それ以外: `0x08014034`, 4B + CRC16）→ `gamepad_type != 1` のときのみ `WriteAPPID`（`0x0801401C`, 12B + CRC16）→ `JumpApp 0x0006`（`0x01018000` [gamepad_type == 1]）の順序を確認した
+- [ ] 非 gamepad_type == 1 の場合、`readVersionInBoot` / `JumpApp` の offset を推測せず、`docs/PROTOCOL_SPEC.md` / Issue を確認して停止した
 - [ ] OTA 失敗時: `"8bt"` へ再接続 → `readPID` → 全セクタ消去 → 再書き込みで復旧できることを確認した（再接続だけでは復旧とみなさない）
-- [ ] マクロ: `Erase 0x0104`（`subcmd=(mode<<8)|slot`, `offset=macro_idx<<12`, `total_len=0x1000`, 4KB）→ `Write 0x0103`（同 subcmd/offset, `total_len=align32(max_steps*10)`, 64B チャンク, 32B アライン, 各チャンク CRC16）→ ヘッダ `0x0001`（`subcmd 0x0000`, `offset=0x68C + slot*0xD8`, `len=0xD8`, `total_len=0xAD0`）→ `Save 0x0006`（BLE `0x0067` / USB `0x0123`）の順序を確認した
+- [ ] マクロ: `Erase 0x0104`（`cmd=0x0104`, `subcmd=(mode<<8)|slot`, `offset=macro_idx<<12`, `total_len=0x1000`, `chunk_len=0` [payload なし], 4KB）→ `Write 0x0103`（同 subcmd/offset, `total_len=align32(max_steps*10)`, 64B チャンク, 32B アライン, 各チャンク CRC16）→ ヘッダ `0x0001`（`subcmd 0x0000`, `offset=0x68C + slot*0xD8`, `len=0xD8`, `total_len=0xAD0`）→ `Save 0x0006`（BLE `0x0067` / USB `0x0123`）の順序を確認した
+- [ ] マクロ Erase は `chunk_len=0`（payload なし）。`total_len=0x1000` は消去サイズであり、ペイロード長ではない
 - [ ] マクロ 4×3 のバックアップと復元を確認した
 
 #### C. docs / チェックリストのみの場合
@@ -119,6 +122,7 @@ Tier 3 は以下のサブセクションを削除しないでください。Tier
 - [ ] `.github/rulesets/main-protection.json`（canonical）と live ruleset `27785806` の `conditions` / `bypass_actors` / `current_user_can_bypass` / `required_status_checks` を監査した
 - [ ] `required_approving_review_count` を確認した（現状 0。2 人目のプリンシパルがいる場合の目標 1）
 - [ ] `gh pr view --json statusCheckRollup` と `commits/$SHA/statuses` / `commits/$SHA/check-runs` で status と check run を監査した
+- [ ] セキュリティ境界 / review-gate script を検証するテスト（stale-SHA refusal、failure overwrite、check-run audit など）の変更・削除を確認した
 - [ ] workflow の権限、status / check-run 偽装の可否、secret の扱いを確認した
 - [ ] action の pin、署名、配布物、ロールバック手順を確認した
 - [ ] リリースを含む場合、バージョン（Cargo.toml / ファームウェアバージョン）を確認した

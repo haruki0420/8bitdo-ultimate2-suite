@@ -48,9 +48,10 @@ if [ "$STATE" = "failure" ]; then
   description="$description (changes requested)"
 fi
 
+# The tier argument must be 1/2/3. This script does not verify the PR's
+# declared Tier or quorum; those are procedural checks recorded in the PR.
 # Tier 1: the reviewer posts. Tier 2/3: the lead reviewer posts only after all
-# reviewers have approved this exact SHA. This script does not verify quorum;
-# that is a procedural check recorded in the PR.
+# reviewers have approved this exact SHA.
 gh api --method POST "repos/$REPO/statuses/$REVIEWED_SHA" \
   -f state="$STATE" \
   -f context=review-gate \

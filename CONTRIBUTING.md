@@ -48,7 +48,7 @@
    scripts/post-review-status.sh <PR> <レビューした head SHA> <1|2|3>
    ```
 
-   スクリプトは Tier を検証し、投稿直前に head SHA を固定し、投稿後に全 status と check run を監査します。修正が必要な場合は `failure` を付けてください。
+   スクリプトは Tier 引数（1/2/3）を検証します。PR の宣言 Tier と quorum は検証しないため（手続き）、呼び出し側が PR の宣言 Tier を渡してください。投稿直前に head SHA を固定し、投稿後に全 status と check run を監査します。修正が必要な場合は `failure` を付けてください。
 
    ```bash
    scripts/post-review-status.sh <PR> <レビューした head SHA> <1|2|3> failure
@@ -64,17 +64,17 @@
 
 Tier の判定・パス別トリガー・故障リストの詳細は **[docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)** を参照してください。ここでは要約だけを示します。
 
-- **Tier 1**: レビュアー 1 名。**振る舞いを変えない変更のみ**（コメント・整形・通常 docs・純粋なテスト追加）。純粋なテスト追加は 1〜2 件の故障注入を記録する。write-path / Flash / OTA / backup を検証するテストは Tier 3。
+- **Tier 1**: レビュアー 1 名。**振る舞いを変えない変更のみ**（コメント・整形・通常 docs・純粋なテスト追加）。純粋なテスト追加は 1〜2 件の故障注入を記録する。write-path / Flash / OTA / backup / セキュリティ境界 / review-gate script を検証するテストは Tier 3。
 - **Tier 2**: レビュアー 2 名（仕様検収 + 実装/回帰）。
 - **Tier 3**: レビュアー 2 名 + 別セッションの敵対的パス（計 3 セッション）。
-- 混合 PR は最大 Tier。著者が提案し、レビュアーは昇格できる（降格は不可）。
+- 混合 PR は最大 Tier。著者が提案し、レビュアーは昇格できる。原則として降格できない（例外は REVIEW_TIERS §2 のダウングレード制限のみ。規範仕様・ゲート・プロセス文書は Tier 2 まで）。
 - **Content-based override**: チェックリスト項目、コントリビューター手順、required check、status コマンド、安全手順を変える PR は、docs パスでも Tier 3。
-- **Write-path rule**: デバイス書き込みのバイト・順序・タイミング・エラー処理、またはそれを検証するテスト/mock/golden vector を変える PR は Tier 3。読み取り専用 builder は Tier 2。
+- **Write-path rule**: デバイス書き込みのバイト・順序・タイミング・エラー処理、write-path に影響する依存更新、またはそれを検証するテスト/mock/golden vector を変える PR は Tier 3。読み取り専用 builder は Tier 2。
 - **自己修正ルール**: Tier 定義・パス別トリガー・レビュアー数・quorum・故障リスト最低数・チェックリスト・required check・ruleset・status コマンド・ゲート手順の変更は Tier 3。
-- コードのリファクタは Tier 1 にしない。テストの変更・削除は Tier 2（ただし write-path を検証するテスト/mock/golden vector は Tier 3）。実機書き込み・Flash・OTA・セキュリティは小さくても Tier 3。
+- コードのリファクタは Tier 1 にしない。テストの変更・削除は Tier 2（ただし write-path、セキュリティ境界、review-gate script を検証するテスト/mock/golden vector は Tier 3）。実機書き込み・Flash・OTA・セキュリティは小さくても Tier 3。
 - レビュアーは **著者とも他のレビュアーとも別セッション**。Tier 2/3 は **全レビュアーが同じ head SHA で「マージ可」** を出すまでマージしない。1 名でも要修正なら status を付けない。
 - **Tier 1 はレビュアー本人、Tier 2/3 はリードレビュアー**が、全員の判定を確認してから `scripts/post-review-status.sh` で `review-gate` status を付ける。Tier 3 で判定が割れたら 4 名目の独立 adjudicator を追加し、blocker の撤回または adjudication 理由を記録する。
-- Tier 2/3 は「故障 → 検出方法 → 結果 → 残存リスク → 証跡」を PR に残す。件数はコードの下限であり、docs は検出方法で数える。docs-only は mock/実機項目を `N/A + 理由` とする。
+- Tier 2/3 は「故障 → 検出方法 → 結果 → 残存リスク → 証跡」を PR に残す。証跡はテスト名 / コマンド出力 / URL / 目視メモ / 該当箇所の引用 / file:line のいずれか。件数はコードの下限であり、docs は検出方法で数える。docs-only は mock/実機項目を `N/A + 理由` とする。
 - **「マージ可」が出るまでマージしない。** 修正を push したら新しい SHA で再レビューし、Tier を再評価する。
 
 レビュアーは「作者の意図」ではなく、**仕様書と実装の一致** を確認します。

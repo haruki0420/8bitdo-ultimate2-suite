@@ -12,14 +12,14 @@ PR のリスクに応じてレビューの深さを変えます。目的は「do
 
 | Tier | 対象 | レビュー | 故障リスト |
 | --- | --- | --- | --- |
-| **1** | コメント・整形、通常の docs（規範仕様・ゲート/プロセス文書を除く）、**純粋なテスト追加のみ**（write-path / Flash / OTA / backup を検証するものを除く）。**振る舞いは変えない** | 1 名。diff + テスト + リンク/コマンド | 純粋なテスト追加はレビュアー側で 1〜2 件の故障注入を記録。振る舞いを変えない docs/コメント/整形は不要 |
-| **2** | 読み取り専用コード、読み取り系ビルダー、プロセス文書の散文、規範仕様の編集（安全-critical 以外）、依存・ツールチェーン・リポジトリ衛生、テストの変更/削除（write-path を検証するものを除く）、リファクタ | 2 名（仕様検収 + 実装/回帰）。変更ファイル + 直接の呼び出し側 + テスト | コード 3〜5 件。docs/プロセスは検出方法 3〜5 件。混合 PR は両方 |
+| **1** | コメント・整形、通常の docs（規範仕様・ゲート/プロセス文書を除く）、**純粋なテスト追加のみ**（write-path / Flash / OTA / backup / セキュリティ境界 / review-gate script を検証するものを除く）。**振る舞いは変えない** | 1 名。diff + テスト + リンク/コマンド | 純粋なテスト追加はレビュアー側で 1〜2 件の故障注入を記録。振る舞いを変えない docs/コメント/整形は不要 |
+| **2** | 読み取り専用コード、読み取り系ビルダー、プロセス文書の散文、規範仕様の編集（安全-critical 以外）、依存・ツールチェーン（write-path に影響しないもの）・リポジトリ衛生、テストの変更/削除（write-path / セキュリティ境界 / review-gate script を検証するものを除く）、リファクタ | 2 名（仕様検収 + 実装/回帰）。変更ファイル + 直接の呼び出し側 + テスト | コード 3〜5 件。docs/プロセスは検出方法 3〜5 件。混合 PR は両方 |
 | **3** | 書き込み経路 / Flash / OTA / backup-restore / CRC / offset / framing / マクロ step、セキュリティの振る舞い、ゲート実装・チェックリスト、リリース、大規模な混合差分 | 2 名 + 別セッションの敵対的パス（計 3 セッション）。関連ファイル全体 + 呼び出し側 + モック | コード 10 件以上。docs/ゲートは検出方法 5 件以上。混合 PR は両方 |
 
 ## 2. 判定ルール
 
 - **混合 PR は最大 Tier**（docs + code なら code の Tier）。混合 PR の故障リストは、コード 10 件以上と docs/ゲート 5 件以上の **両方** を満たす。
-- 著者が PR で Tier を提案し、**レビュアーは昇格できる。降格はできない。**
+- 著者が PR で Tier を提案し、**レビュアーは昇格できる。原則として降格できない。例外は §2 のダウングレード制限のみ。**
 - 迷ったら 1 段上に倒す。
 - 行数は目安にしない。10 行の CRC 変更は Tier 3、1000 行の README 整形は Tier 1。
 
@@ -48,6 +48,7 @@ PR のリスクに応じてレビューの深さを変えます。目的は「do
 - `config_bt2.rs` の setter（offset / CRC / マクロ以外でも、書き込みバイトを変えるもの）
 - `keymap.rs` のビットマスク（書き込みデータに影響するもの）
 - mock transport、golden vector、CRC テストベクタ
+- `btleplug` / `hidapi` など BLE/USB 依存の更新（write timing・MTU/chunking・retry・error handling が変わるもの）
 - build script / native dependency / feature flag（ビルドされる書き込みコードを変えるもの）
 - `apps/ios/**` / `apps/android/**` の native write path
 - 将来の `crates/eightbitdo-gui` など、デバイス書き込みを引き起こしうる新規 crate
@@ -60,10 +61,11 @@ Tier 定義、パス別トリガー、レビュアー数、quorum、故障リス
 
 ### ダウングレードの制限
 
-Tier 3 のパスに対するコメント・整形のみの変更は、次の **両方** を満たす場合に限り Tier 1/2 にできます。
+Tier 3 のパスに対する変更は、原則として Tier 3 のままです。次の **(A1) または (A2)** と **(B)** を満たす場合に限り Tier 1/2 にできます。ただし規範仕様（`PROTOCOL_SPEC` / `STRUCT` / `IMPLEMENTATION_PLAN`）、ゲート文書、プロセス文書は **Tier 2 まで** とし、Tier 1 にはしません。
 
-- `git diff -w --exit-code "$(git merge-base HEAD origin/main)"..HEAD` が空（空白無視で差分なし）、または `cargo fmt` のみのコミットである。コミット範囲と `git diff --stat` で確認する。
-- レビュアーが「意味の変更なし」を確認し、その証跡（コマンド出力またはコミット URL）を PR に記録した。
+- **(A1) 整形のみ**: `git diff -w --exit-code "$(git merge-base HEAD origin/main)"..HEAD` が空（空白無視で差分なし）、または `cargo fmt` のみのコミットである。コミット範囲と `git diff --stat` で確認する。
+- **(A2) コードコメントのみ**: `git diff -U0 "$(git merge-base HEAD origin/main)"..HEAD` の追加・削除行がすべてコメント行（`//` / `///` / `//!` / `/*` / `*` など）で、コード・文字列・設定値の変更を含まないことをレビュアーが確認し、diff を PR に記録した。
+- **(B) レビュアーの確認**: レビュアーが「意味の変更なし」を確認し、その証跡（コマンド出力、diff、またはコミット URL）を PR に記録した。
 
 それ以外は Tier 3 のままです。
 
@@ -77,7 +79,7 @@ Tier 3 のパスに対するコメント・整形のみの変更は、次の **�
 
 ### Tier 1 の例
 
-- `README.md` など通常の docs の散文・リンク、コメント、整形、純粋なテスト追加（write-path / Flash / OTA / backup を検証しないもの）。§2 の content-based override に該当しないこと。
+- `README.md` など通常の docs の散文・リンク、コメント、整形、純粋なテスト追加（write-path / Flash / OTA / backup / セキュリティ境界 / review-gate script を検証しないもの）。§2 の content-based override に該当しないこと。
 
 ### Tier 2 以上（パス別の基本 Tier。内容による上書きは §2）
 
@@ -86,11 +88,11 @@ Tier 3 のパスに対するコメント・整形のみの変更は、次の **�
 - `AGENTS.md` / `CLAUDE.md` / `CONTRIBUTING.md` / `docs/REVIEW_TIERS.md` / `docs/BRANCH_PROTECTION.md`
   - **散文・リンク・誤字のみ Tier 2。** チェックリスト項目、レビュアーが確認する内容、コントリビューターの手順、required check、status コマンド、ゲート手順、安全手順は **Tier 3**（§2）。
 - `docs/PROTOCOL_SPEC.md` / `docs/STRUCT_BT2_2768B.md` / `docs/IMPLEMENTATION_PLAN.md`
-  - **CRC / offset / flash / OTA / framing / 書き込みコマンド・subcmd / `total_len` / Save 手順 / チャンク分割の変更は Tier 3。** 誤字・リンク・表現の修正は Tier 2。
+  - **CRC / offset / flash / OTA / framing / 書き込みコマンド・subcmd / `total_len` / Save 手順 / チャンク分割の変更は Tier 3。** 安全-critical な内容に触れない誤字・リンク・表現のみ Tier 2。安全手順・offset・CRC・OTA/Flash/backup の記述変更は Tier 3。
 - `.github/pull_request_template.md`
   - **散文・リンクのみ Tier 2。** チェックリスト項目・手順・N/A 条件は Tier 3。
 - `Cargo.toml` / `Cargo.lock` / `rust-toolchain.toml`
-  - 依存・ツールチェーンの更新のみ Tier 2。build script / native dependency / feature flag が書き込みコードに影響する場合は Tier 3。
+  - 書き込み経路に影響しうる依存・ツールチェーン更新（例: `btleplug` / `hidapi` の更新で BLE/USB の write timing・MTU/chunking・retry・error handling が変わるもの）は Tier 3。影響しない更新のみ Tier 2。build script / native dependency / feature flag が書き込みコードに影響する場合も Tier 3。
 - `.gitignore`（公式バイナリの除外が維持されているか確認する）
 - `.github/dependabot.yml`
 
@@ -105,6 +107,7 @@ Tier 3 のパスに対するコメント・整形のみの変更は、次の **�
 - `crates/eightbitdo-protocol/src/commands.rs` の設定書き込み / マクロ / OTA コマンド
 - `crates/eightbitdo-protocol/src/keymap.rs` のビットマスク（書き込みデータに影響する変更）
 - mock transport / golden vector / safety-critical test vector
+- セキュリティ境界・review-gate script（stale-SHA refusal、failure overwrite、check-run audit など）を検証するテスト / mock の変更・削除
 - `crates/eightbitdo-core/**` の書き込み・セッション・OTA・backup/restore
 - `crates/eightbitdo-cli/**` の書き込みコマンド
 - `crates/eightbitdo-uniffi/**` の書き込み / OTA 公開 API
@@ -130,14 +133,15 @@ Tier 3 のパスに対するコメント・整形のみの変更は、次の **�
 
 ## 4. Tier 1（軽量・振る舞いを変えない）
 
-- **Tier 1 は振る舞いを変えない変更のみ**です。コメント、整形、通常の docs、**純粋なテスト追加**（write-path / Flash / OTA / backup を検証するものを除く）が対象です。
+- **Tier 1 は振る舞いを変えない変更のみ**です。コメント、整形、通常の docs、**純粋なテスト追加**（write-path / Flash / OTA / backup / セキュリティ境界 / review-gate script を検証するものを除く）が対象です。
 - コードのリファクタは Tier 1 にしない（Tier 2 以上）。
-- テストの変更・削除は Tier 1 にしない（Tier 2。write-path を検証するものは Tier 3）。
-- 規範仕様（`PROTOCOL_SPEC` / `STRUCT` / `IMPLEMENTATION_PLAN`）、ゲート文書、プロセス文書は Tier 1 にしない。
+- テストの変更・削除は Tier 1 にしない（Tier 2。write-path、セキュリティ境界、review-gate script を検証するものは Tier 3）。
+- 規範仕様（`PROTOCOL_SPEC` / `STRUCT` / `IMPLEMENTATION_PLAN`）、ゲート文書、プロセス文書は Tier 1 にしない（最大 Tier 2）。
+- Tier 3 サブセクションは削除せず、該当しないものは `N/A + 理由` を 1 行記入する（全項目を埋める必要はない）。
 - 振る舞いを変える docs は Tier 2/3 とし、故障リストを必須にする。
 - レビュアー 1 名。diff、関連テスト、リンク、コマンド例を確認する。
 - 振る舞いを変えない docs/コメント/整形は、故障注入なし。PR テンプレートの故障リストと故障注入記録は削除できる。
-- 純粋なテスト追加（write-path / Flash / OTA / backup を検証しないもの）では、レビュアー側で 1〜2 件の故障を注入し「テストが落ちるか」を確認する。結果は **PR 本文またはレビューコメント** に「注入した故障 / 検出したテスト / 結果 / 証跡」を記録する。純粋なテスト追加の Tier 1 は、この記録セクションを削除できない。write-path / Flash / OTA / backup を検証するテストは Tier 3（§2 Write-path rule）。
+- 純粋なテスト追加（write-path / Flash / OTA / backup / セキュリティ境界 / review-gate script を検証しないもの）では、レビュアー側で 1〜2 件の故障を注入し「テストが落ちるか」を確認する。結果は **PR 本文またはレビューコメント** に「注入した故障 / 検出したテスト / 結果 / 証跡」を記録する。純粋なテスト追加の Tier 1 は、この記録セクションを削除できない。write-path / Flash / OTA / backup / セキュリティ境界 / review-gate script を検証するテストは Tier 3（§2 / §3）。
 
 ## 5. Tier 2（標準）
 
@@ -145,10 +149,12 @@ Tier 3 のパスに対するコメント・整形のみの変更は、次の **�
   - **仕様検収**: `docs/` との一致、オフセット、CRC、エンディアン、コマンド引数。
   - **実装/回帰**: API、エラー処理、境界値、呼び出し側、テストの抜け。
 - 範囲は「変更ファイル + 直接の呼び出し側 + テスト」。変更ファイルだけを読んで終わらせない。
+- write-path / セキュリティ境界 / review-gate script を検証するテストは Tier 3（§2 / §3）。
+- Tier 3 サブセクションは削除せず、該当しないものは `N/A + 理由` を 1 行記入する（全項目を埋める必要はない）。
 - 故障リストを 3〜5 件作り、それぞれ「検出方法」「結果」「証跡」を記録する。
   - コード: テストで検出する。
   - docs/プロセス: リンクチェック、grep、コマンド実行、シナリオ通読で検出する（3〜5 件）。
-- 証跡はテスト名、コマンド出力、URL のいずれかで残す。
+- 証跡はテスト名、コマンド出力、URL、目視メモ、該当箇所の引用、file:line のいずれかで残す。
 
 ## 6. Tier 3（安全-critical）
 
@@ -163,7 +169,7 @@ Tier 3 のパスに対するコメント・整形のみの変更は、次の **�
   - マクロ 4×3 スロットのステップデータ（2768B には含まれない。`slot 0..2` × `macro_idx 0..3` の 12 領域。`macro_idx << 12` の 4KB セクタ）
 - 復元テスト、または文書化された復元手順を確認し、結果を記録する。復元後は 2768B と各マクロを読み戻し、SHA-256 を比較する。
 - OTA を含む場合は、OTA イメージの SHA-256 と Bootloader 復旧結果を記録する。
-- すべての故障に証跡（テスト名 / コマンド出力 / URL）を付け、**Tier をレビューした head SHA で再評価**する。
+- すべての故障に証跡（テスト名 / コマンド出力 / URL / 目視メモ / 該当箇所の引用 / file:line）を付け、**Tier をレビューした head SHA で再評価**する。
 
 ### 6.1 コード変更を含む場合
 
@@ -192,7 +198,7 @@ enterBoot 0x000C (subcmd 0x0067, total_len 4, offset 4)
 → BLE 切断 → "8bt" (FF20/FF21) へ再接続（CCCD + MTU 設定）
 → readPID 0x0008 (subcmd 0x0067, total_len 2)
 → readVersionInBoot 0x0005 (subcmd 0x0067, total_len 4,
-   offset は gamepad_type に応じる。type 1 は 0x01017040、5s)
+   offset 0x01017040 [gamepad_type == 1]、5s)
 ```
 
 `readPID` の結果で `gamepad_type` を判定し、`WriteAPPID` の要否を決める。
@@ -210,9 +216,11 @@ EraseFlash 0x0004 (4KB セクタ単位、10 秒タイムアウト、ACK を待�
     それ以外: offset 0x08014034、4B + CRC16)
 → WriteAPPID 0x0002
    (gamepad_type != 1 のみ、offset 0x0801401C、12B + CRC16、5 秒)
-→ JumpApp 0x0006 (offset 0x01018000、5 秒)
+→ JumpApp 0x0006 (offset 0x01018000 [gamepad_type == 1]、5 秒)
 ```
 
+- `readVersionInBoot` / `JumpApp` の documented offset は `gamepad_type == 1` 用。非 type 1 では値を推測せず、`docs/PROTOCOL_SPEC.md` / Issue を確認して停止する。
+- `WriteFirmwareVersion` は仕様書に両分岐（type 1: `0x01017040` / それ以外: `0x08014034`）がある。
 - 4KB セクタ境界、64B チャンク、**最終チャンクの 64B 固定**、CRC の範囲を確認する。
 - `EraseFlash` の ACK 前に `WriteFirmware` を送らない。
 - 失敗時は `"8bt"` へ再接続し、`readPID` → 全セクタ消去 → 再書き込みで復旧する。「再接続だけ」で復旧したとみなさない。
@@ -223,8 +231,9 @@ EraseFlash 0x0004 (4KB セクタ単位、10 秒タイムアウト、ACK を待�
 
 ```text
 Erase 0x0104
-  (subcmd = (mode << 8) | slot, offset = macro_idx << 12,
-   total_len = 0x1000, ペイロードなし / chunk_len 0)
+  (cmd = 0x0104, subcmd = (mode << 8) | slot,
+   offset = macro_idx << 12, total_len = 0x1000,
+   chunk_len = 0、ペイロードなし (len = 0))
 → Write 0x0103
   (subcmd = (mode << 8) | slot, offset = macro_idx << 12,
    total_len = align32(max_steps * 10), 64B チャンク,
@@ -236,6 +245,7 @@ Erase 0x0104
   (BLE: subcmd 0x0067 / USB: subcmd 0x0123)
 ```
 
+- `Erase 0x0104` はペイロードを持たないため `chunk_len = 0`。`total_len = 0x1000` は消去サイズであり、ペイロード長ではない。
 - `align32(x) = (x + 31) & ~31 = ((x + 31) / 32) * 32`、`offset = macro_idx << 12`、4KB セクタを確認する。
 - バックアップは 2768B 設定から `max_steps` を読み、各 `(slot, macro_idx)` を `Read 0x0102`（`subcmd=(mode<<8)|slot`, `offset=macro_idx<<12`, `total_len=max_steps*10`）で取得する。
 - マクロ 4×3（`slot 0..2` × `macro_idx 0..3`）のバックアップと復元を確認する。
@@ -245,13 +255,14 @@ Erase 0x0104
 ### 6.5 ゲート / セキュリティ / リリース
 
 - **ゲート**: `.github/rulesets/main-protection.json`（canonical）と live ruleset `27785806` の `conditions` / `bypass_actors` / `current_user_can_bypass` / `required_status_checks` / `required_approving_review_count`（現在 0。2 人目のプリンシパルがいる場合の目標 1）を監査する。`gh pr view --json statusCheckRollup`、`commits/$SHA/statuses`、`commits/$SHA/check-runs` で status と check run を確認する。
-- **セキュリティ**: workflow 権限、status / check-run 偽装の可否、secret の扱い、action の pin、署名検証。
+- **セキュリティ**: workflow 権限、status / check-run 偽装の可否、secret の扱い、action の pin、署名検証、セキュリティ境界 / review-gate script のテスト（stale-SHA refusal、failure overwrite、check-run audit など）。
 - **リリース**: バージョン（Cargo.toml / ファームウェアバージョン）、署名、配布物、ロールバック。
 
 ## 7. レビュアーの独立性と合議
 
 - レビュアーは **著者とも他のレビュアーとも別セッション** でレビューする。互いの指摘を見る前に、同じ diff / SHA に対して独立に判定する。
 - 各レビュアーは **自分の行/コメント** を書き、セッション ID、レビューした SHA、判定、レビューコメントの URL を残す。リードレビュアーは他のレビュアーの行を代筆せず、全員のコメント URL と SHA を確認する。
+- PR 本文を編集できないレビュアーは、役割 / レビューした SHA / 判定を含む standalone review comment を投稿する。リードレビュアーはその URL を記録するが、判定を代筆しない。
 - Tier 2/3 は **全レビュアーが同じ head SHA で「マージ可」** を出すまでマージしない。
 - 1 名でも blocker / 要修正を出したら `review-gate` の `success` を付けない。必要なら `failure` を付ける。
 - **リードレビュアー**（仕様検収レビュアー）が、全員の判定とコメント URL を確認してから status を付ける。Tier 1 はレビュアー本人が付ける。
@@ -263,7 +274,7 @@ Erase 0x0104
 
 件数を満たすことではなく、**検出したい故障を先に列挙**します。カウントはコードの下限です。docs/ゲートはテストの有無ではなく、検出方法（リンクチェック、grep、コマンド実行、目視）で 3〜5 / 5+ 件を記録します。混合 PR はコード 10 件以上と docs/ゲート 5 件以上の両方を満たします。各項目には証跡を付けます。
 
-**以下の表は例であり、実際のテスト結果ではありません。** PR では自分の故障を記入してください。
+**以下の表は記入例です。`実例（未解決）` と付いた行だけは、このリポジトリの既知の残存リスクです。** PR では自分の故障を記入してください。
 
 | 故障 | 検出方法（テスト / コマンド / 目視） | 結果 | 残存リスク | 証跡 |
 | --- | --- | --- | --- | --- |
@@ -273,7 +284,7 @@ Erase 0x0104
 | RT/LT を入れ替える | マクロステップのバイト配置テスト | 例: 検出 | なし | テスト名 |
 | BLE RX に `0x04` プレフィックスを要求する | 受信フレーミングテスト | 例: 検出 | なし | テスト名 |
 | `cmd 0x0103` の 64B クランプを外す | チャンク分割テスト | 例: 検出 | なし | テスト名 |
-| OTA の最終チャンクを 64B 未満で送る | ファームウェア分割テスト | **未検出** | 最終チャンクの 64B パディング未実装。Issue #2 に記録済み（修正 PR 未作成） | Issue #2 |
+| 実例（未解決）: OTA の最終チャンクを 64B 未満で送る | ファームウェア分割テスト | **未検出** | 最終チャンクの 64B パディング未実装。Issue #2 に記録済み（修正 PR 未作成） | Issue #2 |
 | docs の相対リンクを壊す | リンクチェック | 例: 検出 | なし | コマンド出力 |
 | Tier 表の記述が 2 箇所でずれる | grep / 目視 | 例: 検出 | なし | grep 出力 |
 | セキュリティトリガーが抜ける | チェックリスト照合 | 例: 検出 | なし | 照合メモ |
@@ -283,7 +294,7 @@ Erase 0x0104
 ## 9. レビュー記録
 
 - レビュー結果は PR のレビューコメントに残す。各レビュアーは自分の行を書き、リードは代筆しない。
-- **`scripts/post-review-status.sh <PR> <reviewed-sha> <TIER> [success|failure]`** で、レビューした head SHA に `review-gate` status を付ける。スクリプトは Tier を検証し、投稿直前に head SHA を固定し、投稿後に全 status と check run を監査する。
+- **`scripts/post-review-status.sh <PR> <reviewed-sha> <TIER> [success|failure]`** で、レビューした head SHA に `review-gate` status を付ける。スクリプトは Tier 引数（1/2/3）を検証する。PR の宣言 Tier と quorum は検証しない（手続き）。呼び出し側は PR の宣言 Tier を渡すこと。投稿直前に head SHA を固定し、投稿後に全 status と check run を監査する。
 - status の description に Tier と SHA を含める（例: `Tier 3 review of abc1234`）。
 - 修正を push したら新しい SHA で再レビューする。前の SHA の status は引き継がれない。
 - Tier、故障リスト、レビュアー表は PR 本文に残す。Tier は各 push 後に再評価する。

@@ -492,7 +492,7 @@ struct Bt2Header {
     - 例: `max_steps = 4` → `raw_bytes = 40` → `aligned_len = 64`（不足分 24 バイトはホスト側バッファ上のゼロ詰め領域が送られる）
     - 例: `max_steps = 16` → `raw_bytes = 160` → `aligned_len = 160`
   - **Read (`cmd 0x0102`) の `total_len`**: アライメントなしの `max_steps * 10` をそのまま指定。
-  - **Erase (`cmd 0x0104`) の `total_len`**: `0x1000` (4096 バイト = 1 セクタ分)。
+  - **Erase (`cmd 0x0104`) の `total_len`**: `0x1000` (4096 バイト = 1 セクタ分)。ペイロードを持たないためヘッダの `chunk_len` は `0` とする。
 
 ### 9.3 Flash 読み書き完全シーケンス
 
@@ -502,8 +502,8 @@ struct Bt2Header {
    - `cmd = 0x0104`
    - `subcmd = (gamepad_mode << 8) | slot`
    - `offset = macro_idx << 12`
-   - `total_len = 0x1000`
-   - `chunk_len = 0x1000`, ペイロードなし (`len = 0`)
+   - `total_len = 0x1000`（消去サイズ。ペイロード長ではない）
+   - `chunk_len = 0`（ペイロードなし、`len = 0`）
 2. **Step 2: マクロステップデータ書込 (`Write`)**
    - `cmd = 0x0103`
    - `subcmd = (gamepad_mode << 8) | slot`
