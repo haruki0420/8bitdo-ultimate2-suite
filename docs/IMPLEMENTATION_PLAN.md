@@ -183,7 +183,8 @@ Track C: モバイル
   - BLE `"80ND"` スキャン、`FF10` + `FF13`（`FF11` フォールバック）、MTU ネゴシエーション
   - `Session`: operation lock（keepalive とコマンドの直列化）、ReadVersion（4B ダミーペイロード + `cmd=0x0004` エンベロープ）、ReadConfig（`chunk_len = total_len = 0x0AD0`、1 要求 = 1 チャンク、142B、最終チャンク切り詰め）、入力レポート
   - CLI: `scan` / `info` / `config dump` / `backup` / `monitor` / `keepalive` / **`session`**
-  - `session`: 1 接続、`0x0007` enable + 20ms `0x0003` keepalive + 受信ドレイン、`info` / `config dump` / `backup` / `monitor` / `status` / `quit`
+  - `session`: 1 接続、`0x0007` enable + 20ms `0x0003` keepalive + 受信ドレイン、operation lock でコマンド中は keepalive を停止、`info` / `config dump` / `backup` / `monitor` / `monitor stop` / `status` / `help` / `quit`。連続失敗 3 回または `Disconnected` で degraded 停止し、自動再接続しない
+  - `session` は将来のデーモン化（常駐プロセス）への布石。1 回の Profile 長押しで複数操作を完結させる
   - docs: `FF13` 実機観測、`cmd=0x0004` エンベロープ、ReadConfig の `chunk_len`、keepalive 設計
 - **完了条件**: 1 回の Profile で `session` 内の `info` → `backup` → `monitor` が通り、Tier 2 レビューと CI 4/4 を満たすこと。
 - **状態**: 進行中。

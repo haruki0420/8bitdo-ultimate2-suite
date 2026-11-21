@@ -53,6 +53,7 @@ graph LR
 - 実機実験: `eightbitdo keepalive --interval-ms 20 --duration 120`。測定項目は、維持できた秒数、切断理由、USB 併用の有無、送信数 / 受信数、背面相当（送信停止）との比較である。
 - **実機観測**: 20ms `0x0003` の keepalive では **128.9 秒**維持できた。一方、`config dump` を別プロセスで実行すると BLE 設定モードが切れて `Timeout waiting for reply` になった。BLE は 1 central しか接続できず、プロセスをまたいで接続を共有できないため、複数の読み取りは 1 接続にまとめる必要がある。
 - **1 接続バックアップ**: `eightbitdo backup --raw backup.bin --json backup.json --hold N` は、1 回の接続で `ReadVersion`（`0x000B`）→ `read_config_snapshot()`（20 チャンク）→ 必要なら `0x0007` + 20ms `0x0003` の keepalive を N 秒実行する。`--hold` 中は他のコマンドを送らない。`N=0` なら読み終えて直ちに切断する。
+- **1 接続 REPL (`session`)**: `eightbitdo session [--interval-ms 20]` は 1 回の Profile 長押しで接続を保持し、`info` / `config dump` / `backup` / `monitor` / `status` を同一接続で実行する。アイドル時は `0x0007` enable 1 回 + 20ms `0x0003` + 受信ドレイン。コマンド実行中は operation lock（単一フライト）で keepalive を止め、終了後に再開する。`monitor stop` でバックグラウンド monitor を停止でき、Ctrl-C はセッション終了。連続失敗 3 回または `Disconnected` で keepalive を degraded 停止し、自動再接続はしない（設定モード切れの可能性を案内する）。これは最小構成ではなく、`status` / `monitor stop` / 失敗方針を含む正式設計である。
 - **これは設計ノートであり、プロトコル要件ではない。**
 
 ---

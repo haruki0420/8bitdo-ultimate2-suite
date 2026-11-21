@@ -228,7 +228,9 @@ impl<T: Transport> Session<T> {
             };
 
             let (header, payload) = header::decode_app_response(&frame)?;
-            if header.cmd != commands::cmd::INPUT {
+            let is_input = header.cmd == commands::cmd::INPUT
+                || (header.cmd == commands::cmd::RESPONSE && header.subcmd == commands::cmd::INPUT);
+            if !is_input || header.chunk_len == 0 {
                 continue;
             }
             return Ok(Some(InputReport::from_bytes(payload)?));
@@ -1119,6 +1121,33 @@ mod tests {
             .await
             .unwrap()
             .expect("a report is queued");
+        assert_eq!(decoded, report);
+    }
+
+    #[tokio::test]
+    async fn input_reader_accepts_envelope_report() {
+        let mock = MockTransport::new();
+        let report = InputReport {
+            keys: 0x0000_4002,
+            left_stick_x: 0x40,
+            left_stick_y: 0x80,
+            right_stick_x: 0x10,
+            right_stick_y: 0xF0,
+            trigger_r: 0x20,
+            trigger_l: 0x30,
+            battery: 0x55,
+            reserved: 0,
+        };
+        let header = CustomHeader::new(commands::cmd::RESPONSE, commands::cmd::INPUT, 12, 12)
+            .with_payload(&report.to_bytes());
+        mock.push_response(&header, &report.to_bytes());
+
+        let session = Session::new(&mock);
+        let decoded = session
+            .try_next_input(Duration::from_millis(200))
+            .await
+            .unwrap()
+            .expect("an envelope report is queued");
         assert_eq!(decoded, report);
     }
 
