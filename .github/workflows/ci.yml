@@ -45,6 +45,8 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install D-Bus development files
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p eightbitdo-protocol --no-default-features --all-targets --locked -- -D warnings
 
@@ -60,6 +62,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install D-Bus development files
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - run: cargo test --workspace --locked
       - run: cargo test --workspace --all-features --locked
       - run: cargo test -p eightbitdo-protocol --no-default-features --locked
@@ -78,5 +82,7 @@ jobs:
         with:
           toolchain: "1.85.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install D-Bus development files
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - run: cargo check --workspace --all-targets --all-features --locked
       - run: cargo +1.85.0 check -p eightbitdo-protocol --no-default-features --all-targets --locked
