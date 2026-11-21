@@ -171,6 +171,16 @@ impl Request {
                  (cmd 0x0104, total_len = chunk_len = 0x1000)",
             ));
         }
+        if self.header.crc16 != 0xFFFF {
+            return Err(Error::InvalidFrame(
+                "EraseBT2Macro header crc16 must be 0xFFFF",
+            ));
+        }
+        if !matches!(self.header.offset, 0 | 0x1000 | 0x2000 | 0x3000) {
+            return Err(Error::InvalidFrame(
+                "EraseBT2Macro offset must be macro_idx << 12",
+            ));
+        }
         Ok(())
     }
 
@@ -186,8 +196,13 @@ impl Request {
     /// # Errors
     ///
     /// Returns [`Error::UnexpectedPayload`] when a payload is attached, or
-    /// [`Error::InvalidFrame`] for any other command shape.
+    /// [`Error::InvalidFrame`] for a non-App `kind` or any other command shape.
     pub fn encode_ble_payloadless(&self, kind: PacketKind) -> Result<Vec<u8>, Error> {
+        if kind != PacketKind::App {
+            return Err(Error::InvalidFrame(
+                "payloadless BLE encoding is App Mode only",
+            ));
+        }
         self.validate_payloadless()?;
         Ok(header::encode_ble_payloadless(kind, &self.header))
     }
@@ -443,15 +458,17 @@ pub fn write_macro_steps(
 
 /// Write a pre-encoded macro payload (already 32-byte aligned).
 ///
-/// `payload.len()` must be a multiple of [`MACRO_PAYLOAD_ALIGNMENT`] (`0x20`).
-/// `chunk_size` must be [`MACRO_USB_CHUNK_SIZE`] (`0x20`) or
-/// [`MACRO_MAX_CHUNK_SIZE`] (`0x40`); larger values are first clamped to
-/// `0x40`, matching the official BLE limit. Offsets advance by the **clamped**
-/// chunk size, and every packet carries the CRC-16/MODBUS of its own payload.
+/// `payload` must not be empty, and `payload.len()` must be a multiple of
+/// [`MACRO_PAYLOAD_ALIGNMENT`] (`0x20`). `chunk_size` must be
+/// [`MACRO_USB_CHUNK_SIZE`] (`0x20`) or [`MACRO_MAX_CHUNK_SIZE`] (`0x40`);
+/// larger values are first clamped to `0x40`, matching the official BLE limit.
+/// Offsets advance by the **clamped** chunk size, and every packet carries the
+/// CRC-16/MODBUS of its own payload.
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidChunkSize`] when `chunk_size` is zero,
+/// Returns [`Error::EmptyPayload`] when `payload` is empty,
+/// [`Error::InvalidChunkSize`] when `chunk_size` is zero,
 /// [`Error::PayloadTooLarge`] when `payload` exceeds one 4 KB flash sector,
 /// [`Error::UnsupportedChunkSize`] when the clamped size is not 32 or 64, or
 /// [`Error::UnalignedPayloadLength`] when the payload is not 32-byte aligned.
@@ -462,6 +479,9 @@ pub fn write_macro_payload(
     payload: &[u8],
     chunk_size: usize,
 ) -> Result<Vec<Request>, Error> {
+    if payload.is_empty() {
+        return Err(Error::EmptyPayload);
+    }
     if chunk_size == 0 {
         return Err(Error::InvalidChunkSize {
             max: MACRO_MAX_CHUNK_SIZE,
@@ -590,10 +610,20 @@ pub mod boot {
 
     /// Write one full 64-byte firmware chunk with CRC-16/MODBUS.
     ///
+    /// The primitive enforces the same guards as
+    /// [`write_firmware_packets`], so callers cannot bypass them by sending
+    /// individual chunks.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::error::Error::InvalidLength`] unless `chunk` is
-    /// exactly [`CHUNK_SIZE`] (`0x40`) bytes.
+    /// exactly [`CHUNK_SIZE`] (`0x40`) bytes,
+    /// [`crate::error::Error::EmptyFirmwareImage`] for `image_len == 0`,
+    /// [`crate::error::Error::UnalignedImageLength`] when `image_len` is not a
+    /// multiple of [`CHUNK_SIZE`], [`crate::error::Error::AddressOverflow`]
+    /// when `addr + 64` exceeds `u32::MAX + 1`, or
+    /// [`crate::error::Error::UnalignedAddress`] when `addr` is not 64-byte
+    /// aligned.
     pub fn write_firmware(
         addr: u32,
         image_len: u32,
@@ -603,6 +633,27 @@ pub mod boot {
             return Err(crate::error::Error::InvalidLength {
                 expected: CHUNK_SIZE,
                 actual: chunk.len(),
+            });
+        }
+        if image_len == 0 {
+            return Err(crate::error::Error::EmptyFirmwareImage);
+        }
+        if image_len % CHUNK_SIZE as u32 != 0 {
+            return Err(crate::error::Error::UnalignedImageLength {
+                actual: image_len as usize,
+                alignment: CHUNK_SIZE,
+            });
+        }
+        if u64::from(addr) + CHUNK_SIZE as u64 > u64::from(u32::MAX) + 1 {
+            return Err(crate::error::Error::AddressOverflow {
+                base: addr,
+                offset: CHUNK_SIZE as u64,
+            });
+        }
+        if addr % CHUNK_SIZE as u32 != 0 {
+            return Err(crate::error::Error::UnalignedAddress {
+                address: addr,
+                alignment: CHUNK_SIZE as u32,
             });
         }
         Ok(Request::new(CMD_WRITE_FIRMWARE, 0, image_len, addr).with_crc_payload(chunk))
@@ -679,8 +730,11 @@ pub mod boot {
     /// # Errors
     ///
     /// Returns [`crate::error::Error::InvalidLength`] unless `header24` is
-    /// exactly 24 bytes, or [`crate::error::Error::ImageLengthMismatch`] when
-    /// `image_len` disagrees with the header field.
+    /// exactly 24 bytes, [`crate::error::Error::EmptyFirmwareImage`] for
+    /// `image_len == 0`, [`crate::error::Error::UnalignedImageLength`] when
+    /// `image_len` is not a multiple of [`CHUNK_SIZE`], or
+    /// [`crate::error::Error::ImageLengthMismatch`] when `image_len` disagrees
+    /// with the header field.
     pub fn write_version_header(
         image_len: u32,
         header24: &[u8],
@@ -689,6 +743,15 @@ pub mod boot {
             return Err(crate::error::Error::InvalidLength {
                 expected: 0x18,
                 actual: header24.len(),
+            });
+        }
+        if image_len == 0 {
+            return Err(crate::error::Error::EmptyFirmwareImage);
+        }
+        if image_len % CHUNK_SIZE as u32 != 0 {
+            return Err(crate::error::Error::UnalignedImageLength {
+                actual: image_len as usize,
+                alignment: CHUNK_SIZE,
             });
         }
         let mut length_bytes = [0u8; 4];
@@ -980,6 +1043,19 @@ mod tests {
     }
 
     #[test]
+    fn write_macro_rejects_empty_payloads() {
+        assert!(matches!(
+            write_macro_payload(0, Slot::S1, MacroIndex::M1, &[], 64),
+            Err(Error::EmptyPayload)
+        ));
+        let no_steps: [MacroStep; 0] = [];
+        assert!(matches!(
+            write_macro_steps(0, Slot::S1, MacroIndex::M1, &no_steps, 64),
+            Err(Error::EmptyPayload)
+        ));
+    }
+
+    #[test]
     fn erase_macro_declares_one_sector_without_payload() {
         let request = erase_macro(3, Slot::S1, MacroIndex::M2);
         assert_eq!(request.header.cmd, 0x0104);
@@ -1047,6 +1123,34 @@ mod tests {
         let save_request = save(SaveTransport::Ble);
         assert!(matches!(
             save_request.encode_ble_payloadless(PacketKind::App),
+            Err(Error::InvalidFrame(_))
+        ));
+
+        let boot_request = erase_macro(3, Slot::S1, MacroIndex::M2);
+        assert!(matches!(
+            boot_request.encode_ble_payloadless(PacketKind::Boot),
+            Err(Error::InvalidFrame(_))
+        ));
+
+        let mut bad_offset = erase_macro(3, Slot::S1, MacroIndex::M2);
+        bad_offset.header.offset = 0x0800;
+        assert!(matches!(
+            bad_offset.encode_ble_payloadless(PacketKind::App),
+            Err(Error::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            bad_offset.encode_usb_app_payloadless(),
+            Err(Error::InvalidFrame(_))
+        ));
+
+        let mut bad_crc = erase_macro(3, Slot::S1, MacroIndex::M2);
+        bad_crc.header.crc16 = 0;
+        assert!(matches!(
+            bad_crc.encode_ble_payloadless(PacketKind::App),
+            Err(Error::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            bad_crc.encode_usb_app_payloadless(),
             Err(Error::InvalidFrame(_))
         ));
     }
@@ -1161,6 +1265,39 @@ mod tests {
                 offset: 64,
             })
         ));
+        // A single chunk ending exactly at 0xFFFF_FFFF is still valid.
+        assert!(boot::write_firmware_packets(0xFFFF_FFC0, 64, &[0u8; 64]).is_ok());
+    }
+
+    #[test]
+    fn boot_write_firmware_enforces_ota_primitive_guards() {
+        let chunk = [0x5Au8; 64];
+        assert!(matches!(
+            boot::write_firmware(0x0800_0000, 0, &chunk),
+            Err(Error::EmptyFirmwareImage)
+        ));
+        assert!(matches!(
+            boot::write_firmware(0x0800_0000, 65, &chunk),
+            Err(Error::UnalignedImageLength {
+                actual: 65,
+                alignment: 0x40,
+            })
+        ));
+        assert!(matches!(
+            boot::write_firmware(0x0800_0020, 128, &chunk),
+            Err(Error::UnalignedAddress {
+                address: 0x0800_0020,
+                alignment: 0x40,
+            })
+        ));
+        assert!(matches!(
+            boot::write_firmware(0xFFFF_FFFF, 128, &chunk),
+            Err(Error::AddressOverflow {
+                base: 0xFFFF_FFFF,
+                offset: 64,
+            })
+        ));
+        assert!(boot::write_firmware(0xFFFF_FFC0, 64, &chunk).is_ok());
     }
 
     #[test]
@@ -1209,6 +1346,22 @@ mod tests {
             Err(Error::ImageLengthMismatch {
                 declared: 0x2000,
                 actual: 0x1000,
+            })
+        ));
+
+        let mut zero_header = header;
+        zero_header[8..12].copy_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            boot::write_version_header(0, &zero_header),
+            Err(Error::EmptyFirmwareImage)
+        ));
+        let mut short_header = header;
+        short_header[8..12].copy_from_slice(&65u32.to_le_bytes());
+        assert!(matches!(
+            boot::write_version_header(65, &short_header),
+            Err(Error::UnalignedImageLength {
+                actual: 65,
+                alignment: 0x40,
             })
         ));
 

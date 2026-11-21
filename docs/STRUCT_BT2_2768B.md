@@ -512,8 +512,8 @@ struct Bt2Header {
    - `subcmd = (gamepad_mode << 8) | slot`
    - `offset = (macro_idx << 12) + chunk_index * chunk_size`（`chunk_index` はパケットごとに進む）
    - `total_len = align32(max_steps * 10)`
-   - `chunk_size` は BLE 64B / USB HID 32B（または交渉済みチャンクサイズ）。最終チャンクは 32B アライン長。`chunk_size` が BLE `0x40` / USB HID `0x20` を超える場合は **拒否または上限へクランプ** し、上限超過をテストする
-   - ペイロード: `max_steps * 10` バイト＋32B アライメント用ゼロパディング（BLE 64B / USB HID 32B または交渉済みサイズで分割送信・`Send_CustomCmdPacket` 準拠で各チャンクヘッダ `CRC-16/MODBUS (0xA001)` 付与）
+   - `chunk_size` は BLE 64B / USB HID 32B（32B アライン。それ以外は拒否。64B 超は 64B にクランプしてから判定）。最終チャンクは 32B アライン長。46B などの交渉済みサイズは将来拡張で、現在の API は `UnsupportedChunkSize` を返す
+   - ペイロード: `max_steps * 10` バイト＋32B アライメント用ゼロパディング（BLE 64B / USB HID 32B で分割送信・`Send_CustomCmdPacket` 準拠で各チャンクヘッダ `CRC-16/MODBUS (0xA001)` 付与）
 3. **Step 3: 2768B コンフィグ内のマクロ管理ヘッダ更新**
    - `max_steps`, `key_map`, `cycles_num`, `interval_ms`, `filename`, `total_cnt`, `flag` 等を `0x68C + slot * 0xD8` に反映し、`ANSI_CRC_16_sh` を再計算する。
    - 部分書込 (`cmd = 0x0001, subcmd = 0x0000, offset = 0x68C + slot * 0xD8, len = 0xD8, total_len = 0x0AD0`) または全体書込を送信する。

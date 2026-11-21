@@ -112,8 +112,9 @@ Windows の `FindHid` / `enum_hid` は `HidD_GetPreparsedData` + `HidP_GetCaps` 
      - パケット総送信バイト上限: `MAX_ATT_MTU - 2`（先頭 1B プレフィックス含むため、ヘッダ 16B + ペイロードの合計上限は `MAX_ATT_MTU - 2` とみなされる、実質ペイロード上限は **`MAX_ATT_MTU - 0x12`**（`MAX_ATT_MTU - 18`）バイト）。
      - 例: `MAX_ATT_MTU = 100` のとき最大ペイロード `82` バイト。`MAX_ATT_MTU = 64` のとき `46` バイト。
    - **`cmd == 0x0103`（マクロデータ書き込み）**:
-     - `chunk_len` は **`0x40`（64 バイト）を上限にクランプ**される（`min(chunk_len, 0x40)`）。
+     - プロトコル上の `chunk_len` 上限は BLE **`0x40`（64 バイト）** / USB HID **`0x20`（32 バイト）**。BLE は `min(chunk_len, 0x40)` でクランプされる。
      - 呼び出し元の `getBT2_WriteMacro(slot, macro_idx)` では、マクロの `total_len` を `0x20`（32 バイト）単位に切り上げて転送する。
+     - 本クレートの `write_macro_payload` API は **32B / 64B のみ**を受け付ける（最終チャンクを 32B アラインに保つため）。46B などの交渉済みサイズは将来拡張であり、現在は `UnsupportedChunkSize` を返す。
    - **`cmd == 0x0104`（マクロデータ消去）**:
      - チャンク上限クランプをスキップし、`bVar5 = true` としてそのまま送信する。
    - **`cmd == 0x0007`（`SetReportEnable`）実行時**:
@@ -313,7 +314,7 @@ sequenceDiagram
 | **`0x0013`** | `0x0000` | `total_len=0, offset=0` (Windows `StartConfig` flag=`1`) | Host → Ctrl | **Windows USB HID 用 `StartConfig`**（最大 30 回リトライし `cmd=0x13` ACK を待機） |
 | **`0x0015`** | `slot` (`0..2`) | `total_len=0, offset=0` | Host → Ctrl | **`WriteSLOT`**。アクティブプロファイルスロット切替 |
 | **`0x0102`** | `(mode << 8) \| slot` | `total_len = steps * 10`, `offset = macro_idx << 12` (`macro_idx * 0x1000`) | Host → Ctrl | **`ReadBT2Macro`**。指定スロット・マクロ番号のステップ列を読み出し（1 ステップ = 10B） |
-| **`0x0103`** | `(mode << 8) \| slot` | `total_len = align32(steps * 10)` (`((steps * 10) + 0x1F) & ~0x1F`), `offset = (macro_idx << 12) + chunk_index * chunk_size`（`chunk_index` はパケットごとに進む。`chunk_size` は BLE `0x40` / USB HID `0x20`、または交渉済みサイズ。上限超過は拒否またはクランプ） | Host → Ctrl | **`WriteBT2Macro`**。BLE 最大 **`0x40` (64B)** / USB HID 最大 **`0x20` (32B)** 分割でマクロを書き込み、完了後に `0x0006` (Save) を実行。`chunk_size` が上限を超える場合は拒否または上限へクランプし、上限超過をテストする |
+| **`0x0103`** | `(mode << 8) \| slot` | `total_len = align32(steps * 10)` (`((steps * 10) + 0x1F) & ~0x1F`), `offset = (macro_idx << 12) + chunk_index * chunk_size`（`chunk_index` はパケットごとに進む。プロトコル上限は BLE `0x40` / USB HID `0x20`。本クレートの API は 32B / 64B のみで、46B などは `UnsupportedChunkSize`。64B 超は 64B にクランプ） | Host → Ctrl | **`WriteBT2Macro`**。BLE 最大 **`0x40` (64B)** / USB HID 最大 **`0x20` (32B)** 分割でマクロを書き込み、完了後に `0x0006` (Save) を実行。API の chunk サイズは 32B / 64B のみ（32B アライン保証） |
 | **`0x0104`** | `(mode << 8) \| slot` | `total_len = 0x1000`, `chunk_len = 0x1000`（wire header `+0x04`。公式実装のチャネル設定値。ペイロードなし `len = 0`）, `crc16 = 0xFFFF`（空ペイロードの CRC-16/MODBUS）, `offset = macro_idx << 12` | Host → Ctrl | **`EraseBT2Macro`**。指定スロット・マクロ領域（4KB 単位）を消去 |
 
 > ※ `mode` は `record_ultimatebt2` 内オフセット `+0x10` の `GamepadMode` 値。
@@ -493,6 +494,14 @@ Bootloader Mode (`"8bt"`, Service `0000FF20-...`, Char `0000FF21-...`) では先
 | **`0x0006`** | `0x0000` | `0x01018000` (`gamepad_type==1`) | `total_len = 0` | なし | `5000 ms` (送信設定 `0`) | **`jumpApp`**: アプリケーション領域へジャンプして通常モードへ復帰 |
 | **`0x0008`** | **`0x0067`** | `0x00000000` | `total_len = 2` | なし | `5000 ms` (5s) | **`readPID` (BLE Boot)**: Bootloader でのデバイス PID 読み出し（※ Windows USB Boot では `cmd=0x0000, subcmd=0x0008`、5s） |
 | **`0x00C4`** | `0x0000` | `0x00000000` | `total_len = header[8]` (イメージ総長), `chunk_len = 0x18` (24B) | なし | **`3000 ms`** | **`WriteVersion`**: 24B イメージヘッダメタデータを書き込み |
+
+> **実装側の安全ガード（デバイス要件ではない）**: `eightbitdo-protocol` の OTA builder は、実機を危険な書込順序に導かないために次の入力を拒否する。
+> - 空イメージ / `image_len == 0`（`EmptyFirmwareImage`）
+> - `image_len` が 64 の倍数でない（`UnalignedImageLength`）
+> - base address が 64B アラインでない（`UnalignedAddress { alignment: 64 }`）
+> - chunk address が `u32` を overflow する（`AddressOverflow`）
+> - `WriteFirmware` の chunk が 64B ちょうどでない（`InvalidLength`）
+> - `WriteVersion` の `image_len` が `header[8..12]`（`image_data_len`）と一致しない（`ImageLengthMismatch`）
 
 ### 8.4 エラー復旧・ブリック防止の重要設計ポイント
 

@@ -97,7 +97,7 @@ pub enum Error {
         /// Length read from the supplied image or image header.
         actual: u32,
     },
-    /// A flash address was not aligned to the erase sector size.
+    /// An address was not aligned to the required boundary.
     UnalignedAddress {
         /// Address supplied by the caller.
         address: u32,
