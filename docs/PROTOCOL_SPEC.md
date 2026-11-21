@@ -134,8 +134,8 @@ Windows の `FindHid` / `enum_hid` は `HidD_GetPreparsedData` + `HidP_GetCaps` 
 | `+0x02` | 2B | `u16` | `subcmd_or_param` | サブコマンド・引数・スロット指定（例: `0x0067` / `0x0123` Save, `(mode << 8) \| slot`） |
 | `+0x04` | 2B | `u16` | `chunk_len` | このパケットに含まれるペイロード実長（送信要求コマンドでペイロード無しなら `0`） |
 | `+0x06` | 2B | `u16` | `crc16` | ペイロードに対する CRC-16/MODBUS（条件付き、未使用時は `0x0000`） |
-| `+0x08` | 4B | `u32` | `total_len` | 転送全体の総バイト数（または読み出し要求総長。`0x000B` 等では識別値 `0x01020030` 等） |
-| `+0x0C` | 4B | `u32` | `offset` | 分割転送時の開始オフセット。ただし `cmd == 0x0001` / `0x0066`（`PID == 0x600F, 0x6009, 0x202F, 0x2072`）および `cmd == 0x000B` では `total_len` 側の値が設定される |
+| `+0x08` | 4B | `u32` | `total_len` | 転送全体の総バイト数（または読み出し要求総長）。`0x000B` ReadVersion では `gamepad_type == 1` (`0x600F`) は `4`、`gamepad_type == 2` は `0x01020030` |
+| `+0x0C` | 4B | `u32` | `offset` | 分割転送時の開始オフセット。ただし `cmd == 0x0001` / `0x0066`（`PID == 0x600F, 0x6009, 0x202F, 0x2072`）では `total_len` 側の値が設定される。`cmd == 0x000B` ReadVersion は `gamepad_type == 1` (`0x600F`) で `0x01017040`、`gamepad_type == 2` で `0x01020030`（`total_len` と同値） |
 
 > **例外 (`cmd = 0x0104` `EraseBT2Macro`)**: このコマンドはペイロードを持たないが、公式実装 (`getBT2_EraseMacro`) はチャネルの `total_len` と `chunk_len` をともに `0x1000` に設定し、`Generate_CustomDataCmd` が `chunk_len` フィールドを wire header `+0x04` に書く。実際のペイロードは `len = 0` である。`chunk_len` の一般則（ペイロード実長）だけから `0` と解釈しないこと。
 
@@ -159,7 +159,7 @@ Windows の `FindHid` / `enum_hid` は `HidD_GetPreparsedData` + `HidP_GetCaps` 
   [0x05] (1B) + cumstom_header_t (16B) + payload (chunk_len B)
   ```
 - **送信長上限**: `1 + min(16 + chunk_len, MAX_ATT_MTU - 2)` バイト（ただし `cmd == 0x0103` のとき `chunk_len <= 0x40`）。
-- **例外 (`cmd == 0x0104` `EraseBT2Macro`)**: ヘッダ `+0x04` には `chunk_len = 0x1000` が入るが、ペイロードは送らない（実送信長は 17B + プレフィックス）。このコマンドに上の `16 + chunk_len` の式を適用しない。
+- **例外 (`cmd == 0x0104` `EraseBT2Macro`)**: ヘッダ `+0x04` には `chunk_len = 0x1000` が入るが、ペイロードは送らない（実際の送信長は 1B プレフィックス + 16B ヘッダ = 17B（プレフィックス込み））。このコマンドに上の `16 + chunk_len` の式を適用しない。
 
 ### 4.3 BLE 受信フォーマット (`HIDChannel_readBleHidData`)
 
@@ -278,7 +278,7 @@ sequenceDiagram
     Host->>Ctrl: BLE 接続 → Service FF10 / Char FF11 発見
     Host->>Ctrl: CCCD (0x2902) に [0x01, 0x00] 書込 (Notify 有効化)
     Host->>Ctrl: MTU 要求 (100 bytes)
-    Host->>Ctrl: cmd=0x000B (ReadVersion, total_len=0x01020030)
+    Host->>Ctrl: cmd=0x000B (ReadVersion, total_len=4, offset=0x01017040 [0x600F / gamepad_type == 1])
     Ctrl-->>Host: Version 応答 (gamepadVersion)
     Host->>Ctrl: cmd=0x0010, subcmd=0x0001 (setPhonePlatform)
     Ctrl-->>Host: ACK
@@ -303,7 +303,7 @@ sequenceDiagram
 | **`0x0003`** | `0x0000` | `total_len=0x0C`, `offset=0x0C` | Ctrl ↔ Host | **リアルタイム入力レポート取得 / 通知**（12 バイト、セクション 7 参照） |
 | **`0x0006`** | **`0x0067`** (BLE)<br/>**`0x0123`** (Windows USB) | `total_len=0, offset=0` | Host → Ctrl | **Save（Flash 永続化）**。書き込み系（`0x0001` / `0x0103`）完了後に必ず発行。**BLE(Android) と USB(Windows) でサブコマンドが異なる点に注意**（6.4 参照） |
 | **`0x0007`** | `0x0000` (無効) / `0x0001` (有効) | `total_len=0, offset=0` | Host → Ctrl | **`SetReportEnable`**。リアルタイム入力通知の開始/停止。発行時にクライアント側 `MAX_ATT_MTU = 0x3F` へ設定 |
-| **`0x000B`** | `0x0000` | `total_len = 0x01020030` (`gamepad_type==2` 時。`offset` にも同値) | Host → Ctrl | **`ReadVersion`**。ファームウェアバージョン読み出し |
+| **`0x000B`** | `0x0000` | `0x600F` (`gamepad_type == 1`): `total_len = 4`, `offset = 0x01017040`<br/>`gamepad_type == 2`: `total_len = offset = 0x01020030` | Host → Ctrl | **`ReadVersion`**。ファームウェアバージョン読み出し。`0x01020030` は `gamepad_type == 2` の variant |
 | **`0x000C`** | **`0x0067`** | `total_len=4, offset=4` | Host → Ctrl | **`EnterBoot`**。App Mode から Bootloader Mode (`"8bt"`) へ再起動遷移 |
 | **`0x000E`** | — | — | Ctrl → Host | エラー応答通知（`readBleHidData` でエラーコードログ出力） |
 | **`0x000F`** | **`0x000F`** | `total_len=0, offset=4` | Host → Ctrl | **`DisConnectBluetooth`**。Bluetooth 設定接続の明示的切断 |

@@ -13,12 +13,12 @@ PR のリスクに応じてレビューの深さを変えます。目的は「do
 | Tier | 対象 | レビュー | 故障リスト |
 | --- | --- | --- | --- |
 | **1** | **Tier 3 パス以外**のコメント・整形、通常の docs（規範仕様・ゲート/プロセス文書を除く）、**純粋なテスト追加のみ**（write-path / Flash / OTA / backup / CRC / golden vector / mock transport / safety-critical test vector / セキュリティ境界 / review-gate script を検証するものを除く）。**振る舞いは変えない** | 1 名。diff + テスト + リンク/コマンド | 純粋なテスト追加はレビュアー側で 1〜2 件の故障注入を記録。**Tier 3 パス以外**の振る舞いを変えない docs/コメント/整形は不要。Tier 3 パスの整形は A1 の条件を満たす場合のみ降格、コメントは A2 で常に Tier 3 |
-| **2** | 読み取り専用コード（セキュリティの振る舞いを除く）、読み取り系ビルダー、プロセス文書の散文、規範仕様の編集（誤字・リンク・表現、および安全-critical でない明確化）、依存・ツールチェーン（write-path / セキュリティに影響しないもの）・リポジトリ衛生、テストの変更/削除（Tier 3 パス、write-path / Flash / OTA / backup / CRC / golden vector / mock transport / safety-critical test vector / セキュリティ境界 / review-gate script を検証するものを除く）、リファクタ（write-path / Flash / OTA / backup / CRC / セキュリティの振る舞いに触れないもの） | 2 名（仕様検収 + 実装/回帰）。変更ファイル + 直接の呼び出し側 + テスト | コード 3 件以上（目安 3–5、見つかった故障はすべて記録）。docs/プロセスは検出方法 3 件以上（目安 3–5）。混合 PR は両方 |
-| **3** | 書き込み経路 / Flash / OTA / backup-restore / CRC / offset / framing / マクロ step、セキュリティの振る舞い（authn/authz、crypto/signature、secrets、trust-boundary、permissions）、ゲート実装・チェックリスト、リリース、大規模な混合差分 | 2 名 + 別セッションの敵対的パス（計 3 セッション）。関連ファイル全体 + 呼び出し側 + モック | コード 10 件以上。docs/ゲートは検出方法 5 件以上。混合 PR は両方 |
+| **2** | 読み取り専用コード（セキュリティの振る舞いを除く）、読み取り系ビルダー、プロセス文書の散文、規範仕様の編集（誤字・リンク・表現、および安全-critical でない明確化）、依存・ツールチェーン（write-path / セキュリティに影響しないもの）・リポジトリ衛生、テストの変更/削除（Tier 3 パス、write-path / Flash / OTA / backup / CRC / golden vector / mock transport / safety-critical test vector / セキュリティ境界 / review-gate script を検証するものを除く）、リファクタ（write-path / Flash / OTA / backup / CRC / セキュリティの振る舞いに触れないもの） | 2 名（仕様検収 + 実装/回帰）。変更ファイル + 直接の呼び出し側 + テスト | コード 3 件以上（目安 3–5、見つかった故障はすべて記録）。docs/プロセスは検出方法 3 件以上（目安 3–5）。Tier 2 混合 PR はコード 3 件以上 / docs 3 件以上 |
+| **3** | 書き込み経路 / Flash / OTA / backup-restore / CRC / offset / framing / マクロ step、セキュリティの振る舞い（authn/authz、crypto/signature、secrets、trust-boundary、permissions）、ゲート実装・チェックリスト、リリース、大規模な混合差分 | 2 名 + 別セッションの敵対的パス（計 3 セッション）。関連ファイル全体 + 呼び出し側 + モック | コード 10 件以上。docs/ゲートは検出方法 5 件以上。Tier 3 混合 PR はコード 10 件以上 / docs 5 件以上 |
 
 ## 2. 判定ルール
 
-- **混合 PR は最大 Tier**（docs + code なら code の Tier）。混合 PR の故障リストは、コード 10 件以上と docs/ゲート 5 件以上の **両方** を満たす。
+- **混合 PR は最大 Tier**（code と docs の Tier の最大。例: code Tier 3 / docs Tier 2 → Tier 3、code Tier 2 / docs Tier 3 → Tier 3）。混合 PR の故障リストは、その最大 Tier の要件を **両方** に適用する: **Tier 2 混合 = コード 3 件以上 + docs 3 件以上、Tier 3 混合 = コード 10 件以上 + docs/ゲート 5 件以上**。
 - 著者が PR で Tier を提案し、**レビュアーは昇格できる。原則として降格できない。例外は §2 のダウングレード制限のみ。**
 - 迷ったら 1 段上に倒す。
 - 行数は目安にしない。10 行の CRC 変更は Tier 3、1000 行の README 整形は Tier 1。
@@ -81,8 +81,10 @@ Tier 3 のパスに対する変更は、原則として Tier 3 のままです�
   git worktree add "$WORK" "$BASE"
   TREE=$(cd "$WORK" && cargo fmt --all && git add -A && git write-tree)
   test "$TREE" = "$(git rev-parse HEAD^{tree})"
-  git worktree remove "$WORK"
+  git worktree remove --force "$WORK"
   ```
+  `--force` は `cargo fmt` で dirty になった **この一時 worktree の後片付け専用**。他の作業 worktree には使わない。
+
 - **(A2) コードコメントのみ**: 例外は設けない。コメントのみの変更は Tier 3 のまま（token-aware な full diff 確認が必要で、`*` などの prefix heuristic は使わない）。A2 をダウングレード経路として扱わない。
 - **(A3) ドキュメント**: 非規範の散文のみを対象とし、HTML コメント・リンク参照定義・コードフェンスの info string など **レンダリングで見えない内容を含まない** ものに限る。レンダリング結果の比較だけでは不十分なため、base..head の **ソースレベルの diff** を確認する。次のいずれかを含む変更は意味の変更として扱い、Tier 2/3 のまま（Tier 1 にしない）。
   - `<!-- ... -->` など HTML コメントの追加・削除・変更
@@ -180,7 +182,7 @@ Tier 3 のパスに対する変更は、原則として Tier 3 のままです�
 - 範囲は「変更ファイル + 直接の呼び出し側 + テスト」。変更ファイルだけを読んで終わらせない。
 - Tier 3 パス、write-path / Flash / OTA / backup / CRC / golden vector / mock transport / safety-critical test vector / セキュリティ境界 / review-gate script を検証するテストは Tier 3（§2 / §3）。
 - Tier 3 サブセクションは削除せず、該当しないものは `N/A + 理由` を 1 行記入する（全項目を埋める必要はない）。
-- 故障リストを 3 件以上（目安 3–5、見つかった故障はすべて記録）作り、それぞれ「検出方法」「結果」「証跡」を記録する。
+- 故障リストを 3 件以上（目安 3–5、見つかった故障はすべて記録）作り、それぞれ「検出方法」「結果」「証跡」を記録する。Tier 2 混合 PR はコード 3 件以上 / docs 3 件以上を両方満たす。
   - コード: テストで検出する。
   - docs/プロセス: リンクチェック、grep、コマンド実行、シナリオ通読で検出する（3 件以上、目安 3–5）。
 - 証跡はテスト名、コマンド出力、URL、目視メモ、該当箇所の引用、file:line のいずれかで残す。
@@ -191,7 +193,7 @@ Tier 3 のパスに対する変更は、原則として Tier 3 のままです�
   - 敵対的パスは、正常系の確認ではなく「仕様の矛盾」「境界値」「失敗系」「中断・再試行」「予約バイト破壊」を探す。
   - コスト制約がある場合も、実装レビュアーとは別のセッションで敵対的パスを 1 パス追加する（2 名 + 1 パスを維持）。
 - 範囲は関連ファイル全体 + 呼び出し側 + モックトランスポート。
-- 故障リストをコード 10 件以上、docs/ゲート 5 件以上作る。可能なら `cargo-mutants` などの自動変異も併用する。各項目に証跡を付ける。
+- 故障リストをコード 10 件以上、docs/ゲート 5 件以上作る。Tier 3 混合 PR はこの両方（Tier 2 混合はコード 3 件以上 / docs 3 件以上）。可能なら `cargo-mutants` などの自動変異も併用する。各項目に証跡を付ける。
 - **PR テンプレートの Tier 3 A-E は PR 本文に存在しなければならない。省略は欠陥（要修正）。** 該当しない項目は `N/A + 理由` を記録する。
 - 実機書き込みを含む場合は、次の **両方** をバックアップし、ファイル名（path）と SHA-256 を記録する。
   - 2768B 設定 (`record_ultimatebt2`)
@@ -289,7 +291,7 @@ Erase 0x0104
   (BLE: subcmd 0x0067 / USB: subcmd 0x0123)
 ```
 
-- `Erase 0x0104` はペイロードを持たない。公式実装（`getBT2_EraseMacro`）は `total_len` と `chunk_len` をともに `0x1000` に設定し、`Generate_CustomDataCmd` が wire header `+0x04` にその値を書く。実ペイロードは `len = 0`。`total_len = 0x1000` は消去サイズであり、ペイロード長ではない。`chunk_len = 0` と混同しない（Rust 実装の修正は Issue #2）。
+- `Erase 0x0104` はペイロードを持たない。公式実装（`getBT2_EraseMacro`）は `total_len` と `chunk_len` をともに `0x1000` に設定し、`Generate_CustomDataCmd` が wire header `+0x04` にその値を書く。実ペイロードは `len = 0`。`total_len = 0x1000` は消去サイズであり、ペイロード長ではない。`chunk_len = 0` と混同しない（Rust 実装の修正は本 PR に含めない。Issue #2 の追記を参照: `fix/phase1-review-findings` の `be375d1` で実装済み、本 PR の後に別 PR）。
 - `Write 0x0103` の `offset` は `(macro_idx << 12) + chunk_index * chunk_size`。`chunk_size` は BLE 64B / USB HID 32B（または交渉済みサイズ）。各チャンク送信ごとに `chunk_index` を進める。
 - マクロのチャンクは BLE 最大 64B / USB HID 最大 32B（または交渉済みサイズ）。**最終チャンクは 32B アライン長まで** とし、OTA の「最終チャンク 64B 固定」とは混同しない。`chunk_size` が上限（BLE `0x40` / USB HID `0x20`）を超える場合は **拒否または上限へクランプ** し、上限超過のテストを追加する。
 - マクロの ACK タイムアウトは OTA と別に扱う。`Erase 0x0104` / `Write 0x0103` / ヘッダ `0x0001` は 2 秒（実装定数 `0x44fa0000`）、マクロ `Save 0x0006` は 3 秒（USB HID の仕様記載。BLE は transport の `wait_ack` 既定値とリトライ方針を記録する）。OTA の 10 秒 erase / 1 秒 chunk / 64B 固定をマクロに適用しない。`Save 0x0006` の ACK を受けるまで成功とみなさない。
@@ -320,7 +322,7 @@ Erase 0x0104
 
 ## 8. 故障リスト
 
-件数を満たすことではなく、**検出したい故障を先に列挙**します。カウントはコードの下限です。docs/ゲートはテストの有無ではなく、検出方法（リンクチェック、grep、コマンド実行、目視）で 3 件以上（目安 3–5）/ 5 件以上を記録します。混合 PR はコード 10 件以上と docs/ゲート 5 件以上の両方を満たします。各項目には証跡を付けます。
+件数を満たすことではなく、**検出したい故障を先に列挙**します。カウントはコードの下限です。docs/ゲートはテストの有無ではなく、検出方法（リンクチェック、grep、コマンド実行、目視）で 3 件以上（目安 3–5）/ 5 件以上を記録します。混合 PR は最大 Tier の要件を両方に適用します（**Tier 2 混合 = コード 3 件以上 / docs 3 件以上、Tier 3 混合 = コード 10 件以上 / docs/ゲート 5 件以上**）。各項目には証跡を付けます。
 
 **以下の表は記入例です。`実例（未解決）` と付いた行だけは、このリポジトリの既知の残存リスクです。** PR では自分の故障を記入してください。
 

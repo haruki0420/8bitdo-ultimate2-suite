@@ -75,7 +75,7 @@ Tier の判定・パス別トリガー・故障リストの詳細は **[docs/REV
 - コードのリファクタは Tier 1 にしない。テストの変更・削除は Tier 2（Tier 3 パス、write-path / Flash / OTA / backup / CRC / golden vector / mock transport / safety-critical test vector / セキュリティ境界 / review-gate script を検証するものは Tier 3）。実機書き込み・Flash・OTA・セキュリティは小さくても Tier 3。
 - レビュアーは **著者とも他のレビュアーとも別セッション**。Tier 2/3 は **全レビュアーが同じ head SHA で「マージ可」** を出すまでマージしない。1 名でも要修正なら status を付けない。
 - **Tier 1 はレビュアー本人、Tier 2/3 はリードレビュアー**が、全員の判定を確認してから `scripts/post-review-status.sh` で `review-gate` を満たす commit status を投稿する。Tier 3 で判定が割れたら 4 名目の独立 adjudicator を追加し、blocker の撤回または adjudication 理由を記録する。
-- Tier 2/3 は「故障 → 検出方法 → 結果 → 残存リスク → 証跡」を PR に残す。証跡はテスト名 / コマンド出力 / URL / 目視メモ / 該当箇所の引用 / file:line のいずれか。件数はコードの下限であり、Tier 2 は 3 件以上（目安 3–5、見つかった故障はすべて記録）、Tier 3 は 10 件以上。docs は検出方法で数え、3 件以上（目安 3–5）/ 5 件以上。docs/gate-only は mock/実機項目を `N/A + 理由` とする。
+- Tier 2/3 は「故障 → 検出方法 → 結果 → 残存リスク → 証跡」を PR に残す。証跡はテスト名 / コマンド出力 / URL / 目視メモ / 該当箇所の引用 / file:line のいずれか。件数はコードの下限であり、Tier 2 は 3 件以上（目安 3–5、見つかった故障はすべて記録）、Tier 3 は 10 件以上。docs は検出方法で数え、3 件以上（目安 3–5）/ 5 件以上。混合 PR は最大 Tier の要件を両方に適用する（Tier 2 混合 = コード 3 件以上 / docs 3 件以上、Tier 3 混合 = コード 10 件以上 / docs 5 件以上）。docs/gate-only は mock/実機項目を `N/A + 理由` とする。
 - **「マージ可」が出るまでマージしない。** 修正を push したら新しい SHA で再レビューし、Tier を再評価する。
 - **late `CHANGES_REQUESTED`**: `review-gate=success` の投稿後に blocker が出た場合、リードレビュアーは **同じ SHA に直ちに `review-gate=failure`** を投稿し、修正 push 後の新しい SHA で再レビューする。`success` を維持したままマージしない。スクリプトの `reviewDecision` 確認は best-effort であり、確認後に届くレビューは防げない。
 
@@ -86,7 +86,7 @@ Tier の判定・パス別トリガー・故障リストの詳細は **[docs/REV
 - [ ] 予約領域 `0x1F4..0x68B` / `0x914..0x92B` を破壊していないか
 - [ ] 名前が UTF-16**BE**、数値が Little-Endian になっているか
 - [ ] マクロの `align32`、BLE 64B / USB HID 32B チャンク（または交渉済みサイズ、上限超過は拒否またはクランプ）、4KB セクタ、Erase → Write → Header → Save の順序。`Erase 0x0104` は `total_len = chunk_len = 0x1000`、ペイロードなし
-- [ ] OTA の前提（BLE Boot: `enterBoot` → `"8bt"` → `readPID 0x0008` 5s、USB Boot: **RX** `[0x00,0x05]` → `readPID cmd=0x0000/subcmd=0x0008` 5s、`readVersionInBoot 0x0005`）と書込順序、失敗時の全セクタ消去・再書き込み。`readVersionInBoot` の offset `0x01017040` は type 1 用で、非 type 1 は停止して仕様/Issue を確認する。USB Boot の **TX** フレーミングは未文書化のため、USB OTA 書込は停止し、`PROTOCOL_SPEC` に証跡を追加するか `N/A + 理由` を記録する。USB の復旧は再列挙/再接続
+- [ ] OTA の前提（BLE Boot: `enterBoot` → `"8bt"` → `readPID 0x0008` 5s、USB Boot: **RX** `[0x00,0x05]` → `readPID cmd=0x0000/subcmd=0x0008` 5s、`readVersionInBoot 0x0005`）と書込順序、失敗時の全セクタ消去・再書き込み。`readVersionInBoot` の offset `0x01017040` は type 1 用で、非 type 1 は停止して仕様/Issue を確認する。USB Boot の **TX** フレーミングは未文書化のため、USB OTA 書込は停止し、`PROTOCOL_SPEC` に証跡を追加するか `N/A + 理由（USB Boot TX 未文書化）` を記録する。USB の復旧は再列挙/再接続
 - [ ] 実機書き込み前に 2768B 設定とマクロ 4×3 をバックアップし、SHA-256 と復元結果を記録しているか。`max_steps` は `0x68C + slot * 0xD8 + 0x08 + macro_idx * 0x34 + 0x22`（`u16`）
 - [ ] BLE 受信にプレフィックスを要求していないか（`0x600F`）
 - [ ] USB HID の送信 `[0x81, 0x04]` / 受信 `[0x02, 0x04]` を混同していないか
