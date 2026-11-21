@@ -355,36 +355,6 @@ fn dangling_link_target(path: PathBuf, depth: usize) -> Option<PathBuf> {
     Some(dangling_link_target(next.clone(), depth + 1).unwrap_or(next))
 }
 
-/// Canonicalize the longest existing prefix of `path` and append the rest.
-///
-/// `std::fs::canonicalize` fails on the first missing component, which would
-/// hide everything after it: for a dangling `link -> missing` the missing
-/// target compares equal to `missing`, and `link` compares equal to `target`.
-/// Every final component stays unresolved here; symlinks are handled by
-/// comparing this value against [`normalize_lexically`] and by inode identity.
-fn resolve_existing_prefix(path: &Path) -> std::io::Result<PathBuf> {
-    let mut ancestor = path;
-    let mut remainder: Vec<&std::ffi::OsStr> = Vec::new();
-    loop {
-        if let Ok(canonical) = std::fs::canonicalize(ancestor) {
-            let mut resolved = canonical;
-            for part in remainder.iter().rev() {
-                resolved.push(part);
-            }
-            return Ok(resolved);
-        }
-        match (ancestor.file_name(), ancestor.parent()) {
-            (Some(name), Some(parent)) => {
-                remainder.push(name);
-                ancestor = parent;
-            }
-            // Reached the root (or an empty relative path): report the
-            // original failure.
-            _ => return std::fs::canonicalize(path),
-        }
-    }
-}
-
 /// Resolve `.` / `..` without touching the filesystem or following symlinks.
 fn normalize_lexically(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
@@ -3385,7 +3355,7 @@ mod tests {
         let missing = dir.join("created.bin");
         let dangling = dir.join("dangling.json");
         symlink(&missing, &dangling).unwrap();
-        let err = validate_output_paths(Some(&missing), Some(&dangling)).map(|()| ());
+        let err = validate_output_paths(Some(&missing), Some(&dangling));
         assert!(
             matches!(&err, Err(error) if is_invalid_input(error)),
             "a dangling symlink to the other path must be rejected: {err:?}"
