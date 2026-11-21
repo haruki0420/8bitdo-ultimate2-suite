@@ -19,9 +19,7 @@ use clap::{Parser, Subcommand};
 use eightbitdo_core::{
     scan_devices, BleOptions, BleTransport, ConfigSnapshot, Error, Session, Transport, VersionInfo,
 };
-use eightbitdo_protocol::commands;
 use eightbitdo_protocol::config_bt2::{Slot, CONFIG_SIZE};
-use eightbitdo_protocol::header;
 use eightbitdo_protocol::input_report::InputReport;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -408,6 +406,47 @@ fn sync_parent_directory(parent: &Path) {
 #[cfg(not(unix))]
 fn sync_parent_directory(_parent: &Path) {}
 
+/// Refuse to replace anything but a regular file.
+///
+/// `rename` replaces a symlink itself (not its target), and it will also
+/// replace a FIFO, socket or device node that an operator aimed the output at
+/// by mistake (`--raw link`, `--raw /dev/null`). Only a regular file or a path
+/// that does not exist yet may be an output target.
+fn ensure_regular_target(path: &Path) -> Result<(), Error> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(Error::Io(std::io::Error::new(
+                error.kind(),
+                format!("cannot inspect {}: {error}", path.display()),
+            )))
+        }
+    };
+    let file_type = metadata.file_type();
+    let mut regular = file_type.is_file();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        regular = regular
+            && !file_type.is_fifo()
+            && !file_type.is_socket()
+            && !file_type.is_block_device()
+            && !file_type.is_char_device();
+    }
+    if regular {
+        Ok(())
+    } else {
+        Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a regular file (symlink, directory, or special file); refusing to replace it",
+                path.display()
+            ),
+        )))
+    }
+}
+
 /// Write `contents` through a temporary file in the same directory, then
 /// rename it over `path`.
 ///
@@ -418,6 +457,7 @@ fn sync_parent_directory(_parent: &Path) {}
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), Error> {
     use std::io::Write as _;
 
+    ensure_regular_target(path)?;
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -473,12 +513,17 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), Error> {
         use std::os::unix::fs::PermissionsExt as _;
 
         let mode = replaced_mode.unwrap_or(0o600);
+        // Best effort: FAT/exFAT, NFS mounts and some emulated platforms
+        // accept the write but reject chmod. The file was created with
+        // `mode(0o600)` above, so a failed adjustment leaves the backup
+        // private instead of failing the whole export. When an existing mode
+        // cannot be preserved, the result is narrower than before, never
+        // wider.
         if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(mode)) {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(Error::Io(std::io::Error::new(
-                error.kind(),
-                format!("cannot set the mode of {}: {error}", path.display()),
-            )));
+            eprintln!(
+                "warning: cannot set the mode of {} to {mode:o}: {error}; continuing",
+                path.display()
+            );
         }
     }
 
@@ -560,6 +605,40 @@ async fn dump_config(
     Ok(())
 }
 
+/// Write the raw configuration, then re-check that the JSON path is still a
+/// different file.
+///
+/// [`validate_output_paths`] runs once before the backup, when neither file
+/// exists. On a case-insensitive filesystem (APFS, NTFS) `Backup.bin` and
+/// `backup.bin` therefore look distinct until the raw file exists. Once it
+/// does, canonicalization / metadata resolve both names to the same entry and
+/// this second check rejects the pair before the JSON rename can replace the
+/// 2768-byte raw backup.
+fn write_raw_and_revalidate(raw: &Path, json: Option<&Path>, bytes: &[u8]) -> Result<(), Error> {
+    write_raw_and_revalidate_with(raw, json, bytes, || {})
+}
+
+/// Inner form with a test seam between the write and the recheck.
+///
+/// Linux cannot create a case-insensitive alias, so the test uses
+/// `before_recheck` to link the JSON path to the just-written raw file: the
+/// alias exists only after the raw write, which is the same window the second
+/// check exists for.
+fn write_raw_and_revalidate_with(
+    raw: &Path,
+    json: Option<&Path>,
+    bytes: &[u8],
+    before_recheck: impl FnOnce(),
+) -> Result<(), Error> {
+    write_atomic(raw, bytes)?;
+    println!(
+        "wrote raw configuration: {} ({CONFIG_SIZE} bytes)",
+        raw.display()
+    );
+    before_recheck();
+    validate_output_paths(Some(raw), json)
+}
+
 /// Write the optional raw/JSON files and return the SHA-256 hex digest.
 fn write_config_outputs(
     snapshot: &ConfigSnapshot,
@@ -570,11 +649,7 @@ fn write_config_outputs(
     let sha256 = sha256_hex(snapshot.config.as_bytes());
 
     if let Some(path) = raw_path {
-        write_atomic(path, snapshot.config.as_bytes())?;
-        println!(
-            "wrote raw configuration: {} ({CONFIG_SIZE} bytes)",
-            path.display()
-        );
+        write_raw_and_revalidate(path, json_path, snapshot.config.as_bytes())?;
     }
 
     if let Some(path) = json_path {
@@ -821,11 +896,22 @@ async fn run_keepalive<T: Transport>(
     result
 }
 
+/// Per-frame wait for the top-level `keepalive` notification drain.
+///
+/// It matches the official app's 20 ms poll cadence and bounds how long the
+/// loop can block before it services its tickers or the shutdown future.
+const KEEPALIVE_FRAME_WAIT: Duration = Duration::from_millis(20);
+
 /// Poll `0x0003` at `interval` and drain every incoming notification.
 ///
 /// The official Android app sends `ReadKeysAndJoy` every 20 ms in the
 /// foreground, with no response timeout or retry. Notifications are consumed
 /// here so the 64-slot BLE queue cannot fill up.
+///
+/// The drain goes through [`Session::try_next_input`] so this command uses the
+/// same policy as the `session` keepalive: one corrupt frame is skipped, and
+/// only a run of malformed frames without a usable frame or an idle return
+/// ends the command.
 async fn keepalive_loop<T: Transport>(
     session: &Session<T>,
     interval: Duration,
@@ -852,9 +938,8 @@ async fn keepalive_loop<T: Transport>(
                 session.request_input().await?;
                 stats.sent += 1;
             }
-            frame = session.transport().recv() => {
-                let frame = frame?;
-                if is_input_notification(&frame)? {
+            report = session.try_next_input(KEEPALIVE_FRAME_WAIT) => {
+                if report?.is_some() {
                     stats.received += 1;
                 }
             }
@@ -871,13 +956,6 @@ async fn keepalive_loop<T: Transport>(
         }
     }
     Ok(stats)
-}
-
-fn is_input_notification(frame: &[u8]) -> Result<bool, Error> {
-    let (header, _) = header::decode_app_response(frame)?;
-    let is_input = header.cmd == commands::cmd::INPUT
-        || (header.cmd == commands::cmd::RESPONSE && header.subcmd == commands::cmd::INPUT);
-    Ok(is_input && header.chunk_len > 0)
 }
 
 /// Shared counters, failure state, and shutdown signalling for the session
@@ -1828,7 +1906,9 @@ where
     loop {
         let buffer = reader.fill_buf().await?;
         if buffer.is_empty() {
-            return finish_session_line(pending, overflow);
+            // Only an empty `fill_buf` is EOF. A consumed newline/NUL with no
+            // bytes before it is an empty line, not the end of the stream.
+            return finish_session_line(pending, overflow, false);
         }
 
         let end = buffer
@@ -1846,7 +1926,7 @@ where
 
         // A NUL (possibly a long paste) or a newline ends the line.
         if cut || consumed > end {
-            let mut read = finish_session_line(pending, overflow)?;
+            let mut read = finish_session_line(pending, overflow, true)?;
             if let LineRead::Line { cut: line_cut, .. } = &mut read {
                 *line_cut = cut;
             }
@@ -1855,8 +1935,14 @@ where
     }
 }
 
-fn finish_session_line(pending: &mut Vec<u8>, overflow: usize) -> std::io::Result<LineRead> {
-    if pending.is_empty() && overflow == 0 {
+fn finish_session_line(
+    pending: &mut Vec<u8>,
+    overflow: usize,
+    terminated: bool,
+) -> std::io::Result<LineRead> {
+    // `terminated` distinguishes a newline/NUL that ended an empty line from
+    // an empty `fill_buf` at EOF. Without it, pressing Enter ended the REPL.
+    if !terminated && pending.is_empty() && overflow == 0 {
         return Ok(LineRead::Eof);
     }
     let bytes = std::mem::take(pending);
@@ -2104,6 +2190,7 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
+    use eightbitdo_protocol::commands;
     use eightbitdo_protocol::config_bt2::Bt2Config;
     use eightbitdo_protocol::header::CustomHeader;
 
@@ -2156,6 +2243,11 @@ mod tests {
             let mut frame = header.to_bytes().to_vec();
             frame.extend_from_slice(payload);
             self.incoming.lock().unwrap().push_back(frame);
+        }
+
+        /// Queue a notification exactly as given, without a header.
+        fn queue_raw(&self, frame: &[u8]) {
+            self.incoming.lock().unwrap().push_back(frame.to_vec());
         }
 
         fn sent_frames(&self) -> Vec<Vec<u8>> {
@@ -2279,6 +2371,54 @@ mod tests {
             assert_eq!(header.total_len, 0x0C);
             assert_eq!(header.offset, 0x0C);
         }
+    }
+
+    #[tokio::test]
+    async fn keepalive_skips_one_malformed_frame_and_counts_the_next_report() {
+        // M-1 regression: the top-level `keepalive` used to propagate a decode
+        // error from a single corrupt notification and exit. It now follows
+        // the session keepalive's skip policy.
+        let transport = KeepaliveTestTransport::new();
+        transport.queue_raw(&[0xEE; 5]);
+        transport.queue_input(&sample_input_report());
+
+        let session = Session::new(&transport);
+        let stats = run_keepalive(
+            &session,
+            Duration::from_millis(1),
+            Duration::from_millis(100),
+            std::future::pending::<()>(),
+        )
+        .await
+        .expect("one malformed frame must not end the keepalive");
+        assert_eq!(
+            stats.received, 1,
+            "the report after the malformed frame must be counted"
+        );
+        assert_eq!(session.skipped_frames(), 1);
+    }
+
+    #[tokio::test]
+    async fn keepalive_fails_after_a_run_of_malformed_frames() {
+        // The same run limit as the session keepalive: a link that only
+        // delivers garbage still ends the command instead of spinning.
+        let transport = KeepaliveTestTransport::new();
+        for _ in 0..eightbitdo_core::MAX_CONSECUTIVE_DECODE_FAILURES {
+            transport.queue_raw(&[0xEE; 5]);
+        }
+
+        let session = Session::new(&transport);
+        let result = run_keepalive(
+            &session,
+            Duration::from_millis(1),
+            Duration::from_millis(100),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(Error::Protocol(_))),
+            "a run of malformed frames must end the keepalive, got {result:?}"
+        );
     }
 
     #[test]
@@ -3258,10 +3398,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_quit_after_monitor_disconnect_disables_and_disconnects() {
-        // M4 regression: quitting while the background monitor has ended with
-        // `Disconnected` must still run the shutdown path, so `0x0007` disable
-        // is sent and the link is closed.
+    async fn shutdown_after_monitor_disconnect_disables_and_disconnects() {
+        // M4 regression: after the background monitor has ended with
+        // `Disconnected`, the shutdown that `run_session` performs when the
+        // REPL returns must still send the `0x0007` disable and close the
+        // link. The REPL half (waking from the monitor's disconnected state
+        // and returning `Err(Disconnected)`) is covered by
+        // `repl_detects_background_monitor_error_and_disconnect_without_input`;
+        // this test keeps the transport disconnected and checks the shutdown
+        // half that follows it.
         let transport = KeepaliveTestTransport::new();
         let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
         let keepalive = start_session_keepalive(Arc::clone(&session), Duration::from_millis(1))
@@ -3300,8 +3445,9 @@ mod tests {
                 .is_some_and(SessionMonitor::is_finished),
             "the monitor must fail with Disconnected"
         );
-        transport.allow_receives();
 
+        // Receives stay disconnected: shutdown must rely on `send` and
+        // `disconnect` only, as it does when the link is already gone.
         let before = transport.sent_frames().len();
         shutdown_session(&session, keepalive).await;
         let frames = transport.sent_frames();
@@ -3702,6 +3848,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_refuses_symlinks_and_directories() {
+        let dir = scratch_dir("atomic-refuse");
+        let target = dir.join("target.bin");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = dir.join("link.bin");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = write_atomic(&link, b"replaced").unwrap_err();
+        assert!(is_invalid_input(&err), "unexpected error: {err:?}");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"keep",
+            "the symlink target must not be overwritten"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must not be replaced by a regular file"
+        );
+
+        let subdir = dir.join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        let err = write_atomic(&subdir, b"x").unwrap_err();
+        assert!(is_invalid_input(&err), "unexpected error: {err:?}");
+        assert!(subdir.is_dir(), "the directory must be left in place");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_refuses_sockets() {
+        use std::os::unix::fs::FileTypeExt as _;
+        use std::os::unix::net::UnixListener;
+
+        let dir = scratch_dir("atomic-socket");
+        let socket = dir.join("out.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+
+        let err = write_atomic(&socket, b"x").unwrap_err();
+        assert!(is_invalid_input(&err), "unexpected error: {err:?}");
+        assert!(
+            std::fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_socket(),
+            "the socket must not be replaced by a regular file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_atomic_refuses_character_devices() {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let null = Path::new("/dev/null");
+        if !null.exists() {
+            return;
+        }
+        let err = write_atomic(null, b"x").unwrap_err();
+        assert!(is_invalid_input(&err), "unexpected error: {err:?}");
+        assert!(
+            std::fs::metadata(null)
+                .unwrap()
+                .file_type()
+                .is_char_device(),
+            "/dev/null must stay a character device"
+        );
+    }
+
     #[test]
     fn write_config_outputs_writes_both_files_atomically() {
         let dir = scratch_dir("outputs");
@@ -3724,6 +3946,41 @@ mod tests {
         assert_eq!(value["sha256"], digest);
         assert_eq!(value["size"], CONFIG_SIZE);
         assert!(text.ends_with('\n'));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raw_write_is_revalidated_before_the_json_file() {
+        // B-2 regression: on a case-insensitive filesystem `Backup.bin` and
+        // `backup.bin` look distinct before either exists, then resolve to the
+        // same entry after the raw write. The second check runs while the raw
+        // file exists and must reject the pair. Linux cannot make a
+        // case-insensitive alias, so the seam creates a hard link at the JSON
+        // path between the write and the recheck.
+        let dir = scratch_dir("outputs-recheck");
+        let raw = dir.join("backup.bin");
+        let json = dir.join("backup.json");
+
+        let err = write_raw_and_revalidate_with(&raw, Some(&json), b"raw backup", || {
+            std::fs::hard_link(&raw, &json).unwrap();
+        })
+        .unwrap_err();
+        assert!(is_invalid_input(&err), "unexpected error: {err:?}");
+        assert_eq!(std::fs::read(&raw).unwrap(), b"raw backup");
+        // The JSON path was never given a JSON summary; it is still the raw
+        // bytes via the alias, so the backup was not replaced.
+        assert_eq!(std::fs::read(&json).unwrap(), b"raw backup");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raw_write_revalidation_allows_unrelated_paths() {
+        let dir = scratch_dir("outputs-recheck-ok");
+        let raw = dir.join("backup.bin");
+        let json = dir.join("backup.json");
+        write_raw_and_revalidate(&raw, Some(&json), b"raw backup").unwrap();
+        assert_eq!(std::fs::read(&raw).unwrap(), b"raw backup");
+        assert!(!json.exists(), "revalidation must not create the JSON file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3788,6 +4045,93 @@ mod tests {
         assert_eq!(
             read_session_line(&mut reader, &mut pending).await.unwrap(),
             LineRead::Eof
+        );
+    }
+
+    #[tokio::test]
+    async fn repl_reader_treats_empty_lines_as_empty_commands() {
+        // B-3 regression: a consumed newline with no bytes before it used to
+        // come back as `Eof`, so pressing Enter at the prompt ended the
+        // session.
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(b"\n\r\ninfo\n".to_vec()));
+        let mut pending = Vec::new();
+
+        for expected in ["", "", "info"] {
+            assert_eq!(
+                read_session_line(&mut reader, &mut pending).await.unwrap(),
+                LineRead::Line {
+                    text: expected.to_string(),
+                    cut: false
+                },
+                "an empty line must stay a line, not become EOF"
+            );
+        }
+        assert!(pending.is_empty());
+        assert_eq!(
+            read_session_line(&mut reader, &mut pending).await.unwrap(),
+            LineRead::Eof
+        );
+    }
+
+    #[tokio::test]
+    async fn repl_reader_treats_a_lone_nul_as_an_empty_cut_line() {
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(b"\0info\n".to_vec()));
+        let mut pending = Vec::new();
+
+        assert_eq!(
+            read_session_line(&mut reader, &mut pending).await.unwrap(),
+            LineRead::Line {
+                text: String::new(),
+                cut: true
+            }
+        );
+        assert_eq!(
+            read_session_line(&mut reader, &mut pending).await.unwrap(),
+            LineRead::Line {
+                text: "info".to_string(),
+                cut: false
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn repl_reader_keeps_reading_after_an_empty_line_from_a_pipe() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut pending = Vec::new();
+
+        writer.write_all(b"\n").await.unwrap();
+        let empty = tokio::time::timeout(
+            Duration::from_millis(500),
+            read_session_line(&mut reader, &mut pending),
+        )
+        .await
+        .expect("the empty line arrives")
+        .unwrap();
+        assert_eq!(
+            empty,
+            LineRead::Line {
+                text: String::new(),
+                cut: false
+            }
+        );
+
+        writer.write_all(b"info\n").await.unwrap();
+        let info = tokio::time::timeout(
+            Duration::from_millis(500),
+            read_session_line(&mut reader, &mut pending),
+        )
+        .await
+        .expect("the next line arrives after the empty one")
+        .unwrap();
+        assert_eq!(
+            info,
+            LineRead::Line {
+                text: "info".to_string(),
+                cut: false
+            }
         );
     }
 
@@ -4019,7 +4363,32 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outcome, SessionOutcome::Continue);
-        assert!(keepalive_state_label(true, false).contains("paused"));
+
+        // The `Status` branch above builds exactly this report with
+        // `status_report` and prints it. Verifying the pure function covers
+        // the printed text without having to capture stdout.
+        let (monitor_sent, monitor_received) = monitor_counters(monitor.as_ref());
+        let report = status_report(
+            state.degraded.load(Ordering::SeqCst),
+            64,
+            state.sent.load(Ordering::SeqCst),
+            state.received.load(Ordering::SeqCst),
+            state.last_error().as_deref(),
+            state.started_at.elapsed(),
+            started.elapsed(),
+            monitor.is_some(),
+            monitor_sent,
+            monitor_received,
+        );
+        assert!(
+            report.contains("keepalive: paused (monitor running)"),
+            "status must report the starved keepalive while the monitor runs:\n{report}"
+        );
+        assert!(report.contains("monitor: running"), "{report}");
+        assert!(
+            monitor.is_some(),
+            "the status command must not stop the background monitor"
+        );
 
         let stopped = monitor.take().unwrap();
         stopped.stop().await;

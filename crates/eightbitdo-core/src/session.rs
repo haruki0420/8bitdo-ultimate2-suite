@@ -222,6 +222,16 @@ pub struct ConfigSnapshot {
 ///
 /// The transport is consumed and can be recovered with
 /// [`Session::into_inner`].
+///
+/// # Single-flight contract
+///
+/// Operations must not overlap: await each one to completion (or drop its
+/// future) before starting the next. The session tracks the in-flight
+/// operation and the resync flag in atomics, and a second concurrent
+/// operation would corrupt that bookkeeping. The CLI serializes access with
+/// a mutex; debug builds assert on overlap, but release builds have no guard,
+/// so front ends (including a future UniFFI or GUI layer) must enforce the
+/// contract themselves.
 pub struct Session<T: Transport> {
     transport: T,
     timeout: Duration,
@@ -286,7 +296,7 @@ impl<T: Transport> Session<T> {
 
     /// Run a read body, recording what is in flight and whether it failed.
     ///
-    /// A drop (Ctrl-C, `monitor stop`) leaves `needs_drain` false, but the
+    /// A drop (Ctrl-C, `monitor stop`) leaves `needs_resync` false, but the
     /// guard's own `Drop` bumps it back to true for reads: an abandoned read
     /// always leaves a response behind.
     async fn run_read<F, O>(&self, read: F) -> Result<O, Error>
@@ -472,9 +482,10 @@ impl<T: Transport> Session<T> {
     /// A frame that does not decode as an App Mode response is skipped and
     /// counted in [`skipped_frames`](Self::skipped_frames); one corrupt
     /// notification must not stop a keepalive or monitor loop. Only
-    /// [`MAX_CONSECUTIVE_DECODE_FAILURES`] malformed frames *in a row* end the
-    /// call with a protocol error, so a link that keeps delivering garbage
-    /// still fails instead of spinning.
+    /// [`MAX_CONSECUTIVE_DECODE_FAILURES`] malformed frames without a usable
+    /// frame or a normal idle return in between end the call with a protocol
+    /// error, so a link that keeps delivering garbage still fails instead of
+    /// spinning, while sparse corruption does not accumulate across calls.
     ///
     /// The call is bounded in three ways so a caller that drains the input
     /// queue in a loop cannot hold the session lock forever: the `wait`
@@ -487,9 +498,9 @@ impl<T: Transport> Session<T> {
     ///
     /// Returns [`Error::InvalidTimeout`] when `wait` exceeds [`MAX_WAIT`],
     /// [`Error::Disconnected`] when the transport closes, a protocol error
-    /// after [`MAX_CONSECUTIVE_DECODE_FAILURES`] malformed frames in a row,
-    /// or another transport error. Malformed frames below that limit are
-    /// skipped, not returned.
+    /// after [`MAX_CONSECUTIVE_DECODE_FAILURES`] malformed frames without a
+    /// usable frame or idle return in between, or another transport error.
+    /// Malformed frames below that limit are skipped, not returned.
     pub async fn try_next_input(&self, wait: Duration) -> Result<Option<InputReport>, Error> {
         // An abandoned input poll leaves at most one realtime report behind,
         // which every read path skips, so it never marks the session for
@@ -500,6 +511,7 @@ impl<T: Transport> Session<T> {
             let now = Instant::now();
             if now >= deadline {
                 self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
+                self.clear_decode_failures();
                 return Ok(None);
             }
             let remaining = deadline.saturating_duration_since(now);
@@ -512,6 +524,7 @@ impl<T: Transport> Session<T> {
                 Ok(result) => result?,
                 Err(_) => {
                     self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
+                    self.clear_decode_failures();
                     return Ok(None);
                 }
             };
@@ -528,6 +541,10 @@ impl<T: Transport> Session<T> {
             let is_input = header.cmd == commands::cmd::INPUT
                 || (header.cmd == commands::cmd::RESPONSE && header.subcmd == commands::cmd::INPUT);
             if !is_input || header.chunk_len == 0 {
+                // A decodable frame that is not an input report (notice, ACK)
+                // proves the link is delivering valid frames, so it ends the
+                // malformed run like an idle return does.
+                self.clear_decode_failures();
                 continue;
             }
             let Ok(report) = InputReport::from_bytes(payload) else {
@@ -548,14 +565,18 @@ impl<T: Transport> Session<T> {
         // Frame budget spent: discard at most one more queued frame so the
         // next call starts with a fresh frame instead of the backlog.
         self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
+        self.clear_decode_failures();
         Ok(None)
     }
 
     /// Count one malformed input-path frame; true when the run is too long.
     ///
-    /// A decodable input report resets the run. Frames that decode but are
-    /// not input reports (notices, ACKs) neither extend nor reset it: the
-    /// load-bearing signal is "consecutive malformed App Mode frames".
+    /// A usable frame (input report, notice, ACK) and a normal idle return
+    /// (`Ok(None)`) both clear the run. The load-bearing signal is "malformed
+    /// frames since the last usable frame or idle gap", so sparse corruption
+    /// spread over many calls never adds up to a degraded session, while one
+    /// burst within a single call still fails after
+    /// [`MAX_CONSECUTIVE_DECODE_FAILURES`].
     fn record_decode_failure(&self) -> bool {
         self.skipped_frames.fetch_add(1, Ordering::Relaxed);
         let failures = self
@@ -563,6 +584,12 @@ impl<T: Transport> Session<T> {
             .fetch_add(1, Ordering::Relaxed)
             + 1;
         failures >= MAX_CONSECUTIVE_DECODE_FAILURES as u32
+    }
+
+    /// End the current malformed-frame run after a usable frame or an idle
+    /// return.
+    fn clear_decode_failures(&self) {
+        self.consecutive_decode_failures.store(0, Ordering::Relaxed);
     }
 
     /// Number of incoming frames this session skipped because they did not
@@ -760,7 +787,7 @@ impl<T: Transport> Session<T> {
                 let sequential_first = offset == 0 && response_offset == 0;
                 if response_offset != offset && !sequential_first {
                     return Err(Error::UnexpectedResponse(format!(
-                        "config chunk offset 0x{response_offset:X} does not match requested offset 0x{offset:X}"
+                        "config chunk response offset 0x{response_offset:X} does not match requested offset 0x{offset:X}"
                     )));
                 }
 
@@ -1027,6 +1054,18 @@ mod tests {
     const OBSERVED_CONFIG_ACK: [u8; 16] = [
         0x04, 0x00, 0x02, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xD0, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00,
+    ];
+
+    /// `offset` values captured from the FF13 unit in the 20 responses of one
+    /// full ReadConfig.
+    ///
+    /// The first chunk reports 0 (the unit's sequential-chunk convention) and
+    /// every later chunk echoes the requested offset. Each chunk carries 142
+    /// bytes, including the final one (70 valid bytes plus 72 bytes of
+    /// padding past the end of the 2768-byte block).
+    const OBSERVED_CONFIG_OFFSETS: [u32; 20] = [
+        0, 142, 284, 426, 568, 710, 852, 994, 1136, 1278, 1420, 1562, 1704, 1846, 1988, 2130, 2272,
+        2414, 2556, 2698,
     ];
 
     /// Exact 17-byte ReadConfig request. `chunk_len` and `total_len` both
@@ -1304,6 +1343,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_config_snapshot_accepts_the_observed_hardware_offset_sequence() {
+        // Golden test for the real FF13 sequence: the first response reports
+        // offset 0 and every later response echoes the requested offset.
+        // Payloads are 142 bytes even for the final chunk, whose last 72 bytes
+        // are padding past the 2768-byte block.
+        let config = sample_config();
+        let bytes = config.as_bytes();
+        let mock = MockTransport::new();
+
+        for (index, &offset) in OBSERVED_CONFIG_OFFSETS.iter().enumerate() {
+            if index > 0 {
+                assert_eq!(
+                    offset as usize,
+                    index * 142,
+                    "the observed offsets must be contiguous 142-byte chunks"
+                );
+            }
+            let start = offset as usize;
+            let valid = (CONFIG_SIZE - start).min(142);
+            let mut payload = vec![0xAAu8; 142];
+            payload[..valid].copy_from_slice(&bytes[start..start + valid]);
+
+            let mut header =
+                envelope_header(commands::cmd::READ_CONFIG, CONFIG_SIZE as u32, offset, 142);
+            // The final chunk's CRC covers all 142 bytes, padding included:
+            // the implementation verifies the CRC over the whole payload
+            // before trimming the 72 bytes outside the block.
+            header.crc16 = packet_crc16(&payload);
+            mock.push_response(&header, &payload);
+        }
+
+        let session = Session::new(&mock);
+        let snapshot = session.read_config_snapshot().await.unwrap();
+
+        assert_eq!(snapshot.config.as_bytes(), bytes);
+        let sent = mock.sent_frames();
+        assert_eq!(sent.len(), OBSERVED_CONFIG_OFFSETS.len());
+        for (index, frame) in sent.iter().enumerate() {
+            let header = CustomHeader::parse(&frame[1..]).unwrap();
+            assert_eq!(header.cmd, commands::cmd::READ_CONFIG);
+            assert_eq!(header.offset, OBSERVED_CONFIG_OFFSETS[index]);
+            assert_eq!(header.chunk_len, CONFIG_SIZE as u16);
+            assert_eq!(header.total_len, CONFIG_SIZE as u32);
+        }
+    }
+
+    #[tokio::test]
     async fn config_envelope_chunks_are_assembled() {
         let config = sample_config();
         let mock = MockTransport::new();
@@ -1444,20 +1530,25 @@ mod tests {
 
         let first = envelope_header(commands::cmd::READ_CONFIG, CONFIG_SIZE as u32, 0, 142);
         mock.push_response(&first, &bytes[..142]);
-        // The stale re-send of chunk 0 arrives for the offset=142 request.
+        // The stale re-send of chunk 0 arrives for the offset=0x8E request.
         let resent = envelope_header(commands::cmd::READ_CONFIG, CONFIG_SIZE as u32, 0, 142);
         mock.push_response(&resent, &bytes[..142]);
-        push_config_envelope_chunks(&mock, &bytes[142..], 142);
+        // Nothing later is queued: the read must fail on this frame instead of
+        // advancing and shifting the rest of the block.
 
         let session = Session::new(&mock);
         let result = session.read_config_snapshot().await;
+        let Err(Error::UnexpectedResponse(message)) = result else {
+            panic!("a re-sent first chunk must fail the read, got {result:?}");
+        };
         assert!(
-            matches!(
-                result,
-                Err(Error::UnexpectedResponse(ref message))
-                    if message.contains("does not match requested offset")
-            ),
-            "a re-sent first chunk must fail the read, got {result:?}"
+            message.contains("requested offset 0x8E") && message.contains("response offset 0x0"),
+            "the error must name both the requested and the response offset: {message}"
+        );
+        assert_eq!(
+            mock.sent_frames().len(),
+            2,
+            "the read must fail on the re-sent first chunk, not continue with later offsets"
         );
     }
 
@@ -2091,47 +2182,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seven_malformed_frames_then_a_report_stay_below_the_cap() {
+        // B2 boundary: one malformed frame below the limit is still noise and
+        // the report that follows is delivered.
+        let mock = MockTransport::new();
+        for _ in 0..MAX_CONSECUTIVE_DECODE_FAILURES - 1 {
+            mock.push_incoming(&[0xEE; 5]);
+        }
+        let report = InputReport {
+            keys: 0x0000_0041,
+            ..InputReport::default()
+        };
+        let input =
+            CustomHeader::new(commands::cmd::INPUT, 0, 12, 12).with_payload(&report.to_bytes());
+        mock.push_response(&input, &report.to_bytes());
+
+        let session = Session::new(&mock);
+        let decoded = session
+            .try_next_input(Duration::from_millis(200))
+            .await
+            .expect("seven malformed frames are below the cap")
+            .expect("the report after the noise is delivered");
+        assert_eq!(decoded, report);
+        assert_eq!(
+            session.skipped_frames(),
+            (MAX_CONSECUTIVE_DECODE_FAILURES - 1) as u64
+        );
+        assert_eq!(session.recovered_frame_runs(), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_returns_clear_the_decode_failure_run_between_calls() {
+        // M-2 regression: one malformed frame per call, with an idle gap that
+        // ends the call normally, must not accumulate into a degraded link.
+        let mut scripted = Vec::new();
+        for _ in 0..MAX_CONSECUTIVE_DECODE_FAILURES {
+            scripted.push(ScriptedFrame::Data(vec![0xEE; 5]));
+            // Two idle gaps: the main wait and the opportunistic drain that
+            // follows it each need to see an empty queue.
+            scripted.push(ScriptedFrame::Stall);
+            scripted.push(ScriptedFrame::Stall);
+        }
+        let transport = ScriptedTransport::new(scripted);
+        let session = Session::new(&transport).with_timeout(Duration::from_millis(20));
+
+        for call in 0..MAX_CONSECUTIVE_DECODE_FAILURES {
+            let result = session.try_next_input(Duration::from_millis(50)).await;
+            assert!(
+                matches!(result, Ok(None)),
+                "call {call} must end idle, not fail: {result:?}"
+            );
+            assert_eq!(
+                session.consecutive_decode_failures.load(Ordering::Relaxed),
+                0,
+                "call {call} must end the malformed run"
+            );
+        }
+        assert_eq!(
+            session.skipped_frames(),
+            MAX_CONSECUTIVE_DECODE_FAILURES as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn a_decodable_notice_clears_the_decode_failure_run() {
+        // M-2: 7 malformed, a decodable notice, 7 more malformed and a report.
+        // Without the reset on a decodable non-input frame the second run
+        // reaches 8 and fails; the notice proves the link still works.
+        let mock = MockTransport::new();
+        for _ in 0..MAX_CONSECUTIVE_DECODE_FAILURES - 1 {
+            mock.push_incoming(&[0xEE; 5]);
+        }
+        let notice = CustomHeader::new(commands::cmd::ALLOW_CONFIG_DONE, 0, 0, 0);
+        mock.push_response(&notice, &[]);
+        for _ in 0..MAX_CONSECUTIVE_DECODE_FAILURES - 1 {
+            mock.push_incoming(&[0xEE; 5]);
+        }
+        let report = InputReport {
+            keys: 0x0000_0042,
+            ..InputReport::default()
+        };
+        let input =
+            CustomHeader::new(commands::cmd::INPUT, 0, 12, 12).with_payload(&report.to_bytes());
+        mock.push_response(&input, &report.to_bytes());
+
+        let session = Session::new(&mock);
+        let decoded = session
+            .try_next_input(Duration::from_millis(200))
+            .await
+            .expect("a notice between the two malformed runs resets the count")
+            .expect("the report is delivered");
+        assert_eq!(decoded, report);
+        assert_eq!(
+            session.skipped_frames(),
+            (2 * (MAX_CONSECUTIVE_DECODE_FAILURES - 1)) as u64
+        );
+    }
+
+    #[tokio::test]
     async fn try_next_input_resets_the_failure_run_after_a_good_frame() {
-        // Three malformed frames, an idle gap that ends the first call, one
-        // more malformed frame, and then a report. The run spans the call
-        // boundary without reaching the cap, and the decoded report ends it
-        // and is counted as a recovery.
-        let mut scripted: Vec<ScriptedFrame> =
-            (0..3).map(|_| ScriptedFrame::Data(vec![0xEE; 5])).collect();
-        scripted.push(ScriptedFrame::Stall);
-        scripted.push(ScriptedFrame::Data(vec![0xEE; 5]));
+        // Three malformed frames and then a report in one call: the decoded
+        // report ends the run without reaching the cap, clears the counter,
+        // and is counted as a recovery. (An idle return also clears the run;
+        // see `idle_returns_clear_the_decode_failure_run_between_calls`.)
+        let mock = MockTransport::new();
+        for _ in 0..3 {
+            mock.push_incoming(&[0xEE; 5]);
+        }
         let report = InputReport {
             keys: 0x0000_0030,
             ..InputReport::default()
         };
         let input =
             CustomHeader::new(commands::cmd::INPUT, 0, 12, 12).with_payload(&report.to_bytes());
-        let mut frame = input.to_bytes().to_vec();
-        frame.extend_from_slice(&report.to_bytes());
-        scripted.push(ScriptedFrame::Data(frame));
+        mock.push_response(&input, &report.to_bytes());
 
-        let transport = ScriptedTransport::new(scripted);
-        let session = Session::new(&transport).with_timeout(Duration::from_millis(20));
-
-        let first = session.try_next_input(Duration::from_millis(200)).await;
-        assert!(
-            matches!(first, Ok(None)),
-            "an idle gap ends the call without an error, got {first:?}"
-        );
-        assert_eq!(session.skipped_frames(), 3);
-        assert_eq!(session.recovered_frame_runs(), 0);
-
+        let session = Session::new(&mock);
         let decoded = session
             .try_next_input(Duration::from_millis(200))
             .await
-            .expect("the malformed frame followed by a report is not an error")
+            .expect("three malformed frames are below the cap")
             .expect("the report after the noise is delivered");
         assert_eq!(decoded, report);
-        assert!(
-            session.skipped_frames() >= 3,
-            "the malformed frames must be counted, got {}",
-            session.skipped_frames()
-        );
+        assert_eq!(session.skipped_frames(), 3);
         assert_eq!(
             session.recovered_frame_runs(),
             1,
@@ -2145,10 +2318,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_input_frames_do_not_disturb_read_version_or_read_config() {
-        // A frame that is not a valid input report stays the input path's
-        // business: the read paths classify it separately and must not fail,
-        // and the skip counter belongs to the input path only.
+    async fn valid_input_frames_are_skipped_by_reads_and_short_frames_fail_closed() {
+        // A valid realtime input report is unrelated to a non-input request:
+        // the read path skips it without touching the input-path counters.
         let mock = MockTransport::new();
         let report = InputReport {
             keys: 0x0000_0040,
@@ -2169,29 +2341,52 @@ mod tests {
         let read = session.read_version().await;
         assert!(
             read.is_ok(),
-            "read_version must be unaffected by non-version frames: {read:?}"
+            "read_version must be unaffected by a complete input frame: {read:?}"
         );
         assert_eq!(
             session.skipped_frames(),
             0,
-            "the non-input frame is skipped by classify_response, not counted as a decode failure"
+            "the input frame is skipped by classify_response, not counted as a decode failure"
         );
         assert!(
             !session.needs_resync.load(Ordering::SeqCst),
             "a successfully skipped frame must not leave a resync mark"
         );
 
-        // A frame too short to decode reaches the transport in front of a
-        // config read only when it is queued outside the input path, so it is
-        // exercised through `read_transfer` here: it must not corrupt the
-        // 2768-byte read that follows.
-        let config = sample_config();
+        // A frame too short to contain an App Mode header is a framing error,
+        // not input-path noise. Both read paths fail closed instead of
+        // treating the following bytes as a response and resync is requested
+        // so stale bytes cannot be reused by the next read.
         let mock = MockTransport::new();
-        push_config_envelope_chunks(&mock, config.as_bytes(), 692);
+        mock.push_incoming(&[0xEE; 5]);
         let session = Session::new(&mock);
-        let snapshot = session.read_config_snapshot().await.unwrap();
-        assert_eq!(snapshot.config.as_bytes(), config.as_bytes());
-        assert_eq!(session.skipped_frames(), 0);
+        let version = session.read_version().await;
+        assert!(
+            matches!(version, Err(Error::Protocol(_))),
+            "a 5-byte frame must fail read_version, got {version:?}"
+        );
+        assert!(
+            session.needs_resync.load(Ordering::SeqCst),
+            "a framing error must mark the session for resync"
+        );
+        assert_eq!(
+            session.skipped_frames(),
+            0,
+            "read paths do not use the input-path skip counter"
+        );
+
+        let mock = MockTransport::new();
+        mock.push_incoming(&[0xEE; 5]);
+        let session = Session::new(&mock);
+        let snapshot = session.read_config_snapshot().await;
+        assert!(
+            matches!(snapshot, Err(Error::Protocol(_))),
+            "a 5-byte frame must fail read_config_snapshot, got {snapshot:?}"
+        );
+        assert!(
+            session.needs_resync.load(Ordering::SeqCst),
+            "a framing error during ReadConfig must mark the session for resync"
+        );
     }
 
     #[tokio::test]
