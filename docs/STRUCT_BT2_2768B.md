@@ -494,7 +494,7 @@ struct Bt2Header {
     - 例: `max_steps = 4` → `raw_bytes = 40` → `aligned_len = 64`（不足分 24 バイトはホスト側バッファ上のゼロ詰め領域が送られる）
     - 例: `max_steps = 16` → `raw_bytes = 160` → `aligned_len = 160`
   - **Read (`cmd 0x0102`) の `total_len`**: アライメントなしの `max_steps * 10` をそのまま指定。
-  - **Erase (`cmd 0x0104`) の `total_len`**: `0x1000` (4096 バイト = 1 セクタ分)。ペイロードを持たないが、公式実装は `chunk_len` も `0x1000` に設定する（wire header `+0x04` はその値。実ペイロードは `len = 0`）。
+  - **Erase (`cmd 0x0104`) の `total_len` / `chunk_len` / `crc16`**: `total_len` は `0x1000` (4096 バイト = 1 セクタ分)。ペイロードを持たないが、公式実装は `chunk_len` も `0x1000` に設定する（wire header `+0x04` はその値。実ペイロードは `len = 0`）。`gamepad_type == 1` の CRC 計算は空ペイロードに対して行われ、`crc16` は長さ `<= 0` で `0xFFFF` を返すため、wire header `+0x06` は `0xFFFF` となる。
 
 ### 9.3 Flash 読み書き完全シーケンス
 
@@ -506,6 +506,7 @@ struct Bt2Header {
    - `offset = macro_idx << 12`
    - `total_len = 0x1000`（消去サイズ。ペイロード長ではない）
    - `chunk_len = 0x1000`（公式実装のチャネル設定値。wire header `+0x04` に書かれる。ペイロードなし、`len = 0`）
+   - `crc16 = 0xFFFF`（空ペイロードに対する CRC-16/MODBUS。公式 `crc16` は長さ `<= 0` で `0xFFFF`）
 2. **Step 2: マクロステップデータ書込 (`Write`)**
    - `cmd = 0x0103`
    - `subcmd = (gamepad_mode << 8) | slot`
