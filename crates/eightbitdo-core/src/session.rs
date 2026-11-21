@@ -468,8 +468,13 @@ impl<T: Transport> Session<T> {
         let (response, payload) = header::decode_app_response(frame)?;
 
         // Backward compatibility: older mocks and possible firmware revisions
-        // answer with the request command directly.
+        // answer with the request command directly. A payload-less direct ACK
+        // must be skipped like the envelope form; otherwise the caller sees a
+        // zero-length chunk and re-requests the same offset forever.
         if response.cmd == request_cmd {
+            if response.chunk_len == 0 {
+                return Ok(None);
+            }
             return Ok(Some((response, payload)));
         }
         if response.cmd != commands::cmd::RESPONSE {
@@ -975,6 +980,22 @@ mod tests {
         let session = Session::new(&mock);
         let snapshot = session.read_config_snapshot().await.unwrap();
         assert_eq!(snapshot.config.as_bytes(), config.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn direct_config_ack_with_zero_chunk_len_is_skipped() {
+        let config = sample_config();
+        let mock = MockTransport::new();
+        // Some units answer the first ReadConfig with a direct cmd=0x0002
+        // frame instead of the 0x0004 envelope. Its chunk_len is 0, so it must
+        // not be treated as a zero-byte chunk that stalls the offset.
+        mock.push_incoming(&config_header(0, 0).to_bytes());
+        push_config_chunks(&mock, config.as_bytes(), 142);
+
+        let session = Session::new(&mock);
+        let snapshot = session.read_config_snapshot().await.unwrap();
+        assert_eq!(snapshot.config.as_bytes(), config.as_bytes());
+        assert_eq!(mock.sent_frames().len(), 20);
     }
 
     #[tokio::test]
