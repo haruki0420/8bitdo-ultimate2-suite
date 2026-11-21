@@ -375,12 +375,12 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 /// Windows file identity (volume serial + file index) is not implemented here.
 ///
 /// This is not a gap for the backup output check. A case-insensitive alias such
-/// as `Backup.bin` versus `backup.bin` only needs the post-write revalidation:
-/// once the raw file exists, `OutputPathKey::real` canonicalizes both spellings
-/// to the same path, and `OutputPathKey::existing` gives both names the same
-/// metadata, so `validate_output_paths` still rejects the pair. Hard-link
-/// detection stays Unix-only; on Windows the raw and JSON names would have to
-/// be different links to the same file, which the operator would have to create
+/// as `Backup.bin` versus `backup.bin` is caught by the post-write
+/// revalidation: once the raw file exists, `OutputPathKey::real` canonicalizes
+/// both spellings to the same path, so `validate_output_paths` rejects the
+/// pair even though `same_file` returns false on Windows. Hard-link detection
+/// stays Unix-only; on Windows the raw and JSON names would have to be
+/// different links to the same file, which the operator would have to create
 /// explicitly.
 #[cfg(unix)]
 fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
@@ -435,9 +435,10 @@ fn ensure_regular_target(path: &Path) -> Result<(), Error> {
     };
     let file_type = metadata.file_type();
     // On Unix `is_file()` alone accepts FIFOs, sockets and device nodes, so
-    // they are excluded explicitly. Windows has no equivalent special files to
-    // reject here; a directory is the only non-file `rename` target that
-    // `FileType::is_file` reports as false.
+    // they are excluded explicitly. Windows has no `FileTypeExt` equivalent;
+    // NUL and named pipes are not regular files and are rejected by
+    // `is_file()` where metadata is available, and any remaining special
+    // target makes the later `rename` fail with its own error.
     #[cfg(unix)]
     let regular = {
         use std::os::unix::fs::FileTypeExt as _;
@@ -1900,13 +1901,32 @@ enum LineRead {
     TooLong { discarded: usize },
 }
 
+/// Progress of one REPL line across `read_session_line` calls.
+///
+/// This is caller-owned so that dropping the read future (Ctrl-C, `select!`)
+/// loses nothing. In particular `overflow` must survive cancellation with
+/// `pending`: otherwise a 4096-byte prefix of a longer line would look like a
+/// complete line and could be executed as a command.
+#[derive(Debug, Default)]
+struct LineState {
+    /// Bytes of the current line, up to [`MAX_SESSION_LINE_BYTES`].
+    pending: Vec<u8>,
+    /// Bytes of the current line beyond the limit: counted, not stored.
+    overflow: usize,
+    /// True while the only overflow byte is a single `\r` that may be the CR of
+    /// a CRLF whose `\n` arrives in the next chunk. Such a byte belongs to the
+    /// line ending and must not count against `MAX_SESSION_LINE_BYTES`.
+    overflow_is_only_cr: bool,
+}
+
 /// Read one line without losing input when the future is cancelled.
 ///
 /// The previous `BufReader::read_line` inside `tokio::select!` lost the
 /// partial line on a Ctrl-C and could split a multi-byte character. This
-/// version keeps every consumed byte in caller-owned `pending` and reads one
-/// `fill_buf` at a time, so dropping the future at any `await` point resumes
-/// with exactly the bytes that were already read.
+/// version keeps every consumed byte and the over-limit count in the
+/// caller-owned [`LineState`] and reads one `fill_buf` at a time, so dropping
+/// the future at any `await` point resumes with exactly the progress that was
+/// already made (including a line that must still be reported as too long).
 ///
 /// NUL bytes end the line: on Unix a very long paste without a newline is
 /// still delivered through the terminal's canonical buffer and
@@ -1914,35 +1934,29 @@ enum LineRead {
 /// line.
 fn read_session_line<'a, R>(
     reader: &'a mut R,
-    pending: &'a mut Vec<u8>,
+    state: &'a mut LineState,
 ) -> impl Future<Output = std::io::Result<LineRead>> + 'a
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    read_session_line_inner(reader, pending)
+    read_session_line_inner(reader, state)
 }
 
 async fn read_session_line_inner<R>(
     reader: &mut R,
-    pending: &mut Vec<u8>,
+    state: &mut LineState,
 ) -> std::io::Result<LineRead>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
     use tokio::io::AsyncBufReadExt as _;
 
-    // Bytes of this line beyond the limit: counted, not stored.
-    let mut overflow = 0usize;
-    // True while the only overflow byte is a single `\r` that may be the CR of
-    // a CRLF whose `\n` arrives in the next chunk. Such a byte belongs to the
-    // line ending and must not count against MAX_SESSION_LINE_BYTES.
-    let mut overflow_is_only_cr = false;
     loop {
         let buffer = reader.fill_buf().await?;
         if buffer.is_empty() {
             // Only an empty `fill_buf` is EOF. A consumed newline/NUL with no
             // bytes before it is an empty line, not the end of the stream.
-            return finish_session_line(pending, overflow, false);
+            return finish_session_line(state, false);
         }
 
         let newline = buffer.iter().position(|&byte| byte == b'\n');
@@ -1954,37 +1968,42 @@ where
             (None, None) => (buffer.len(), false),
         };
         let consumed = end + usize::from(end < buffer.len());
-        // A `\r` immediately before the `\n` is part of the line ending, so it
-        // must not count against MAX_SESSION_LINE_BYTES.
-        let content_end = if !cut && end > 0 && buffer[end - 1] == b'\r' {
+        // A `\r` immediately before a `\n` in this same buffer is part of the
+        // line ending, so it must not count against MAX_SESSION_LINE_BYTES.
+        // Without a terminator in this buffer a trailing `\r` is ordinary
+        // content: the next chunk may be `--raw x`, and dropping the CR would
+        // turn `backup\r--raw x` into the unknown command `backup--raw x`.
+        // A CRLF split across chunks is handled by the `end == 0` correction
+        // below.
+        let content_end = if !cut && end < buffer.len() && end > 0 && buffer[end - 1] == b'\r' {
             end - 1
         } else {
             end
         };
 
-        let room = MAX_SESSION_LINE_BYTES.saturating_sub(pending.len());
+        let room = MAX_SESSION_LINE_BYTES.saturating_sub(state.pending.len());
         let accepted = room.min(content_end);
-        pending.extend_from_slice(&buffer[..accepted]);
+        state.pending.extend_from_slice(&buffer[..accepted]);
         let dropped = &buffer[accepted..content_end];
         if !dropped.is_empty() {
-            overflow += dropped.len();
-            overflow_is_only_cr = overflow == 1 && dropped == b"\r";
+            state.overflow += dropped.len();
+            state.overflow_is_only_cr = state.overflow == 1 && dropped == b"\r";
         }
         reader.consume(consumed);
 
         if !cut && end == 0 {
             // The CR of a CRLF was consumed by the previous chunk: it is
             // already in `pending`, or it was the only overflow byte.
-            if overflow == 0 && pending.last() == Some(&b'\r') {
-                pending.pop();
-            } else if overflow_is_only_cr {
-                overflow -= 1;
+            if state.overflow == 0 && state.pending.last() == Some(&b'\r') {
+                state.pending.pop();
+            } else if state.overflow_is_only_cr {
+                state.overflow -= 1;
             }
         }
 
         // A NUL (possibly a long paste) or a newline ends the line.
         if cut || consumed > end {
-            let mut read = finish_session_line(pending, overflow, true)?;
+            let mut read = finish_session_line(state, true)?;
             if let LineRead::Line { cut: line_cut, .. } = &mut read {
                 *line_cut = cut;
             }
@@ -1993,17 +2012,15 @@ where
     }
 }
 
-fn finish_session_line(
-    pending: &mut Vec<u8>,
-    overflow: usize,
-    terminated: bool,
-) -> std::io::Result<LineRead> {
+fn finish_session_line(state: &mut LineState, terminated: bool) -> std::io::Result<LineRead> {
     // `terminated` distinguishes a newline/NUL that ended an empty line from
     // an empty `fill_buf` at EOF. Without it, pressing Enter ended the REPL.
-    if !terminated && pending.is_empty() && overflow == 0 {
+    let overflow = std::mem::take(&mut state.overflow);
+    state.overflow_is_only_cr = false;
+    if !terminated && state.pending.is_empty() && overflow == 0 {
         return Ok(LineRead::Eof);
     }
-    let bytes = std::mem::take(pending);
+    let bytes = std::mem::take(&mut state.pending);
     if overflow > 0 {
         return Ok(LineRead::TooLong {
             discarded: overflow,
@@ -2065,9 +2082,9 @@ where
         Line(std::io::Result<LineRead>),
     }
 
-    // Cancellation-safe line state: bytes already consumed from `reader` but
-    // not yet terminated by a newline survive a dropped `read_session_line`.
-    let mut pending: Vec<u8> = Vec::new();
+    // Cancellation-safe line state: bytes already consumed from `reader`, and
+    // the over-limit count, survive a dropped `read_session_line`.
+    let mut line_state = LineState::default();
     tokio::pin!(ctrl_c);
     let mut monitor: Option<SessionMonitor> = None;
     let mut result = Ok(());
@@ -2082,15 +2099,17 @@ where
             _ = &mut ctrl_c => LoopEvent::CtrlC,
             _ = wait_for_keepalive_stop(keepalive) => LoopEvent::KeepaliveStopped,
             _ = wait_for_monitor_finish(monitor.as_ref()) => LoopEvent::MonitorFinished,
-            read_result = read_session_line(reader, &mut pending) => LoopEvent::Line(read_result),
+            read_result = read_session_line(reader, &mut line_state) => LoopEvent::Line(read_result),
         };
         match event {
             LoopEvent::CtrlC => {
-                // Ctrl-C while idle: no command future is in flight, so there
-                // is no cancelled read to acknowledge. A read that was running
-                // takes the branch below; the `Session` tracks it through
-                // `ResyncGuard` / `InFlight` and the next command drains only
-                // if a read (not an input poll) was abandoned.
+                // Ctrl-C while idle: no command future is in flight. If a
+                // command was running, its branch below drops the future
+                // instead. `Session` records abandoned reads through
+                // `ResyncGuard` / `InFlight`; the next read calls
+                // `prepare_read` and drains only when a read (not an input
+                // poll) may have left a response behind. A protocol error from
+                // an input poll marks the session explicitly.
                 break;
             }
             LoopEvent::KeepaliveStopped => {
@@ -2141,8 +2160,9 @@ where
                     _ = &mut ctrl_c => {
                         // The command future is dropped, not aborted. Dropping
                         // a `Session` read marks it for resync via
-                        // `ResyncGuard` (an abandoned input poll does not), so
-                        // the next command drains only when a response could
+                        // `ResyncGuard` (an abandoned input poll does not; a
+                        // protocol error from one is marked by `fail()`), so
+                        // the next read drains only when a response could
                         // still be in flight. There is no caller-side mark to
                         // clear; `Session::InFlight` makes that decision.
                         break;
@@ -3677,22 +3697,24 @@ mod tests {
 
     #[tokio::test]
     async fn validate_output_paths_rejects_identical_paths_before_io() {
-        let same = Path::new("/tmp/eightbitdo-same-output-test");
-        let err = validate_output_paths(Some(same), Some(same)).unwrap_err();
+        let dir = scratch_dir("outputs-identical");
+        let same = dir.join("same-output.bin");
+        let other = dir.join("other-output.bin");
+        let err = validate_output_paths(Some(&same), Some(&same)).unwrap_err();
         assert!(matches!(
             err,
             Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::InvalidInput
         ));
-        assert!(validate_output_paths(Some(same), Some(Path::new("/tmp/other"))).is_ok());
-        assert!(validate_output_paths(Some(same), None).is_ok());
+        assert!(validate_output_paths(Some(&same), Some(&other)).is_ok());
+        assert!(validate_output_paths(Some(&same), None).is_ok());
 
         // backup_session rejects identical paths before sending any BLE frame.
         let transport = KeepaliveTestTransport::new();
         let session = Session::new(&transport);
         let err = backup_session(
             &session,
-            Some(same),
-            Some(same),
+            Some(&same),
+            Some(&same),
             Duration::ZERO,
             std::future::pending::<()>(),
         )
@@ -3741,6 +3763,7 @@ mod tests {
             transport.sent_frames().is_empty(),
             "session commands must reject identical --raw/--json before any device I/O"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -4088,12 +4111,12 @@ mod tests {
 
         let (mut writer, reader) = tokio::io::duplex(64);
         let mut reader = tokio::io::BufReader::new(reader);
-        let mut pending = Vec::new();
+        let mut state = LineState::default();
 
         writer.write_all(b"inf").await.unwrap();
         let cancelled = tokio::time::timeout(
             Duration::from_millis(20),
-            read_session_line(&mut reader, &mut pending),
+            read_session_line(&mut reader, &mut state),
         )
         .await;
         assert!(
@@ -4101,14 +4124,14 @@ mod tests {
             "no newline yet, so the read must still be pending"
         );
         assert_eq!(
-            pending, b"inf",
+            state.pending, b"inf",
             "consumed bytes must survive the cancellation"
         );
 
         writer.write_all(b"o\n").await.unwrap();
         let read = tokio::time::timeout(
             Duration::from_millis(500),
-            read_session_line(&mut reader, &mut pending),
+            read_session_line(&mut reader, &mut state),
         )
         .await
         .expect("the rest of the line arrives")
@@ -4121,17 +4144,176 @@ mod tests {
             },
             "the line must be reassembled, not lost or split"
         );
-        assert!(pending.is_empty());
+        assert!(state.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn repl_reader_keeps_a_trailing_cr_before_more_content() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut state = LineState::default();
+
+        writer.write_all(b"ab\r").await.unwrap();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(20),
+            read_session_line(&mut reader, &mut state),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "no newline yet, so the read must still be pending"
+        );
+        assert_eq!(
+            state.pending, b"ab\r",
+            "a trailing CR is content when the next chunk continues the line"
+        );
+
+        writer.write_all(b"cd\n").await.unwrap();
+        let read = tokio::time::timeout(
+            Duration::from_millis(500),
+            read_session_line(&mut reader, &mut state),
+        )
+        .await
+        .expect("the rest of the line arrives")
+        .unwrap();
+        assert_eq!(
+            read,
+            LineRead::Line {
+                text: "ab\rcd".to_string(),
+                cut: false
+            },
+            "the CR must survive when the newline is not in the same buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn repl_reader_keeps_a_trailing_cr_before_command_options() {
+        // Blocker regression: `backup\r` followed by `--raw x\n` must stay
+        // `backup\r--raw x` (CR is whitespace for the parser), not collapse
+        // into the unknown command `backup--raw x`.
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut state = LineState::default();
+
+        writer.write_all(b"backup\r").await.unwrap();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(20),
+            read_session_line(&mut reader, &mut state),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "no newline yet, so the read must still be pending"
+        );
+
+        writer.write_all(b"--raw x\n").await.unwrap();
+        let read = tokio::time::timeout(
+            Duration::from_millis(500),
+            read_session_line(&mut reader, &mut state),
+        )
+        .await
+        .expect("the rest of the line arrives")
+        .unwrap();
+        let text = match read {
+            LineRead::Line { text, cut: false } => text,
+            other => panic!("expected a complete line, got {other:?}"),
+        };
+        assert_eq!(text, "backup\r--raw x");
+        assert_eq!(
+            parse_session_command(&text),
+            SessionCommand::Backup {
+                raw: Some(PathBuf::from("x")),
+                json: None,
+            },
+            "the preserved CR must keep the options as separate words"
+        );
+    }
+
+    #[tokio::test]
+    async fn repl_reader_reports_a_cancelled_overlong_line_as_too_long() {
+        // Major regression: `overflow` used to live inside the read future.
+        // Dropping it (Ctrl-C / select!) forgot that the 4096-byte prefix was
+        // already too long, so the prefix could run as a command.
+        use tokio::io::AsyncWriteExt as _;
+
+        let extra = 904;
+        let (mut writer, reader) = tokio::io::duplex(8192);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut state = LineState::default();
+
+        writer
+            .write_all(&vec![b'a'; MAX_SESSION_LINE_BYTES + extra])
+            .await
+            .unwrap();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(20),
+            read_session_line(&mut reader, &mut state),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the line is not terminated, so the read must still be pending"
+        );
+        assert_eq!(state.pending.len(), MAX_SESSION_LINE_BYTES);
+        assert_eq!(
+            state.overflow, extra,
+            "the over-limit count must survive the dropped future"
+        );
+
+        writer.write_all(b"\n").await.unwrap();
+        let read = tokio::time::timeout(
+            Duration::from_millis(500),
+            read_session_line(&mut reader, &mut state),
+        )
+        .await
+        .expect("the newline arrives")
+        .unwrap();
+        assert_eq!(
+            read,
+            LineRead::TooLong { discarded: extra },
+            "the truncated prefix must not be returned as a runnable line"
+        );
+        assert!(state.pending.is_empty());
+        assert_eq!(state.overflow, 0);
+    }
+
+    #[tokio::test]
+    async fn repl_reader_strips_a_crlf_split_across_buffers() {
+        // A one-byte buffer forces the CR and LF into separate `fill_buf`
+        // calls, so the CR is already in `pending` when the `\n` arrives. The
+        // `end == 0` correction must still treat the pair as one ending.
+        let mut reader =
+            tokio::io::BufReader::with_capacity(1, std::io::Cursor::new(b"ab\r\nnext\n".to_vec()));
+        let mut state = LineState::default();
+
+        assert_eq!(
+            read_session_line(&mut reader, &mut state).await.unwrap(),
+            LineRead::Line {
+                text: "ab".to_string(),
+                cut: false
+            }
+        );
+        assert_eq!(
+            read_session_line(&mut reader, &mut state).await.unwrap(),
+            LineRead::Line {
+                text: "next".to_string(),
+                cut: false
+            }
+        );
     }
 
     #[tokio::test]
     async fn repl_reader_handles_crlf_and_eof() {
         let mut reader =
             tokio::io::BufReader::new(std::io::Cursor::new(b"info\r\nbogus\n".to_vec()));
-        let mut pending = Vec::new();
+        let mut state = LineState::default();
 
         for expected in ["info", "bogus"] {
-            let read = read_session_line(&mut reader, &mut pending).await.unwrap();
+            let read = read_session_line(&mut reader, &mut state).await.unwrap();
             assert_eq!(
                 read,
                 LineRead::Line {
@@ -4141,7 +4323,7 @@ mod tests {
             );
         }
         assert_eq!(
-            read_session_line(&mut reader, &mut pending).await.unwrap(),
+            read_session_line(&mut reader, &mut state).await.unwrap(),
             LineRead::Eof
         );
     }
@@ -4152,11 +4334,11 @@ mod tests {
         // come back as `Eof`, so pressing Enter at the prompt ended the
         // session.
         let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(b"\n\r\ninfo\n".to_vec()));
-        let mut pending = Vec::new();
+        let mut state = LineState::default();
 
         for expected in ["", "", "info"] {
             assert_eq!(
-                read_session_line(&mut reader, &mut pending).await.unwrap(),
+                read_session_line(&mut reader, &mut state).await.unwrap(),
                 LineRead::Line {
                     text: expected.to_string(),
                     cut: false
@@ -4164,9 +4346,9 @@ mod tests {
                 "an empty line must stay a line, not become EOF"
             );
         }
-        assert!(pending.is_empty());
+        assert!(state.pending.is_empty());
         assert_eq!(
-            read_session_line(&mut reader, &mut pending).await.unwrap(),
+            read_session_line(&mut reader, &mut state).await.unwrap(),
             LineRead::Eof
         );
     }
@@ -4174,17 +4356,17 @@ mod tests {
     #[tokio::test]
     async fn repl_reader_treats_a_lone_nul_as_an_empty_cut_line() {
         let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(b"\0info\n".to_vec()));
-        let mut pending = Vec::new();
+        let mut state = LineState::default();
 
         assert_eq!(
-            read_session_line(&mut reader, &mut pending).await.unwrap(),
+            read_session_line(&mut reader, &mut state).await.unwrap(),
             LineRead::Line {
                 text: String::new(),
                 cut: true
             }
         );
         assert_eq!(
-            read_session_line(&mut reader, &mut pending).await.unwrap(),
+            read_session_line(&mut reader, &mut state).await.unwrap(),
             LineRead::Line {
                 text: "info".to_string(),
                 cut: false
@@ -4198,12 +4380,12 @@ mod tests {
 
         let (mut writer, reader) = tokio::io::duplex(64);
         let mut reader = tokio::io::BufReader::new(reader);
-        let mut pending = Vec::new();
+        let mut state = LineState::default();
 
         writer.write_all(b"\n").await.unwrap();
         let empty = tokio::time::timeout(
             Duration::from_millis(500),
-            read_session_line(&mut reader, &mut pending),
+            read_session_line(&mut reader, &mut state),
         )
         .await
         .expect("the empty line arrives")
@@ -4219,7 +4401,7 @@ mod tests {
         writer.write_all(b"info\n").await.unwrap();
         let info = tokio::time::timeout(
             Duration::from_millis(500),
-            read_session_line(&mut reader, &mut pending),
+            read_session_line(&mut reader, &mut state),
         )
         .await
         .expect("the next line arrives after the empty one")
@@ -4238,12 +4420,12 @@ mod tests {
         let mut input = vec![b'a'; MAX_SESSION_LINE_BYTES + 10];
         input.extend_from_slice(b"\ninfo\n");
         let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input));
-        let mut pending = Vec::new();
+        let mut state = LineState::default();
 
-        let long = read_session_line(&mut reader, &mut pending).await.unwrap();
+        let long = read_session_line(&mut reader, &mut state).await.unwrap();
         assert_eq!(long, LineRead::TooLong { discarded: 10 });
-        assert!(pending.is_empty());
-        let next = read_session_line(&mut reader, &mut pending).await.unwrap();
+        assert!(state.pending.is_empty());
+        let next = read_session_line(&mut reader, &mut state).await.unwrap();
         assert_eq!(
             next,
             LineRead::Line {
@@ -4258,17 +4440,19 @@ mod tests {
     async fn repl_reader_does_not_count_crlf_toward_the_line_limit() {
         // M-1 regression: a line of exactly MAX_SESSION_LINE_BYTES characters
         // followed by CRLF is not too long; the `\r` belongs to the ending.
-        // The capacities cover the CR and LF arriving in the same chunk
-        // (default), in separate chunks, and with the CR as the only overflow
-        // byte.
+        // With the default and 4096-byte capacities the `\r` and `\n` arrive
+        // together, so `content_end` drops the CR before it is counted. With
+        // 4097 bytes the first chunk ends on the CR (no terminator yet), and
+        // the next chunk's `\n` takes the `end == 0` correction for the only
+        // overflow byte.
         for capacity in [8 * 1024, MAX_SESSION_LINE_BYTES, MAX_SESSION_LINE_BYTES + 1] {
             let mut input = vec![b'a'; MAX_SESSION_LINE_BYTES];
             input.extend_from_slice(b"\r\n");
             let mut reader =
                 tokio::io::BufReader::with_capacity(capacity, std::io::Cursor::new(input));
-            let mut pending = Vec::new();
+            let mut state = LineState::default();
 
-            let read = read_session_line(&mut reader, &mut pending).await.unwrap();
+            let read = read_session_line(&mut reader, &mut state).await.unwrap();
             assert_eq!(
                 read,
                 LineRead::Line {
@@ -4277,7 +4461,7 @@ mod tests {
                 },
                 "CRLF must not count against the limit (buffer capacity {capacity})"
             );
-            assert!(pending.is_empty());
+            assert!(state.pending.is_empty());
         }
     }
 
@@ -4286,14 +4470,14 @@ mod tests {
         let mut input = vec![b'a'; MAX_SESSION_LINE_BYTES + 1];
         input.extend_from_slice(b"\r\n");
         let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input));
-        let mut pending = Vec::new();
+        let mut state = LineState::default();
 
         assert_eq!(
-            read_session_line(&mut reader, &mut pending).await.unwrap(),
+            read_session_line(&mut reader, &mut state).await.unwrap(),
             LineRead::TooLong { discarded: 1 },
             "one content byte over the limit must still be reported, without the CR"
         );
-        assert!(pending.is_empty());
+        assert!(state.pending.is_empty());
     }
 
     #[tokio::test]
@@ -4302,11 +4486,11 @@ mod tests {
         input.push(0);
         input.extend_from_slice(b"info\n");
         let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input));
-        let mut pending = Vec::new();
+        let mut state = LineState::default();
 
-        let cut = read_session_line(&mut reader, &mut pending).await.unwrap();
+        let cut = read_session_line(&mut reader, &mut state).await.unwrap();
         assert_eq!(cut, LineRead::TooLong { discarded: 5 });
-        let next = read_session_line(&mut reader, &mut pending).await.unwrap();
+        let next = read_session_line(&mut reader, &mut state).await.unwrap();
         assert_eq!(
             next,
             LineRead::Line {
@@ -4319,16 +4503,16 @@ mod tests {
     #[tokio::test]
     async fn repl_reader_cuts_at_nul_below_the_limit() {
         let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(b"fi\0ve\n".to_vec()));
-        let mut pending = Vec::new();
+        let mut state = LineState::default();
         assert_eq!(
-            read_session_line(&mut reader, &mut pending).await.unwrap(),
+            read_session_line(&mut reader, &mut state).await.unwrap(),
             LineRead::Line {
                 text: "fi".to_string(),
                 cut: true
             }
         );
         assert_eq!(
-            read_session_line(&mut reader, &mut pending).await.unwrap(),
+            read_session_line(&mut reader, &mut state).await.unwrap(),
             LineRead::Line {
                 text: "ve".to_string(),
                 cut: false
