@@ -37,6 +37,13 @@ pub enum Error {
         operation: String,
     },
 
+    /// A requested wait or timeout was too large to schedule.
+    ///
+    /// Returning this instead of panicking keeps user-supplied durations
+    /// (`--timeout`, `--hold`, ...) from overflowing [`std::time::Instant`].
+    #[error("timeout of {0:?} is too large (maximum is 30 years)")]
+    InvalidTimeout(std::time::Duration),
+
     /// A response carried an unexpected command or range.
     #[error("unexpected response: {0}")]
     UnexpectedResponse(String),

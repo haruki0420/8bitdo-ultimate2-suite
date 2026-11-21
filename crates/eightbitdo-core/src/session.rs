@@ -6,12 +6,18 @@
 //!
 //! Every operation in this module is read-only except
 //! [`Session::set_report_enable`], which toggles the realtime input stream.
+//!
+//! Reads fail closed: a stale-frame drain that cannot finish within its
+//! budget refuses the read ([`Error::UnexpectedResponse`] with
+//! `drain budget exhausted`) instead of risking a stale frame being mistaken
+//! for the new response.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use eightbitdo_protocol::commands;
 use eightbitdo_protocol::config_bt2::{Bt2Config, CONFIG_SIZE};
+use eightbitdo_protocol::crc::packet_crc16;
 use eightbitdo_protocol::header::{self, PacketKind};
 use eightbitdo_protocol::input_report::InputReport;
 use tokio::time::Instant;
@@ -28,11 +34,74 @@ pub const CONFIG_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum number of stale frames discarded in a single resync drain.
 const MAX_DRAIN_FRAMES: usize = 64;
 
+/// Maximum number of frames consumed by one [`Session::try_next_input`] call.
+///
+/// This is also the upper bound on how many non-input frames it skips before
+/// returning `Ok(None)`, so a caller looping over input reports always
+/// regains control.
+pub const MAX_INPUT_DRAIN_FRAMES: usize = 16;
+
 /// Overall time budget for discarding stale frames during resync.
 const MAX_DRAIN_DURATION: Duration = Duration::from_millis(50);
 
 /// Idle gap used to decide that no more stale frames are queued.
 const DRAIN_FRAME_WAIT: Duration = Duration::from_millis(1);
+
+/// Upper bound accepted for a single wait ([`Session::try_next_input`], the
+/// per-frame and total timeouts). It mirrors the [`std::time::Instant`] range
+/// so every computed deadline stays representable; anything larger is
+/// rejected with [`Error::InvalidTimeout`] instead of panicking.
+pub const MAX_WAIT: Duration = Duration::from_secs(3600 * 24 * 365 * 30);
+
+/// Compute `Instant::now() + duration` with a range check.
+///
+/// [`tokio::time::Instant::add`] panics on overflow, and the CLI accepts
+/// user-supplied durations (`--scan-timeout`, `--timeout`, `--hold`), so every
+/// deadline goes through this helper.
+fn deadline_after(duration: Duration) -> Result<Instant, Error> {
+    if duration > MAX_WAIT {
+        return Err(Error::InvalidTimeout(duration));
+    }
+    Instant::now()
+        .checked_add(duration)
+        .ok_or(Error::InvalidTimeout(duration))
+}
+
+/// Bounds applied to one stale-frame drain ([`Session::drain_pending`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DrainPolicy {
+    /// Maximum number of frames discarded in one drain.
+    max_frames: usize,
+    /// Maximum wall-clock time spent in one drain.
+    max_duration: Duration,
+}
+
+impl DrainPolicy {
+    /// The bounds used by automatic resync: enough to clear the largest
+    /// burst a full ReadConfig can leave behind, still bounded.
+    const RESYNC: Self = Self {
+        max_frames: MAX_DRAIN_FRAMES,
+        max_duration: MAX_DRAIN_DURATION,
+    };
+
+    /// A small drain used by read paths that must not consume a response
+    /// that is already queued for their own request.
+    const OPPORTUNISTIC: Self = Self {
+        max_frames: 1,
+        max_duration: Duration::from_millis(1),
+    };
+}
+
+/// Result of one bounded stale-frame drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainOutcome {
+    /// The transport was idle within the current budget, so the queue is
+    /// empty and the next read starts from a clean state.
+    Quiesced,
+    /// The frame or time budget ran out while frames could still arrive;
+    /// stale frames may remain queued.
+    Exhausted,
+}
 
 /// Marks a session as needing resync when a read operation returns an error or
 /// its future is dropped before completion.
@@ -140,38 +209,60 @@ impl<T: Transport> Session<T> {
     /// custom request should invoke this **before** sending the request so
     /// stale frames from an earlier failed read are discarded without
     /// consuming the response to the new request.
-    pub async fn resync(&self) {
-        self.prepare_read().await;
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedResponse`] (message contains `drain budget
+    /// exhausted`) when stale frames could not all be discarded within the
+    /// drain budget, or the transport error that ended the drain.
+    pub async fn resync(&self) -> Result<(), Error> {
+        self.prepare_read().await
     }
 
-    async fn prepare_read(&self) {
+    /// Clear the resync flag, failing closed when the drain budget runs out.
+    ///
+    /// If stale frames may still be queued, the flag stays set so the next
+    /// read retries the drain, and the current read is refused instead of
+    /// risking a stale frame being mistaken for its response.
+    async fn prepare_read(&self) -> Result<(), Error> {
         if self.needs_resync.load(Ordering::SeqCst) {
-            self.drain_pending().await;
-            self.needs_resync.store(false, Ordering::SeqCst);
+            match self.drain_pending(DrainPolicy::RESYNC).await {
+                Ok(DrainOutcome::Quiesced) => self.needs_resync.store(false, Ordering::SeqCst),
+                Ok(DrainOutcome::Exhausted) => {
+                    return Err(Error::UnexpectedResponse(
+                        "drain budget exhausted while discarding stale frames; \
+                         the read was refused so a stale frame cannot be used as its response"
+                            .to_string(),
+                    ))
+                }
+                Err(error) => return Err(error),
+            }
         }
+        Ok(())
     }
 
     /// Discard frames left over from a timed-out or failed read.
     ///
-    /// Bounded by both [`MAX_DRAIN_FRAMES`] and [`MAX_DRAIN_DURATION`] so a
-    /// noisy transport cannot livelock the session.
-    async fn drain_pending(&self) {
-        let deadline = Instant::now() + MAX_DRAIN_DURATION;
-        for _ in 0..MAX_DRAIN_FRAMES {
+    /// Bounded by [`DrainPolicy::max_frames`] and [`DrainPolicy::max_duration`]
+    /// so a noisy transport cannot livelock the session. A transport error or
+    /// disconnect also stops the drain.
+    async fn drain_pending(&self, policy: DrainPolicy) -> Result<DrainOutcome, Error> {
+        let deadline = deadline_after(policy.max_duration)?;
+        for _ in 0..policy.max_frames {
             let now = Instant::now();
             if now >= deadline {
-                break;
+                return Ok(DrainOutcome::Exhausted);
             }
             let wait = DRAIN_FRAME_WAIT.min(deadline.saturating_duration_since(now));
-            if tokio::time::timeout(wait, self.transport.recv())
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .is_none()
-            {
-                break;
+            match tokio::time::timeout(wait, self.transport.recv()).await {
+                // Idle gap: nothing more is queued right now.
+                Err(_) => return Ok(DrainOutcome::Quiesced),
+                Ok(Ok(_frame)) => {}
+                // The stale transport is gone; reads will fail on their own.
+                Ok(Err(Error::Disconnected)) => return Ok(DrainOutcome::Quiesced),
+                Ok(Err(error)) => return Err(error),
             }
         }
+        Ok(DrainOutcome::Exhausted)
     }
 
     /// Read the firmware version (`cmd 0x000B`).
@@ -187,10 +278,10 @@ impl<T: Transport> Session<T> {
     ///
     /// Returns [`Error::Timeout`] when no matching notification arrives within
     /// the configured per-frame timeout, [`Error::UnexpectedResponse`] for a
-    /// mismatched envelope or a range outside the declared transfer, or a
-    /// transport error.
+    /// mismatched envelope, `total_len` or `crc16`, or a range outside the
+    /// declared transfer, or a transport error.
     pub async fn read_version(&self) -> Result<VersionInfo, Error> {
-        self.prepare_read().await;
+        self.prepare_read().await?;
         let mut guard = ResyncGuard::new(&self.needs_resync);
         self.transport
             .send(&commands::read_version().encode_ble(PacketKind::App)?)
@@ -236,7 +327,8 @@ impl<T: Transport> Session<T> {
     /// Returns [`Error::Timeout`] when the transfer does not complete within
     /// [`CONFIG_TOTAL_TIMEOUT`] or a chunk does not arrive within the
     /// configured per-frame timeout, [`Error::UnexpectedResponse`] when a
-    /// chunk has a mismatched envelope, offset or range, or a transport error.
+    /// chunk has a mismatched envelope, `total_len`, `crc16`, offset or range,
+    /// or a transport error.
     pub async fn read_config_snapshot(&self) -> Result<ConfigSnapshot, Error> {
         let bytes = self
             .read_config_chunks(CONFIG_SIZE, self.timeout, CONFIG_TOTAL_TIMEOUT)
@@ -289,15 +381,25 @@ impl<T: Transport> Session<T> {
     /// (`cmd=0x0004, subcmd=0x0003`). Other frames are skipped. A timeout
     /// returns `Ok(None)`; a closed transport returns [`Error::Disconnected`].
     ///
+    /// The call is bounded in three ways so a caller that drains the input
+    /// queue in a loop cannot hold the session lock forever: the `wait`
+    /// budget, at most [`MAX_INPUT_DRAIN_FRAMES`] frames consumed per call
+    /// (so at most that many non-input frames are skipped), and a final
+    /// [`DrainPolicy::OPPORTUNISTIC`] stale-frame drain when the budget ends
+    /// without a report. The whole call therefore settles within roughly
+    /// `wait + 1 ms`.
+    ///
     /// # Errors
     ///
-    /// Returns [`Error::Disconnected`] when the transport closes, a protocol
-    /// error for a malformed input frame, or another transport error.
+    /// Returns [`Error::InvalidTimeout`] when `wait` exceeds [`MAX_WAIT`],
+    /// [`Error::Disconnected`] when the transport closes, a protocol error
+    /// for a malformed input frame, or another transport error.
     pub async fn try_next_input(&self, wait: Duration) -> Result<Option<InputReport>, Error> {
-        let deadline = Instant::now() + wait;
-        loop {
+        let deadline = deadline_after(wait)?;
+        for _ in 0..MAX_INPUT_DRAIN_FRAMES {
             let now = Instant::now();
             if now >= deadline {
+                self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
                 return Ok(None);
             }
             let remaining = deadline.saturating_duration_since(now);
@@ -308,7 +410,10 @@ impl<T: Transport> Session<T> {
             .await
             {
                 Ok(result) => result?,
-                Err(_) => return Ok(None),
+                Err(_) => {
+                    self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
+                    return Ok(None);
+                }
             };
 
             let (header, payload) = header::decode_app_response(&frame)?;
@@ -319,6 +424,11 @@ impl<T: Transport> Session<T> {
             }
             return Ok(Some(InputReport::from_bytes(payload)?));
         }
+
+        // Frame budget spent: discard at most one more queued frame so the
+        // next call starts with a fresh frame instead of the backlog.
+        self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
+        Ok(None)
     }
 
     /// Read a transfer of exactly `expected_len` bytes for `cmd`.
@@ -369,7 +479,7 @@ impl<T: Transport> Session<T> {
         total_timeout: Duration,
     ) -> Result<Vec<u8>, Error> {
         let mut buffer = TransferBuffer::new(expected_len);
-        let deadline = Instant::now() + total_timeout;
+        let deadline = deadline_after(total_timeout)?;
 
         while !buffer.is_complete() {
             let now = Instant::now();
@@ -434,7 +544,7 @@ impl<T: Transport> Session<T> {
                 "chunked ReadConfig expects {CONFIG_SIZE} bytes, got {expected_len}"
             )));
         }
-        self.prepare_read().await;
+        self.prepare_read().await?;
         let mut guard = ResyncGuard::new(&self.needs_resync);
         let raw = self
             .read_config_chunks_inner(expected_len, per_frame_timeout, total_timeout)
@@ -451,7 +561,7 @@ impl<T: Transport> Session<T> {
     ) -> Result<Vec<u8>, Error> {
         let mut buffer = TransferBuffer::new(expected_len);
         let mut offset = 0usize;
-        let deadline = Instant::now() + total_timeout;
+        let deadline = deadline_after(total_timeout)?;
 
         while offset < expected_len {
             let request = commands::read_config_from(offset as u32)?;
@@ -535,6 +645,17 @@ impl<T: Transport> Session<T> {
             if response.chunk_len == 0 {
                 return Ok(None);
             }
+            Self::verify_response_crc(&response, payload)?;
+            // A direct data frame declares the same transfer length as the
+            // envelope form. Accept the observed `total_len = 0` convention of
+            // direct echoes, but reject any other mismatch so a response for
+            // a different transfer cannot be spliced into this one.
+            if response.total_len != 0 && response.total_len as usize != expected_len {
+                return Err(Error::UnexpectedResponse(format!(
+                    "direct response total_len {} does not match the expected {expected_len} bytes",
+                    response.total_len
+                )));
+            }
             return Ok(Some((response, payload)));
         }
         if response.cmd != commands::cmd::RESPONSE {
@@ -566,7 +687,30 @@ impl<T: Transport> Session<T> {
                 response.total_len
             )));
         }
+        Self::verify_response_crc(&response, payload)?;
         Ok(Some((response, payload)))
+    }
+
+    /// Check `crc16` on a data response when the device supplied one.
+    ///
+    /// `0x600F` data responses carry the packet CRC-16/MODBUS (poly `0xA001`,
+    /// init `0xFFFF`) of their payload, e.g. `C8 00 00 00` → `0x443E`
+    /// (`docs/PROTOCOL_SPEC.md` §4.3.1). `crc16 = 0` means "unused" and is
+    /// accepted without checking, matching [`CustomHeader::new`] and the
+    /// intentionally unchecked `0xFFFF` ACKs.
+    fn verify_response_crc(response: &header::CustomHeader, payload: &[u8]) -> Result<(), Error> {
+        if response.crc16 == 0 {
+            return Ok(());
+        }
+        let computed = packet_crc16(payload);
+        if computed != response.crc16 {
+            return Err(Error::UnexpectedResponse(format!(
+                "response crc16 0x{:04X} does not match the computed 0x{computed:04X} over {} payload bytes",
+                response.crc16,
+                payload.len()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1437,9 +1581,19 @@ mod tests {
         let session = Session::new(&fast);
         session.needs_resync.store(true, Ordering::SeqCst);
         let started = Instant::now();
-        session.resync().await;
+        // The frame budget is spent before the transport goes idle, so the
+        // drain cannot prove the queue is empty: it fails closed and keeps
+        // the resync flag set for the next attempt.
+        let result = session.resync().await;
+        assert!(
+            matches!(result, Err(Error::UnexpectedResponse(ref message)) if message.contains("drain budget exhausted")),
+            "unexpected resync result: {result:?}"
+        );
         assert_eq!(fast.recv_calls.load(Ordering::SeqCst), MAX_DRAIN_FRAMES);
-        assert!(!session.needs_resync.load(Ordering::SeqCst));
+        assert!(
+            session.needs_resync.load(Ordering::SeqCst),
+            "an exhausted drain must leave needs_resync set"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "drain_pending took {:?}",
@@ -1454,7 +1608,17 @@ mod tests {
         let session = Session::new(&paced);
         session.needs_resync.store(true, Ordering::SeqCst);
         let started = Instant::now();
-        session.resync().await;
+        // Each frame costs 500 µs of the 50 ms budget, so the time budget
+        // expires well before the frame budget and the drain fails closed.
+        let result = session.resync().await;
+        assert!(
+            matches!(result, Err(Error::UnexpectedResponse(ref message)) if message.contains("drain budget exhausted")),
+            "unexpected paced resync result: {result:?}"
+        );
+        assert!(
+            session.needs_resync.load(Ordering::SeqCst),
+            "a time-exhausted drain must leave needs_resync set"
+        );
         let calls = paced.recv_calls.load(Ordering::SeqCst);
         assert!(calls > 0 && calls <= MAX_DRAIN_FRAMES);
         assert!(
@@ -1462,6 +1626,249 @@ mod tests {
             "paced drain_pending took {:?}",
             started.elapsed()
         );
+    }
+
+    /// Transport that never runs out of unrelated frames, so a drain loop can
+    /// only stop because of its own frame or time budget.
+    struct EndlessNoiseTransport {
+        recv_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl EndlessNoiseTransport {
+        fn new() -> Self {
+            Self {
+                recv_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn recv_calls(&self) -> usize {
+            self.recv_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Transport for EndlessNoiseTransport {
+        async fn send(&self, _data: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn recv(&self) -> Result<Vec<u8>, Error> {
+            self.recv_calls.fetch_add(1, Ordering::SeqCst);
+            // A complete but non-input frame (the 0x0012 notice).
+            Ok(CustomHeader::new(commands::cmd::ALLOW_CONFIG_DONE, 0, 0, 0)
+                .to_bytes()
+                .to_vec())
+        }
+
+        fn mtu(&self) -> u16 {
+            64
+        }
+
+        async fn disconnect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn try_next_input_stops_after_frame_budget_with_endless_notifications() {
+        let transport = EndlessNoiseTransport::new();
+        let session = Session::new(&transport);
+
+        // A caller loop (keepalive / monitor) must regain control even while
+        // notifications never stop arriving.
+        let started = Instant::now();
+        for _ in 0..3 {
+            let report = session
+                .try_next_input(Duration::from_secs(5))
+                .await
+                .expect("non-input frames are skipped, not errored");
+            assert!(report.is_none(), "no input report is ever delivered");
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "three bounded drains took {:?}",
+            started.elapsed()
+        );
+        // Per call: MAX_INPUT_DRAIN_FRAMES skipped frames plus at most one
+        // final opportunistic drain.
+        assert!(
+            transport.recv_calls() <= 3 * (MAX_INPUT_DRAIN_FRAMES + 1),
+            "try_next_input consumed {} frames",
+            transport.recv_calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn try_next_input_returns_trailing_report_after_skipped_frames() {
+        let mock = MockTransport::new();
+        for _ in 0..3 {
+            let notice = CustomHeader::new(commands::cmd::ALLOW_CONFIG_DONE, 0, 0, 0);
+            mock.push_response(&notice, &[]);
+        }
+        let report = InputReport {
+            keys: 0x0000_0001,
+            ..InputReport::default()
+        };
+        let input =
+            CustomHeader::new(commands::cmd::INPUT, 0, 12, 12).with_payload(&report.to_bytes());
+        mock.push_response(&input, &report.to_bytes());
+
+        let session = Session::new(&mock);
+        let decoded = session
+            .try_next_input(Duration::from_millis(200))
+            .await
+            .unwrap()
+            .expect("the queued report is found after the notices");
+        assert_eq!(decoded, report);
+    }
+
+    #[tokio::test]
+    async fn resync_with_idle_transport_clears_needs_resync() {
+        let transport = ResyncTransport::new();
+        let session = Session::new(&transport).with_timeout(Duration::from_millis(20));
+        assert!(session.read_version().await.is_err());
+        assert!(session.needs_resync.load(Ordering::SeqCst));
+
+        session.resync().await.expect("an idle queue quiesces");
+        assert!(
+            !session.needs_resync.load(Ordering::SeqCst),
+            "a quiesced drain must clear needs_resync"
+        );
+    }
+
+    fn observed_version_envelope_header() -> CustomHeader {
+        let header = CustomHeader::parse(&OBSERVED_VERSION_DATA).unwrap();
+        assert_eq!(header.crc16, 0x443E, "observed payload CRC");
+        header
+    }
+
+    #[tokio::test]
+    async fn envelope_response_with_matching_crc_is_accepted() {
+        let mock = MockTransport::new();
+        mock.push_incoming(&OBSERVED_VERSION_DATA);
+
+        let session = Session::new(&mock);
+        let version = session.read_version().await.unwrap();
+        assert_eq!(version.raw, [0xC8, 0x00, 0x00, 0x00]);
+    }
+
+    #[tokio::test]
+    async fn envelope_response_with_bad_crc_is_rejected() {
+        let mock = MockTransport::new();
+        let mut frame = OBSERVED_VERSION_DATA;
+        // Flip one payload bit; crc16 still claims 0x443E.
+        frame[16] ^= 0x01;
+        mock.push_incoming(&frame);
+
+        let session = Session::new(&mock);
+        let result = session.read_version().await;
+        assert!(
+            matches!(result, Err(Error::UnexpectedResponse(ref message)) if message.contains("crc16")),
+            "unexpected result: {result:?}"
+        );
+        assert!(
+            session.needs_resync.load(Ordering::SeqCst),
+            "a rejected frame must mark the session for resync"
+        );
+    }
+
+    #[tokio::test]
+    async fn envelope_response_with_zero_crc_is_accepted_without_check() {
+        let mock = MockTransport::new();
+        let mut header = observed_version_envelope_header();
+        header.crc16 = 0;
+        mock.push_response(&header, &[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        let session = Session::new(&mock);
+        let version = session.read_version().await.unwrap();
+        assert_eq!(version.raw, [0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[tokio::test]
+    async fn direct_response_with_total_len_mismatch_is_rejected() {
+        let mock = MockTransport::new();
+        // A direct echo that declares a different transfer size (0x0AD0).
+        let response = CustomHeader::new(commands::cmd::READ_VERSION, 0, CONFIG_SIZE as u32, 0)
+            .with_payload(&[1, 2, 3, 4]);
+        mock.push_response(&response, &[1, 2, 3, 4]);
+
+        let session = Session::new(&mock);
+        let result = session.read_version().await;
+        assert!(
+            matches!(result, Err(Error::UnexpectedResponse(ref message)) if message.contains("total_len")),
+            "unexpected result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_response_with_zero_total_len_is_accepted() {
+        let mock = MockTransport::new();
+        let response =
+            CustomHeader::new(commands::cmd::READ_VERSION, 0, 0, 0).with_payload(&[7, 7, 7, 7]);
+        mock.push_response(&response, &[7, 7, 7, 7]);
+
+        let session = Session::new(&mock);
+        let version = session.read_version().await.unwrap();
+        assert_eq!(version.raw, [7, 7, 7, 7]);
+    }
+
+    #[tokio::test]
+    async fn direct_response_with_bad_crc_is_rejected() {
+        let mock = MockTransport::new();
+        let payload = [1u8, 2, 3, 4];
+        let mut header =
+            CustomHeader::new(commands::cmd::READ_VERSION, 0, 4, 0).with_payload(&payload);
+        header.crc16 ^= 0xFFFF;
+        mock.push_response(&header, &payload);
+
+        let session = Session::new(&mock);
+        let result = session.read_version().await;
+        assert!(
+            matches!(result, Err(Error::UnexpectedResponse(ref message)) if message.contains("crc16")),
+            "unexpected result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_wait_is_rejected_without_panicking() {
+        let mock = MockTransport::new();
+        let session = Session::new(&mock);
+
+        for wait in [Duration::MAX, MAX_WAIT + Duration::from_secs(1)] {
+            let result = session.try_next_input(wait).await;
+            assert!(
+                matches!(result, Err(Error::InvalidTimeout(value)) if value == wait),
+                "unexpected result for {wait:?}: {result:?}"
+            );
+        }
+
+        let result = session
+            .read_transfer(
+                commands::cmd::READ_VERSION,
+                4,
+                Duration::from_millis(1),
+                Duration::MAX,
+            )
+            .await;
+        assert!(matches!(result, Err(Error::InvalidTimeout(_))));
+        assert!(
+            mock.sent_frames().is_empty(),
+            "an invalid timeout is rejected before any I/O"
+        );
+    }
+
+    #[test]
+    fn deadline_after_accepts_max_wait_and_rejects_larger() {
+        assert!(deadline_after(MAX_WAIT).is_ok());
+        assert!(deadline_after(Duration::ZERO).is_ok());
+        assert!(matches!(
+            deadline_after(MAX_WAIT + Duration::from_nanos(1)),
+            Err(Error::InvalidTimeout(_))
+        ));
+        assert!(matches!(
+            deadline_after(Duration::MAX),
+            Err(Error::InvalidTimeout(_))
+        ));
     }
 
     #[tokio::test]

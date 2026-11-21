@@ -313,7 +313,7 @@ pub async fn scan_devices(timeout: Duration) -> Result<Vec<BleDevice>, Error> {
 }
 
 async fn collect_devices(adapter: &Adapter, timeout: Duration) -> Result<Vec<BleDevice>, Error> {
-    let deadline = Instant::now() + timeout;
+    let deadline = checked_deadline(timeout)?;
     let mut devices: BTreeMap<String, BleDevice> = BTreeMap::new();
 
     loop {
@@ -353,7 +353,7 @@ async fn find_app_peripheral(
     adapter: &Adapter,
     options: &BleOptions,
 ) -> Result<Option<(Peripheral, Option<String>)>, Error> {
-    let deadline = Instant::now() + options.scan_timeout;
+    let deadline = checked_deadline(options.scan_timeout)?;
 
     loop {
         for peripheral in adapter.peripherals().await.map_err(ble_error)? {
@@ -442,6 +442,20 @@ fn check_tx_frame_len(mtu: u16, frame_len: usize) -> Result<MtuCheck, Error> {
 
 fn compute_write_timeout(connect_timeout: Duration) -> Duration {
     DEFAULT_WRITE_TIMEOUT.min(connect_timeout)
+}
+
+/// `Instant::now() + timeout`, rejecting durations that cannot be scheduled.
+///
+/// `Duration::add` on `tokio::time::Instant` panics on overflow; user-supplied
+/// `--scan-timeout` / `--timeout` values reach here, so overflow must become an
+/// error instead of a panic.
+fn checked_deadline(timeout: Duration) -> Result<Instant, Error> {
+    if timeout > crate::session::MAX_WAIT {
+        return Err(Error::InvalidTimeout(timeout));
+    }
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or(Error::InvalidTimeout(timeout))
 }
 
 fn ble_error(error: btleplug::Error) -> Error {
