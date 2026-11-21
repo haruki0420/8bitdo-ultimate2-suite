@@ -1,7 +1,6 @@
 # 8BitDo Ultimate 2 Cross-Platform Suite
 
 [![CI](https://github.com/haruki0420/8bitdo-ultimate2-suite/actions/workflows/ci.yml/badge.svg)](https://github.com/haruki0420/8bitdo-ultimate2-suite/actions/workflows/ci.yml)
-[![Review Gate](https://github.com/haruki0420/8bitdo-ultimate2-suite/actions/workflows/review-gate.yml/badge.svg)](https://github.com/haruki0420/8bitdo-ultimate2-suite/actions/workflows/review-gate.yml)
 
 **8BitDo Ultimate 2 Bluetooth Controller**（内部 PID `0x600F` / 2.4G レシーバー `0x6011`）向けのオープンソース・クロスプラットフォーム設定／マクロ編集／ファームウェアアップデートスイート（設計・仕様リポジトリ）。
 
@@ -43,6 +42,7 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 
 ## 現在のステータス
 
+- `main` は **PR + CI + 独立レビュー（SHA 紐づきの `review-gate` status）** 必須です。詳細は [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
 - [x] 公式アプリ（Android v2.01 / Windows v1.38）の通信プロトコル・バイナリ構造・OTA シーケンスの解析完了
 - [x] 完全仕様書・実装計画書・AI 引き継ぎドキュメント作成
 - [x] Phase 1: `eightbitdo-protocol`（Rust プロトコル・構造体・CRC・マクロ、単体テスト 74 件 + doc test 4 件）
