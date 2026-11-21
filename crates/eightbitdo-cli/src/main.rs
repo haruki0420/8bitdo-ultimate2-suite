@@ -1,7 +1,7 @@
 //! Read-only command-line interface for the 8BitDo Ultimate 2 Bluetooth
 //! controller.
 //!
-//! The binary exposes `scan`, `info`, `config dump`, `monitor` and
+//! The binary exposes `scan`, `info`, `config dump`, `backup`, `monitor` and
 //! `keepalive`. No configuration write, macro flash, save or OTA command is
 //! reachable from this binary.
 
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use eightbitdo_core::{
-    scan_devices, BleOptions, BleTransport, ConfigSnapshot, Error, Session, Transport,
+    scan_devices, BleOptions, BleTransport, ConfigSnapshot, Error, Session, Transport, VersionInfo,
 };
 use eightbitdo_protocol::commands;
 use eightbitdo_protocol::config_bt2::{Slot, CONFIG_SIZE};
@@ -64,6 +64,21 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+
+    /// Read version and configuration in one connection, optionally holding it.
+    Backup {
+        /// Write the raw 2768 bytes to this file.
+        #[arg(long, value_name = "FILE")]
+        raw: Option<PathBuf>,
+
+        /// Write the JSON summary to this file.
+        #[arg(long, value_name = "FILE")]
+        json: Option<PathBuf>,
+
+        /// Keep the connection alive with 20 ms input polling for this many seconds.
+        #[arg(long, default_value_t = 0, value_name = "SECONDS")]
+        hold: u64,
     },
 
     /// Stream realtime input reports.
@@ -128,6 +143,15 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                 dump_config(&options, raw.as_deref(), json.as_deref()).await?;
             }
         },
+        Command::Backup { raw, json, hold } => {
+            backup(
+                &options,
+                raw.as_deref(),
+                json.as_deref(),
+                Duration::from_secs(hold),
+            )
+            .await?;
+        }
         Command::Monitor { count } => monitor(&options, count).await?,
         Command::Keepalive {
             interval_ms,
@@ -189,7 +213,11 @@ async fn info(options: &BleOptions) -> Result<(), Error> {
     let version = session.read_version().await;
     let _ = session.transport().disconnect().await;
     let version = version?;
+    print_version(&version);
+    Ok(())
+}
 
+fn print_version(version: &VersionInfo) {
     let raw = if version.raw.is_empty() {
         "<empty>".to_string()
     } else {
@@ -208,7 +236,6 @@ async fn info(options: &BleOptions) -> Result<(), Error> {
         // little-endian i32.
         println!("version value: 0x{:08X}", u32::from_le_bytes(bytes));
     }
-    Ok(())
 }
 
 async fn dump_config(
@@ -222,6 +249,17 @@ async fn dump_config(
     let _ = session.transport().disconnect().await;
     let snapshot = snapshot?;
 
+    let sha256 = write_config_outputs(&snapshot, raw_path, json_path)?;
+    print_config_summary(&snapshot, &sha256);
+    Ok(())
+}
+
+/// Write the optional raw/JSON files and return the SHA-256 hex digest.
+fn write_config_outputs(
+    snapshot: &ConfigSnapshot,
+    raw_path: Option<&Path>,
+    json_path: Option<&Path>,
+) -> Result<String, Error> {
     let sha256 = hex::encode(Sha256::digest(snapshot.config.as_bytes()));
 
     if let Some(path) = raw_path {
@@ -233,14 +271,13 @@ async fn dump_config(
     }
 
     if let Some(path) = json_path {
-        let summary = json_summary(&snapshot, &sha256);
+        let summary = json_summary(snapshot, &sha256);
         let encoded = serde_json::to_string_pretty(&summary).map_err(std::io::Error::other)?;
         std::fs::write(path, format!("{encoded}\n"))?;
         println!("wrote JSON summary: {}", path.display());
     }
 
-    print_config_summary(&snapshot, &sha256);
-    Ok(())
+    Ok(sha256)
 }
 
 fn json_summary(snapshot: &ConfigSnapshot, sha256: &str) -> serde_json::Value {
@@ -311,6 +348,51 @@ fn print_config_summary(snapshot: &ConfigSnapshot, sha256: &str) {
         "crc: stored=0x{:04X} in_place=0x{:04X} (informational)",
         snapshot.stored_crc, snapshot.computed_crc
     );
+}
+
+async fn backup(
+    options: &BleOptions,
+    raw_path: Option<&Path>,
+    json_path: Option<&Path>,
+    hold: Duration,
+) -> Result<(), Error> {
+    let transport = BleTransport::connect(options).await?;
+    let session = Session::new(transport);
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    let result = backup_session(&session, raw_path, json_path, hold, shutdown).await;
+    let _ = session.transport().disconnect().await;
+    result
+}
+
+/// One-connection backup: ReadVersion, the 2768-byte config, optional hold.
+///
+/// The connection stays open for the whole sequence. If `hold` is non-zero,
+/// the official-style keepalive (`0x0007` enable, 20 ms `0x0003`, receive
+/// drain, `0x0007` disable) keeps it alive before disconnecting.
+async fn backup_session<T: Transport>(
+    session: &Session<T>,
+    raw_path: Option<&Path>,
+    json_path: Option<&Path>,
+    hold: Duration,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), Error> {
+    let version = session.read_version().await?;
+    print_version(&version);
+
+    let snapshot = session.read_config_snapshot().await?;
+    let sha256 = write_config_outputs(&snapshot, raw_path, json_path)?;
+    print_config_summary(&snapshot, &sha256);
+
+    if !hold.is_zero() {
+        let stats = run_keepalive(session, Duration::from_millis(20), hold, shutdown).await?;
+        println!(
+            "hold finished: sent={} received={}",
+            stats.sent, stats.received
+        );
+    }
+    Ok(())
 }
 
 async fn monitor(options: &BleOptions, count: Option<u64>) -> Result<(), Error> {
@@ -487,7 +569,9 @@ async fn keepalive_loop<T: Transport>(
 
 fn is_input_notification(frame: &[u8]) -> Result<bool, Error> {
     let (header, _) = header::decode_app_response(frame)?;
-    Ok(header.cmd == commands::cmd::INPUT)
+    let is_input = header.cmd == commands::cmd::INPUT
+        || (header.cmd == commands::cmd::RESPONSE && header.subcmd == commands::cmd::INPUT);
+    Ok(is_input && header.chunk_len > 0)
 }
 
 fn print_report(report: &InputReport) {
@@ -534,8 +618,24 @@ mod tests {
             let payload = report.to_bytes();
             let header =
                 CustomHeader::new(commands::cmd::INPUT, 0, 0x0C, 0x0C).with_payload(&payload);
+            self.queue_frame(&header, &payload);
+        }
+
+        fn queue_envelope_input(&self, report: &InputReport) {
+            let payload = report.to_bytes();
+            let header =
+                CustomHeader::new(commands::cmd::RESPONSE, commands::cmd::INPUT, 0x0C, 0x0C)
+                    .with_payload(&payload);
+            self.queue_frame(&header, &payload);
+        }
+
+        fn queue_response(&self, header: &CustomHeader, payload: &[u8]) {
+            self.queue_frame(header, payload);
+        }
+
+        fn queue_frame(&self, header: &CustomHeader, payload: &[u8]) {
             let mut frame = header.to_bytes().to_vec();
-            frame.extend_from_slice(&payload);
+            frame.extend_from_slice(payload);
             self.incoming.lock().unwrap().push_back(frame);
         }
 
@@ -582,9 +682,9 @@ mod tests {
             battery: 0x4B,
             reserved: 0,
         };
-        for _ in 0..3 {
-            transport.queue_input(&report);
-        }
+        transport.queue_input(&report);
+        transport.queue_envelope_input(&report);
+        transport.queue_envelope_input(&report);
 
         let session = Session::new(&transport);
         let stats = run_keepalive(
@@ -656,5 +756,114 @@ mod tests {
         assert!(summary.get("crc_valid").is_none());
         assert!(summary.get("stored_crc").is_none());
         assert!(summary.get("computed_crc").is_none());
+    }
+
+    fn sample_input_report() -> InputReport {
+        InputReport {
+            keys: 0x0000_2001,
+            left_stick_x: 0x7F,
+            left_stick_y: 0x80,
+            right_stick_x: 0xFF,
+            right_stick_y: 0x00,
+            trigger_r: 0xCC,
+            trigger_l: 0x33,
+            battery: 0x4B,
+            reserved: 0,
+        }
+    }
+
+    fn queue_version_response(transport: &KeepaliveTestTransport) {
+        let payload = [0u8; 4];
+        let header = CustomHeader::new(commands::cmd::RESPONSE, commands::cmd::READ_VERSION, 4, 0)
+            .with_payload(&payload);
+        transport.queue_response(&header, &payload);
+    }
+
+    fn queue_config_responses(transport: &KeepaliveTestTransport, config: &Bt2Config) {
+        let bytes = config.as_bytes();
+        for (index, chunk) in bytes.chunks(142).enumerate() {
+            let offset = (index * 142) as u32;
+            let header = CustomHeader::new(
+                commands::cmd::RESPONSE,
+                commands::cmd::READ_CONFIG,
+                CONFIG_SIZE as u32,
+                offset,
+            )
+            .with_payload(chunk);
+            transport.queue_response(&header, chunk);
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_reads_version_and_config_in_one_session() {
+        let transport = KeepaliveTestTransport::new();
+        queue_version_response(&transport);
+        let config = Bt2Config::zeroed();
+        queue_config_responses(&transport, &config);
+
+        let session = Session::new(&transport);
+        backup_session(
+            &session,
+            None,
+            None,
+            Duration::ZERO,
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap();
+
+        let frames = transport.sent_frames();
+        assert_eq!(frames.len(), 1 + 20);
+        let version = CustomHeader::parse(&frames[0][1..]).unwrap();
+        assert_eq!(version.cmd, commands::cmd::READ_VERSION);
+        assert_eq!(version.chunk_len, 4);
+
+        for (index, frame) in frames[1..].iter().enumerate() {
+            assert_eq!(frame.len(), 17);
+            let header = CustomHeader::parse(&frame[1..]).unwrap();
+            assert_eq!(header.cmd, commands::cmd::READ_CONFIG);
+            assert_eq!(header.offset as usize, index * 142);
+            assert_eq!(header.chunk_len, CONFIG_SIZE as u16);
+            assert_eq!(header.total_len, CONFIG_SIZE as u32);
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_hold_runs_official_input_keepalive() {
+        let transport = KeepaliveTestTransport::new();
+        queue_version_response(&transport);
+        let config = Bt2Config::zeroed();
+        queue_config_responses(&transport, &config);
+        transport.queue_envelope_input(&sample_input_report());
+        transport.queue_envelope_input(&sample_input_report());
+
+        let session = Session::new(&transport);
+        backup_session(
+            &session,
+            None,
+            None,
+            Duration::from_millis(50),
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap();
+
+        let frames = transport.sent_frames();
+        assert!(
+            frames.len() >= 1 + 20 + 2 + 2,
+            "unexpected frame count: {}",
+            frames.len()
+        );
+        let hold = &frames[21..];
+        let enable = CustomHeader::parse(&hold[0][1..]).unwrap();
+        assert_eq!(enable.cmd, commands::cmd::REPORT_ENABLE);
+        assert_eq!(enable.subcmd, 1);
+        let disable = CustomHeader::parse(&hold[hold.len() - 1][1..]).unwrap();
+        assert_eq!(disable.cmd, commands::cmd::REPORT_ENABLE);
+        assert_eq!(disable.subcmd, 0);
+        for frame in &hold[1..hold.len() - 1] {
+            let header = CustomHeader::parse(&frame[1..]).unwrap();
+            assert_eq!(header.cmd, commands::cmd::INPUT);
+        }
     }
 }

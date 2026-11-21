@@ -51,6 +51,8 @@ graph LR
 - したがって、CLI が長寿命セッションを維持するには、前面アプリ相当の定期通信（`0x0007` + 20ms `0x0003`）が必要になる可能性がある（未検証）。
 - 推奨する keepalive は公式方式であり、`ReadVersion` を keepalive に使う案は採用しない。`ReadVersion` は接続時の 1 回のみとする。
 - 実機実験: `eightbitdo keepalive --interval-ms 20 --duration 120`。測定項目は、維持できた秒数、切断理由、USB 併用の有無、送信数 / 受信数、背面相当（送信停止）との比較である。
+- **実機観測**: 20ms `0x0003` の keepalive では **128.9 秒**維持できた。一方、`config dump` を別プロセスで実行すると BLE 設定モードが切れて `Timeout waiting for reply` になった。BLE は 1 central しか接続できず、プロセスをまたいで接続を共有できないため、複数の読み取りは 1 接続にまとめる必要がある。
+- **1 接続バックアップ**: `eightbitdo backup --raw backup.bin --json backup.json --hold N` は、1 回の接続で `ReadVersion`（`0x000B`）→ `read_config_snapshot()`（20 チャンク）→ 必要なら `0x0007` + 20ms `0x0003` の keepalive を N 秒実行する。`--hold` 中は他のコマンドを送らない。`N=0` なら読み終えて直ちに切断する。
 - **これは設計ノートであり、プロトコル要件ではない。**
 
 ---

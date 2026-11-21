@@ -154,9 +154,11 @@ graph TD
   - 読み取り専用コマンドから順に実機検証:
     1. `eightbitdo-cli scan` / `info`（バージョン・内部 PID 取得）
     2. `eightbitdo-cli config dump --raw backup.bin`（2768B ダンプ＆JSON 出力）
-    3. `eightbitdo-cli monitor`（`cmd 0x0007` → `0x0003` リアルタイム入力表示）
-    4. `eightbitdo-cli macro read / write / record`（Erase `0x104` → Write `0x103` → Header `0x01` → Save `0x06`）
-    5. `eightbitdo-cli config apply`（部分書込 + CRC 再計算 + Save）
+    3. `eightbitdo-cli backup --raw backup.bin --json backup.json [--hold N]`（**1 接続**で version + 2768B config を読み、必要なら `0x0007` + 20ms `0x0003` の keepalive で接続を保持）
+    4. `eightbitdo-cli monitor`（`cmd 0x0007` → `0x0003` リアルタイム入力表示）
+    5. `eightbitdo-cli macro read / write / record`（Erase `0x104` → Write `0x103` → Header `0x01` → Save `0x06`）
+    6. `eightbitdo-cli config apply`（部分書込 + CRC 再計算 + Save）
+  - **1 接続でまとめる方針**: BLE は 1 central しか接続できず、プロセスをまたいで接続を共有できない。また `80ND` は無通信で切れることがある。複数の読み取りは `backup` のように同一 `Session` でまとめ、長寿命が必要な場合だけ `--hold` で公式方式の keepalive を回す。
   - Linux 用 udev ルール（`packaging/linux/99-8bitdo-ultimate2.rules`）作成
 - **完了条件**: Switch で操作できる状態を維持したまま、Linux PC から BLE 経由でプロファイル読込・マクロ録音＆書込・Switch 側でのマクロ発動まで確認できること。
 
