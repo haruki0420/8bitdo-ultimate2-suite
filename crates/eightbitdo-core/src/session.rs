@@ -119,12 +119,16 @@ enum DrainOutcome {
 ///
 /// Dropping a **read** leaves its response in flight, so the next read must
 /// drain stale frames first. Dropping an **input poll** leaves only a realtime
-/// report (or nothing) behind, which the input path always skips, so it needs
-/// no resync.
+/// report (or nothing) behind, which the input path always skips, so a normal
+/// input poll (report, `Ok(None)`, or a drop while waiting) needs no resync.
+/// A **protocol error** on the input path is different: `try_next_input` calls
+/// `fail()` before returning, because an unknown frame may be followed by a
+/// stale response for a later read.
 ///
-/// This is the whole judgement: a front end never has to tell the session
-/// "that drop was mine", which is what allowed a stale frame to be accepted by
-/// the next read.
+/// This is the whole judgement for successful and cancelled operations: a
+/// front end never has to tell the session "that drop was mine", which is what
+/// allowed a stale frame to be accepted by the next read. Failed input polls
+/// are marked explicitly by the caller.
 struct ResyncGuard<'a> {
     needs_resync: &'a AtomicBool,
     in_flight: &'a AtomicU8,
@@ -512,6 +516,10 @@ impl<T: Transport> Session<T> {
     /// an earlier `info`), and the next read must drain it instead of accepting
     /// it as the answer to its own request.
     pub async fn try_next_input(&self, wait: Duration) -> Result<Option<InputReport>, Error> {
+        // M-4: the cap is "consecutive within one call", so a run left at the
+        // cap by a previous protocol error must not make the first frame of
+        // this call fail immediately.
+        self.clear_decode_failures();
         // An abandoned input poll leaves at most one realtime report behind,
         // which every read path skips, so it never marks the session for
         // resync (see `ResyncGuard`). A protocol error is different: it is
@@ -522,9 +530,10 @@ impl<T: Transport> Session<T> {
             let now = Instant::now();
             if now >= deadline {
                 self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
-                // M-4 boundary: this is an idle return. Even if the drain
-                // above consumes one more malformed frame, the run ends here;
-                // the cap counts back-to-back frames within one call only.
+                // M-4 boundary: this is an idle return. The opportunistic
+                // drain may consume the next malformed frame, but that frame
+                // is discarded without being counted; the cap counts only
+                // back-to-back frames read by the loop within one call.
                 self.clear_decode_failures();
                 return Ok(None);
             }
@@ -539,8 +548,8 @@ impl<T: Transport> Session<T> {
                 Err(_) => {
                     self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
                     // Same M-4 boundary as the deadline branch: a per-frame
-                    // timeout is an idle gap, so the next call starts a new
-                    // malformed run.
+                    // timeout is an idle gap. A frame eaten by the drain is
+                    // discarded, and the next call starts a new run.
                     self.clear_decode_failures();
                     return Ok(None);
                 }
@@ -2209,6 +2218,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn protocol_error_run_does_not_carry_into_the_next_call() {
+        // M-4: the cap is per call. After an eight-frame protocol error, the
+        // next call's first malformed frame starts a new run instead of
+        // failing immediately on a stale counter.
+        let mock = MockTransport::new();
+        for _ in 0..MAX_CONSECUTIVE_DECODE_FAILURES {
+            mock.push_incoming(&[0xEE; 5]);
+        }
+        let session = Session::new(&mock);
+
+        let result = session.try_next_input(Duration::from_millis(200)).await;
+        assert!(
+            matches!(result, Err(Error::Protocol(_))),
+            "the first call must fail at the cap, got {result:?}"
+        );
+        assert_eq!(
+            session.consecutive_decode_failures.load(Ordering::Relaxed),
+            MAX_CONSECUTIVE_DECODE_FAILURES as u32
+        );
+
+        mock.push_incoming(&[0xEE; 5]);
+        let report = InputReport {
+            keys: 0x0000_0011,
+            ..InputReport::default()
+        };
+        let input =
+            CustomHeader::new(commands::cmd::INPUT, 0, 12, 12).with_payload(&report.to_bytes());
+        mock.push_response(&input, &report.to_bytes());
+
+        let decoded = session
+            .try_next_input(Duration::from_millis(200))
+            .await
+            .expect("one malformed frame is below the per-call cap")
+            .expect("the report after it is delivered");
+        assert_eq!(decoded, report);
+        assert_eq!(
+            session.skipped_frames(),
+            (MAX_CONSECUTIVE_DECODE_FAILURES + 1) as u64,
+            "the next call counted only its own malformed frame"
+        );
+    }
+
     /// Transport that keeps queueing frames and appends a fresh ReadVersion
     /// response when the request is sent, like a device answering on demand.
     struct StaleVersionAfterNoiseTransport {
@@ -2389,19 +2441,20 @@ mod tests {
 
     #[tokio::test]
     async fn seven_malformed_frames_then_idle_then_one_more_do_not_fail() {
-        // M-4 boundary: the cap counts back-to-back frames within one call.
-        // Seven malformed frames, an idle gap, and the eighth in the next call
-        // must not add up to a protocol error (and the eighth must not be
-        // silently eaten by the first call's deadline drain).
+        // M-4 boundary: the cap counts frames read back-to-back by the loop
+        // within one call. Seven malformed frames, then a stall: the deadline
+        // drain consumes the eighth frame queued behind it without counting
+        // it, so the call returns Ok(None) and skipped_frames stays 7. The
+        // second call proves the drain consumed the eighth: if it were still
+        // queued, that call would count it (skipped_frames would become 8).
         let mut scripted = Vec::new();
         for _ in 0..MAX_CONSECUTIVE_DECODE_FAILURES - 1 {
             scripted.push(ScriptedFrame::Data(vec![0xEE; 5]));
         }
-        // Main wait and opportunistic drain of the first call.
+        // Main wait, then the frame the opportunistic drain discards.
         scripted.push(ScriptedFrame::Stall);
-        scripted.push(ScriptedFrame::Stall);
-        // The eighth malformed frame arrives after the idle gap.
         scripted.push(ScriptedFrame::Data(vec![0xEE; 5]));
+        // Second call: idle, with no malformed frame left to count.
         scripted.push(ScriptedFrame::Stall);
 
         let transport = ScriptedTransport::new(scripted);
@@ -2421,8 +2474,8 @@ mod tests {
         }
         assert_eq!(
             session.skipped_frames(),
-            MAX_CONSECUTIVE_DECODE_FAILURES as u64,
-            "the eighth malformed frame must be counted in the second run, not hidden"
+            (MAX_CONSECUTIVE_DECODE_FAILURES - 1) as u64,
+            "the eighth frame was drained, not counted in a new run"
         );
         assert!(
             !session.needs_resync.load(Ordering::SeqCst),
