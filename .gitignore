@@ -1,0 +1,47 @@
+# Proprietary official binaries & installers (DO NOT COMMIT)
+*.apk
+*.exe
+*.dll
+*.pdb
+*.lib
+*.so
+*.dylib
+8BitDo_Ultimate_Software_V2_*/
+
+# Build artifacts & dependencies
+target/
+build/
+dist/
+out/
+.gradle/
+.build/
+DerivedData/
+*.xcarchive
+*.ipa
+*.aab
+
+# Rust / Cargo
+Cargo.lock.bak
+**/*.rs.bk
+
+# Android / Kotlin
+local.properties
+.idea/
+*.iml
+captures/
+.cxx/
+
+# iOS / Xcode / Swift
+*.xcuserdata/
+*.xcworkspace/xcuserdata/
+.swiftpm/
+
+# OS & Editor temporary files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.env
+.env.local
