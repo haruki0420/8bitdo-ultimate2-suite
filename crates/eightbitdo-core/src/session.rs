@@ -361,9 +361,10 @@ impl<T: Transport> Session<T> {
     /// subcmd 0x0002` envelope and as a direct `cmd 0x0002` frame. A
     /// payload-less acknowledgement (`chunk_len = 0`) and unrelated commands
     /// (for example the asynchronous `0x0012` "configuration allowed" notice)
-    /// are skipped. A response `offset` equal to the requested offset is used
-    /// as-is; `offset = 0` is treated as a sequential chunk and placed at the
-    /// requested offset.
+    /// are skipped. The first chunk may report `offset = 0` (the unit's
+    /// sequential-chunk convention) and is placed at the requested offset;
+    /// every later chunk must name the requested offset exactly. A chunk that
+    /// overlaps bytes already received fails the read.
     ///
     /// The CRC is checked with the official in-place algorithm: the stored
     /// `+0x0C` value is compared with `ANSI_CRC_16_sh` over a copy of the
@@ -567,9 +568,10 @@ impl<T: Transport> Session<T> {
     /// This is the ReadConfig-specific transfer loop. Each iteration sends
     /// `read_config_from(offset)` and waits for exactly one data response.
     /// The response payload is copied at the requested offset, and the offset
-    /// advances by `payload.len()`. A response `offset` equal to the requested
-    /// offset is used as-is; `offset = 0` is treated as the device's
-    /// sequential-chunk convention and placed at the requested offset.
+    /// advances by `payload.len()`. `offset = 0` is accepted only for the
+    /// first chunk, where it is the device's sequential-chunk convention;
+    /// later chunks must echo the requested offset, so a re-sent first chunk
+    /// fails the read instead of shifting the whole block.
     ///
     /// `expected_len` must be [`CONFIG_SIZE`]. Use
     /// [`read_transfer`](Self::read_transfer) for single-request transfers
@@ -647,17 +649,21 @@ impl<T: Transport> Session<T> {
                 if response_offset >= expected_len {
                     return Err(out_of_range(response_offset, expected_len));
                 }
-                if response_offset != offset && response_offset != 0 {
+
+                // The unit answers offset=0 for sequential chunks and echoes
+                // the request offset for the final chunk. offset=0 only marks a
+                // sequential chunk for the first request: after that, a chunk
+                // that still names offset 0 can only be a re-send of the first
+                // one. Placing it at the requested offset would shift every
+                // later chunk by one payload length and still fill the buffer.
+                let sequential_first = offset == 0 && response_offset == 0;
+                if response_offset != offset && !sequential_first {
                     return Err(Error::UnexpectedResponse(format!(
                         "config chunk offset 0x{response_offset:X} does not match requested offset 0x{offset:X}"
                     )));
                 }
 
-                let placement = if response_offset == 0 {
-                    offset
-                } else {
-                    response_offset
-                };
+                let placement = offset;
                 // The unit returns a fixed 142-byte final chunk even when the
                 // remaining transfer is shorter. Keep only the bytes inside
                 // the 2768-byte block and ignore the trailing padding.
@@ -786,14 +792,19 @@ impl TransferBuffer {
             return Err(out_of_range(offset, expected));
         }
 
-        for (index, &byte) in chunk.iter().enumerate() {
-            let position = offset + index;
-            if !self.filled[position] {
-                self.data[position] = byte;
-                self.filled[position] = true;
-                self.received += 1;
-            }
+        // A chunk that overlaps bytes already received is a re-send of an
+        // older response (or device misbehaviour), not new data. Accepting it
+        // silently would splice stale bytes into the transfer, so the whole
+        // read fails instead.
+        if let Some(position) = (offset..end).find(|&position| self.filled[position]) {
+            return Err(Error::UnexpectedResponse(format!(
+                "chunk at offset 0x{offset:X} overlaps bytes already received at 0x{position:X}"
+            )));
         }
+
+        self.data[offset..end].copy_from_slice(chunk);
+        self.filled[offset..end].fill(true);
+        self.received += chunk.len();
         Ok(())
     }
 
@@ -1132,11 +1143,15 @@ mod tests {
             if index == 7 {
                 mock.push_incoming(&OBSERVED_CONFIG_ACK);
             }
-            // The unit returns offset=0 for sequential chunks.
+            // The unit reports offset=0 only for the first request; later
+            // chunks must echo the requested offset. A repeated offset=0 is a
+            // stale re-send and is rejected (see
+            // `resent_first_config_chunk_is_rejected_instead_of_shifting_the_block`).
+            let offset = (index * chunk_size) as u32;
             let header = envelope_header(
                 commands::cmd::READ_CONFIG,
                 CONFIG_SIZE as u32,
-                0,
+                offset,
                 chunk.len() as u16,
             );
             mock.push_response(&header, chunk);
@@ -1309,6 +1324,92 @@ mod tests {
             result,
             Err(Error::UnexpectedResponse(message)) if message.contains("does not match requested offset")
         ));
+    }
+
+    #[tokio::test]
+    async fn resent_first_config_chunk_is_rejected_instead_of_shifting_the_block() {
+        // B1 regression: only the first chunk may report offset=0. A re-sent
+        // first chunk (offset=0, 142 bytes) arriving for the offset=142 request
+        // must fail the read; splicing it there would shift every later byte
+        // by 142 and still produce a complete 2768-byte buffer that the CLI
+        // would save as a valid backup.
+        let config = sample_config();
+        let bytes = config.as_bytes();
+        let mock = MockTransport::new();
+
+        let first = envelope_header(commands::cmd::READ_CONFIG, CONFIG_SIZE as u32, 0, 142);
+        mock.push_response(&first, &bytes[..142]);
+        mock.push_response(&first, &bytes[..142]);
+        push_config_envelope_chunks(&mock, &bytes[142..], 142);
+
+        let session = Session::new(&mock);
+        let result = session.read_config_snapshot().await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::UnexpectedResponse(ref message))
+                    if message.contains("does not match requested offset")
+            ),
+            "a re-sent first chunk must fail the read, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_chunk_in_one_transfer_is_rejected_as_an_overlap() {
+        // The ReadConfig loop never lets a re-send reach the buffer (the
+        // offset check refuses it first), so the buffer guard is exercised
+        // through a single-request transfer: two chunks at the same offset.
+        let mock = MockTransport::new();
+        let header = envelope_header(
+            commands::cmd::READ_VERSION,
+            commands::VERSION_RESPONSE_LEN as u32,
+            0,
+            2,
+        );
+        mock.push_response(&header, &[0x01, 0x02]);
+        mock.push_response(&header, &[0x0A, 0x0B]);
+
+        let session = Session::new(&mock);
+        let result = session
+            .read_transfer(
+                commands::cmd::READ_VERSION,
+                commands::VERSION_RESPONSE_LEN,
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(Error::UnexpectedResponse(ref message)) if message.contains("overlaps")),
+            "a duplicate chunk must fail the read, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn transfer_buffer_rejects_overlapping_inserts() {
+        let mut buffer = TransferBuffer::new(16);
+        buffer.insert(0, &[1u8; 8]).unwrap();
+        buffer.insert(8, &[2u8; 8]).unwrap();
+        assert!(buffer.is_complete());
+        assert_eq!(buffer.received(), 16);
+
+        let mut buffer = TransferBuffer::new(16);
+        buffer.insert(0, &[1u8; 8]).unwrap();
+        let error = buffer.insert(4, &[2u8; 8]).unwrap_err();
+        assert!(
+            matches!(error, Error::UnexpectedResponse(ref message) if message.contains("overlaps")),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            buffer.received(),
+            8,
+            "a rejected chunk must not fill any byte"
+        );
+        // A partial overlap with the end of the filled range is rejected too.
+        let error = buffer.insert(6, &[3u8; 2]).unwrap_err();
+        assert!(matches!(error, Error::UnexpectedResponse(_)));
+        // Adjacent, non-overlapping writes still work.
+        buffer.insert(8, &[4u8; 8]).unwrap();
+        assert!(buffer.is_complete());
     }
 
     #[tokio::test]
