@@ -41,15 +41,20 @@
 5. PR を作成する。PR テンプレートで **Review Tier** を提案する（混合 PR は最大 Tier）。
 6. CI がすべて通ることを確認する。
 7. **著者以外**のレビュアー（別セッションの AI エージェント、または人間）が、Tier に応じた深度で差分をレビューする。
-8. レビュアーが PR にレビューを投稿し、**マージ可**の場合のみ、**レビューした head SHA** に `review-gate` status を付ける。
+8. Tier 1 はレビュアー本人、Tier 2/3 はリードレビュアーが、全員の「マージ可」を確認してから、**レビューした head SHA** に `review-gate` status を付ける。
 
    ```bash
    set -euo pipefail
 
    REPO=haruki0420/8bitdo-ultimate2-suite
    PR=123
-   TIER=2
+   TIER=2  # Tier 1/3 では変更する
    REVIEWED_SHA=<レビューした head SHA>
+
+   case "$TIER" in
+     1|2|3) ;;
+     *) echo "TIER must be 1, 2 or 3" >&2; exit 1 ;;
+   esac
 
    current=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)
    if [ "$current" != "$REVIEWED_SHA" ]; then
@@ -74,17 +79,15 @@
 
 Tier の判定・パス別トリガー・故障リストの詳細は **[docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)** を参照してください。ここでは要約だけを示します。
 
-- **Tier 1**: コメント・整形、通常の docs、純粋なテスト追加。レビュアー 1 名。
-- **Tier 2**: 通常のコード（書き込み経路を除く）、読み取り系ビルダー、プロセス文書、依存・ツールチェーン、リファクタ、テスト変更。レビュアー 2 名（仕様検収 + 実装/回帰）。
-- **Tier 3**: 実機書き込み / Flash / OTA / backup-restore / CRC / offset / framing / マクロ step / セキュリティ / ゲート実装 / リリース。レビュアー 2 名 + 別セッションの敵対的パス。
-
-- 行数ではなく **触った領域** で判定する。10 行の CRC 変更は Tier 3、1000 行の README 整形は Tier 1。
-- コードのリファクタは Tier 1 にしない。テストの変更・削除は Tier 2。実機書き込み・Flash・OTA・セキュリティは小さくても Tier 3。
+- **Tier 1**: レビュアー 1 名。
+- **Tier 2**: レビュアー 2 名（仕様検収 + 実装/回帰）。
+- **Tier 3**: レビュアー 2 名 + 別セッションの敵対的パス（計 3 セッション）。
+- 対象・パス別トリガー・故障リストは **[docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)** を参照。
 - 混合 PR は最大 Tier。著者が提案し、レビュアーは昇格できる（降格は不可）。
-- **プロセス文書は Tier 2、ゲートの実装（workflow / ruleset / status）は Tier 3。**
+- コードのリファクタは Tier 1 にしない。テストの変更・削除は Tier 2。実機書き込み・Flash・OTA・セキュリティは小さくても Tier 3。
 - Tier 2/3 は **全レビュアーが同じ head SHA で「マージ可」** を出すまでマージしない。1 名でも要修正なら status を付けない。
-- リードレビュアーが全員の判定を確認してから `review-gate` status を付ける。判定が割れたら Tier を上げるか 3 本目を追加する。
-- Tier 2/3 は「故障 → 検出方法 → 結果 → 残存リスク」を PR に残す。件数はコードの下限であり、docs のノルマではない。
+- **Tier 1 はレビュアー本人、Tier 2/3 はリードレビュアー**が、全員の判定を確認してから `review-gate` status を付ける。判定が割れたら Tier を上げるか 3 名目を追加する。
+- Tier 2/3 は「故障 → 検出方法 → 結果 → 残存リスク」を PR に残す。件数はコードの下限であり、docs は検出方法で数える。
 - **「マージ可」が出るまでマージしない。** 修正を push したら新しい SHA で再レビューする。
 
 レビュアーは「作者の意図」ではなく、**仕様書と実装の一致** を確認します。

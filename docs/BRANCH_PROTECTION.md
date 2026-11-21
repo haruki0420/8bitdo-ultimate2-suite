@@ -113,6 +113,10 @@ REPO=haruki0420/8bitdo-ultimate2-suite
 PR="${1:?usage: post-review-status.sh <pr-number> <reviewed-sha> <tier>}"
 REVIEWED_SHA="${2:?usage: post-review-status.sh <pr-number> <reviewed-sha> <tier>}"
 TIER="${3:?usage: post-review-status.sh <pr-number> <reviewed-sha> <tier>}"
+case "$TIER" in
+  1|2|3) ;;
+  *) echo "TIER must be 1, 2 or 3" >&2; exit 1 ;;
+esac
 
 current=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)
 if [ "$current" != "$REVIEWED_SHA" ]; then
