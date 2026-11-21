@@ -25,6 +25,14 @@ pub mod cmd {
     pub const REPORT_ENABLE: u16 = 0x0007;
     /// Read firmware version.
     pub const READ_VERSION: u16 = 0x000B;
+
+    /// Generic App Mode response envelope (`cmd 0x0004`).
+    ///
+    /// On the observed `0x600F` unit every command response arrives with this
+    /// `cmd`; the request command is echoed in `subcmd` and the transfer size
+    /// in `total_len`. A payload-less acknowledgement uses
+    /// `chunk_len = total_len = 0`.
+    pub const RESPONSE: u16 = 0x0004;
     /// Enter the BLE bootloader.
     pub const ENTER_BOOT: u16 = 0x000C;
     /// Disconnect the Bluetooth configuration link.
@@ -71,8 +79,22 @@ pub mod subcmd {
 /// valid for the Ultimate 2 Bluetooth.
 pub const VERSION_REQUEST_LEN: u32 = 4;
 
-/// `ReadVersion` response payload length (version string + metadata).
-pub const VERSION_RESPONSE_LEN: usize = 0x30;
+/// Dummy payload sent with the `0x600F` `ReadVersion` request.
+///
+/// The official `getVersionChannel` (0x2c7a0) points the channel payload at
+/// the 4-byte `gamepadVersion` buffer and sets both `total_len` and
+/// `chunk_len` to 4. `Generate_CustomDataCmd` (0x27620) copies those 4 bytes
+/// into the request, so the wire request is 21 bytes
+/// (`0x04` + 16-byte header + 4 bytes) rather than the 17-byte payload-less
+/// frame. The buffer is zero-initialised on the first call; this
+/// implementation always sends zeroes and does not cache a previous version.
+pub const VERSION_REQUEST_PAYLOAD: [u8; VERSION_REQUEST_LEN as usize] = [0; 4];
+
+/// `ReadVersion` response payload length on `0x600F` (`total_len = 4`).
+///
+/// The official `getVersion` (0x35700) reads the first four bytes as a
+/// little-endian `i32`; no long version string is transferred.
+pub const VERSION_RESPONSE_LEN: usize = VERSION_REQUEST_LEN as usize;
 
 /// Maximum `WriteBT2Macro` (`cmd 0x0103`) payload per packet (`0x40`).
 pub const MACRO_MAX_CHUNK_SIZE: usize = 0x40;
@@ -338,8 +360,16 @@ pub fn save(transport: SaveTransport) -> Request {
 /// Read the firmware version.
 ///
 /// For the `0x600F` (`gamepad_type == 1`) the official request uses
-/// `total_len = 4` and `offset = 0x01017040`. The `0x01020030` query value is
-/// the `gamepad_type == 2` variant and must not be used here.
+/// `total_len = chunk_len = 4` and `offset = 0x01017040`. The
+/// `0x01020030` query value is the `gamepad_type == 2` variant and must not
+/// be used here.
+///
+/// The request carries a 4-byte zero payload. The official channel points at
+/// the zero-initialised `gamepadVersion` buffer and `Generate_CustomDataCmd`
+/// copies it into the packet (payload copy and CRC path around
+/// `0x27a37..0x27b72` in `libadvancelib.so`). The packet CRC is computed over
+/// those four bytes, so the wire header has `crc16 = 0x2400`
+/// (CRC-16/MODBUS of `00 00 00 00`), not `0xFFFF`.
 #[must_use]
 pub fn read_version() -> Request {
     Request::new(
@@ -348,6 +378,7 @@ pub fn read_version() -> Request {
         VERSION_REQUEST_LEN,
         boot::VERSION_ADDR,
     )
+    .with_crc_payload(&VERSION_REQUEST_PAYLOAD)
 }
 
 /// Report the host as a phone platform.
@@ -903,9 +934,41 @@ mod tests {
     fn read_version_uses_type_1_parameters() {
         let request = read_version();
         assert_eq!(request.header.cmd, 0x000B);
+        assert_eq!(request.header.subcmd, 0);
+        assert_eq!(request.header.chunk_len, 4);
+        assert_eq!(request.header.crc16, 0x2400);
         assert_eq!(request.header.total_len, 4);
         assert_eq!(request.header.offset, boot::VERSION_ADDR);
         assert_eq!(request.header.offset, 0x0101_7040);
+        assert_eq!(request.payload, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn read_version_golden_request_matches_hardware_shape() {
+        // Evidence: getVersionChannel (0x2c7a0) sets chunk_len = total_len = 4
+        // and points the payload at gamepadVersion; Generate_CustomDataCmd
+        // copies 4 zero bytes and computes CRC-16/MODBUS over them.
+        let bytes = read_version().encode_ble(PacketKind::App).unwrap();
+        assert_eq!(
+            bytes,
+            [
+                0x04, // BLE App prefix
+                0x0B, 0x00, // cmd = 0x000B
+                0x00, 0x00, // subcmd
+                0x04, 0x00, // chunk_len = 4
+                0x00, 0x24, // crc16 = 0x2400
+                0x04, 0x00, 0x00, 0x00, // total_len = 4
+                0x40, 0x70, 0x01, 0x01, // offset = 0x01017040
+                0x00, 0x00, 0x00, 0x00, // payload
+            ]
+        );
+    }
+
+    #[test]
+    fn version_response_envelope_constant_is_not_a_request_command() {
+        assert_eq!(cmd::RESPONSE, 0x0004);
+        assert_ne!(cmd::RESPONSE, cmd::READ_VERSION);
+        assert_ne!(cmd::RESPONSE, cmd::READ_CONFIG);
     }
 
     #[test]

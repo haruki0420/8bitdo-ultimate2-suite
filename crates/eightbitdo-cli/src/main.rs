@@ -176,6 +176,11 @@ async fn info(options: &BleOptions) -> Result<(), Error> {
 
     println!("version raw: {raw}");
     println!("version text: {text}");
+    if let Ok(bytes) = <[u8; 4]>::try_from(version.raw.as_slice()) {
+        // The official getVersion (0x35700) reads the 4-byte payload as a
+        // little-endian i32.
+        println!("version value: 0x{:08X}", u32::from_le_bytes(bytes));
+    }
     Ok(())
 }
 

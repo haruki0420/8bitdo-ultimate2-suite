@@ -179,6 +179,44 @@ Windows の `FindHid` / `enum_hid` は `HidD_GetPreparsedData` + `HidP_GetCaps` 
      - `cmd == 0x000E`: コントローラ側エラー通知。
    - **Bootloader チャネル応答一致**: Bootloader 応答では `*(u16*)pkt == 0x00F5` 等（`0xF5` を含む先頭タグ）や `pkt[2] == Channel[+0x32]` により進行中 Boot チャネルと照合する。
 
+#### 4.3.1 FF13 個体の実機観測（2026-11-21）
+
+実機 Ultimate 2 Bluetooth（BLE 設定モード `80ND`、GATT characteristic は `FF11` ではなく **`FF13`**、MTU 200）で次を観測した。これは仕様変更ではなく、受信エンベロープと `ReadVersion` 要求形状に関する**観測・実装ノート**である。
+
+- 旧実装が送った `ReadVersion`（17B、ペイロードなし）:
+  ```text
+  04 0B 00 00 00 00 00 00 00 04 00 00 00 40 70 01 01
+  ```
+  - `0x04` は BLE App プレフィックス。続く 16B は `cmd=0x000B`, `subcmd=0`, `chunk_len=0`, `crc16=0`, `total_len=4`, `offset=0x01017040`。
+- その応答（16B、プレフィックスなし）:
+  ```text
+  04 00 0B 00 00 00 FF FF 00 00 00 00 00 00 00 00
+  ```
+  - `cmd=0x0004`（汎用応答エンベロープ）, `subcmd=0x000B`（要求 `cmd` のエコー）, `chunk_len=0`, `crc16=0xFFFF`, `total_len=0`, `offset=0`。
+  - これはデータ 0 バイトの **ACK** であり、`ReadVersion` のデータ応答ではない。
+
+**確定したこと**:
+
+- `0x600F` の応答は `cmd=0x0004` の汎用エンベロープで、`subcmd` に要求 `cmd`（この個体では `0x000B` / `0x0002`）が入る。`total_len`（`+0x8`）は要求側チャネルの `total_len` と一致する必要がある（`readBleHidData` 0x29030 の照合）。
+- `chunk_len=0` かつ `total_len=0` のフレームは ACK であり、データ応答として扱ってはならない。データ応答は `chunk_len > 0` かつ `total_len == 要求 total_len`。
+- `ReadVersion` の要求には **4 バイトのダミーペイロード**が必要である。公式 `getVersionChannel`（0x2c7a0）はチャネル `+0x34 = 4`, `+0x40 = 4`（`total_len`）, `+0x44 = 4`（`chunk_len`）, `+0x50 = gamepadVersion` を設定し、`Generate_CustomDataCmd`（0x27620）は `+0x50` の 4 バイトを要求へコピーする。`gamepadVersion` は初回 0 初期化である。
+- その結果、正しい要求は 21B になる（CRC は 4 バイトのゼロに対して計算され `0x2400`）:
+  ```text
+  04 0B 00 00 04 00 00 24 04 00 00 00 40 70 01 01 00 00 00 00
+  ```
+  - 内訳: `04` + `cmd=0x000B` + `subcmd=0` + `chunk_len=4` + `crc16=0x2400` + `total_len=4` + `offset=0x01017040` + 4B ゼロ。
+- データ応答の例（`total_len=4`, `chunk_len=4`）:
+  ```text
+  04 00 0B 00 04 00 00 00 04 00 00 00 00 00 00 00 XX XX XX XX
+  ```
+  - `cmd=0x0004`, `subcmd=0x000B`, `chunk_len=4`, `crc16=0`（応答側の CRC は未使用）, `total_len=4`, `offset=0`。末尾 4B がバージョン値で、公式 `getVersion`（0x35700）は先頭 4B を LE の `i32` として読む。
+
+**未確定のこと**:
+
+- 4B ペイロード付き要求に対する実機のデータ応答は、本ノート作成時点では未取得である（親エージェントが実機で確認する）。特に、応答ヘッダの `offset` が `0` か要求 `offset`（`0x01017040`）をエコーするかは未確定。現実装は `offset=0` を前提に範囲検査するが、実機で `offset=0x01017040` が観測された場合はこの節と実装を更新する。
+- `config` 読み出しでも同じ `cmd=0x0004, subcmd=0x0002` エンベロープを使うことは解析（`readBleHidData`）で確定しているが、この個体での `config dump` の生フレームは未取得である。
+- 公式アプリは要求ペイロードに直前の `gamepadVersion` を再利用する。本実装は常にゼロを送るため、同一接続で 2 回目以降の読み出し時にデバイスが同じ応答を返すかは未確認である（今回の CLI は 1 回読みのみ）。
+
 ### 4.4 USB HID / 2.4G HID フレーミング（Windows `8BitDoAdvance.dll` / Android USB）
 
 USB 有線接続および 2.4GHz ドングル経由の HID 通信は、**65 バイト固定（Report ID 1 バイト + 64 バイトレポート）** で行われる。
@@ -306,7 +344,7 @@ sequenceDiagram
 | **`0x0003`** | `0x0000` | `total_len=0x0C`, `offset=0x0C` | Ctrl ↔ Host | **リアルタイム入力レポート取得 / 通知**（12 バイト、セクション 7 参照） |
 | **`0x0006`** | **`0x0067`** (BLE)<br/>**`0x0123`** (Windows USB) | `total_len=0, offset=0` | Host → Ctrl | **Save（Flash 永続化）**。書き込み系（`0x0001` / `0x0103`）完了後に必ず発行。**BLE(Android) と USB(Windows) でサブコマンドが異なる点に注意**（6.4 参照） |
 | **`0x0007`** | `0x0000` (無効) / `0x0001` (有効) | `total_len=0, offset=0` | Host → Ctrl | **`SetReportEnable`**。リアルタイム入力通知の開始/停止。発行時にクライアント側 `MAX_ATT_MTU = 0x3F` へ設定 |
-| **`0x000B`** | `0x0000` | `0x600F` (`gamepad_type == 1`): `total_len = 4`, `offset = 0x01017040`<br/>`gamepad_type == 2`: `total_len = offset = 0x01020030` | Host → Ctrl | **`ReadVersion`**。ファームウェアバージョン読み出し。`0x01020030` は `gamepad_type == 2` の variant |
+| **`0x000B`** | `0x0000` | `0x600F` (`gamepad_type == 1`): `total_len = 4`, `chunk_len = 4`, `offset = 0x01017040`, 4B ダミーペイロード（`gamepadVersion`、初回ゼロ。CRC-16/MODBUS = `0x2400`）<br/>`gamepad_type == 2`: `total_len = offset = 0x01020030` | Host → Ctrl | **`ReadVersion`**。ファームウェアバージョン読み出し。`0x01020030` は `gamepad_type == 2` の variant。応答は `cmd=0x0004, subcmd=0x000B` エンベロープ（§4.3.1） |
 | **`0x000C`** | **`0x0067`** | `total_len=4, offset=4` | Host → Ctrl | **`EnterBoot`**。App Mode から Bootloader Mode (`"8bt"`) へ再起動遷移 |
 | **`0x000E`** | — | — | Ctrl → Host | エラー応答通知（`readBleHidData` でエラーコードログ出力） |
 | **`0x000F`** | **`0x000F`** | `total_len=0, offset=4` | Host → Ctrl | **`DisConnectBluetooth`**。Bluetooth 設定接続の明示的切断 |

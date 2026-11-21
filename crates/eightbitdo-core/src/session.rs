@@ -24,21 +24,16 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Overall deadline for one 2768-byte configuration read.
 pub const CONFIG_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Upper bound for an assembled `ReadVersion` response.
-///
-/// A real response is [`commands::VERSION_RESPONSE_LEN`] bytes. The bound
-/// exists only to reject a corrupt or wrong-model `total_len` before
-/// allocating.
-const MAX_VERSION_LEN: usize = 0x1000;
-
 /// Decoded firmware version response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionInfo {
-    /// Raw response payload exactly as received (assembled when split).
+    /// Raw response payload exactly as received (`4` bytes on `0x600F`).
     pub raw: Vec<u8>,
     /// Longest printable ASCII run in `raw`, trimmed.
     ///
-    /// Empty when the payload contains no printable bytes.
+    /// Empty when the payload contains no printable bytes. The official
+    /// `getVersion` treats the payload as a little-endian `i32`, so this is
+    /// usually empty for a binary version value.
     pub text: String,
 }
 
@@ -101,53 +96,32 @@ impl<T: Transport> Session<T> {
 
     /// Read the firmware version (`cmd 0x000B`).
     ///
-    /// A response may arrive as one payload or split by `header.offset`. When
-    /// the first chunk declares a larger `total_len` (or a non-zero offset),
-    /// the remaining chunks are assembled before decoding.
+    /// The `0x600F` request carries a 4-byte zero payload and declares
+    /// `total_len = chunk_len = 4`; the device answers with a
+    /// `cmd = 0x0004, subcmd = 0x000B` envelope whose `total_len` is 4. A
+    /// payload-less acknowledgement (`chunk_len = total_len = 0`) is skipped
+    /// and the read continues until the data response arrives or the timeout
+    /// expires.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Timeout`] when no matching notification arrives within
     /// the configured per-frame timeout, [`Error::UnexpectedResponse`] for a
-    /// range outside the declared transfer, or a transport error.
+    /// mismatched envelope or a range outside the declared transfer, or a
+    /// transport error.
     pub async fn read_version(&self) -> Result<VersionInfo, Error> {
         self.transport
             .send(&commands::read_version().encode_ble(PacketKind::App)?)
             .await?;
 
-        let deadline = Instant::now() + self.timeout;
-        let (header, payload) = loop {
-            let frame = self
-                .recv_before(deadline, "waiting for the version response")
-                .await?;
-            let (header, payload) = header::decode_app_response(&frame)?;
-            if header.cmd == commands::cmd::READ_VERSION {
-                break (header, payload.to_vec());
-            }
-        };
-
-        let offset = header.offset as usize;
-        let declared = header.total_len as usize;
-        let split = offset > 0 || (declared > payload.len() && declared <= MAX_VERSION_LEN);
-
-        let raw = if split {
-            let expected = declared.max(offset.saturating_add(payload.len()));
-            if expected > MAX_VERSION_LEN {
-                return Err(Error::UnexpectedResponse(format!(
-                    "version response range 0x{offset:X}..0x{expected:X} exceeds 0x{MAX_VERSION_LEN:X} bytes"
-                )));
-            }
-            self.collect_transfer(
+        let raw = self
+            .read_transfer(
                 commands::cmd::READ_VERSION,
-                expected,
-                Some((header.offset, payload)),
+                commands::VERSION_RESPONSE_LEN,
                 self.timeout,
                 self.timeout,
             )
-            .await?
-        } else {
-            payload
-        };
+            .await?;
 
         let text = longest_printable_run(&raw);
         Ok(VersionInfo { raw, text })
@@ -155,10 +129,13 @@ impl<T: Transport> Session<T> {
 
     /// Read and validate the full 2768-byte configuration block.
     ///
-    /// Notifications with `cmd 0x0002` are assembled by `header.offset`.
-    /// Unrelated commands (for example the asynchronous `0x0012`
-    /// "configuration allowed" notice) are skipped. Duplicate and overlapping
-    /// chunks are accepted; every byte is counted exactly once.
+    /// Responses are accepted both as the observed
+    /// `cmd 0x0004, subcmd 0x0002` envelope and as a direct `cmd 0x0002`
+    /// frame, and are assembled by `header.offset`. A payload-less
+    /// acknowledgement (`chunk_len = total_len = 0`) and unrelated commands
+    /// (for example the asynchronous `0x0012` "configuration allowed" notice)
+    /// are skipped. Duplicate and overlapping chunks are accepted; every byte
+    /// is counted exactly once.
     ///
     /// The CRC is checked with the official in-place algorithm: the stored
     /// `+0x0C` value is compared with `ANSI_CRC_16_sh` over a copy of the
@@ -245,16 +222,24 @@ impl<T: Transport> Session<T> {
 
     /// Read a transfer of exactly `expected_len` bytes for `cmd`.
     ///
-    /// Frames with another command are ignored. `header.offset` and
-    /// `header.chunk_len` must stay inside `expected_len`. Bytes are written
-    /// only on their first arrival, so duplicates cannot shorten or corrupt
-    /// the transfer.
+    /// Both response shapes are accepted:
+    ///
+    /// - the generic envelope observed on `0x600F`
+    ///   (`cmd = 0x0004`, `subcmd = request cmd`, `total_len = expected_len`);
+    /// - a legacy direct echo whose `cmd` equals the request command.
+    ///
+    /// A payload-less acknowledgement (`cmd = 0x0004`, `chunk_len = 0`,
+    /// `total_len = 0`) is skipped. Unrelated asynchronous frames (input
+    /// reports, `0x0012` notices) are also skipped. Envelope frames with a
+    /// mismatched `subcmd` or `total_len`, and chunks whose range falls
+    /// outside `expected_len`, are rejected.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Timeout`] when `total_timeout` expires or a frame does
     /// not arrive within `per_frame_timeout`, [`Error::UnexpectedResponse`] for
-    /// an out-of-range chunk, or a transport/protocol error.
+    /// a mismatched envelope or an out-of-range chunk, or a transport/protocol
+    /// error.
     pub async fn read_transfer(
         &self,
         cmd: u16,
@@ -262,24 +247,9 @@ impl<T: Transport> Session<T> {
         per_frame_timeout: Duration,
         total_timeout: Duration,
     ) -> Result<Vec<u8>, Error> {
-        self.collect_transfer(cmd, expected_len, None, per_frame_timeout, total_timeout)
-            .await
-    }
-
-    async fn collect_transfer(
-        &self,
-        cmd: u16,
-        expected_len: usize,
-        first: Option<(u32, Vec<u8>)>,
-        per_frame_timeout: Duration,
-        total_timeout: Duration,
-    ) -> Result<Vec<u8>, Error> {
         let mut buffer = TransferBuffer::new(expected_len);
-        if let Some((offset, payload)) = first {
-            buffer.insert(offset as usize, &payload)?;
-        }
-
         let deadline = Instant::now() + total_timeout;
+
         while !buffer.is_complete() {
             let now = Instant::now();
             if now >= deadline {
@@ -305,30 +275,61 @@ impl<T: Transport> Session<T> {
                 }
             };
 
-            let (header, payload) = header::decode_app_response(&frame)?;
-            if header.cmd != cmd {
+            let Some((header, payload)) = Self::classify_response(&frame, cmd, expected_len)?
+            else {
                 continue;
-            }
+            };
             buffer.insert(header.offset as usize, payload)?;
         }
 
         Ok(buffer.into_vec())
     }
 
-    async fn recv_before(&self, deadline: Instant, operation: &str) -> Result<Vec<u8>, Error> {
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(Error::Timeout {
-                operation: operation.to_string(),
-            });
+    /// Classify one notification for a request.
+    ///
+    /// Returns `Ok(None)` for a payload-less acknowledgement or an unrelated
+    /// command, and an error for a response envelope that names a different
+    /// request or transfer size.
+    fn classify_response(
+        frame: &[u8],
+        request_cmd: u16,
+        expected_len: usize,
+    ) -> Result<Option<(header::CustomHeader, &[u8])>, Error> {
+        let (response, payload) = header::decode_app_response(frame)?;
+
+        // Backward compatibility: older mocks and possible firmware revisions
+        // answer with the request command directly.
+        if response.cmd == request_cmd {
+            return Ok(Some((response, payload)));
         }
-        let wait = deadline.saturating_duration_since(now);
-        match tokio::time::timeout(wait, self.transport.recv()).await {
-            Ok(result) => result,
-            Err(_) => Err(Error::Timeout {
-                operation: operation.to_string(),
-            }),
+        if response.cmd != commands::cmd::RESPONSE {
+            return Ok(None);
         }
+        if response.subcmd != request_cmd {
+            return Err(Error::UnexpectedResponse(format!(
+                "response envelope subcmd 0x{:04X} does not match request cmd 0x{request_cmd:04X}",
+                response.subcmd
+            )));
+        }
+
+        // Payload-less acknowledgement: the device received the request but
+        // the data response (if any) follows separately.
+        if response.chunk_len == 0 && response.total_len == 0 {
+            return Ok(None);
+        }
+        if response.total_len as usize != expected_len {
+            return Err(Error::UnexpectedResponse(format!(
+                "response envelope total_len {} does not match the expected {expected_len} bytes",
+                response.total_len
+            )));
+        }
+        if response.chunk_len == 0 {
+            return Err(Error::UnexpectedResponse(format!(
+                "response envelope for cmd 0x{request_cmd:04X} declares total_len={} but carries no data",
+                response.total_len
+            )));
+        }
+        Ok(Some((response, payload)))
     }
 }
 
@@ -429,12 +430,54 @@ mod tests {
             .with_chunk_len(chunk_len)
     }
 
+    fn envelope_header(
+        request_cmd: u16,
+        total_len: u32,
+        offset: u32,
+        chunk_len: u16,
+    ) -> CustomHeader {
+        CustomHeader::new(commands::cmd::RESPONSE, request_cmd, total_len, offset)
+            .with_chunk_len(chunk_len)
+    }
+
     fn push_config_chunks(mock: &MockTransport, bytes: &[u8], chunk_size: usize) {
         for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
             let header = config_header((index * chunk_size) as u32, chunk.len() as u16);
             mock.push_response(&header, chunk);
         }
     }
+
+    fn push_config_envelope_chunks(mock: &MockTransport, bytes: &[u8], chunk_size: usize) {
+        for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
+            let header = envelope_header(
+                commands::cmd::READ_CONFIG,
+                CONFIG_SIZE as u32,
+                (index * chunk_size) as u32,
+                chunk.len() as u16,
+            );
+            mock.push_response(&header, chunk);
+        }
+    }
+
+    /// The 16-byte acknowledgement captured from the FF13 unit when the old
+    /// payload-less ReadVersion request (`chunk_len = 0`) was sent.
+    const OBSERVED_VERSION_ACK: [u8; 16] = [
+        0x04, 0x00, 0x0B, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00,
+    ];
+
+    /// Exact 21-byte ReadVersion request derived from `getVersionChannel`
+    /// (0x2c7a0) and `Generate_CustomDataCmd` (0x27620).
+    const READ_VERSION_REQUEST: [u8; 21] = [
+        0x04, // BLE App prefix
+        0x0B, 0x00, // cmd = 0x000B
+        0x00, 0x00, // subcmd
+        0x04, 0x00, // chunk_len = 4
+        0x00, 0x24, // crc16 = 0x2400
+        0x04, 0x00, 0x00, 0x00, // total_len = 4
+        0x40, 0x70, 0x01, 0x01, // offset = 0x01017040
+        0x00, 0x00, 0x00, 0x00, // gamepadVersion dummy payload
+    ];
 
     fn sample_config() -> Bt2Config {
         let mut config = Bt2Config::zeroed();
@@ -450,38 +493,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_version_sends_exact_app_frame_and_decodes_text() {
+    async fn read_version_sends_exact_app_frame_and_decodes_envelope() {
         let mock = MockTransport::new();
-        let response =
-            CustomHeader::new(commands::cmd::READ_VERSION, 0, 4, 0).with_payload(b"FW 1.23");
-        mock.push_response(&response, b"FW 1.23");
+        let response = envelope_header(
+            commands::cmd::READ_VERSION,
+            commands::VERSION_REQUEST_LEN,
+            0,
+            4,
+        );
+        mock.push_response(&response, &[0x01, 0x02, 0x03, 0x04]);
 
         let session = Session::new(&mock);
         let version = session.read_version().await.unwrap();
 
         let sent = mock.sent_frames();
         assert_eq!(sent.len(), 1);
-        let mut expected = vec![0x04];
-        expected.extend_from_slice(&commands::read_version().header.to_bytes());
-        assert_eq!(sent[0], expected);
-        assert_eq!(sent[0][0], 0x04);
-        assert_eq!(version.raw, b"FW 1.23");
-        assert_eq!(version.text, "FW 1.23");
+        assert_eq!(sent[0], READ_VERSION_REQUEST);
+        assert_eq!(version.raw, [0x01, 0x02, 0x03, 0x04]);
     }
 
     #[tokio::test]
-    async fn version_chunks_are_assembled_by_offset() {
+    async fn read_version_skips_observed_ack_before_data() {
         let mock = MockTransport::new();
-        let first = CustomHeader::new(commands::cmd::READ_VERSION, 0, 8, 0).with_payload(b"FW v");
-        let second = CustomHeader::new(commands::cmd::READ_VERSION, 0, 8, 4).with_payload(b"1.23");
-        mock.push_response(&first, b"FW v");
-        mock.push_response(&second, b"1.23");
+        mock.push_incoming(&OBSERVED_VERSION_ACK);
+        let data = envelope_header(
+            commands::cmd::READ_VERSION,
+            commands::VERSION_REQUEST_LEN,
+            0,
+            4,
+        );
+        mock.push_response(&data, &[0x00, 0x01, 0x02, 0x03]);
 
         let session = Session::new(&mock);
         let version = session.read_version().await.unwrap();
 
-        assert_eq!(version.raw, b"FW v1.23");
-        assert_eq!(version.text, "FW v1.23");
+        assert_eq!(version.raw, [0x00, 0x01, 0x02, 0x03]);
+        assert_eq!(mock.sent_frames(), vec![READ_VERSION_REQUEST.to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn read_version_skips_ack_and_times_out_when_no_data_arrives() {
+        let transport = StallingTransport {
+            first: Mutex::new(Some(OBSERVED_VERSION_ACK.to_vec())),
+        };
+        let session = Session::new(&transport).with_timeout(Duration::from_millis(20));
+        let result = session.read_version().await;
+        assert!(matches!(result, Err(Error::Timeout { .. })));
+    }
+
+    #[tokio::test]
+    async fn legacy_direct_cmd_version_response_is_accepted() {
+        let mock = MockTransport::new();
+        let response =
+            CustomHeader::new(commands::cmd::READ_VERSION, 0, 4, 0).with_payload(&[9, 8, 7, 6]);
+        mock.push_response(&response, &[9, 8, 7, 6]);
+
+        let session = Session::new(&mock);
+        let version = session.read_version().await.unwrap();
+        assert_eq!(version.raw, [9, 8, 7, 6]);
+    }
+
+    #[tokio::test]
+    async fn version_envelope_with_wrong_subcmd_is_rejected() {
+        let mock = MockTransport::new();
+        let response = envelope_header(commands::cmd::ENTER_BOOT, 4, 0, 4);
+        mock.push_response(&response, &[0; 4]);
+
+        let session = Session::new(&mock);
+        let result = session.read_version().await;
+        assert!(matches!(
+            result,
+            Err(Error::UnexpectedResponse(message)) if message.contains("subcmd")
+        ));
+    }
+
+    #[tokio::test]
+    async fn version_envelope_with_wrong_total_len_is_rejected() {
+        let mock = MockTransport::new();
+        let response = envelope_header(commands::cmd::READ_VERSION, 0x30, 0, 4);
+        mock.push_response(&response, &[0; 4]);
+
+        let session = Session::new(&mock);
+        let result = session.read_version().await;
+        assert!(matches!(
+            result,
+            Err(Error::UnexpectedResponse(message)) if message.contains("total_len")
+        ));
+    }
+
+    #[tokio::test]
+    async fn version_envelope_without_data_is_rejected() {
+        let mock = MockTransport::new();
+        // chunk_len = 0 with a non-zero total_len is neither an ACK nor data.
+        let response = envelope_header(commands::cmd::READ_VERSION, 4, 0, 0);
+        mock.push_response(&response, &[]);
+
+        let session = Session::new(&mock);
+        let result = session.read_version().await;
+        assert!(matches!(
+            result,
+            Err(Error::UnexpectedResponse(message)) if message.contains("no data")
+        ));
     }
 
     #[tokio::test]
@@ -505,6 +617,62 @@ mod tests {
         assert_eq!(snapshot.config.as_bytes(), config.as_bytes());
         assert_eq!(snapshot.config.profile_name(Slot::S2), "Fight");
         assert_eq!(snapshot.config.cur_slot(), Some(Slot::S2));
+    }
+
+    #[tokio::test]
+    async fn config_envelope_chunks_are_assembled() {
+        let config = sample_config();
+        let mock = MockTransport::new();
+        push_config_envelope_chunks(&mock, config.as_bytes(), 692);
+
+        let session = Session::new(&mock);
+        let snapshot = session.read_config_snapshot().await.unwrap();
+        assert_eq!(snapshot.config.as_bytes(), config.as_bytes());
+        assert_eq!(snapshot.config.profile_name(Slot::S2), "Fight");
+    }
+
+    #[tokio::test]
+    async fn config_envelope_with_wrong_subcmd_is_rejected() {
+        let mock = MockTransport::new();
+        let header = envelope_header(commands::cmd::READ_VERSION, CONFIG_SIZE as u32, 0, 8);
+        mock.push_response(&header, &[0; 8]);
+
+        let session = Session::new(&mock);
+        let result = session.read_config_snapshot().await;
+        assert!(matches!(
+            result,
+            Err(Error::UnexpectedResponse(message)) if message.contains("subcmd")
+        ));
+    }
+
+    #[tokio::test]
+    async fn config_envelope_with_wrong_total_len_is_rejected() {
+        let mock = MockTransport::new();
+        let header = envelope_header(commands::cmd::READ_CONFIG, 0x100, 0, 8);
+        mock.push_response(&header, &[0; 8]);
+
+        let session = Session::new(&mock);
+        let result = session.read_config_snapshot().await;
+        assert!(matches!(
+            result,
+            Err(Error::UnexpectedResponse(message)) if message.contains("total_len")
+        ));
+    }
+
+    #[tokio::test]
+    async fn config_envelope_out_of_range_offset_is_rejected() {
+        let mock = MockTransport::new();
+        let header = envelope_header(
+            commands::cmd::READ_CONFIG,
+            CONFIG_SIZE as u32,
+            CONFIG_SIZE as u32 - 8,
+            16,
+        );
+        mock.push_response(&header, &[0; 16]);
+
+        let session = Session::new(&mock);
+        let result = session.read_config_snapshot().await;
+        assert!(matches!(result, Err(Error::UnexpectedResponse(_))));
     }
 
     #[tokio::test]
