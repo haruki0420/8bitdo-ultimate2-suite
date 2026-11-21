@@ -12,6 +12,7 @@
 //! `drain budget exhausted`) instead of risking a stale frame being mistaken
 //! for the new response.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::time::Duration;
 
@@ -111,36 +112,81 @@ enum DrainOutcome {
     Exhausted,
 }
 
-/// Marks a session as needing resync when a read operation returns an error or
-/// its future is dropped before completion.
+/// Marks a session for resync when a read returns an error or its future is
+/// dropped before completion, and records what the session has in flight.
+///
+/// Dropping a **read** leaves its response in flight, so the next read must
+/// drain stale frames first. Dropping an **input poll** leaves only a realtime
+/// report (or nothing) behind, which the input path always skips, so it needs
+/// no resync.
+///
+/// This is the whole judgement: a front end never has to tell the session
+/// "that drop was mine", which is what allowed a stale frame to be accepted by
+/// the next read.
 struct ResyncGuard<'a> {
     needs_resync: &'a AtomicBool,
-    dropped_operation: &'a AtomicU8,
-    armed: bool,
+    in_flight: &'a AtomicU8,
+    kind: InFlight,
+    /// True once the operation finished successfully (`disarm`).
+    disarmed: bool,
 }
 
 impl<'a> ResyncGuard<'a> {
-    fn new(needs_resync: &'a AtomicBool, dropped_operation: &'a AtomicU8) -> Self {
+    fn new(needs_resync: &'a AtomicBool, in_flight: &'a AtomicU8, kind: InFlight) -> Self {
+        let previous = in_flight.swap(kind as u8, Ordering::SeqCst);
+        debug_assert_eq!(
+            previous,
+            InFlight::None as u8,
+            "operations on one session must not overlap"
+        );
         Self {
             needs_resync,
-            dropped_operation,
-            armed: true,
+            in_flight,
+            kind,
+            disarmed: false,
         }
     }
 
-    fn disarm(&mut self) {
-        self.armed = false;
+    /// The operation failed: its response may still arrive.
+    fn fail(&mut self) {
+        self.needs_resync.store(true, Ordering::SeqCst);
+    }
+
+    /// The operation completed successfully; nothing is left on the wire.
+    fn disarm(mut self) {
+        self.disarmed = true;
+        self.clear();
+    }
+
+    fn clear(&self) {
+        self.in_flight.store(InFlight::None as u8, Ordering::SeqCst);
     }
 }
 
 impl Drop for ResyncGuard<'_> {
     fn drop(&mut self) {
-        if self.armed {
-            self.dropped_operation
-                .store(DroppedOperation::Resync as u8, Ordering::SeqCst);
-            self.needs_resync.store(true, Ordering::SeqCst);
+        self.clear();
+        // A read whose future is dropped mid-flight leaves a response that the
+        // next read must not mistake for its own. A successfully completed read
+        // was disarmed, which took the early return below. An input poll never
+        // needs the resync path.
+        if self.kind != InFlight::Read || self.disarmed {
+            return;
         }
+        self.needs_resync.store(true, Ordering::SeqCst);
     }
+}
+
+/// The operation a [`Session`] currently has on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InFlight {
+    /// No operation is in flight.
+    None,
+    /// A read (`ReadVersion`, `ReadConfig`, `read_transfer`) is waiting for a
+    /// data response.
+    Read,
+    /// A realtime input poll (`0x0003` / `0x0007`) is waiting for a report.
+    Input,
 }
 
 /// Decoded firmware version response.
@@ -172,25 +218,6 @@ pub struct ConfigSnapshot {
     pub crc_valid: bool,
 }
 
-/// How a session treats a future that was dropped part-way through an
-/// operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DroppedOperation {
-    /// The drop was caused by the caller's own cancel path (Ctrl-C, `stop`).
-    ///
-    /// Nothing was left half-sent and the session state is consistent, so the
-    /// session may issue the next request without a resync. This is the
-    /// default; an interrupted transfer simply re-requests from its first
-    /// chunk.
-    #[default]
-    CallerCancelled,
-    /// The drop interrupted a transfer whose response is still expected.
-    ///
-    /// The next read first drains stale frames and fails closed if the drain
-    /// budget runs out.
-    Resync,
-}
-
 /// A read-only App Mode session over a [`Transport`].
 ///
 /// The transport is consumed and can be recovered with
@@ -199,7 +226,7 @@ pub struct Session<T: Transport> {
     transport: T,
     timeout: Duration,
     needs_resync: AtomicBool,
-    dropped_operation: AtomicU8,
+    in_flight: AtomicU8,
     skipped_frames: AtomicU64,
     consecutive_decode_failures: AtomicU32,
     recovered_frame_runs: AtomicU64,
@@ -213,7 +240,7 @@ impl<T: Transport> Session<T> {
             transport,
             timeout: DEFAULT_TIMEOUT,
             needs_resync: AtomicBool::new(false),
-            dropped_operation: AtomicU8::new(DroppedOperation::CallerCancelled as u8),
+            in_flight: AtomicU8::new(InFlight::None as u8),
             skipped_frames: AtomicU64::new(0),
             consecutive_decode_failures: AtomicU32::new(0),
             recovered_frame_runs: AtomicU64::new(0),
@@ -257,22 +284,23 @@ impl<T: Transport> Session<T> {
         self.prepare_read().await
     }
 
-    /// Cancel any mark left by a dropped operation.
+    /// Run a read body, recording what is in flight and whether it failed.
     ///
-    /// Call this when a front end cancelled an operation mid-flight for its
-    /// own reasons (Ctrl-C, `monitor stop`) and nothing else is pending on the
-    /// wire. The session then issues the next request immediately instead of
-    /// spending up to the resync drain budget discarding frames that may
-    /// already contain the start of its response.
-    ///
-    /// It only clears a [`DroppedOperation::CallerCancelled`] mark: a mark
-    /// left by a timeout or by an aborted task whose frame may still be
-    /// written (`DroppedOperation::Resync`) always keeps its resync.
-    pub fn acknowledge_cancelled_operation(&self) {
-        if self.dropped_operation.load(Ordering::SeqCst) == DroppedOperation::CallerCancelled as u8
-        {
-            self.needs_resync.store(false, Ordering::SeqCst);
+    /// A drop (Ctrl-C, `monitor stop`) leaves `needs_drain` false, but the
+    /// guard's own `Drop` bumps it back to true for reads: an abandoned read
+    /// always leaves a response behind.
+    async fn run_read<F, O>(&self, read: F) -> Result<O, Error>
+    where
+        F: Future<Output = Result<O, Error>>,
+    {
+        let mut guard = ResyncGuard::new(&self.needs_resync, &self.in_flight, InFlight::Read);
+        let output = read.await;
+        if output.is_err() {
+            guard.fail();
+        } else {
+            guard.disarm();
         }
+        output
     }
 
     /// Clear the resync flag, failing closed when the drain budget runs out.
@@ -284,8 +312,6 @@ impl<T: Transport> Session<T> {
         if self.needs_resync.load(Ordering::SeqCst) {
             match self.drain_pending(DrainPolicy::RESYNC).await {
                 Ok(DrainOutcome::Quiesced) => {
-                    self.dropped_operation
-                        .store(DroppedOperation::CallerCancelled as u8, Ordering::SeqCst);
                     self.needs_resync.store(false, Ordering::SeqCst);
                 }
                 Ok(DrainOutcome::Exhausted) => {
@@ -343,21 +369,21 @@ impl<T: Transport> Session<T> {
     /// declared transfer, or a transport error.
     pub async fn read_version(&self) -> Result<VersionInfo, Error> {
         self.prepare_read().await?;
-        let mut guard = ResyncGuard::new(&self.needs_resync, &self.dropped_operation);
-        self.transport
-            .send(&commands::read_version().encode_ble(PacketKind::App)?)
-            .await?;
-
         let raw = self
-            .read_transfer_inner(
-                commands::cmd::READ_VERSION,
-                commands::VERSION_RESPONSE_LEN,
-                self.timeout,
-                self.timeout,
-            )
+            .run_read(async {
+                self.transport
+                    .send(&commands::read_version().encode_ble(PacketKind::App)?)
+                    .await?;
+                self.read_transfer_inner(
+                    commands::cmd::READ_VERSION,
+                    commands::VERSION_RESPONSE_LEN,
+                    self.timeout,
+                    self.timeout,
+                )
+                .await
+            })
             .await?;
 
-        guard.disarm();
         let text = longest_printable_run(&raw);
         Ok(VersionInfo { raw, text })
     }
@@ -465,6 +491,10 @@ impl<T: Transport> Session<T> {
     /// or another transport error. Malformed frames below that limit are
     /// skipped, not returned.
     pub async fn try_next_input(&self, wait: Duration) -> Result<Option<InputReport>, Error> {
+        // An abandoned input poll leaves at most one realtime report behind,
+        // which every read path skips, so it never marks the session for
+        // resync (see `ResyncGuard`).
+        let _guard = ResyncGuard::new(&self.needs_resync, &self.in_flight, InFlight::Input);
         let deadline = deadline_after(wait)?;
         for _ in 0..MAX_INPUT_DRAIN_FRAMES {
             let now = Instant::now();
@@ -587,12 +617,8 @@ impl<T: Transport> Session<T> {
         per_frame_timeout: Duration,
         total_timeout: Duration,
     ) -> Result<Vec<u8>, Error> {
-        let mut guard = ResyncGuard::new(&self.needs_resync, &self.dropped_operation);
-        let raw = self
-            .read_transfer_inner(cmd, expected_len, per_frame_timeout, total_timeout)
-            .await?;
-        guard.disarm();
-        Ok(raw)
+        self.run_read(self.read_transfer_inner(cmd, expected_len, per_frame_timeout, total_timeout))
+            .await
     }
 
     async fn read_transfer_inner(
@@ -672,12 +698,8 @@ impl<T: Transport> Session<T> {
             )));
         }
         self.prepare_read().await?;
-        let mut guard = ResyncGuard::new(&self.needs_resync, &self.dropped_operation);
-        let raw = self
-            .read_config_chunks_inner(expected_len, per_frame_timeout, total_timeout)
-            .await?;
-        guard.disarm();
-        Ok(raw)
+        self.run_read(self.read_config_chunks_inner(expected_len, per_frame_timeout, total_timeout))
+            .await
     }
 
     async fn read_config_chunks_inner(
@@ -882,9 +904,7 @@ impl TransferBuffer {
         }
 
         self.data[offset..end].copy_from_slice(chunk);
-        for position in offset..end {
-            self.filled[position] = true;
-        }
+        self.filled[offset..end].fill(true);
         self.received += chunk.len();
         Ok(())
     }
@@ -1450,7 +1470,7 @@ mod tests {
         let mock = MockTransport::new();
         let header = envelope_header(
             commands::cmd::READ_VERSION,
-            commands::VERSION_REQUEST_LEN as u32,
+            commands::VERSION_REQUEST_LEN,
             0,
             2,
         );
@@ -2360,20 +2380,23 @@ mod tests {
 
     #[tokio::test]
     async fn drop_mid_pipeline_marks_resync_and_next_read_drains() {
-        // Cancelling while the 3rd config chunk is in flight keeps the
-        // partially filled exchange classified as Resync, the next read
-        // drains the leftover chunks first, and the drain's quiescence resets
-        // the classification to CallerCancelled.
+        // Cancelling while the 3rd config chunk is in flight leaves a response
+        // in flight, so the next read drains the leftover chunks first and
+        // then assembles the fresh transfer.
         let transport = ResyncTransport::new();
         let session = Session::new(&transport).with_timeout(Duration::from_secs(60));
 
         let cancelled =
             tokio::time::timeout(Duration::from_millis(10), session.read_config_snapshot()).await;
         assert!(cancelled.is_err(), "the read must be cancelled mid-flight");
-        assert!(session.needs_resync.load(Ordering::SeqCst));
+        assert!(
+            session.needs_resync.load(Ordering::SeqCst),
+            "an abandoned read must mark the session for resync"
+        );
         assert_eq!(
-            session.dropped_operation.load(Ordering::SeqCst),
-            DroppedOperation::Resync as u8
+            session.in_flight.load(Ordering::SeqCst),
+            InFlight::None as u8,
+            "the guard must clear the in-flight marker when it drops"
         );
 
         let config = sample_config();
@@ -2385,34 +2408,55 @@ mod tests {
             "the stale frame must be drained before the next ReadConfig send"
         );
         assert_eq!(snapshot.config.as_bytes(), config.as_bytes());
-        assert_eq!(
-            session.dropped_operation.load(Ordering::SeqCst),
-            DroppedOperation::CallerCancelled as u8,
-            "a quiesced drain resets the classification"
+        assert!(
+            !session.needs_resync.load(Ordering::SeqCst),
+            "a quiesced drain clears the mark"
         );
     }
 
-    #[test]
-    fn acknowledge_cancellation_does_not_clear_resync_after_timeout() {
-        // After a timeout the response may still arrive, so an explicit
-        // acknowledgement must not suppress the resync.
-        let session = Session::new(MockTransport::new());
-        session.needs_resync.store(true, Ordering::SeqCst);
-        session
-            .dropped_operation
-            .store(DroppedOperation::Resync as u8, Ordering::SeqCst);
-        session.acknowledge_cancelled_operation();
+    #[tokio::test]
+    async fn an_abandoned_input_poll_does_not_require_a_resync() {
+        // Ctrl-C during `monitor` drops `try_next_input`; the leftover is at
+        // most a realtime report, which every read path skips. Marking the
+        // session for resync here used to be hidden by the caller-side
+        // acknowledgement, which also hid genuinely stale read responses.
+        let transport = StallingTransport {
+            first: Mutex::new(None),
+        };
+        let session = Session::new(&transport).with_timeout(Duration::from_secs(60));
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(10),
+            session.try_next_input(Duration::from_secs(60)),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the poll must be cancelled mid-flight");
+        assert!(
+            !session.needs_resync.load(Ordering::SeqCst),
+            "an abandoned input poll must not require a resync"
+        );
+        assert_eq!(
+            session.in_flight.load(Ordering::SeqCst),
+            InFlight::None as u8
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timeout_on_a_read_keeps_the_resync_mark() {
+        // A timeout is not a caller cancellation: the response may still
+        // arrive, so the session must keep asking for a drain even though no
+        // caller acknowledged anything.
+        let transport = StallingTransport {
+            first: Mutex::new(None),
+        };
+        let session = Session::new(&transport).with_timeout(Duration::from_millis(20));
+
+        let result = session.read_version().await;
+        assert!(matches!(result, Err(Error::Timeout { .. })));
         assert!(
             session.needs_resync.load(Ordering::SeqCst),
-            "a Resync mark must survive acknowledgement"
+            "a timed-out read must keep the resync mark"
         );
-
-        // A default session (CallerCancelled) may clear it, which is what the
-        // CLI does on Ctrl-C / `monitor stop`.
-        let plain = Session::new(MockTransport::new());
-        plain.needs_resync.store(true, Ordering::SeqCst);
-        plain.acknowledge_cancelled_operation();
-        assert!(!plain.needs_resync.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

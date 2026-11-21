@@ -1797,12 +1797,10 @@ where
         };
         match event {
             LoopEvent::CtrlC => {
-                // Ctrl-C while idle: nothing is running, so the next read must
-                // not spend its budget clearing a mark left by a previous
-                // Ctrl-C.
-                if let Ok(guard) = session.try_lock() {
-                    guard.acknowledge_cancelled_operation();
-                }
+                // Ctrl-C while idle: nothing is in flight, so the session has
+                // no resync mark to clear. If a read was running, the REPL
+                // takes the branch below and the session decides for itself
+                // whether a drain is needed (Session::InFlight).
                 break;
             }
             LoopEvent::KeepaliveStopped => {
@@ -1851,12 +1849,11 @@ where
                 let outcome = tokio::select! {
                     biased;
                     _ = &mut ctrl_c => {
-                        // The command future is dropped (not aborted), so any
-                        // read it held is unwound synchronously and the
-                        // session state stays consistent.
-                        if let Ok(guard) = session.try_lock() {
-                            guard.acknowledge_cancelled_operation();
-                        }
+                        // The command future is dropped (not aborted), so the
+                        // session unwinds it synchronously: an abandoned read
+                        // leaves its resync mark for the next command, and an
+                        // abandoned input poll leaves none. Correctness is
+                        // preferred over saving one drain.
                         break;
                     }
                     outcome = execute_session_command(
@@ -3637,5 +3634,53 @@ mod tests {
             );
             tokio::task::yield_now().await;
         }
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_during_monitor_count_leaves_the_next_read_usable() {
+        // B3 regression: a `monitor --count N` interrupted by Ctrl-C drops the
+        // input poll. The leftover realtime report must not make the session
+        // look dirty, and the next `read_version` must succeed without
+        // consuming a stale frame as its own response.
+        let transport = KeepaliveTestTransport::new();
+        // Plenty of reports so the poll is guaranteed to be in flight.
+        for _ in 0..8 {
+            transport.queue_envelope_input(&sample_input_report());
+        }
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let state = Arc::new(SessionKeepaliveState::new());
+        let mut monitor: Option<SessionMonitor> = None;
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(5),
+            execute_session_command(
+                &session,
+                &state,
+                Instant::now(),
+                64,
+                Duration::from_millis(20),
+                &mut monitor,
+                SessionCommand::Monitor { count: Some(1000) },
+            ),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the monitor must be cancelled mid-run");
+
+        // A read that arrives after the cancellation is answered normally.
+        queue_version_response(&transport);
+        let version = execute_session_command(
+            &session,
+            &state,
+            Instant::now(),
+            64,
+            Duration::from_millis(20),
+            &mut monitor,
+            SessionCommand::Info,
+        )
+        .await;
+        assert!(
+            version.is_ok(),
+            "read_version after an abandoned input poll must succeed: {version:?}"
+        );
     }
 }
