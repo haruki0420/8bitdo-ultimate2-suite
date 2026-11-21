@@ -313,6 +313,8 @@ sequenceDiagram
 | **`0x0104`** | `(mode << 8) \| slot` | `total_len = 0x1000`, `offset = macro_idx << 12` | Host → Ctrl | **`EraseBT2Macro`**。指定スロット・マクロ領域（4KB 単位）を消去 |
 
 > ※ `mode` は `record_ultimatebt2` 内オフセット `+0x10` の `GamepadMode` 値。
+>
+> **実機ソースでの再確認（x86_64 `libadvancelib.so`）**: 設定読み出しは **`cmd=0x0002` / `subcmd=0x0000`**、設定書き込みは **`cmd=0x0001` / `subcmd=0x0000`**。`STRUCT_BT2_2768B.md` 旧版にあった `subcmd=0x0101` / `0x0102` は誤記であり、`getUT2_ReadCofigChannel` / `getBT2_WriteCofigChannel` のチャネル構造体 `+0x4E` はどちらも `0` である。
 
 ### 6.3 Ultimate 2 Bluetooth 設定データ構造体 (`record_ultimatebt2`, `0x0AD0` = 2768 バイト) 部分書き込みオフセット一覧
 

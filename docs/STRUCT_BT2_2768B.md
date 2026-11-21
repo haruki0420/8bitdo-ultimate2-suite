@@ -41,26 +41,29 @@
 
 > **重要（`PROTOCOL_SPEC.md` との突合・補正結果）**:
 > `libadvancelib.so` の `PTR_record_ultimatebt2` は `u8*`（バイトポインタ）であり、Windows 版 `8BitDoAdvance.dll` と合わせて **Rumble (`0x74 + slot * 0x0C`)、SixAxis (`0x92C + slot * 0x0C`)、Dynamic (`0x950 + slot * 0x0C`) のスロット乗数はすべて `0x0C` (12 バイト)** である（`slot * 4` ではない）。
+>
+> **`cmd` / `subcmd` の補正（x86_64 `libadvancelib.so` 再確認済み）**:
+> 設定の読み出しは **`cmd = 0x0002`, `subcmd = 0x0000`**、書き込みは **`cmd = 0x0001`, `subcmd = 0x0000`** が正しい。旧版の本書にあった `subcmd = 0x0101` / `0x0102` は誤記である。`getUT2_ReadCofigChannel` はチャネル構造体の `+0x4C` に `0x0002` を、`getBT2_WriteCofigChannel` は `0x0001` を設定し、`+0x4E`（subcmd）はどちらも `0` のままである。個別書込（`getBT2_WriteRumble` 等）も同様に `cmd = 0x0001`, `subcmd = 0` を設定する。
 
 | 操作 | 関数名 (`libadvancelib.so` / `8BitDoAdvance.dll`) | `cmd` | `subcmd` | `offset` | `len` (1回/全体) | `total_len` |
 | --- | --- | :---: | :---: | --- | --- | --- |
-| 全体読込 | `getUT2_ReadCofigChannel` | `0x0001` | `0x0101` | `0x0000` | `0x0AD0` | `0x0AD0` |
-| ヘッダ読込 | `getBT2_head_CofigChannel` | `0x0001` | `0x0101` | `0x0000` | `0x0074` (116B) | `0x0074` |
-| 現在スロット読込 | `getBT2_ReadCurslot_CofigChannel` | `0x0001` | `0x0101` | `0x0012` | `0x0002` (2B) | `0x0002` |
-| 全体書込 | `getBT2_WriteCofigChannel` / `writeUltimateBT2` | `0x0001` | `0x0102` | `0x0000` | `0x0AD0` | `0x0AD0` |
-| スロット切替書込 | `getBT2_WriteSLOTChannel(slot)` | `0x0001` | `0x0102` | `0x0012` | `0x0002` | `0x0AD0` |
-| プロファイル名書込 | `getBT2_WriteFileName(slot)` | `0x0001` | `0x0102` | `0x0014 + slot * 0x20` | `0x0020` (32B) | `0x0AD0` |
-| 振動書込 | `getBT2_WriteRumble(slot)` | `0x0001` | `0x0102` | `0x0074 + slot * 0x0C` | `0x000C` (12B) | `0x0AD0` |
-| スティック書込 | `getBT2_WriteJoyStick(slot)` | `0x0001` | `0x0102` | `0x0098 + slot * 0x08` | `0x0008` (8B) | `0x0AD0` |
-| トリガー書込 | `getBT2_WriteTrigger(slot)` | `0x0001` | `0x0102` | `0x00B0 + slot * 0x08` | `0x0008` (8B) | `0x0AD0` |
-| 特殊機能書込 | `getBT2_WriteSpecial(slot)` | `0x0001` | `0x0102` | `0x00C8 + slot * 0x08` | `0x0008` (8B) | `0x0AD0` |
-| 単一ボタンリマップ | `getBT2_WriteMapKey(slot, idx)` | `0x0001` | `0x0102` | `0x00E4 + slot * 0x5C + idx * 4` | `0x0004` (4B) | `0x0AD0` |
-| マクロヘッダ書込 | `getBT2_WriteMacro(slot)` | `0x0001` | `0x0102` | `0x068C + slot * 0xD8` | `0x00D8` (216B) | `0x0AD0` |
-| マクロ名単体書込 | `writeUltimateBT2MacroName(slot, m)` | `0x0001` | `0x0102` | `0x0694 + slot * 0xD8 + m * 0x34` | `0x0020` (32B) | `0x0AD0` |
-| ジャイロ書込 | `writeUltimateBT2sixaxis(slot)` *(DLL正)* | `0x0001` | `0x0102` | `0x092C + slot * 0x0C` *(※注1)* | `0x000C` (12B) | `0x0AD0` *(※注1)* |
-| RGB Dynamic書込 | `getBT2_WriteDyNamic(slot)` | `0x0001` | `0x0102` | `0x0950 + slot * 0x0C` | `0x000C` (12B) | `0x0AD0` |
-| RGB HotWheel書込 | `getBT2_WriteHotWheel(slot)` | `0x0001` | `0x0102` | `0x0974 + slot * 0x10` | `0x0010` (16B) | `0x0AD0` |
-| RGB Single書込 | `getBT2_WriteSingle(slot)` | `0x0001` | `0x0102` | `0x09A4 + slot * 0x64` | `0x0064` (100B) | `0x0AD0` |
+| 全体読込 | `getUT2_ReadCofigChannel` | `0x0002` | `0x0000` | `0x0000` | `0x0AD0` | `0x0AD0` |
+| ヘッダ読込 | `getBT2_head_CofigChannel` | `0x0002` | `0x0000` | `0x0000` | `0x0074` (116B) | `0x0074` |
+| 現在スロット読込 | `getBT2_ReadCurslot_CofigChannel` | `0x0002` | `0x0000` | `0x0012` | `0x0002` (2B) | `0x0002` |
+| 全体書込 | `getBT2_WriteCofigChannel` / `writeUltimateBT2` | `0x0001` | `0x0000` | `0x0000` | `0x0AD0` | `0x0AD0` |
+| スロット切替書込 | `getBT2_WriteSLOTChannel(slot)` | `0x0001` | `0x0000` | `0x0012` | `0x0002` | `0x0AD0` |
+| プロファイル名書込 | `getBT2_WriteFileName(slot)` | `0x0001` | `0x0000` | `0x0014 + slot * 0x20` | `0x0020` (32B) | `0x0AD0` |
+| 振動書込 | `getBT2_WriteRumble(slot)` | `0x0001` | `0x0000` | `0x0074 + slot * 0x0C` | `0x000C` (12B) | `0x0AD0` |
+| スティック書込 | `getBT2_WriteJoyStick(slot)` | `0x0001` | `0x0000` | `0x0098 + slot * 0x08` | `0x0008` (8B) | `0x0AD0` |
+| トリガー書込 | `getBT2_WriteTrigger(slot)` | `0x0001` | `0x0000` | `0x00B0 + slot * 0x08` | `0x0008` (8B) | `0x0AD0` |
+| 特殊機能書込 | `getBT2_WriteSpecial(slot)` | `0x0001` | `0x0000` | `0x00C8 + slot * 0x08` | `0x0008` (8B) | `0x0AD0` |
+| 単一ボタンリマップ | `getBT2_WriteMapKey(slot, idx)` | `0x0001` | `0x0000` | `0x00E4 + slot * 0x5C + idx * 4` | `0x0004` (4B) | `0x0AD0` |
+| マクロヘッダ書込 | `getBT2_WriteMacro(slot)` | `0x0001` | `0x0000` | `0x068C + slot * 0xD8` | `0x00D8` (216B) | `0x0AD0` |
+| マクロ名単体書込 | `writeUltimateBT2MacroName(slot, m)` | `0x0001` | `0x0000` | `0x0694 + slot * 0xD8 + m * 0x34` | `0x0020` (32B) | `0x0AD0` |
+| ジャイロ書込 | `writeUltimateBT2sixaxis(slot)` *(DLL正)* | `0x0001` | `0x0000` | `0x092C + slot * 0x0C` *(※注1)* | `0x000C` (12B) | `0x0AD0` *(※注1)* |
+| RGB Dynamic書込 | `getBT2_WriteDyNamic(slot)` | `0x0001` | `0x0000` | `0x0950 + slot * 0x0C` | `0x000C` (12B) | `0x0AD0` |
+| RGB HotWheel書込 | `getBT2_WriteHotWheel(slot)` | `0x0001` | `0x0000` | `0x0974 + slot * 0x10` | `0x0010` (16B) | `0x0AD0` |
+| RGB Single書込 | `getBT2_WriteSingle(slot)` | `0x0001` | `0x0000` | `0x09A4 + slot * 0x64` | `0x0064` (100B) | `0x0AD0` |
 | 設定保存 (BLE) | `getSaveCustomConfigChannel` | `0x0006` | `0x0067` | `0x0000` | `0` | `0` |
 | 設定保存 (USB) | `8BitDoAdvance.dll` 各書込末尾 | `0x0006` | `0x0123` | `0x0000` | `0` | `0` |
 
@@ -509,7 +512,7 @@ struct Bt2Header {
    - ペイロード: `max_steps * 10` バイト＋32B アライメント用ゼロパディング（最大 64 バイト単位または交渉済みチャンクサイズで分割送信・`Send_CustomCmdPacket` 準拠で各チャンクヘッダ `CRC-16/MODBUS (0xA001)` 付与）
 3. **Step 3: 2768B コンフィグ内のマクロ管理ヘッダ更新**
    - `max_steps`, `key_map`, `cycles_num`, `interval_ms`, `filename`, `total_cnt`, `flag` 等を `0x68C + slot * 0xD8` に反映し、`ANSI_CRC_16_sh` を再計算する。
-   - 部分書込 (`cmd = 0x0001, subcmd = 0x0102, offset = 0x68C + slot * 0xD8, len = 0xD8, total_len = 0x0AD0`) または全体書込を送信する。
+   - 部分書込 (`cmd = 0x0001, subcmd = 0x0000, offset = 0x68C + slot * 0xD8, len = 0xD8, total_len = 0x0AD0`) または全体書込を送信する。
 4. **Step 4: 不揮発メモリへのコミット (`Save`)**
    - **BLE**: `cmd = 0x0006, subcmd = 0x0067, offset = 0, len = 0, total_len = 0`
    - **USB**: `cmd = 0x0006, subcmd = 0x0123, offset = 0, len = 0, total_len = 0`

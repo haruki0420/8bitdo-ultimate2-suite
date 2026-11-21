@@ -7,7 +7,7 @@
 ## 1. プロジェクト概要
 
 - **目的**: **8BitDo Ultimate 2 Bluetooth Controller**（内部 PID `0x600F` / 2.4G レシーバー `0x6011`）を、Nintendo Switch と接続したまま **Linux / macOS / Windows / Android / iOS** から BLE GATT（および USB/2.4G HID）でフル設定・マクロ編集・ファームウェアアップデートできるクロスプラットフォーム OSS ツール群を構築する。
-- **現在のフェーズ**: **リバースエンジニアリング・仕様確定・実装計画完了（Phase 1 実装着手待ち）**。
+- **現在のフェーズ**: **Phase 1 完了（`eightbitdo-protocol` 実装・テスト済み）。Phase 2 実装着手待ち**。
 - **ライセンス／公開方針**: パブリックリポジトリ。公式バイナリ（`.apk`, `.exe`, `.dll`, `.so` 等）や公式ファームウェアファイル自体は `.gitignore` で除外しており、**絶対にコミットしないこと**。
 
 ---
@@ -35,15 +35,16 @@
 
 以下の意思決定はユーザーと合意済みのため、理由なく変更しないでください。
 
-- **共通コア (`8bitdo-protocol`, `8bitdo-core`)**: **Rust**
-  - `8bitdo-protocol` は I/O 非依存の純粋なバイナリプロトコル／構造体クレートとして分離し、充実した単体テストを書く。
-  - `8bitdo-core` は `Transport` トレイト経由で BLE / USB HID / モックを差し替え可能にする。
+- **共通コア (`eightbitdo-protocol`, `eightbitdo-core`)**: **Rust**
+  - `eightbitdo-protocol` は I/O 非依存の純粋なバイナリプロトコル／構造体クレートとして分離し、充実した単体テストを書く。
+  - `eightbitdo-core` は `Transport` トレイト経由で BLE / USB HID / モックを差し替え可能にする。
+  - **クレート名の注意**: Cargo のパッケージ名は数字で開始できないため、`8bitdo-*` ではなく **`eightbitdo-*`** を正式名とする（ディレクトリ名も同様）。
 - **デスクトップ (Linux / macOS / Windows)**:
   - **Pure Rust** で実装する（Electron / Tauri / Node.js / WebView は使わない）。
   - BLE: `btleplug`、USB/2.4G HID: `hidapi`、CLI: `clap`、GUI: **`egui` (`eframe`)**（または `iced`）。
 - **モバイル (iOS / Android)**:
-  - 各 OS の**ネイティブ UI**（**iOS: SwiftUI**, **Android: Jetpack Compose**）から Rust コアを **`UniFFI` (`8bitdo-uniffi`)** 経由で呼び出す。
-  - モバイルの BLE / USB OTG トランスポートは OS ネイティブ API（CoreBluetooth / Android BluetoothGatt & UsbManager）で実装し、UniFFI の Callback Interface で `8bitdo-core` に注入する。
+  - 各 OS の**ネイティブ UI**（**iOS: SwiftUI**, **Android: Jetpack Compose**）から Rust コアを **`UniFFI` (`eightbitdo-uniffi`)** 経由で呼び出す。
+  - モバイルの BLE / USB OTG トランスポートは OS ネイティブ API（CoreBluetooth / Android BluetoothGatt & UsbManager）で実装し、UniFFI の Callback Interface で `eightbitdo-core` に注入する。
 - **機能要件**:
   - マクロエディタは **リアルタイム入力録音 + GUI ステップ編集 + JSON/TOML インポート・エクスポート** に対応し、1ms 解像度とフル 8-bit アナログスティック／トリガー値を開放する。
   - コントローラ設定は 2768 バイト構造体の全機能（プロファイル、リマップ、スティック/トリガー、振動、6軸ジャイロ、RGB、マクロ）を公式同等にサポートする。
@@ -55,6 +56,7 @@
 
 1. **プロトコル仕様の厳守**:
    - BLE 受信時の `0x600F` における先頭バイト有無、USB HID 送信 (`[0x81, 0x04]`) と受信 (`[0x02, 0x04]`) の違い、Save サブコマンドの差異（BLE `0x0067` vs USB `0x0123`）、2 種類の CRC-16 の使い分けを混同しないこと。
+   - 設定の読み出しは **`cmd=0x0002` / `subcmd=0x0000`**、書き込みは **`cmd=0x0001` / `subcmd=0x0000`**（x86_64 `libadvancelib.so` で再確認済み。旧仕様書の `subcmd=0x0101/0x0102` は誤記）。
 2. **構造体の未知・予約バイト保全**:
    - 2768 バイト構造体を編集する際は必ず元のバイトバッファを保持した上で変更箇所だけ上書きし、`ANSI_CRC_16_sh` を再計算してから書き込むこと。
 3. **マクロ Flash 書き込み順序**:
@@ -66,10 +68,20 @@
 
 ---
 
-## 5. 次に着手すべき作業（Next Actions）
+## 5. 現在の状態と次に着手すべき作業
 
-次のセッションで実装を開始する場合は、**[docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)** の **Phase 1** から順に進めてください。
+**Phase 1 は完了済み**です（`crates/eightbitdo-protocol`）。
 
-1. `Cargo.toml`（Workspace）と `crates/8bitdo-protocol` を初期化する。
-2. `crc.rs`, `header.rs`, `keymap.rs`, `macro_data.rs`, `config_bt2.rs`, `input_report.rs`, `commands.rs` を実装し、仕様書の全バイトオフセット・CRC・ラウンドトリップの単体テストを通す。
-3. 続けて Phase 2 の `crates/8bitdo-core` と `crates/8bitdo-cli` を実装し、実機での読み取り専用テスト（`scan` / `info` / `config dump` / `monitor`）から検証を開始する。
+- 実装済み: `crc.rs` / `header.rs` / `commands.rs` / `config_bt2.rs` / `keymap.rs` / `macro_data.rs` / `input_report.rs`
+- 検証コマンド:
+  - `cargo test -p eightbitdo-protocol` → 単体テスト 74 件 + doc test 4 件
+  - `cargo clippy -p eightbitdo-protocol --all-targets` → 警告なし
+  - `cargo check -p eightbitdo-protocol --no-default-features` → `no_std` + `alloc` でビルド可
+  - `cargo test -p eightbitdo-protocol --features serde` → JSON/TOML 用 `MacroFile` を含めてビルド可
+
+次は **[docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)** の **Phase 2** に進んでください。
+
+1. `crates/eightbitdo-core` に `Transport` トレイト（BLE / USB HID / Mock）とセッション管理を実装する。
+2. `crates/eightbitdo-cli` に `scan` / `info` / `config dump` / `monitor` を実装する。
+3. 実機では **読み取り専用コマンドから**検証し、最初の書き込み前に必ず 2768B 設定とマクロ 4×3 スロットをバックアップする。
+4. 書き込み系の前に、モックトランスポートで `Erase 0x0104 → Write 0x0103 → Header 0x0001 → Save 0x0006` のパケット列と CRC を固定する。

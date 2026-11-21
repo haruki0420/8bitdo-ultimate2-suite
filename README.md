@@ -18,7 +18,7 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 - **PC & モバイル対応ファームウェアアップデート**:
   - PC（BLE / USB）だけでなく、**Android / iOS からの BLE Bootloader OTA（`"8bt"`, `0000FF20`/`0000FF21`）** および Android USB OTG 更新に対応
 - **クロスプラットフォーム・ネイティブ構成**:
-  - 共通プロトコル＆コア: **Rust** (`8bitdo-protocol`, `8bitdo-core`, `8bitdo-uniffi`)
+  - 共通プロトコル＆コア: **Rust** (`eightbitdo-protocol`, `eightbitdo-core`, `eightbitdo-uniffi`)
   - PC (Linux / macOS / Windows): Pure Rust CLI + ネイティブ GUI（`egui`、`btleplug` + `hidapi`）
   - モバイル: **iOS (SwiftUI + CoreBluetooth)** / **Android (Jetpack Compose + Android BLE / USB OTG)**
 
@@ -41,11 +41,11 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 
 - [x] 公式アプリ（Android v2.01 / Windows v1.38）の通信プロトコル・バイナリ構造・OTA シーケンスの解析完了
 - [x] 完全仕様書・実装計画書・AI 引き継ぎドキュメント作成
-- [ ] Phase 1: `8bitdo-protocol`（Rust プロトコル・構造体・CRC・マクロ単体テスト）
-- [ ] Phase 2: `8bitdo-core` + `8bitdo-cli`（BLE / USB 実機通信＆検証）
-- [ ] Phase 3: `8bitdo-gui`（デスクトップネイティブ GUI）
+- [x] Phase 1: `eightbitdo-protocol`（Rust プロトコル・構造体・CRC・マクロ、単体テスト 74 件 + doc test 4 件）
+- [ ] Phase 2: `eightbitdo-core` + `eightbitdo-cli`（BLE / USB 実機通信＆検証）
+- [ ] Phase 3: `eightbitdo-gui`（デスクトップネイティブ GUI）
 - [ ] Phase 4: BLE OTA / USB ファームウェアアップデーター
-- [ ] Phase 5: `8bitdo-uniffi` + iOS (SwiftUI) / Android (Jetpack Compose) アプリ
+- [ ] Phase 5: `eightbitdo-uniffi` + iOS (SwiftUI) / Android (Jetpack Compose) アプリ
 
 ---
 
