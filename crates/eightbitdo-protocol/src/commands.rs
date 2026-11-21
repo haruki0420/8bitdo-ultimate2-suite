@@ -152,7 +152,7 @@ impl Request {
     /// Read commands (`ReadConfig` / `ReadMacro`) on `0x600F` use this shape:
     /// the wire packet contains only the 16-byte header, but `chunk_len`
     /// carries the requested transfer length. See
-    /// [`commands::read_config`] and [`commands::read_macro`].
+    /// [`read_config`] and [`read_macro`].
     ///
     /// # Panics
     ///

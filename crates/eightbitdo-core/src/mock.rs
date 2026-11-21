@@ -47,7 +47,7 @@ pub struct MockTransport {
 }
 
 impl MockTransport {
-    /// Create a mock with an empty queue and MTU [`DEFAULT_MTU`].
+    /// Create a mock with an empty queue and the default MTU.
     #[must_use]
     pub fn new() -> Self {
         Self::with_mtu(DEFAULT_MTU)

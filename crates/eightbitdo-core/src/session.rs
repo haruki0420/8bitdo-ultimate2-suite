@@ -248,7 +248,7 @@ impl<T: Transport> Session<T> {
     /// Call this when a front end cancelled an operation mid-flight for its
     /// own reasons (Ctrl-C, `monitor stop`) and nothing else is pending on the
     /// wire. The session then issues the next request immediately instead of
-    /// spending up to [`MAX_DRAIN_DURATION`] discarding frames that may
+    /// spending up to the resync drain budget discarding frames that may
     /// already contain the start of its response.
     ///
     /// It only clears a [`DroppedOperation::CallerCancelled`] mark: a mark
@@ -432,7 +432,7 @@ impl<T: Transport> Session<T> {
     /// queue in a loop cannot hold the session lock forever: the `wait`
     /// budget, at most [`MAX_INPUT_DRAIN_FRAMES`] frames consumed per call
     /// (so at most that many non-input frames are skipped), and a final
-    /// [`DrainPolicy::OPPORTUNISTIC`] stale-frame drain when the budget ends
+    /// small opportunistic stale-frame drain when the budget ends
     /// without a report. The whole call therefore settles within roughly
     /// `wait + 1 ms`.
     ///
@@ -572,8 +572,9 @@ impl<T: Transport> Session<T> {
     /// offset is used as-is; `offset = 0` is treated as the device's
     /// sequential-chunk convention and placed at the requested offset.
     ///
-    /// `expected_len` must be [`CONFIG_SIZE`]. Use [`read_transfer`] for
-    /// single-request transfers such as `ReadVersion`.
+    /// `expected_len` must be [`CONFIG_SIZE`]. Use
+    /// [`read_transfer`](Self::read_transfer) for single-request transfers
+    /// such as `ReadVersion`.
     ///
     /// # Errors
     ///

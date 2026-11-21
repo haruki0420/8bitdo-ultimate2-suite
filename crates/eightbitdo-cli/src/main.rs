@@ -25,7 +25,6 @@ use eightbitdo_protocol::header;
 use eightbitdo_protocol::input_report::InputReport;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncBufReadExt;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
@@ -1389,6 +1388,103 @@ async fn execute_session_command<T: Transport + 'static>(
     }
 }
 
+/// Maximum byte length of one REPL command line, excluding the line ending.
+///
+/// Longer lines are reported once and discarded up to the next newline so the
+/// next prompt reads a clean line.
+const MAX_SESSION_LINE_BYTES: usize = 4096;
+
+/// Why [`read_session_line`] returned.
+#[derive(Debug, PartialEq, Eq)]
+enum LineRead {
+    /// A line (without its `\n` / `\r\n`) plus whether it was cut at a NUL.
+    Line { text: String, cut: bool },
+    /// The input ended before a line was complete (EOF).
+    Eof,
+    /// The line exceeded [`MAX_SESSION_LINE_BYTES`] and the rest was dropped.
+    TooLong { discarded: usize },
+}
+
+/// Read one line without losing input when the future is cancelled.
+///
+/// The previous `BufReader::read_line` inside `tokio::select!` lost the
+/// partial line on a Ctrl-C and could split a multi-byte character. This
+/// version keeps every consumed byte in caller-owned `pending` and reads one
+/// `fill_buf` at a time, so dropping the future at any `await` point resumes
+/// with exactly the bytes that were already read.
+///
+/// NUL bytes end the line: on Unix a very long paste without a newline is
+/// still delivered through the terminal's canonical buffer and
+/// NUL-separated, so each chunk becomes its own line instead of one unbounded
+/// line.
+fn read_session_line<'a, R>(
+    reader: &'a mut R,
+    pending: &'a mut Vec<u8>,
+) -> impl Future<Output = std::io::Result<LineRead>> + 'a
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    read_session_line_inner(reader, pending)
+}
+
+async fn read_session_line_inner<R>(
+    reader: &mut R,
+    pending: &mut Vec<u8>,
+) -> std::io::Result<LineRead>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt as _;
+
+    // Bytes of this line beyond the limit: counted, not stored.
+    let mut overflow = 0usize;
+    loop {
+        let buffer = reader.fill_buf().await?;
+        if buffer.is_empty() {
+            return finish_session_line(pending, overflow);
+        }
+
+        let end = buffer
+            .iter()
+            .position(|&byte| matches!(byte, b'\n' | b'\0'))
+            .unwrap_or(buffer.len());
+        let cut = end < buffer.len() && buffer[end] == b'\0';
+        let consumed = end + usize::from(end < buffer.len());
+
+        let room = MAX_SESSION_LINE_BYTES.saturating_sub(pending.len());
+        let accepted = room.min(end);
+        pending.extend_from_slice(&buffer[..accepted]);
+        overflow += end - accepted;
+        reader.consume(consumed);
+
+        // A NUL (possibly a long paste) or a newline ends the line.
+        if cut || consumed > end {
+            let mut read = finish_session_line(pending, overflow)?;
+            if let LineRead::Line { cut: line_cut, .. } = &mut read {
+                *line_cut = cut;
+            }
+            return Ok(read);
+        }
+    }
+}
+
+fn finish_session_line(pending: &mut Vec<u8>, overflow: usize) -> std::io::Result<LineRead> {
+    if pending.is_empty() && overflow == 0 {
+        return Ok(LineRead::Eof);
+    }
+    let bytes = std::mem::take(pending);
+    if overflow > 0 {
+        return Ok(LineRead::TooLong {
+            discarded: overflow,
+        });
+    }
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    while text.ends_with(['\r', '\n']) {
+        text.pop();
+    }
+    Ok(LineRead::Line { text, cut: false })
+}
+
 async fn session_repl_loop<T: Transport + 'static>(
     session: &Arc<AsyncMutex<Session<T>>>,
     keepalive: &Arc<SessionKeepaliveState>,
@@ -1435,10 +1531,12 @@ where
         CtrlC,
         KeepaliveStopped,
         MonitorFinished,
-        Line(std::io::Result<usize>),
+        Line(std::io::Result<LineRead>),
     }
 
-    let mut line = String::new();
+    // Cancellation-safe line state: bytes already consumed from `reader` but
+    // not yet terminated by a newline survive a dropped `read_session_line`.
+    let mut pending: Vec<u8> = Vec::new();
     tokio::pin!(ctrl_c);
     let mut monitor: Option<SessionMonitor> = None;
     let mut result = Ok(());
@@ -1453,10 +1551,18 @@ where
             _ = &mut ctrl_c => LoopEvent::CtrlC,
             _ = wait_for_keepalive_stop(keepalive) => LoopEvent::KeepaliveStopped,
             _ = wait_for_monitor_finish(monitor.as_ref()) => LoopEvent::MonitorFinished,
-            read_result = reader.read_line(&mut line) => LoopEvent::Line(read_result),
+            read_result = read_session_line(reader, &mut pending) => LoopEvent::Line(read_result),
         };
         match event {
-            LoopEvent::CtrlC => break,
+            LoopEvent::CtrlC => {
+                // Ctrl-C while idle: nothing is running, so the next read must
+                // not spend its budget clearing a mark left by a previous
+                // Ctrl-C.
+                if let Ok(guard) = session.try_lock() {
+                    guard.acknowledge_cancelled_operation();
+                }
+                break;
+            }
             LoopEvent::KeepaliveStopped => {
                 if let Some(error) = keepalive_degraded_error(keepalive) {
                     result = Err(error);
@@ -1482,14 +1588,35 @@ where
                         break;
                     }
                 };
-                if read == 0 {
-                    break;
-                }
-                let command = parse_session_command(line.trim());
-                line.clear();
+                let text = match read {
+                    LineRead::Eof => break,
+                    LineRead::TooLong { discarded } => {
+                        eprintln!(
+                            "line too long: discarded {discarded} bytes (limit {MAX_SESSION_LINE_BYTES} per line); command ignored"
+                        );
+                        continue;
+                    }
+                    LineRead::Line { text, cut } => {
+                        if cut {
+                            eprintln!(
+                                "note: line cut at an embedded NUL byte (long paste?); the remainder runs as its own line"
+                            );
+                        }
+                        text
+                    }
+                };
+                let command = parse_session_command(text.trim());
                 let outcome = tokio::select! {
                     biased;
-                    _ = &mut ctrl_c => break,
+                    _ = &mut ctrl_c => {
+                        // The command future is dropped (not aborted), so any
+                        // read it held is unwound synchronously and the
+                        // session state stays consistent.
+                        if let Ok(guard) = session.try_lock() {
+                            guard.acknowledge_cancelled_operation();
+                        }
+                        break;
+                    }
                     outcome = execute_session_command(
                         session,
                         keepalive,
@@ -2367,9 +2494,19 @@ mod tests {
             .await
             .unwrap();
 
+        // The tick's bounded input drain waits for real elapsed time
+        // (`try_next_input` uses a wall-clock deadline, not the paused timer),
+        // so advance in small steps until each tick has been recorded instead
+        // of racing one 21 ms jump.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         for _ in 0..4 {
-            tokio::time::advance(Duration::from_millis(21)).await;
-            for _ in 0..10 {
+            let before = keepalive.state.sent.load(Ordering::SeqCst);
+            while keepalive.state.sent.load(Ordering::SeqCst) == before {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "keepalive tick did not complete"
+                );
+                tokio::time::advance(Duration::from_millis(1)).await;
                 tokio::task::yield_now().await;
             }
         }
