@@ -367,20 +367,27 @@ impl<T: Transport> Session<T> {
                 };
 
                 let response_offset = header.offset as usize;
+                if response_offset >= expected_len {
+                    return Err(out_of_range(response_offset, expected_len));
+                }
                 if response_offset != offset && response_offset != 0 {
                     return Err(Error::UnexpectedResponse(format!(
                         "config chunk offset 0x{response_offset:X} does not match requested offset 0x{offset:X}"
                     )));
                 }
 
-                let end = offset
-                    .checked_add(payload.len())
-                    .ok_or_else(|| out_of_range(offset, expected_len))?;
-                if end > expected_len {
-                    return Err(out_of_range(offset, expected_len));
-                }
-                buffer.insert(offset, payload)?;
-                offset = end;
+                let placement = if response_offset == 0 {
+                    offset
+                } else {
+                    response_offset
+                };
+                // The unit returns a fixed 142-byte final chunk even when the
+                // remaining transfer is shorter. Keep only the bytes inside
+                // the 2768-byte block and ignore the trailing padding.
+                let remaining = expected_len - placement;
+                let copy_len = payload.len().min(remaining);
+                buffer.insert(placement, &payload[..copy_len])?;
+                offset = placement + copy_len;
                 break;
             }
         }
@@ -920,13 +927,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_chunk_overrunning_transfer_is_rejected() {
+    async fn config_final_chunk_padding_is_truncated() {
         let config = sample_config();
         let bytes = config.as_bytes();
         let mock = MockTransport::new();
-        // 19 * 142 = 2698; a further 142-byte chunk would end at 2840.
         push_config_envelope_chunks(&mock, &bytes[..2698], 142);
-        let bad = envelope_header(commands::cmd::READ_CONFIG, CONFIG_SIZE as u32, 0, 142);
+
+        // The unit returns a fixed 142-byte final chunk: 70 valid bytes plus
+        // 72 bytes of padding past the end of the 2768-byte block.
+        let mut final_payload = bytes[2698..].to_vec();
+        final_payload.extend_from_slice(&[0xAA; 72]);
+        assert_eq!(final_payload.len(), 142);
+        let header = envelope_header(commands::cmd::READ_CONFIG, CONFIG_SIZE as u32, 2698, 142);
+        mock.push_response(&header, &final_payload);
+
+        let session = Session::new(&mock);
+        let snapshot = session.read_config_snapshot().await.unwrap();
+        assert_eq!(snapshot.config.as_bytes(), bytes);
+        assert_ne!(&snapshot.config.as_bytes()[2768 - 8..], &[0xAA; 8]);
+    }
+
+    #[tokio::test]
+    async fn config_final_chunk_with_exact_remaining_length_succeeds() {
+        let config = sample_config();
+        let bytes = config.as_bytes();
+        let mock = MockTransport::new();
+        push_config_envelope_chunks(&mock, &bytes[..2698], 142);
+        let header = envelope_header(commands::cmd::READ_CONFIG, CONFIG_SIZE as u32, 2698, 70);
+        mock.push_response(&header, &bytes[2698..]);
+
+        let session = Session::new(&mock);
+        let snapshot = session.read_config_snapshot().await.unwrap();
+        assert_eq!(snapshot.config.as_bytes(), bytes);
+    }
+
+    #[tokio::test]
+    async fn config_response_offset_at_or_beyond_end_is_rejected() {
+        let config = sample_config();
+        let bytes = config.as_bytes();
+        let mock = MockTransport::new();
+        push_config_envelope_chunks(&mock, &bytes[..2698], 142);
+        let bad = envelope_header(
+            commands::cmd::READ_CONFIG,
+            CONFIG_SIZE as u32,
+            CONFIG_SIZE as u32,
+            142,
+        );
         mock.push_response(&bad, &[0u8; 142]);
 
         let session = Session::new(&mock);

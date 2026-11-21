@@ -262,12 +262,18 @@ ReadConfig head:  04 02 00 00 00 74 00 00 74 00 00 00 00 00 00 00
   ```
   - このフレームをエラーにせず読み飛ばし、後続のデータチャンクを待つ必要がある。
 - `ReadConfig` の要求は、旧実装の `chunk_len=0` ではなく **`chunk_len = total_len = 0x0AD0`**（ヘッダ読みは `0x74`）で送る（§4.1.1）。`chunk_len=0` では実機が ACK だけを返した。
-- **ReadConfig は 1 要求 = 1 チャンク**である。実機では `offset=0` の要求に対して 142B（`0x8E`）のデータ応答が 1 つ返り、次の通知は来なかった。残りを読むには `offset += payload.len()` で再要求する。2768B は 19 × 142B + 70B = 20 チャンクになる。
+- **ReadConfig は 1 要求 = 1 チャンク**である。実機では `offset=0` の要求に対して 142B（`0x8E`）のデータ応答が 1 つ返り、次の通知は来なかった。残りを読むには `offset += payload.len()` で再要求する。2768B は 19 × 142B + 70B = 20 要求になる。
 - 実機の最初のデータ応答（ヘッダ 16B + 142B ペイロード）:
   ```text
   04 00 02 00 8E 00 71 A9 D0 0A 00 00 00 00 00 00 + <142 bytes>
   ```
   - `cmd=0x0004`, `subcmd=0x0002`, `chunk_len=0x008E` (142), `crc16=0xA971`, `total_len=0x0AD0`, `offset=0`。
+- 最終要求は `offset=0xA8A` (2698)、残り 70B だが、デバイスは**最終チャンクも 142B 固定**で返す:
+  ```text
+  04 00 02 00 8E 00 ?? ?? D0 0A 00 00 8A 0A 00 00 + <70 valid bytes> + <72 padding bytes>
+  ```
+  - 応答ヘッダは `cmd=0x0004`, `subcmd=0x0002`, `chunk_len=0x008E`, `total_len=0x0AD0`, `offset=0xA8A`。
+  - 2768B を超える末尾 72B はパディングであり、ホスト側で `CONFIG_SIZE - offset = 70B` に切り詰めてコピーする。パディングは破棄する。
 - 応答 `offset` は `0` を返す（順次チャンク）。要求 `offset` と一致する場合はそれを優先し、`0` の場合は要求 `offset` に配置する。どちらも受け入れる。
 - 公式 `baseCumstomChannel` は 1 回だけ要求を送り、`readCustomConfig_unfinished`（0x2e3d0）は受信バイト数をログするのみである。実機では 1 チャンクで次の通知が止まるため、CLI 側で offset を進めた再要求ループを実装する。
 
@@ -278,7 +284,7 @@ ReadConfig head:  04 02 00 00 00 74 00 00 74 00 00 00 00 00 00 00
 
 **未確定のこと**:
 
-- `ReadConfig` のデータチャンクは実機で 142B (`0x8E`) を 1 要求につき 1 つ返す。`offset` を進めた再要求で 20 チャンク（19 × 142B + 70B）を組み立てる。142B が MTU 依存で変化するか、最終チャンクが 70B になるかは実機確認中である。応答 `offset` は 0 を返すが、要求 offset と一致する場合も受け入れる。
+- `ReadConfig` のデータチャンクは実機で 142B (`0x8E`) を 1 要求につき 1 つ返す。`offset` を進めた再要求で 20 要求（19 × 142B + 最終 142B のうち有効 70B）を組み立てる。最終チャンクが 142B 固定で返り、ホスト側で 70B に切り詰めることは実機確認済みである。142B が MTU 依存で変化するかは未確定。応答 `offset` は 0 を返すが、要求 offset と一致する場合も受け入れる。
 - `getBT2_ReadMacro` の公式 `Generate_CustomDataCmd` 経路は `16 + chunk_len` バイト（ペイロードはゼロ埋め）を送ると読める。本実装はタスク指示に従い 17B の payloadless 要求を送るため、ReadMacro の実機応答は未確認である。
 - 公式アプリは要求ペイロードに直前の `gamepadVersion` を再利用する。本実装は常にゼロを送るため、同一接続で 2 回目以降の読み出し時にデバイスが同じ応答を返すかは未確認である（今回の CLI は 1 回読みのみ）。
 - USB 給電併用が BLE 設定モードの持続時間を延ばすかは、1 回の成功では判断できない（ユーザー仮説・未検証）。
@@ -406,7 +412,7 @@ sequenceDiagram
 | `cmd` | `subcmd_or_param` | `total_len` / `offset` | 方向 | 機能・用途 |
 | --- | --- | --- | --- | --- |
 | **`0x0001`** | `0x0000` | `total_len = 0x0AD0`（常に全体長）、`chunk_len` = このパケットの実データ長（例: 部分書込 `0x74` / `0x0C`）、`offset` = 構造体内オフセット | Host → Ctrl | **設定構造体書き込み**（全体 `2768B` または各項目差分書き込み。部分書込でも `total_len` は `0x0AD0` のまま。下記 6.3 参照） |
-| **`0x0002`** | `0x0000` | 全体: `offset=0, total_len = chunk_len = 0x0AD0`<br/>ヘッダ: `offset=0, total_len = chunk_len = 0x74`<br/>現在スロット: `offset=0x12, total_len = chunk_len = 2` | Host → Ctrl | **設定構造体読み出し**。ペイロードなしだが `chunk_len` に要求長を宣言する（§4.1.1）。**1 要求 = 1 チャンク**（実機 142B）で、`offset += payload.len()` の再要求が必要（§4.3.1） |
+| **`0x0002`** | `0x0000` | 全体: `offset=0, total_len = chunk_len = 0x0AD0`<br/>ヘッダ: `offset=0, total_len = chunk_len = 0x74`<br/>現在スロット: `offset=0x12, total_len = chunk_len = 2` | Host → Ctrl | **設定構造体読み出し**。ペイロードなしだが `chunk_len` に要求長を宣言する（§4.1.1）。**1 要求 = 1 チャンク**（実機 142B）で、`offset += payload.len()` の再要求が必要。最終チャンクも 142B で返り、残り 70B に切り詰める（§4.3.1） |
 | **`0x0003`** | `0x0000` | `total_len=0x0C`, `offset=0x0C` | Ctrl ↔ Host | **リアルタイム入力レポート取得 / 通知**（12 バイト、セクション 7 参照） |
 | **`0x0006`** | **`0x0067`** (BLE)<br/>**`0x0123`** (Windows USB) | `total_len=0, offset=0` | Host → Ctrl | **Save（Flash 永続化）**。書き込み系（`0x0001` / `0x0103`）完了後に必ず発行。**BLE(Android) と USB(Windows) でサブコマンドが異なる点に注意**（6.4 参照） |
 | **`0x0007`** | `0x0000` (無効) / `0x0001` (有効) | `total_len=0, offset=0` | Host → Ctrl | **`SetReportEnable`**。リアルタイム入力通知の開始/停止。発行時にクライアント側 `MAX_ATT_MTU = 0x3F` へ設定 |
