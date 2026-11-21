@@ -273,10 +273,13 @@ ReadConfig head:  04 02 00 00 00 74 00 00 00 74 00 00 00 00 00 00 00
   - `cmd=0x0004`, `subcmd=0x0002`, `chunk_len=0x008E` (142), `crc16=0xA971`, `total_len=0x0AD0`, `offset=0`。
 - 最終要求は `offset=0xA8A` (2698)、残り 70B だが、デバイスは**最終チャンクも 142B 固定**で返す:
   ```text
-  04 00 02 00 8E 00 ?? ?? D0 0A 00 00 8A 0A 00 00 + <70 valid bytes> + <72 padding bytes>
+  04 00 02 00 8E 00 22 32 D0 0A 00 00 8A 0A 00 00 + <70 valid bytes> + <72 padding bytes>
   ```
-  - 応答ヘッダは `cmd=0x0004`, `subcmd=0x0002`, `chunk_len=0x008E`, `total_len=0x0AD0`, `offset=0xA8A`。
+  - 応答ヘッダは `cmd=0x0004`, `subcmd=0x0002`, `chunk_len=0x008E`, `total_len=0x0AD0`, `crc16=0x3222`, `offset=0xA8A`。
+  - `crc16=0x3222`（LE `22 32`）は **142B 全体**（有効 70B + 72B ゼロパディング）の CRC-16/MODBUS（init `0xFFFF`, poly `0xA001`）と一致する。有効 70B のみでは `0x8EF7` となり一致しない。
+  - 検証元: `/tmp/opencode/8bitdo-backup/config-20261121b.bin`（2768B、SHA-256 `1dca47facfc1c0394a8893ac0a5b7ef80678c51081001886a4bf17ce2f59c600`）の末尾 70B + 72B ゼロ。
   - 2768B を超える末尾 72B はパディングであり、ホスト側で `CONFIG_SIZE - offset = 70B` に切り詰めてコピーする。パディングは破棄する。
+  - **実装は最終チャンクも 142B 全体で CRC を検証する**（70B に切り詰める前に、受信ペイロード 142B の `crc16` を照合する）。
 - ReadConfig の応答 `offset` は、**初回応答のみ `0`** を「逐次チャンクの印」として許容し、要求 `offset` に配置する。**2 回目以降は要求 `offset` をエコー**するため、要求値と一致しなければ `UnexpectedResponse` とする。実機の 20 応答では `0, 142, 284, 426, 568, 710, 852, 994, 1136, 1278, 1420, 1562, 1704, 1846, 1988, 2130, 2272, 2414, 2556, 2698` を観測した。
 - ReadVersion は単発転送であり、応答 `offset=0` を前提とする。非 0 の `offset` は転送範囲外または未完成として失敗する。
 - データ応答の `total_len` は要求した転送長と一致しなければならない（`ReadConfig` は `0x0AD0`、`ReadVersion` は `4`）。`cmd=0x0004` エンベロープだけでなく、`cmd == 要求 cmd` の直接応答でも同じ検査を行い、`total_len = 0` の直接エコーだけは互換のため許容する。

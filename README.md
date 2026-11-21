@@ -49,7 +49,7 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 - [x] 完全仕様書・実装計画書・AI 引き継ぎドキュメント作成
 - [x] Phase 1: `eightbitdo-protocol`（Rust プロトコル・構造体・CRC・マクロ、単体テスト 74 件 + doc test 4 件）
 - [ ] Phase 2: `eightbitdo-core` + `eightbitdo-cli`（BLE 実機通信＆検証）
-  - [ ] Phase 2a: 読み取り専用 core / CLI / `session`（`eightbitdo session` の REPL は `info` / `config dump` / `backup` / `monitor` / `monitor stop` / `status` / `help` / `quit`。設定バックアップは `--raw` / `--json` を同一ディレクトリの一時ファイル経由でアトミックに書き、同一ファイルを指す 2 つの出力パスは拒否する）
+  - [ ] Phase 2a: 読み取り専用 core / CLI / `session`（`eightbitdo session` の REPL は `info` / `config dump` / `backup` / `monitor` / `monitor stop` / `status` / `help` / `quit`。設定バックアップは `--raw` / `--json` を同一ディレクトリの一時ファイル経由でアトミックに書き、同一ファイルを指す 2 つの出力パスは拒否する。ただし hard link の同一性検出は Unix のみで、Windows は file identity 未実装のため hard link alias を事前拒否せず、raw 書き込み後の再検証と `rename` semantics で保護する）
   - [ ] Phase 2b: マクロ読み書き
   - [ ] Phase 2c: BLE OTA（Linux）
   - [ ] Phase 2d: 設定書き込み
