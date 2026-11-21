@@ -137,12 +137,35 @@ Windows の `FindHid` / `enum_hid` は `HidD_GetPreparsedData` + `HidP_GetCaps` 
 | --- | --- | --- | --- | --- |
 | `+0x00` | 2B | `u16` | `cmd` | コマンド ID（例: `0x0001` Write, `0x0002` Read, `0x000B` Version） |
 | `+0x02` | 2B | `u16` | `subcmd_or_param` | サブコマンド・引数・スロット指定（例: `0x0067` / `0x0123` Save, `(mode << 8) \| slot`） |
-| `+0x04` | 2B | `u16` | `chunk_len` | このパケットに含まれるペイロード実長（送信要求コマンドでペイロード無しなら `0`） |
+| `+0x04` | 2B | `u16` | `chunk_len` | このパケットのペイロード長。**読み取り要求ではペイロードがなくても要求データ長を宣言する**（`ReadConfig` / `ReadMacro` は `chunk_len = total_len`。§4.1.1） |
 | `+0x06` | 2B | `u16` | `crc16` | ペイロードに対する CRC-16/MODBUS（条件付き、未使用時は `0x0000`） |
 | `+0x08` | 4B | `u32` | `total_len` | 転送全体の総バイト数（または読み出し要求総長）。`0x000B` ReadVersion では `gamepad_type == 1` (`0x600F`) は `4`、`gamepad_type == 2` は `0x01020030` |
 | `+0x0C` | 4B | `u32` | `offset` | 分割転送時の開始オフセット。ただし `cmd == 0x0001` / `0x0066`（`PID == 0x600F, 0x6009, 0x202F, 0x2072`）では `total_len` 側の値が設定される。`cmd == 0x000B` ReadVersion は `gamepad_type == 1` (`0x600F`) で `0x01017040`、`gamepad_type == 2` で `0x01020030`（`total_len` と同値） |
 
 > **例外 (`cmd = 0x0104` `EraseBT2Macro`)**: このコマンドはペイロードを持たないが、公式実装 (`getBT2_EraseMacro`) はチャネルの `total_len` と `chunk_len` をともに `0x1000` に設定し、`Generate_CustomDataCmd` が `chunk_len` フィールドを wire header `+0x04` に書く。実際のペイロードは `len = 0` である。`chunk_len` の一般則（ペイロード実長）だけから `0` と解釈しないこと。`gamepad_type == 1` の CRC 計算は空ペイロードに対して行われ、`crc16` は長さ `<= 0` で `0xFFFF` を返すため、wire header `+0x06` は `0xFFFF` となる。
+
+#### 4.1.1 読み取り要求の `chunk_len`（実機 ACK で判明した訂正）
+
+`ReadConfig` (`0x0002`) と `ReadMacro` (`0x0102`) は **ペイロードを送らないが、`chunk_len` に要求データ長を宣言する**。Phase 1 の仕様・実装で `chunk_len = 0` としていたのは見落としであり、実機で `chunk_len = 0` の ReadConfig がデータを返さず ACK だけを返したことで判明した。
+
+証拠（x86_64 `libadvancelib.so`）:
+
+- `getUT2_ReadCofigChannel` **0x29ea0** は `0x1d5f0` の 16 バイトをチャネル `+0x3c` にロードする。`objdump -s --start-address=0x1d5f0 --stop-address=0x1d600` の内容は `00000000 d00a0000 d00a0000 d00a0000`:
+  - `+0x3c = 0`（`offset`）
+  - `+0x40 = 0x0AD0`（`total_len`）
+  - `+0x44 = 0x0AD0`（`chunk_len`）
+  - `+0x48 = 0x0AD0`（追加長 / 残り長）
+- `getBT2_head_CofigChannel` **0x2a000** は `+0x3c = 0`, `+0x40 = 0x74`, `+0x44 = 0x74`（ヘッダ読み）。
+- `getBT2_ReadMacro` **0x2bd90** は `+0x40 = +0x44 = +0x48 = steps * 10` を設定し、`+0x38 = macro_idx << 12`（4 KB セクタベース）を wire `offset` として使う。`cmd = 0x0102`。
+
+したがって wire request は次の 17B（ペイロードなし）になる:
+
+```text
+ReadConfig full:  04 02 00 00 00 D0 0A 00 00 D0 0A 00 00 00 00 00 00
+ReadConfig head:  04 02 00 00 00 74 00 00 74 00 00 00 00 00 00 00
+```
+
+> **実機 ACK**: `chunk_len = 0` の旧要求では `04 00 02 00 00 00 FF FF D0 0A 00 00 00 00 00 00` の ACK だけが返った（実機観測）。`chunk_len = 0x0AD0` に修正した要求の応答は親エージェントが実機確認する。
 
 ```text
  0      1 2      3 4      5 6      7 8            11 12           15
@@ -221,6 +244,8 @@ Windows の `FindHid` / `enum_hid` は `HidD_GetPreparsedData` + `HidP_GetCaps` 
   04 00 02 00 00 00 FF FF D0 0A 00 00 00 00 00 00
   ```
   - このフレームをエラーにせず読み飛ばし、後続のデータチャンクを待つ必要がある。
+- `ReadConfig` の要求は、旧実装の `chunk_len=0` ではなく **`chunk_len = total_len = 0x0AD0`**（ヘッダ読みは `0x74`）で送る（§4.1.1）。`chunk_len=0` では実機が ACK だけを返した。
+- 応答は **1 要求で全チャンクがストリームされる**。公式 `baseCumstomChannel` は `Generate_CustomDataCmd` を 1 回だけ呼び、`handleChannel` は未完了時に `Channel::start` でタイマーを再アームするだけである。`readCustomConfig_unfinished`（0x2e3d0）も受信バイト数をログして `true` を返すのみで、再要求はしない。したがって CLI 側にオフセットごとの再要求ループは不要。
 
 **ユーザー仮説の検証（USB 併用）**:
 
@@ -230,6 +255,7 @@ Windows の `FindHid` / `enum_hid` は `HidD_GetPreparsedData` + `HidP_GetCaps` 
 **未確定のこと**:
 
 - `ReadConfig` のデータチャンク自体の実フレーム（`offset` の進み方、`chunk_len`、CRC）は、本ノート作成時点では取得途中である。先頭の ready ACK のみ実測済み。
+- `getBT2_ReadMacro` の公式 `Generate_CustomDataCmd` 経路は `16 + chunk_len` バイト（ペイロードはゼロ埋め）を送ると読める。本実装はタスク指示に従い 17B の payloadless 要求を送るため、ReadMacro の実機応答は未確認である。
 - 公式アプリは要求ペイロードに直前の `gamepadVersion` を再利用する。本実装は常にゼロを送るため、同一接続で 2 回目以降の読み出し時にデバイスが同じ応答を返すかは未確認である（今回の CLI は 1 回読みのみ）。
 - USB 給電併用が BLE 設定モードの持続時間を延ばすかは、1 回の成功では判断できない（ユーザー仮説・未検証）。
 
@@ -356,7 +382,7 @@ sequenceDiagram
 | `cmd` | `subcmd_or_param` | `total_len` / `offset` | 方向 | 機能・用途 |
 | --- | --- | --- | --- | --- |
 | **`0x0001`** | `0x0000` | `total_len = 0x0AD0`（常に全体長）、`chunk_len` = このパケットの実データ長（例: 部分書込 `0x74` / `0x0C`）、`offset` = 構造体内オフセット | Host → Ctrl | **設定構造体書き込み**（全体 `2768B` または各項目差分書き込み。部分書込でも `total_len` は `0x0AD0` のまま。下記 6.3 参照） |
-| **`0x0002`** | `0x0000` | 全体: `offset=0, total_len=0x0AD0`<br/>ヘッダ: `offset=0, total_len=0x74`<br/>現在スロット: `offset=0x12, total_len=2` | Host → Ctrl | **設定構造体読み出し**。応答は `cumstom_header_t` に続き要求データ片が返る |
+| **`0x0002`** | `0x0000` | 全体: `offset=0, total_len = chunk_len = 0x0AD0`<br/>ヘッダ: `offset=0, total_len = chunk_len = 0x74`<br/>現在スロット: `offset=0x12, total_len = chunk_len = 2` | Host → Ctrl | **設定構造体読み出し**。ペイロードなしだが `chunk_len` に要求長を宣言する（§4.1.1）。応答は `cumstom_header_t` に続き要求データ片が返る |
 | **`0x0003`** | `0x0000` | `total_len=0x0C`, `offset=0x0C` | Ctrl ↔ Host | **リアルタイム入力レポート取得 / 通知**（12 バイト、セクション 7 参照） |
 | **`0x0006`** | **`0x0067`** (BLE)<br/>**`0x0123`** (Windows USB) | `total_len=0, offset=0` | Host → Ctrl | **Save（Flash 永続化）**。書き込み系（`0x0001` / `0x0103`）完了後に必ず発行。**BLE(Android) と USB(Windows) でサブコマンドが異なる点に注意**（6.4 参照） |
 | **`0x0007`** | `0x0000` (無効) / `0x0001` (有効) | `total_len=0, offset=0` | Host → Ctrl | **`SetReportEnable`**。リアルタイム入力通知の開始/停止。発行時にクライアント側 `MAX_ATT_MTU = 0x3F` へ設定 |
@@ -369,7 +395,7 @@ sequenceDiagram
 | **`0x0012`** | `0x0000` | — | Ctrl → Host | **`AllowConfigDone`**。コントローラが設定受付可能になった際の非同期通知 |
 | **`0x0013`** | `0x0000` | `total_len=0, offset=0` (Windows `StartConfig` flag=`1`) | Host → Ctrl | **Windows USB HID 用 `StartConfig`**（最大 30 回リトライし `cmd=0x13` ACK を待機） |
 | **`0x0015`** | `slot` (`0..2`) | `total_len=0, offset=0` | Host → Ctrl | **`WriteSLOT`**。アクティブプロファイルスロット切替 |
-| **`0x0102`** | `(mode << 8) \| slot` | `total_len = steps * 10`, `offset = macro_idx << 12` (`macro_idx * 0x1000`) | Host → Ctrl | **`ReadBT2Macro`**。指定スロット・マクロ番号のステップ列を読み出し（1 ステップ = 10B） |
+| **`0x0102`** | `(mode << 8) \| slot` | `total_len = chunk_len = steps * 10`, `offset = macro_idx << 12` (`macro_idx * 0x1000`) | Host → Ctrl | **`ReadBT2Macro`**。指定スロット・マクロ番号のステップ列を読み出し（1 ステップ = 10B）。ペイロードなしだが `chunk_len` に要求長を宣言する（§4.1.1） |
 | **`0x0103`** | `(mode << 8) \| slot` | `total_len = align32(steps * 10)` (`((steps * 10) + 0x1F) & ~0x1F`), `offset = (macro_idx << 12) + chunk_index * chunk_size`（`chunk_index` はパケットごとに進む。プロトコル上限は BLE `0x40` / USB HID `0x20`。本クレートの API は 32B / 64B のみで、46B などは `UnsupportedChunkSize`。64B 超は 64B にクランプ） | Host → Ctrl | **`WriteBT2Macro`**。BLE 最大 **`0x40` (64B)** / USB HID 最大 **`0x20` (32B)** 分割でマクロを書き込み、完了後に `0x0006` (Save) を実行。API の chunk サイズは 32B / 64B のみ（32B アライン保証） |
 | **`0x0104`** | `(mode << 8) \| slot` | `total_len = 0x1000`, `chunk_len = 0x1000`（wire header `+0x04`。公式実装のチャネル設定値。ペイロードなし `len = 0`）, `crc16 = 0xFFFF`（空ペイロードの CRC-16/MODBUS）, `offset = macro_idx << 12` | Host → Ctrl | **`EraseBT2Macro`**。指定スロット・マクロ領域（4KB 単位）を消去 |
 

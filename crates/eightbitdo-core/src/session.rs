@@ -149,7 +149,7 @@ impl<T: Transport> Session<T> {
     /// chunk points outside the 2768-byte block, or a transport error.
     pub async fn read_config_snapshot(&self) -> Result<ConfigSnapshot, Error> {
         self.transport
-            .send(&commands::read_config_all().encode_ble(PacketKind::App)?)
+            .send(&commands::read_config_all().encode_ble_payloadless(PacketKind::App)?)
             .await?;
 
         let bytes = self
@@ -312,17 +312,12 @@ impl<T: Transport> Session<T> {
             )));
         }
 
-        // Payload-less acknowledgement or "ready" frame. The observed
-        // ReadVersion ACK uses chunk_len = total_len = 0; the config read ACK
-        // uses chunk_len = 0 with the full transfer size in total_len.
+        // Payload-less acknowledgement / "ready" frame. The device does not
+        // carry data when chunk_len is zero; total_len may be 0 (ReadVersion
+        // ACK) or the full transfer size (ReadConfig ready ACK). Skip it and
+        // keep waiting for the data frame(s).
         if response.chunk_len == 0 {
-            if response.total_len == 0 || response.total_len as usize == expected_len {
-                return Ok(None);
-            }
-            return Err(Error::UnexpectedResponse(format!(
-                "response envelope total_len {} does not match the expected {expected_len} bytes",
-                response.total_len
-            )));
+            return Ok(None);
         }
         if response.total_len as usize != expected_len {
             return Err(Error::UnexpectedResponse(format!(
@@ -479,6 +474,18 @@ mod tests {
     const OBSERVED_CONFIG_ACK: [u8; 16] = [
         0x04, 0x00, 0x02, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xD0, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00,
+    ];
+
+    /// Exact 17-byte ReadConfig request. `chunk_len` and `total_len` both
+    /// declare the requested transfer length (0x0AD0).
+    const READ_CONFIG_REQUEST: [u8; 17] = [
+        0x04, // BLE App prefix
+        0x02, 0x00, // cmd = 0x0002
+        0x00, 0x00, // subcmd
+        0xD0, 0x0A, // chunk_len = 0x0AD0
+        0x00, 0x00, // crc16
+        0xD0, 0x0A, 0x00, 0x00, // total_len = 0x0AD0
+        0x00, 0x00, 0x00, 0x00, // offset = 0
     ];
 
     /// Exact 21-byte ReadVersion request derived from `getVersionChannel`
@@ -664,6 +671,25 @@ mod tests {
         let config = sample_config();
         let mock = MockTransport::new();
         mock.push_incoming(&OBSERVED_CONFIG_ACK);
+        push_config_envelope_chunks(&mock, config.as_bytes(), 692);
+
+        let session = Session::new(&mock);
+        let snapshot = session.read_config_snapshot().await.unwrap();
+        assert_eq!(snapshot.config.as_bytes(), config.as_bytes());
+        assert_eq!(mock.sent_frames(), vec![READ_CONFIG_REQUEST.to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn config_ack_is_skipped_regardless_of_total_len() {
+        let config = sample_config();
+        let mock = MockTransport::new();
+        let odd_ack = CustomHeader::new(
+            commands::cmd::RESPONSE,
+            commands::cmd::READ_CONFIG,
+            0x1234,
+            0,
+        );
+        mock.push_response(&odd_ack, &[]);
         push_config_envelope_chunks(&mock, config.as_bytes(), 692);
 
         let session = Session::new(&mock);

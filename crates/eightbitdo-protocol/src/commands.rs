@@ -147,6 +147,28 @@ impl Request {
         }
     }
 
+    /// Build a payload-less request that declares `chunk_len = total_len`.
+    ///
+    /// Read commands (`ReadConfig` / `ReadMacro`) on `0x600F` use this shape:
+    /// the wire packet contains only the 16-byte header, but `chunk_len`
+    /// carries the requested transfer length. See
+    /// [`commands::read_config`] and [`commands::read_macro`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when `total_len` does not fit in `u16`. All built-in read
+    /// builders are bounded by the 2768-byte config block or one 4 KB macro
+    /// sector, so this cannot happen through the public constructors.
+    #[must_use]
+    pub fn new_payloadless(cmd: u16, subcmd: u16, total_len: u32, offset: u32) -> Self {
+        let chunk_len = u16::try_from(total_len)
+            .expect("payload-less read length must fit in the wire chunk_len field");
+        Self {
+            header: CustomHeader::new(cmd, subcmd, total_len, offset).with_chunk_len(chunk_len),
+            payload: Vec::new(),
+        }
+    }
+
     /// Attach a payload, updating `chunk_len` but not `crc16`.
     #[must_use]
     pub fn with_payload(mut self, payload: &[u8]) -> Self {
@@ -177,42 +199,64 @@ impl Request {
     }
 
     /// Validate the shape accepted by the payload-less encoders.
+    ///
+    /// Two families are allowed:
+    ///
+    /// - `ReadConfig` (`0x0002`) and `ReadMacro` (`0x0102`) with an empty
+    ///   payload and `chunk_len == total_len`;
+    /// - `EraseBT2Macro` (`0x0104`) with `chunk_len = total_len = 0x1000`,
+    ///   `crc16 = 0xFFFF` and a 4 KB-aligned sector offset.
     fn validate_payloadless(&self) -> Result<(), Error> {
         if !self.payload.is_empty() {
             return Err(Error::UnexpectedPayload {
                 actual: self.payload.len(),
             });
         }
-        let expected_len = macro_data::MACRO_SECTOR_SIZE;
-        if self.header.cmd != cmd::ERASE_MACRO
-            || self.header.total_len != expected_len
-            || self.header.chunk_len != expected_len as u16
-        {
-            return Err(Error::InvalidFrame(
-                "payloadless encoding is restricted to EraseBT2Macro \
-                 (cmd 0x0104, total_len = chunk_len = 0x1000)",
-            ));
+        match self.header.cmd {
+            cmd::READ_CONFIG | cmd::READ_MACRO => {
+                if u32::from(self.header.chunk_len) != self.header.total_len {
+                    return Err(Error::InvalidFrame(
+                        "payload-less read chunk_len must equal total_len",
+                    ));
+                }
+                Ok(())
+            }
+            cmd::ERASE_MACRO => {
+                let expected_len = macro_data::MACRO_SECTOR_SIZE;
+                if self.header.total_len != expected_len
+                    || self.header.chunk_len != expected_len as u16
+                {
+                    return Err(Error::InvalidFrame(
+                        "payloadless encoding is restricted to EraseBT2Macro \
+                         (cmd 0x0104, total_len = chunk_len = 0x1000)",
+                    ));
+                }
+                if self.header.crc16 != 0xFFFF {
+                    return Err(Error::InvalidFrame(
+                        "EraseBT2Macro header crc16 must be 0xFFFF",
+                    ));
+                }
+                if !matches!(self.header.offset, 0 | 0x1000 | 0x2000 | 0x3000) {
+                    return Err(Error::InvalidFrame(
+                        "EraseBT2Macro offset must be macro_idx << 12",
+                    ));
+                }
+                Ok(())
+            }
+            _ => Err(Error::InvalidFrame(
+                "payloadless encoding is restricted to ReadConfig, ReadMacro \
+                 and EraseBT2Macro",
+            )),
         }
-        if self.header.crc16 != 0xFFFF {
-            return Err(Error::InvalidFrame(
-                "EraseBT2Macro header crc16 must be 0xFFFF",
-            ));
-        }
-        if !matches!(self.header.offset, 0 | 0x1000 | 0x2000 | 0x3000) {
-            return Err(Error::InvalidFrame(
-                "EraseBT2Macro offset must be macro_idx << 12",
-            ));
-        }
-        Ok(())
     }
 
     /// Encode a payload-less command whose header declares a non-zero
     /// `chunk_len`.
     ///
-    /// This is restricted to `EraseBT2Macro` (`cmd 0x0104`), whose official
-    /// request declares `chunk_len = total_len = 0x1000` while sending no
-    /// payload bytes. All other commands must use
-    /// [`encode_ble`](Self::encode_ble), which enforces
+    /// `ReadConfig` (`0x0002`) and `ReadMacro` (`0x0102`) use this path with
+    /// `chunk_len == total_len` and no payload bytes. `EraseBT2Macro`
+    /// (`0x0104`) uses it with `chunk_len = total_len = 0x1000`. All other
+    /// commands must use [`encode_ble`](Self::encode_ble), which enforces
     /// `chunk_len == payload.len()`.
     ///
     /// # Errors
@@ -229,11 +273,10 @@ impl Request {
         Ok(header::encode_ble_payloadless(kind, &self.header))
     }
 
-    /// Encode a payload-less `EraseBT2Macro` request as a 65-byte App Mode
-    /// USB HID report.
+    /// Encode a payload-less request as a 65-byte App Mode USB HID report.
     ///
     /// See [`encode_ble_payloadless`](Self::encode_ble_payloadless) for the
-    /// accepted command shape.
+    /// accepted command shapes.
     ///
     /// # Errors
     ///
@@ -261,13 +304,19 @@ fn check_config_range(offset: u32, len: u64) -> Result<(), Error> {
 
 /// `ReadConfig` for an arbitrary range.
 ///
+/// The request is payload-less but declares `chunk_len == total_len == len`.
+/// The official `getUT2_ReadCofigChannel` (0x29ea0) loads the 16-byte channel
+/// fields from `0x1d5f0`: `offset = 0`, `total_len = chunk_len = 0x0AD0` for
+/// the full block. `getBT2_head_CofigChannel` (0x2a000) uses `0x74` for the
+/// header read.
+///
 /// # Errors
 ///
 /// Returns [`Error::RangeOutOfBounds`] when `offset + len` exceeds the
 /// 2768-byte configuration block.
 pub fn read_config(offset: u32, len: u32) -> Result<Request, Error> {
     check_config_range(offset, u64::from(len))?;
-    Ok(Request::new(cmd::READ_CONFIG, 0, len, offset))
+    Ok(Request::new_payloadless(cmd::READ_CONFIG, 0, len, offset))
 }
 
 /// Read the full 2768-byte configuration block.
@@ -437,6 +486,11 @@ pub const fn macro_subcmd(gamepad_mode: u16, slot: Slot) -> u16 {
 
 /// Read macro steps (`1 step = 10 bytes`, no 32-byte alignment).
 ///
+/// The request is payload-less but declares
+/// `chunk_len == total_len == steps * 10`. The official
+/// `getBT2_ReadMacro` (0x2bd90) sets `+0x40 = +0x44 = +0x48` to that length,
+/// keeps the 4 KB sector base in `+0x38`, and uses `cmd 0x0102`.
+///
 /// # Errors
 ///
 /// Returns [`Error::TooManySteps`] when `steps` exceeds
@@ -463,7 +517,7 @@ pub fn read_macro(
             actual: step_count,
         });
     }
-    Ok(Request::new(
+    Ok(Request::new_payloadless(
         cmd::READ_MACRO,
         macro_subcmd(gamepad_mode, slot),
         total_len,
@@ -846,12 +900,63 @@ mod tests {
         assert_eq!(request.header.cmd, 0x0002);
         assert_eq!(request.header.subcmd, 0);
         assert_eq!(request.header.total_len, 0x0AD0);
+        assert_eq!(request.header.chunk_len, 0x0AD0);
         assert_eq!(request.header.offset, 0);
         assert!(request.payload.is_empty());
 
         let header = read_config_header();
         assert_eq!(header.header.total_len, 0x74);
-        assert_eq!(read_current_slot().header.offset, 0x12);
+        assert_eq!(header.header.chunk_len, 0x74);
+        let slot = read_current_slot();
+        assert_eq!(slot.header.offset, 0x12);
+        assert_eq!(slot.header.chunk_len, 2);
+        assert_eq!(slot.header.total_len, 2);
+    }
+
+    #[test]
+    fn read_config_payloadless_encoding_is_17_bytes_with_declared_chunk_len() {
+        let bytes = read_config_all()
+            .encode_ble_payloadless(PacketKind::App)
+            .unwrap();
+        assert_eq!(
+            bytes,
+            [
+                0x04, // BLE App prefix
+                0x02, 0x00, // cmd = 0x0002
+                0x00, 0x00, // subcmd
+                0xD0, 0x0A, // chunk_len = 0x0AD0
+                0x00, 0x00, // crc16
+                0xD0, 0x0A, 0x00, 0x00, // total_len = 0x0AD0
+                0x00, 0x00, 0x00, 0x00, // offset = 0
+            ]
+        );
+        assert_eq!(bytes.len(), 17);
+    }
+
+    #[test]
+    fn payloadless_read_requires_chunk_len_equal_total_len() {
+        let mut config = read_config_all();
+        config.header.chunk_len = 0;
+        assert!(matches!(
+            config.encode_ble_payloadless(PacketKind::App),
+            Err(Error::InvalidFrame(_))
+        ));
+
+        let mut macro_request = read_macro(3, Slot::S2, MacroIndex::M3, 42).unwrap();
+        macro_request.header.chunk_len = 0;
+        assert!(matches!(
+            macro_request.encode_ble_payloadless(PacketKind::App),
+            Err(Error::InvalidFrame(_))
+        ));
+
+        // The normal encoder still rejects a declared length without payload.
+        assert_eq!(
+            read_config_all().encode_ble(PacketKind::App),
+            Err(Error::ChunkLenMismatch {
+                declared: 0x0AD0,
+                actual: 0,
+            })
+        );
     }
 
     #[test]
@@ -995,6 +1100,18 @@ mod tests {
         assert_eq!(request.header.subcmd, 0x0301);
         assert_eq!(request.header.offset, 0x2000);
         assert_eq!(request.header.total_len, 420);
+        assert_eq!(request.header.chunk_len, 420);
+        assert!(request.payload.is_empty());
+
+        let bytes = request.encode_ble_payloadless(PacketKind::App).unwrap();
+        assert_eq!(bytes.len(), 17);
+        assert_eq!(bytes[0], 0x04);
+        let parsed = CustomHeader::parse(&bytes[1..]).unwrap();
+        assert_eq!(parsed.cmd, 0x0102);
+        assert_eq!(parsed.subcmd, 0x0301);
+        assert_eq!(parsed.chunk_len, 420);
+        assert_eq!(parsed.total_len, 420);
+        assert_eq!(parsed.offset, 0x2000);
     }
 
     #[test]
