@@ -286,7 +286,7 @@ fn write_config_outputs(
             )));
         }
     }
-    let sha256 = hex::encode(Sha256::digest(snapshot.config.as_bytes()));
+    let sha256 = sha256_hex(snapshot.config.as_bytes());
 
     if let Some(path) = raw_path {
         std::fs::write(path, snapshot.config.as_bytes())?;
@@ -304,6 +304,10 @@ fn write_config_outputs(
     }
 
     Ok(sha256)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn json_summary(snapshot: &ConfigSnapshot, sha256: &str) -> serde_json::Value {
@@ -428,46 +432,34 @@ async fn monitor(options: &BleOptions, count: Option<u64>) -> Result<(), Error> 
 
     let transport = BleTransport::connect(options).await?;
     let session = Session::new(transport);
-    if let Err(error) = session.set_report_enable(true).await {
-        let _ = session.transport().disconnect().await;
-        return Err(error);
-    }
-
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-
-    let mut printed: u64 = 0;
-    let mut outcome = Ok(());
-    loop {
-        if count.is_some_and(|limit| printed >= limit) {
-            break;
-        }
-        tokio::select! {
-            signal = &mut ctrl_c => {
-                if let Err(error) = signal {
-                    outcome = Err(Error::Io(error));
-                }
-                break;
-            }
-            report = session.try_next_input(Duration::from_secs(5)) => {
-                match report {
-                    Ok(Some(report)) => {
-                        print_report(&report);
-                        printed += 1;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        outcome = Err(error);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    let _ = session.set_report_enable(false).await;
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    let result = monitor_connection(&session, Duration::from_millis(20), count, shutdown).await;
     let _ = session.transport().disconnect().await;
-    outcome
+    result.map(|_| ())
+}
+
+/// Run the top-level monitor against an already connected session.
+///
+/// This mirrors the `session` monitor: enable reports, poll `0x0003` every
+/// `interval`, print each report, then disable reports on the way out. The
+/// connection itself stays owned by the caller.
+async fn monitor_connection<T: Transport>(
+    session: &Session<T>,
+    interval: Duration,
+    count: Option<u64>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<MonitorPollOutcome, Error> {
+    session.set_report_enable(true).await?;
+    let stop = Notify::new();
+    let stats = MonitorStats::default();
+    tokio::pin!(shutdown);
+    let result = monitor_poll(session, interval, count, &stop, &mut shutdown, &stats).await;
+    // Best effort: stop notifications even if the poll failed or was
+    // interrupted. The caller still disconnects the link.
+    let _ = session.set_report_enable(false).await;
+    result
 }
 
 async fn keepalive(
@@ -604,8 +596,8 @@ fn is_input_notification(frame: &[u8]) -> Result<bool, Error> {
     Ok(is_input && header.chunk_len > 0)
 }
 
-/// Shared counters and shutdown signalling for the session keepalive task.
-/// Shared counters and failure state for the session keepalive task.
+/// Shared counters, failure state, and shutdown signalling for the session
+/// keepalive task.
 struct SessionKeepaliveState {
     sent: AtomicU64,
     received: AtomicU64,
@@ -759,10 +751,16 @@ fn print_session_help() {
     println!("  config dump [--raw FILE] [--json FILE]");
     println!("  backup [--raw FILE] [--json FILE]");
     println!("  monitor [--count N]");
+    println!("  monitor stop");
     println!("  status");
     println!("  help");
     println!("  quit | exit");
-    println!("monitor without --count runs until Ctrl-C; Ctrl-C exits the session.");
+    println!(
+        "monitor runs in the background until 'monitor stop' or Ctrl-C; Ctrl-C exits the session."
+    );
+    println!(
+        "monitor --count N returns after N reports; without responses it can wait indefinitely."
+    );
 }
 
 /// Start the official-style keepalive on a shared session.
@@ -906,7 +904,19 @@ async fn shutdown_session_with_timeout<T: Transport>(
     timeout: Duration,
 ) {
     keepalive.stop_with_timeout(timeout).await;
-    let guard = session.lock().await;
+    let guard = match tokio::time::timeout(timeout, session.lock()).await {
+        Ok(guard) => guard,
+        Err(_) => {
+            // A monitor or command is holding the operation lock. Do not hang
+            // shutdown waiting for it; the link will be dropped with the
+            // process.
+            eprintln!(
+                "session shutdown: operation lock still held after {:.1}s; skipping report disable and disconnect",
+                timeout.as_secs_f64()
+            );
+            return;
+        }
+    };
     let _ = tokio::time::timeout(timeout, guard.set_report_enable(false)).await;
     let _ = tokio::time::timeout(timeout, guard.transport().disconnect()).await;
 }
@@ -918,12 +928,33 @@ enum MonitorPollOutcome {
     Quit,
 }
 
+/// Send/receive counters for one monitor run.
+///
+/// The background session monitor shares these with the REPL so `status` can
+/// report its traffic without racing the operation lock.
+#[derive(Debug, Default)]
+struct MonitorStats {
+    sent: AtomicU64,
+    received: AtomicU64,
+}
+
+impl MonitorStats {
+    fn sent(&self) -> u64 {
+        self.sent.load(Ordering::SeqCst)
+    }
+
+    fn received(&self) -> u64 {
+        self.received.load(Ordering::SeqCst)
+    }
+}
+
 async fn monitor_poll<T, F>(
     session: &Session<T>,
     interval: Duration,
     count: Option<u64>,
     stop: &Notify,
     ctrl_c: &mut Pin<&mut F>,
+    stats: &MonitorStats,
 ) -> Result<MonitorPollOutcome, Error>
 where
     T: Transport,
@@ -938,15 +969,20 @@ where
         }
 
         tokio::select! {
+            biased;
             _ = stop.notified() => return Ok(MonitorPollOutcome::Stopped),
             _ = ctrl_c.as_mut() => return Ok(MonitorPollOutcome::Quit),
             _ = tokio::time::sleep_until(next_send) => {}
         }
 
         tokio::select! {
+            biased;
             _ = stop.notified() => return Ok(MonitorPollOutcome::Stopped),
             _ = ctrl_c.as_mut() => return Ok(MonitorPollOutcome::Quit),
-            result = session.request_input() => result?,
+            result = session.request_input() => {
+                result?;
+                stats.sent.fetch_add(1, Ordering::SeqCst);
+            }
         }
         next_send = tokio::time::Instant::now() + interval;
 
@@ -954,11 +990,13 @@ where
             .saturating_duration_since(tokio::time::Instant::now())
             .max(Duration::from_millis(1));
         let report = tokio::select! {
+            biased;
             _ = stop.notified() => return Ok(MonitorPollOutcome::Stopped),
             _ = ctrl_c.as_mut() => return Ok(MonitorPollOutcome::Quit),
             report = session.try_next_input(wait) => report?,
         };
         if let Some(report) = report {
+            stats.received.fetch_add(1, Ordering::SeqCst);
             print_report(&report);
             printed += 1;
         }
@@ -968,6 +1006,7 @@ where
 struct SessionMonitor {
     stop: Arc<Notify>,
     error: Arc<StdMutex<Option<String>>>,
+    stats: Arc<MonitorStats>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -989,10 +1028,17 @@ impl SessionMonitor {
             .clone()
     }
 
-    async fn stop(mut self) {
+    async fn stop(self) {
+        self.stop_with_timeout(Duration::from_secs(2)).await;
+    }
+
+    async fn stop_with_timeout(mut self, timeout: Duration) {
         self.stop.notify_one();
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
+        if let Some(mut task) = self.task.take() {
+            if tokio::time::timeout(timeout, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
         }
     }
 }
@@ -1018,11 +1064,15 @@ fn start_background_monitor<T: Transport + 'static>(
     let task_stop = Arc::clone(&stop);
     let error = Arc::new(StdMutex::new(None));
     let task_error = Arc::clone(&error);
+    let stats = Arc::new(MonitorStats::default());
+    let task_stats = Arc::clone(&stats);
     let task = tokio::spawn(async move {
         let guard = session.lock().await;
         let never = std::future::pending::<()>();
         tokio::pin!(never);
-        if let Err(error) = monitor_poll(&guard, interval, None, &task_stop, &mut never).await {
+        if let Err(error) =
+            monitor_poll(&guard, interval, None, &task_stop, &mut never, &task_stats).await
+        {
             *task_error
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
@@ -1031,8 +1081,15 @@ fn start_background_monitor<T: Transport + 'static>(
     SessionMonitor {
         stop,
         error,
+        stats,
         task: Some(task),
     }
+}
+
+fn monitor_counters(monitor: Option<&SessionMonitor>) -> (u64, u64) {
+    monitor.map_or((0, 0), |running| {
+        (running.stats.sent(), running.stats.received())
+    })
 }
 
 async fn execute_session_command<T: Transport + 'static>(
@@ -1094,7 +1151,9 @@ async fn execute_session_command<T: Transport + 'static>(
                 let _ = tokio::signal::ctrl_c().await;
             };
             tokio::pin!(ctrl_c);
-            let outcome = monitor_poll(&guard, interval, Some(count), &stop, &mut ctrl_c).await?;
+            let stats = MonitorStats::default();
+            let outcome =
+                monitor_poll(&guard, interval, Some(count), &stop, &mut ctrl_c, &stats).await?;
             Ok(match outcome {
                 MonitorPollOutcome::CountReached(printed) => {
                     SessionOutcome::MonitorReports(printed)
@@ -1123,6 +1182,7 @@ async fn execute_session_command<T: Transport + 'static>(
         }
         SessionCommand::Status => {
             let degraded = keepalive.degraded.load(Ordering::SeqCst);
+            let (monitor_sent, monitor_received) = monitor_counters(monitor.as_ref());
             println!(
                 "connected: {}",
                 if degraded { "false (degraded)" } else { "true" }
@@ -1146,6 +1206,8 @@ async fn execute_session_command<T: Transport + 'static>(
                 "monitor: {}",
                 if monitor.is_some() { "running" } else { "idle" }
             );
+            println!("monitor sent: {monitor_sent}");
+            println!("monitor received: {monitor_received}");
             Ok(SessionOutcome::Continue)
         }
         SessionCommand::Help => {
@@ -1497,6 +1559,30 @@ mod tests {
         assert!(summary.get("computed_crc").is_none());
     }
 
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn write_config_outputs_hashes_the_2768_byte_buffer() {
+        let snapshot = ConfigSnapshot {
+            config: Bt2Config::zeroed(),
+            stored_crc: 0,
+            computed_crc: 0,
+            crc_valid: true,
+        };
+        assert!(snapshot.config.as_bytes().iter().all(|&byte| byte == 0));
+        let digest = write_config_outputs(&snapshot, None, None).unwrap();
+        assert_eq!(
+            digest,
+            "ec5e098511f8ba7b974422f9bfa76e3f1fe350ccb70401174671c5eb5e50b74e"
+        );
+    }
+
     fn sample_input_report() -> InputReport {
         InputReport {
             keys: 0x0000_2001,
@@ -1796,6 +1882,27 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, SessionOutcome::Continue);
         assert!(monitor_state.is_some());
+        for _ in 0..100 {
+            if monitor_state
+                .as_ref()
+                .is_some_and(|monitor| monitor.stats.sent() > 0)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let monitor_sent = monitor_state
+            .as_ref()
+            .map_or(0, |monitor| monitor.stats.sent());
+        assert!(
+            monitor_sent > 0,
+            "background monitor did not send its own 0x0003"
+        );
+        assert_eq!(
+            monitor_counters(monitor_state.as_ref()).0,
+            monitor_sent,
+            "status counters must expose the background monitor traffic"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
         let during_monitor = input_count();
         assert!(
@@ -1816,6 +1923,7 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, SessionOutcome::Continue);
         assert!(monitor_state.is_none());
+        assert_eq!(monitor_counters(monitor_state.as_ref()), (0, 0));
         let at_stop = input_count();
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1827,6 +1935,117 @@ mod tests {
 
         shutdown_session(&session, keepalive).await;
         assert!(transport.is_disconnected());
+    }
+
+    #[tokio::test]
+    async fn monitor_connection_polls_and_disables_reports() {
+        let transport = KeepaliveTestTransport::new();
+        for _ in 0..2 {
+            transport.queue_envelope_input(&sample_input_report());
+        }
+        let session = Session::new(&transport);
+
+        let outcome = monitor_connection(
+            &session,
+            Duration::from_millis(1),
+            Some(2),
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, MonitorPollOutcome::CountReached(2));
+
+        let frames = transport.sent_frames();
+        assert_eq!(frames.len(), 4, "expected enable + 2 polls + disable");
+        let enable = CustomHeader::parse(&frames[0][1..]).unwrap();
+        assert_eq!(enable.cmd, commands::cmd::REPORT_ENABLE);
+        assert_eq!(enable.subcmd, 1);
+        for frame in &frames[1..3] {
+            assert_eq!(
+                CustomHeader::parse(&frame[1..]).unwrap().cmd,
+                commands::cmd::INPUT
+            );
+        }
+        let disable = CustomHeader::parse(&frames[3][1..]).unwrap();
+        assert_eq!(disable.cmd, commands::cmd::REPORT_ENABLE);
+        assert_eq!(disable.subcmd, 0);
+    }
+
+    #[tokio::test]
+    async fn monitor_connection_disables_reports_on_shutdown() {
+        let transport = KeepaliveTestTransport::new();
+        let session = Session::new(&transport);
+
+        let outcome = monitor_connection(
+            &session,
+            Duration::from_millis(20),
+            None,
+            std::future::ready(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, MonitorPollOutcome::Quit);
+
+        let frames = transport.sent_frames();
+        assert_eq!(
+            frames.len(),
+            2,
+            "expected enable + disable on immediate shutdown"
+        );
+        let enable = CustomHeader::parse(&frames[0][1..]).unwrap();
+        assert_eq!(enable.cmd, commands::cmd::REPORT_ENABLE);
+        assert_eq!(enable.subcmd, 1);
+        let disable = CustomHeader::parse(&frames[1][1..]).unwrap();
+        assert_eq!(disable.cmd, commands::cmd::REPORT_ENABLE);
+        assert_eq!(disable.subcmd, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_monitor_polls_every_20ms_without_keepalive() {
+        let transport = KeepaliveTestTransport::new();
+        // Queue more reports than 80 ms of 20 ms ticks so `try_next_input`
+        // returns immediately on every poll; without the 20 ms floor, the loop
+        // would burst far more than 4..=5 requests.
+        for _ in 0..10 {
+            transport.queue_envelope_input(&sample_input_report());
+        }
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let monitor = start_background_monitor(Arc::clone(&session), Duration::from_millis(20));
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(monitor.stats.sent(), 1, "monitor did not start polling");
+
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_millis(20)).await;
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let sent = monitor.stats.sent();
+        assert!(
+            (4..=5).contains(&sent),
+            "unexpected 20 ms monitor poll count: {sent}"
+        );
+        assert_eq!(
+            transport
+                .sent_frames()
+                .iter()
+                .filter(|frame| {
+                    CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::INPUT
+                })
+                .count() as u64,
+            sent,
+            "background monitor shares the input poll counter"
+        );
+        assert_eq!(monitor.stats.received(), sent);
+        let (status_sent, status_received) = monitor_counters(Some(&monitor));
+        assert_eq!(status_sent, sent);
+        assert_eq!(status_received, sent);
+        assert_eq!(monitor_counters(None), (0, 0));
+
+        monitor.stop().await;
     }
 
     #[tokio::test]
@@ -1957,6 +2176,26 @@ mod tests {
             "shutdown took {:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_bounded_when_operation_lock_is_held() {
+        let session = Arc::new(AsyncMutex::new(Session::new(KeepaliveTestTransport::new())));
+        let guard = session.lock().await;
+        let keepalive = SessionKeepalive {
+            state: Arc::new(SessionKeepaliveState::new()),
+            token: CancellationToken::new(),
+            task: None,
+        };
+
+        let started = Instant::now();
+        shutdown_session_with_timeout(&session, keepalive, Duration::from_millis(20)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "shutdown took {:?}",
+            started.elapsed()
+        );
+        drop(guard);
     }
 
     #[tokio::test]
