@@ -62,6 +62,8 @@
 3. **マクロ Flash 書き込み順序**:
    - 必ず `Erase (0x0104)` → `Write (0x0103, 64B チャンク, 32B アライン長)` → `Macro ヘッダ更新 (0x0001)` → `Save (0x0006)` の順序を守ること。
 4. **OTA（ファームウェア更新）の安全性**:
+   - `enterBoot 0x000C` → `"8bt"` へ再接続 → `readPID 0x0008` → `readVersionInBoot 0x0005` の前提を確認し、`readPID` の結果から `gamepad_type` を判定すること。
+   - `EraseFlash 0x0004` の ACK を待ってから `WriteFirmware 0x0003` を送り、失敗時は再接続だけで済ませず、全セクタ消去・再書き込みで復旧すること。
    - 実機テスト前に必ずモックトランスポートで全パケット列・CRC・チャンク境界・リトライ動作をユニットテストで検証すること。
 5. **クリーンなコミット管理**:
    - プロプライエタリな公式バイナリ（ローカル作業環境に置かれている `.apk` や `8BitDo_Ultimate_Software_V2_Windows_V1.38/`）を絶対に `git add` しないこと。
@@ -70,17 +72,17 @@
 
 ## 5. マージ前の独立レビュー（Tier 制）
 
-`main` へマージする前に、**著者とは別のセッション／エージェント**が PR の差分を読み、マージ可否を判定すること。「マージ可」が出るまでマージしない。修正を push したら新しい head SHA で再レビューする。
+`main` へマージする前に、**著者とも他のレビュアーとも別セッション**のレビュアーが PR の差分を読み、マージ可否を判定すること。「マージ可」が出るまでマージしない。修正を push したら新しい head SHA で再レビューする。
 
-- **Tier 1**: レビュアー 1 名。
+- **Tier 1**: レビュアー 1 名。**振る舞いを変えない変更のみ**（コメント・整形・通常 docs・純粋なテスト追加）。純粋なテスト追加は 1〜2 件の故障注入を PR またはレビューコメントに記録する。write-path / Flash / OTA / backup を検証するテストは Tier 3。
 - **Tier 2**: レビュアー 2 名（仕様検収 + 実装/回帰）。
 - **Tier 3**: レビュアー 2 名 + 別セッションの敵対的パス（計 3 セッション）。
-- 対象・パス別トリガー・故障リストは **[docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)** を参照。
+- 判定・パス別トリガー・故障リストの正本は **[docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)**。**チェックリスト項目、コントリビューター手順、required check、status コマンド、安全手順を変える PR は、docs パスでも Tier 3**。**デバイス書き込みのバイト・順序・タイミング・エラー処理、またはそれを検証するテスト/mock/golden vector を変える PR も Tier 3**。
+- Tier 定義・パス別トリガー・レビュアー数・quorum・故障リスト最低数・チェックリスト・required check・ruleset・status コマンド・ゲート手順の変更は Tier 3（自己修正ルール）。
 - コードのリファクタは Tier 1 にしない。実機書き込み・Flash・OTA・セキュリティに触れるコードは、差分が小さくても Tier 3。
-- Tier 2/3 は全レビュアーが同じ SHA で「マージ可」を出した後、リードレビュアーが `review-gate` status を付ける。
-- レビュー後、レビューした head SHA に `review-gate` status を付ける（[docs/BRANCH_PROTECTION.md](docs/BRANCH_PROTECTION.md)）。
-- 詳細な判定ルール・パス別トリガー・故障リストの書き方は **[docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)** を参照。
-- ruleset が強制するのは status の存在まで。レビュー実施自体は手続きであり、write 権限者は迂回できる。
+- Tier 2/3 は全レビュアーが同じ SHA で「マージ可」を出した後、リードレビュアーが `scripts/post-review-status.sh` で `review-gate` status を付ける。Tier 1 はレビュアー本人が付ける。
+- 1 名でも blocker / 要修正なら `success` を付けない。Tier 3 で判定が割れた場合は 4 名目の独立 adjudicator を追加し、blocker の撤回または adjudication 理由を記録する。
+- ruleset が強制するのは status の存在まで。レビュー実施自体は手続きであり、write 権限者は迂回できる。canonical ruleset は **`.github/rulesets/main-protection.json`**（live: id `27785806`）。
 
 ---
 
@@ -99,5 +101,5 @@
 
 1. `crates/eightbitdo-core` に `Transport` トレイト（BLE / USB HID / Mock）とセッション管理を実装する。
 2. `crates/eightbitdo-cli` に `scan` / `info` / `config dump` / `monitor` を実装する。
-3. 実機では **読み取り専用コマンドから**検証し、最初の書き込み前に必ず 2768B 設定とマクロ 4×3 スロットをバックアップする。
+3. 実機では **読み取り専用コマンドから**検証し、最初の書き込み前に必ず 2768B 設定とマクロ 4×3 スロットをバックアップし、ファイル名と SHA-256 を記録する。
 4. 書き込み系の前に、モックトランスポートで `Erase 0x0104 → Write 0x0103 → Header 0x0001 → Save 0x0006` のパケット列と CRC を固定する。
