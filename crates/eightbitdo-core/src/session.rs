@@ -129,13 +129,20 @@ impl<T: Transport> Session<T> {
 
     /// Read and validate the full 2768-byte configuration block.
     ///
-    /// Responses are accepted both as the observed
-    /// `cmd 0x0004, subcmd 0x0002` envelope and as a direct `cmd 0x0002`
-    /// frame, and are assembled by `header.offset`. A payload-less
-    /// acknowledgement (`chunk_len = total_len = 0`) and unrelated commands
+    /// The controller returns **one chunk per request**. The session starts at
+    /// `offset = 0`, sends a payload-less `ReadConfig` with
+    /// `chunk_len = total_len = 0x0AD0`, copies the returned payload to the
+    /// requested offset, advances by `payload.len()`, and repeats until all
+    /// 2768 bytes are assembled. The observed chunk is 142 bytes
+    /// (`0x8E`), so a full read takes 20 requests (19 × 142 + 70).
+    ///
+    /// Responses are accepted both as the observed `cmd 0x0004,
+    /// subcmd 0x0002` envelope and as a direct `cmd 0x0002` frame. A
+    /// payload-less acknowledgement (`chunk_len = 0`) and unrelated commands
     /// (for example the asynchronous `0x0012` "configuration allowed" notice)
-    /// are skipped. Duplicate and overlapping chunks are accepted; every byte
-    /// is counted exactly once.
+    /// are skipped. A response `offset` equal to the requested offset is used
+    /// as-is; `offset = 0` is treated as a sequential chunk and placed at the
+    /// requested offset.
     ///
     /// The CRC is checked with the official in-place algorithm: the stored
     /// `+0x0C` value is compared with `ANSI_CRC_16_sh` over a copy of the
@@ -144,21 +151,12 @@ impl<T: Transport> Session<T> {
     /// # Errors
     ///
     /// Returns [`Error::Timeout`] when the transfer does not complete within
-    /// [`CONFIG_TOTAL_TIMEOUT`] or a single frame does not arrive within the
+    /// [`CONFIG_TOTAL_TIMEOUT`] or a chunk does not arrive within the
     /// configured per-frame timeout, [`Error::UnexpectedResponse`] when a
-    /// chunk points outside the 2768-byte block, or a transport error.
+    /// chunk has a mismatched envelope, offset or range, or a transport error.
     pub async fn read_config_snapshot(&self) -> Result<ConfigSnapshot, Error> {
-        self.transport
-            .send(&commands::read_config_all().encode_ble_payloadless(PacketKind::App)?)
-            .await?;
-
         let bytes = self
-            .read_transfer(
-                commands::cmd::READ_CONFIG,
-                CONFIG_SIZE,
-                self.timeout,
-                CONFIG_TOTAL_TIMEOUT,
-            )
+            .read_config_chunks(CONFIG_SIZE, self.timeout, CONFIG_TOTAL_TIMEOUT)
             .await?;
 
         let config = Bt2Config::from_bytes(&bytes)?;
@@ -285,6 +283,94 @@ impl<T: Transport> Session<T> {
         Ok(buffer.into_vec())
     }
 
+    /// Read the full configuration block with one request per chunk.
+    ///
+    /// This is the ReadConfig-specific transfer loop. Each iteration sends
+    /// `read_config_from(offset)` and waits for exactly one data response.
+    /// The response payload is copied at the requested offset, and the offset
+    /// advances by `payload.len()`. A response `offset` equal to the requested
+    /// offset is used as-is; `offset = 0` is treated as the device's
+    /// sequential-chunk convention and placed at the requested offset.
+    ///
+    /// `expected_len` must be [`CONFIG_SIZE`]. Use [`read_transfer`] for
+    /// single-request transfers such as `ReadVersion`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Timeout`] when the overall deadline or a per-chunk
+    /// wait expires, [`Error::UnexpectedResponse`] for a mismatched envelope,
+    /// offset, `total_len` or range, or a transport/protocol error.
+    pub async fn read_config_chunks(
+        &self,
+        expected_len: usize,
+        per_frame_timeout: Duration,
+        total_timeout: Duration,
+    ) -> Result<Vec<u8>, Error> {
+        if expected_len != CONFIG_SIZE {
+            return Err(Error::UnexpectedResponse(format!(
+                "chunked ReadConfig expects {CONFIG_SIZE} bytes, got {expected_len}"
+            )));
+        }
+
+        let mut buffer = TransferBuffer::new(expected_len);
+        let mut offset = 0usize;
+        let deadline = Instant::now() + total_timeout;
+
+        while offset < expected_len {
+            let request = commands::read_config_from(offset as u32)?;
+            self.transport
+                .send(&request.encode_ble_payloadless(PacketKind::App)?)
+                .await?;
+
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(config_chunk_timeout(
+                        offset,
+                        buffer.received(),
+                        expected_len,
+                    ));
+                }
+                let wait = per_frame_timeout.min(deadline.saturating_duration_since(now));
+                let frame = match tokio::time::timeout(wait, self.transport.recv()).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Err(config_chunk_timeout(
+                            offset,
+                            buffer.received(),
+                            expected_len,
+                        ))
+                    }
+                };
+
+                let Some((header, payload)) =
+                    Self::classify_response(&frame, commands::cmd::READ_CONFIG, expected_len)?
+                else {
+                    continue;
+                };
+
+                let response_offset = header.offset as usize;
+                if response_offset != offset && response_offset != 0 {
+                    return Err(Error::UnexpectedResponse(format!(
+                        "config chunk offset 0x{response_offset:X} does not match requested offset 0x{offset:X}"
+                    )));
+                }
+
+                let end = offset
+                    .checked_add(payload.len())
+                    .ok_or_else(|| out_of_range(offset, expected_len))?;
+                if end > expected_len {
+                    return Err(out_of_range(offset, expected_len));
+                }
+                buffer.insert(offset, payload)?;
+                offset = end;
+                break;
+            }
+        }
+
+        Ok(buffer.into_vec())
+    }
+
     /// Classify one notification for a request.
     ///
     /// Returns `Ok(None)` for a payload-less acknowledgement or an unrelated
@@ -382,6 +468,14 @@ fn out_of_range(offset: usize, expected: usize) -> Error {
     Error::UnexpectedResponse(format!(
         "chunk offset 0x{offset:X} is outside the {expected}-byte transfer"
     ))
+}
+
+fn config_chunk_timeout(offset: usize, received: usize, expected: usize) -> Error {
+    Error::Timeout {
+        operation: format!(
+            "read config chunk at offset 0x{offset:X} (received {received} of {expected} bytes)"
+        ),
+    }
 }
 
 /// Longest run of printable ASCII (`0x20..=0x7E`), trimmed.
@@ -632,26 +726,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_chunks_may_arrive_out_of_order() {
+    async fn config_chunks_are_re_requested_at_advancing_offsets() {
         let config = sample_config();
         let mock = MockTransport::new();
-        let mut chunks: Vec<(u32, Vec<u8>)> = config
-            .as_bytes()
-            .chunks(692)
-            .enumerate()
-            .map(|(index, chunk)| ((index * 692) as u32, chunk.to_vec()))
-            .collect();
-        chunks.reverse();
-        for (offset, chunk) in &chunks {
-            mock.push_response(&config_header(*offset, chunk.len() as u16), chunk);
+        let bytes = config.as_bytes();
+        let chunk_size = 142;
+        let chunks: Vec<&[u8]> = bytes.chunks(chunk_size).collect();
+        assert_eq!(chunks.len(), 20);
+        assert_eq!(chunks.last().unwrap().len(), 70);
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            if index == 7 {
+                mock.push_incoming(&OBSERVED_CONFIG_ACK);
+            }
+            // The unit returns offset=0 for sequential chunks.
+            let header = envelope_header(
+                commands::cmd::READ_CONFIG,
+                CONFIG_SIZE as u32,
+                0,
+                chunk.len() as u16,
+            );
+            mock.push_response(&header, chunk);
         }
 
         let session = Session::new(&mock);
         let snapshot = session.read_config_snapshot().await.unwrap();
+        assert_eq!(snapshot.config.as_bytes(), bytes);
 
+        let sent = mock.sent_frames();
+        assert_eq!(sent.len(), chunks.len());
+        assert_eq!(sent[0], READ_CONFIG_REQUEST);
+        let mut expected_offset = 0usize;
+        for (index, frame) in sent.iter().enumerate() {
+            assert_eq!(frame.len(), 17);
+            let header = CustomHeader::parse(&frame[1..]).unwrap();
+            assert_eq!(header.cmd, commands::cmd::READ_CONFIG);
+            assert_eq!(header.chunk_len, CONFIG_SIZE as u16);
+            assert_eq!(header.total_len, CONFIG_SIZE as u32);
+            assert_eq!(header.offset as usize, expected_offset);
+            expected_offset += chunks[index].len();
+        }
+        assert_eq!(expected_offset, CONFIG_SIZE);
+    }
+
+    #[tokio::test]
+    async fn config_chunks_accept_matching_response_offsets() {
+        let config = sample_config();
+        let mock = MockTransport::new();
+        let chunk_size = 142;
+        for (index, chunk) in config.as_bytes().chunks(chunk_size).enumerate() {
+            let offset = (index * chunk_size) as u32;
+            let header = envelope_header(
+                commands::cmd::READ_CONFIG,
+                CONFIG_SIZE as u32,
+                offset,
+                chunk.len() as u16,
+            );
+            mock.push_response(&header, chunk);
+        }
+
+        let session = Session::new(&mock);
+        let snapshot = session.read_config_snapshot().await.unwrap();
         assert_eq!(snapshot.config.as_bytes(), config.as_bytes());
-        assert_eq!(snapshot.config.profile_name(Slot::S2), "Fight");
-        assert_eq!(snapshot.config.cur_slot(), Some(Slot::S2));
     }
 
     #[tokio::test]
@@ -676,7 +812,15 @@ mod tests {
         let session = Session::new(&mock);
         let snapshot = session.read_config_snapshot().await.unwrap();
         assert_eq!(snapshot.config.as_bytes(), config.as_bytes());
-        assert_eq!(mock.sent_frames(), vec![READ_CONFIG_REQUEST.to_vec()]);
+
+        let sent = mock.sent_frames();
+        assert_eq!(sent.len(), 4);
+        for (index, frame) in sent.iter().enumerate() {
+            let header = CustomHeader::parse(&frame[1..]).unwrap();
+            assert_eq!(header.offset as usize, index * 692);
+            assert_eq!(header.chunk_len, CONFIG_SIZE as u16);
+            assert_eq!(header.total_len, CONFIG_SIZE as u32);
+        }
     }
 
     #[tokio::test]
@@ -742,23 +886,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_chunks_do_not_count_twice_or_shorten_transfer() {
+    async fn config_chunk_with_mismatched_nonzero_offset_is_rejected() {
         let config = sample_config();
-        let mock = MockTransport::new();
         let bytes = config.as_bytes();
-        let first = &bytes[..1024];
-        let second = &bytes[1024..2048];
-        let third = &bytes[2048..];
-
-        // The first chunk is repeated. If the assembler counted frames instead
-        // of bytes it would finish after the third distinct payload.
-        for (offset, chunk) in [(0u32, first), (0, first), (1024, second), (2048, third)] {
-            mock.push_response(&config_header(offset, chunk.len() as u16), chunk);
-        }
+        let mock = MockTransport::new();
+        push_config_envelope_chunks(&mock, &bytes[..426], 142);
+        let bad = envelope_header(commands::cmd::READ_CONFIG, CONFIG_SIZE as u32, 100, 8);
+        mock.push_response(&bad, &bytes[426..434]);
 
         let session = Session::new(&mock);
-        let snapshot = session.read_config_snapshot().await.unwrap();
-        assert_eq!(snapshot.config.as_bytes(), bytes);
+        let result = session.read_config_snapshot().await;
+        assert!(matches!(
+            result,
+            Err(Error::UnexpectedResponse(message)) if message.contains("does not match requested offset")
+        ));
+    }
+
+    #[tokio::test]
+    async fn config_chunk_overrunning_transfer_is_rejected() {
+        let config = sample_config();
+        let bytes = config.as_bytes();
+        let mock = MockTransport::new();
+        // 19 * 142 = 2698; a further 142-byte chunk would end at 2840.
+        push_config_envelope_chunks(&mock, &bytes[..2698], 142);
+        let bad = envelope_header(commands::cmd::READ_CONFIG, CONFIG_SIZE as u32, 0, 142);
+        mock.push_response(&bad, &[0u8; 142]);
+
+        let session = Session::new(&mock);
+        let result = session.read_config_snapshot().await;
+        assert!(matches!(
+            result,
+            Err(Error::UnexpectedResponse(message)) if message.contains("outside")
+        ));
+    }
+
+    #[tokio::test]
+    async fn config_chunk_with_wrong_subcmd_mid_transfer_is_rejected() {
+        let config = sample_config();
+        let bytes = config.as_bytes();
+        let mock = MockTransport::new();
+        push_config_envelope_chunks(&mock, &bytes[..426], 142);
+        let bad = envelope_header(commands::cmd::READ_VERSION, CONFIG_SIZE as u32, 0, 8);
+        mock.push_response(&bad, &[0u8; 8]);
+
+        let session = Session::new(&mock);
+        let result = session.read_config_snapshot().await;
+        assert!(matches!(
+            result,
+            Err(Error::UnexpectedResponse(message)) if message.contains("subcmd")
+        ));
+    }
+
+    #[tokio::test]
+    async fn config_chunk_with_wrong_total_len_mid_transfer_is_rejected() {
+        let config = sample_config();
+        let bytes = config.as_bytes();
+        let mock = MockTransport::new();
+        push_config_envelope_chunks(&mock, &bytes[..426], 142);
+        let bad = envelope_header(commands::cmd::READ_CONFIG, 0x100, 0, 8);
+        mock.push_response(&bad, &[0u8; 8]);
+
+        let session = Session::new(&mock);
+        let result = session.read_config_snapshot().await;
+        assert!(matches!(
+            result,
+            Err(Error::UnexpectedResponse(message)) if message.contains("total_len")
+        ));
     }
 
     #[tokio::test]

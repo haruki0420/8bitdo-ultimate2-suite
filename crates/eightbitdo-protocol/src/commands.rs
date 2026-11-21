@@ -319,10 +319,31 @@ pub fn read_config(offset: u32, len: u32) -> Result<Request, Error> {
     Ok(Request::new_payloadless(cmd::READ_CONFIG, 0, len, offset))
 }
 
+/// Read the full configuration block starting at `offset`.
+///
+/// Every request declares `total_len = chunk_len = 0x0AD0`; only the wire
+/// `offset` advances. The device returns one chunk per request (observed
+/// `chunk_len = 0x8E` = 142 bytes), so callers must re-request at
+/// `offset + payload.len()` until the full block is assembled.
+///
+/// # Errors
+///
+/// Returns [`Error::RangeOutOfBounds`] when `offset` is at or beyond the
+/// 2768-byte configuration block.
+pub fn read_config_from(offset: u32) -> Result<Request, Error> {
+    check_config_range(offset, 1)?;
+    Ok(Request::new_payloadless(
+        cmd::READ_CONFIG,
+        0,
+        CONFIG_SIZE as u32,
+        offset,
+    ))
+}
+
 /// Read the full 2768-byte configuration block.
 #[must_use]
 pub fn read_config_all() -> Request {
-    read_config(0, CONFIG_SIZE as u32).expect("the full configuration range is valid")
+    read_config_from(0).expect("the full configuration range is valid")
 }
 
 /// Read only the 116-byte header (`0x000..0x073`).
@@ -957,6 +978,28 @@ mod tests {
                 actual: 0,
             })
         );
+    }
+
+    #[test]
+    fn read_config_from_advances_only_the_offset() {
+        let request = read_config_from(142).unwrap();
+        assert_eq!(request.header.cmd, 0x0002);
+        assert_eq!(request.header.offset, 142);
+        assert_eq!(request.header.total_len, 0x0AD0);
+        assert_eq!(request.header.chunk_len, 0x0AD0);
+        assert!(request.payload.is_empty());
+
+        let bytes = request.encode_ble_payloadless(PacketKind::App).unwrap();
+        assert_eq!(bytes.len(), 17);
+        let header = CustomHeader::parse(&bytes[1..]).unwrap();
+        assert_eq!(header.offset, 142);
+        assert_eq!(header.total_len, 0x0AD0);
+        assert_eq!(header.chunk_len, 0x0AD0);
+
+        assert!(matches!(
+            read_config_from(0x0AD0),
+            Err(Error::RangeOutOfBounds { .. })
+        ));
     }
 
     #[test]
