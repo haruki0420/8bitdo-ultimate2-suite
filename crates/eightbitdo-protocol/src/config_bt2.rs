@@ -826,7 +826,11 @@ impl Bt2Config {
         ]
     }
 
-    /// Flag of one slot (`1` = valid, `0` = empty).
+    /// Flag of one slot.
+    ///
+    /// Firmware has been observed to store `0x20200911` / `0xFFFFFFFF`.
+    /// A non-zero value may mean valid, but the exact meaning is not
+    /// confirmed; see `docs/STRUCT_BT2_2768B.md`.
     #[must_use]
     pub fn slot_flag(&self, slot: Slot) -> u32 {
         self.u32_at(OFF_SLOT_FLAGS + slot.index() * 4)

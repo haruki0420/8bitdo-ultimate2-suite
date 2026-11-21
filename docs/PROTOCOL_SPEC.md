@@ -36,6 +36,26 @@ graph LR
    - 解析済み文字列リソース（Android APK）: `"2. Press and hold the Profile button for 3 \nseconds until the Status LED will blink rapidly."`
 3. Status LED の高速点滅開始後、コントローラが BLE アドバタイズ名 **`"80ND"`** を送出するため、クライアントからスキャン・GATT 接続を行う。
 
+> **ユーザー観測（未検証）**: BLE 設定モードは、定期的な通信がないと一定時間で終了する可能性がある（ユーザーが実機で `80ND` が見つからなくなる事象を観測）。PC と USB 有線接続したまま BLE 接続すると持続しやすいというユーザー仮説もあるが、1 回の成功のみで因果は未検証である。実機実験用の `eightbitdo keepalive` サブコマンドを実装した（§1.2.1）。
+
+#### 1.2.1 keepalive 設計ノート（プロトコル要件ではない）
+
+**公式 Android v2.01 の観測（DEX 解析）**:
+
+- 専用の keepalive コマンドは存在しない。
+- 接続時に `SetReportEnable`（`cmd 0x0007`, subcmd `1`）でリアルタイム入力通知を有効化する。subcmd `1` を有効として送る（`0` / `1` の解釈は実機で親が確認）。
+- 前面表示中は `MainActivity` が **20ms 周期**で `ReadKeysAndJoy`（`cmd 0x0003`, `total_len=0x0C`, `offset=0x0C`）を送る。ネイティブ `readKeysAndJoy` は応答タイムアウト 0・再送なしの投げっぱなしである。
+- 背面ではこのループが止まり、無通信になる。
+- `ReadVersion`（`0x000B`）は keepalive には使わない。`session` の `info` 実行ごとに送る。2 回目以降の実機応答は未確認（公式 Android v2.01 は接続時に 1 回送る）。`0x0011` は Android v2.01 では未使用。`0x0010` は `gamepad_type == 1` で native が即 return するため UT2 では送られない。
+- **ユーザー観測（未検証）**: 公式アプリをバックグラウンドにすると `80ND` が見えなくなることがある。前面時の 20ms `0x0003` が背面で止まることが原因の可能性が高いが、ファームウェア側の idle タイマー値・正確な条件は未確定である。
+- したがって、CLI が長寿命セッションを維持するには、前面アプリ相当の定期通信（`0x0007` + 20ms `0x0003`）が必要になる可能性がある（未検証）。
+- 推奨する keepalive は公式方式であり、`ReadVersion` を keepalive に使う案は採用しない。`ReadVersion` は `session` の `info` 実行ごとに送る。2 回目以降の実機応答は未確認である。
+- 実機実験: `eightbitdo keepalive --interval-ms 20 --duration 120`。測定項目は、維持できた秒数、切断理由、USB 併用の有無、送信数 / 受信数、背面相当（送信停止）との比較である。
+- **実機観測**: 20ms `0x0003` の keepalive では **128.9 秒**維持できた。一方、`config dump` を別プロセスで実行すると BLE 設定モードが切れて `Timeout waiting for reply` になった。BLE は 1 central しか接続できず、プロセスをまたいで接続を共有できないため、複数の読み取りは 1 接続にまとめる必要がある。
+- **1 接続バックアップ**: `eightbitdo backup --raw backup.bin --json backup.json --hold N` は、1 回の接続で `ReadVersion`（`0x000B`）→ `read_config_snapshot()`（20 チャンク）→ 必要なら `0x0007` + 20ms `0x0003` の keepalive を N 秒実行する。`--hold` 中は他のコマンドを送らない。`N=0` なら読み終えて直ちに切断する。
+- **1 接続 REPL (`session`)**: `eightbitdo session [--interval-ms 20]` は 1 回の Profile 長押しで接続を保持し、`info` / `config dump` / `backup` / `monitor` / `status` を同一接続で実行する。アイドル時は `0x0007` enable 1 回 + 20ms `0x0003` + 受信ドレイン。コマンド実行中は operation lock（単一フライト）で keepalive を止め、終了後に再開する。`monitor` は自身が `--interval-ms`（既定 20ms）周期で `0x0003` を送り、その応答（`cmd=0x0004, subcmd=0x0003`, 12B）を表示する。monitor がロックを保持している間は keepalive が止まるため、**monitor が keepalive を兼ねる**。`monitor stop` でバックグラウンド monitor を停止でき、停止後は keepalive が自動再開する。monitor 実行中は `info` / `config dump` / `backup` / `monitor --count` を拒否し、先に `monitor stop` を要求する。停止後は同じ接続で再実行できる。Ctrl-C は REPL を抜けてセッションを終了する（コマンド実行中でも実行中の future を drop して終了し、次の行は読まない）。トップレベルの `eightbitdo monitor [--count N]` も同じ 20ms `0x0003` ポーリングを共有し、終了時に `0x0007` disable → 切断を行う。なお `monitor --count N`（トップレベル / `session` 共通）は公式の `ReadKeysAndJoy` と同様に投げっぱなしで、応答が 1 件も来ない場合も既定の 20ms 周期で `0x0003` を送り続け、`--count` に達するまで Ctrl-C まで回り続ける。連続失敗 3 回または `Disconnected` で keepalive を degraded 停止し、自動再接続はしない（設定モード切れの可能性を案内する）。1 tick の受信ドレインは最大 4 レポートに固定し、`try_next_input` 自体も 1 回あたり最大 16 フレーム + 1ms で打ち切るため、通知が途切れなくても operation lock を保持し続けない。行リーダーのキャンセル耐性は、`monitor` / keepalive の終了通知で読み取り future が中断されても、すでに消費した読みかけの行を壊さないためのものであり、Ctrl-C 後にセッションを継続する意味ではない。これは最小構成ではなく、`status` / `monitor stop` / 失敗方針を含む正式設計である。
+- **これは設計ノートであり、プロトコル要件ではない。**
+
 ---
 
 ## 2. デバイス VID / PID・モデル対応表
@@ -100,6 +120,8 @@ Windows の `FindHid` / `enum_hid` は `HidD_GetPreparsedData` + `HidP_GetCaps` 
 - Characteristic (`FF11` / `FF21`) は **Write と Notify の双方**を担う単一キャラクタリスティック。
 - 接続後、必ず CCCD (`00002902-...`) へ `[0x01, 0x00]`（Enable Notification）を書き込んでからコマンド送信を開始する。
 
+> **実機観測メモ（Ultimate 2 Bluetooth、2026-11 時点）**: 検証個体はアドバタイズ名 `"80ND"` と service `FF10` を公開するが、characteristic は **`FF13`**（write + notify）であり、`FF11` は存在しなかった。上表の `_CY` 系レイアウトに該当する。クライアントは `FF11` を優先し、存在しなければ `FF13` にフォールバックして解決すること。これは実装上の観測であり、プロトコル仕様の変更ではない。
+
 ### 3.2 MTU ネゴシエーションとチャンクサイズ制御
 
 `SHBLEUtils` および `libadvancelib_pkt.c`（`Generate_CustomDataCmd` / `Send_CustomCmdPacket`）の制御仕様は以下の通り。
@@ -133,12 +155,37 @@ Windows の `FindHid` / `enum_hid` は `HidD_GetPreparsedData` + `HidP_GetCaps` 
 | --- | --- | --- | --- | --- |
 | `+0x00` | 2B | `u16` | `cmd` | コマンド ID（例: `0x0001` Write, `0x0002` Read, `0x000B` Version） |
 | `+0x02` | 2B | `u16` | `subcmd_or_param` | サブコマンド・引数・スロット指定（例: `0x0067` / `0x0123` Save, `(mode << 8) \| slot`） |
-| `+0x04` | 2B | `u16` | `chunk_len` | このパケットに含まれるペイロード実長（送信要求コマンドでペイロード無しなら `0`） |
+| `+0x04` | 2B | `u16` | `chunk_len` | このパケットのペイロード長。**読み取り要求ではペイロードがなくても要求データ長を宣言する**（`ReadConfig` / `ReadMacro` は `chunk_len = total_len`。§4.1.1） |
 | `+0x06` | 2B | `u16` | `crc16` | ペイロードに対する CRC-16/MODBUS（条件付き、未使用時は `0x0000`） |
 | `+0x08` | 4B | `u32` | `total_len` | 転送全体の総バイト数（または読み出し要求総長）。`0x000B` ReadVersion では `gamepad_type == 1` (`0x600F`) は `4`、`gamepad_type == 2` は `0x01020030` |
 | `+0x0C` | 4B | `u32` | `offset` | 分割転送時の開始オフセット。ただし `cmd == 0x0001` / `0x0066`（`PID == 0x600F, 0x6009, 0x202F, 0x2072`）では `total_len` 側の値が設定される。`cmd == 0x000B` ReadVersion は `gamepad_type == 1` (`0x600F`) で `0x01017040`、`gamepad_type == 2` で `0x01020030`（`total_len` と同値） |
 
 > **例外 (`cmd = 0x0104` `EraseBT2Macro`)**: このコマンドはペイロードを持たないが、公式実装 (`getBT2_EraseMacro`) はチャネルの `total_len` と `chunk_len` をともに `0x1000` に設定し、`Generate_CustomDataCmd` が `chunk_len` フィールドを wire header `+0x04` に書く。実際のペイロードは `len = 0` である。`chunk_len` の一般則（ペイロード実長）だけから `0` と解釈しないこと。`gamepad_type == 1` の CRC 計算は空ペイロードに対して行われ、`crc16` は長さ `<= 0` で `0xFFFF` を返すため、wire header `+0x06` は `0xFFFF` となる。
+
+#### 4.1.1 読み取り要求の `chunk_len`（実機 ACK で判明した訂正）
+
+`ReadConfig` (`0x0002`) と `ReadMacro` (`0x0102`) は **ペイロードを送らないが、`chunk_len` に要求データ長を宣言する**。Phase 1 の仕様・実装で `chunk_len = 0` としていたのは見落としであり、実機で `chunk_len = 0` の ReadConfig がデータを返さず ACK だけを返したことで判明した。
+
+証拠（x86_64 `libadvancelib.so`）:
+
+- `getUT2_ReadCofigChannel` **0x29ea0** は `0x1d5f0` の 16 バイトをチャネル `+0x3c` にロードする。`objdump -s --start-address=0x1d5f0 --stop-address=0x1d600` の内容は `00000000 d00a0000 d00a0000 d00a0000`:
+  - `+0x3c = 0`（`offset`）
+  - `+0x40 = 0x0AD0`（`total_len`）
+  - `+0x44 = 0x0AD0`（`chunk_len`）
+  - `+0x48 = 0x0AD0`（追加長 / 残り長）
+- `getBT2_head_CofigChannel` **0x2a000** は `+0x3c = 0`, `+0x40 = 0x74`, `+0x44 = 0x74`（ヘッダ読み）。
+- `getBT2_ReadMacro` **0x2bd90** は `+0x40 = +0x44 = +0x48 = steps * 10` を設定し、`+0x38 = macro_idx << 12`（4 KB セクタベース）を wire `offset` として使う。`cmd = 0x0102`。
+
+したがって wire request は次の 17B（ペイロードなし）になる:
+
+```text
+ReadConfig full:  04 02 00 00 00 D0 0A 00 00 D0 0A 00 00 00 00 00 00
+ReadConfig head:  04 02 00 00 00 74 00 00 00 74 00 00 00 00 00 00 00
+```
+
+応答は 1 要求につき 1 チャンクである。実機の ReadConfig は 142B (`0x8E`) を返し、残りは `offset += payload.len()` で再要求する必要がある（§4.3.1）。
+
+> **実機 ACK**: `chunk_len = 0` の旧要求では `04 00 02 00 00 00 FF FF D0 0A 00 00 00 00 00 00` の ACK だけが返った（実機観測）。`chunk_len = 0x0AD0` に修正した後、142B のデータ応答を実機で確認済み（§4.3.1）。
 
 ```text
  0      1 2      3 4      5 6      7 8            11 12           15
@@ -176,6 +223,81 @@ Windows の `FindHid` / `enum_hid` は `HidD_GetPreparsedData` + `HidP_GetCaps` 
      - `cmd == 0x0003` または `subcmd == 0x0003`: リアルタイム入力レポート。ペイロード 12 バイトを `KeysAndJoy` コールバックへ通知。
      - `cmd == 0x000E`: コントローラ側エラー通知。
    - **Bootloader チャネル応答一致**: Bootloader 応答では `*(u16*)pkt == 0x00F5` 等（`0xF5` を含む先頭タグ）や `pkt[2] == Channel[+0x32]` により進行中 Boot チャネルと照合する。
+
+#### 4.3.1 FF13 個体の実機観測（2026-11-21）
+
+実機 Ultimate 2 Bluetooth（BLE 設定モード `80ND`、GATT characteristic は `FF11` ではなく **`FF13`**、MTU 200）で次を観測した。これは仕様変更ではなく、受信エンベロープと `ReadVersion` 要求形状に関する**観測・実装ノート**である。
+
+- 旧実装が送った `ReadVersion`（17B、ペイロードなし）:
+  ```text
+  04 0B 00 00 00 00 00 00 00 04 00 00 00 40 70 01 01
+  ```
+  - `0x04` は BLE App プレフィックス。続く 16B は `cmd=0x000B`, `subcmd=0`, `chunk_len=0`, `crc16=0`, `total_len=4`, `offset=0x01017040`。
+- その応答（16B、プレフィックスなし）:
+  ```text
+  04 00 0B 00 00 00 FF FF 00 00 00 00 00 00 00 00
+  ```
+  - `cmd=0x0004`（汎用応答エンベロープ）, `subcmd=0x000B`（要求 `cmd` のエコー）, `chunk_len=0`, `crc16=0xFFFF`, `total_len=0`, `offset=0`。
+  - これはデータ 0 バイトの **ACK** であり、`ReadVersion` のデータ応答ではない。
+- USB 給電併用（`lsusb` で `057e:2009` を確認）状態で、修正後の 21B 要求を送ったところ、次の **20B データ応答**を取得した:
+  ```text
+  04 00 0B 00 04 00 3E 44 04 00 00 00 00 00 00 00 C8 00 00 00
+  ```
+  - `cmd=0x0004`, `subcmd=0x000B`, `chunk_len=4`, `crc16=0x443E`（`C8 00 00 00` の CRC-16/MODBUS と一致）, `total_len=4`, `offset=0`。
+  - ペイロード `C8 00 00 00` は LE の `i32` で **200**（`0x000000C8`）。CLI 表示は `version value: 0x000000C8`。
+
+**確定したこと**:
+
+- `0x600F` の応答は `cmd=0x0004` の汎用エンベロープで、`subcmd` に要求 `cmd`（この個体では `0x000B` / `0x0002`）が入る。`total_len`（`+0x8`）は要求側チャネルの `total_len` と一致する必要がある（`readBleHidData` 0x29030 の照合）。
+- `chunk_len=0` のフレームはデータを持たない ACK / ready であり、データ応答として扱ってはならない。観測された形状は 2 種類ある:
+  - `ReadVersion`: `total_len=0`
+  - `ReadConfig`: `total_len=0x0AD0`（要求した転送長）
+- データ応答は `chunk_len > 0` かつ `total_len == 要求 total_len`。`ReadVersion` の実測は `chunk_len=4`, `total_len=4`, `offset=0`。
+- `ReadVersion` の要求には **4 バイトのダミーペイロード**が必要である。公式 `getVersionChannel`（0x2c7a0）はチャネル `+0x34 = 4`, `+0x40 = 4`（`total_len`）, `+0x44 = 4`（`chunk_len`）, `+0x50 = gamepadVersion` を設定し、`Generate_CustomDataCmd`（0x27620）は `+0x50` の 4 バイトを要求へコピーする。`gamepadVersion` は初回 0 初期化である。
+- その結果、正しい要求は 21B になる（CRC は 4 バイトのゼロに対して計算され `0x2400`）。実機で送信・応答とも確認済み:
+  ```text
+  04 0B 00 00 00 04 00 00 24 04 00 00 00 40 70 01 01 00 00 00 00
+  ```
+  - 内訳: `04` + `cmd=0x000B` + `subcmd=0` + `chunk_len=4` + `crc16=0x2400` + `total_len=4` + `offset=0x01017040` + 4B ゼロ。
+- `ReadConfig` の最初の応答は `chunk_len=0`, `total_len=0x0AD0`, `crc16=0xFFFF` の ready ACK である:
+  ```text
+  04 00 02 00 00 00 FF FF D0 0A 00 00 00 00 00 00
+  ```
+  - このフレームをエラーにせず読み飛ばし、後続のデータチャンクを待つ必要がある。
+- `ReadConfig` の要求は、旧実装の `chunk_len=0` ではなく **`chunk_len = total_len = 0x0AD0`**（ヘッダ読みは `0x74`）で送る（§4.1.1）。`chunk_len=0` では実機が ACK だけを返した。
+- **ReadConfig は 1 要求 = 1 チャンク**である。実機では `offset=0` の要求に対して 142B（`0x8E`）のデータ応答が 1 つ返り、次の通知は来なかった。残りを読むには `offset += payload.len()` で再要求する。2768B は 19 × 142B + 70B = 20 要求になる。
+- 実機の最初のデータ応答（ヘッダ 16B + 142B ペイロード）:
+  ```text
+  04 00 02 00 8E 00 71 A9 D0 0A 00 00 00 00 00 00 + <142 bytes>
+  ```
+  - `cmd=0x0004`, `subcmd=0x0002`, `chunk_len=0x008E` (142), `crc16=0xA971`, `total_len=0x0AD0`, `offset=0`。
+- 最終要求は `offset=0xA8A` (2698)、残り 70B だが、デバイスは**最終チャンクも 142B 固定**で返す:
+  ```text
+  04 00 02 00 8E 00 22 32 D0 0A 00 00 8A 0A 00 00 + <70 valid bytes> + <72 padding bytes>
+  ```
+  - 応答ヘッダは `cmd=0x0004`, `subcmd=0x0002`, `chunk_len=0x008E`, `total_len=0x0AD0`, `crc16=0x3222`, `offset=0xA8A`。
+  - `crc16=0x3222`（LE `22 32`）は **142B 全体**（有効 70B + 72B ゼロパディング）の CRC-16/MODBUS（init `0xFFFF`, poly `0xA001`）と一致する。有効 70B のみでは `0x8EF7` となり一致しない。
+  - 検証元: 実機 `eightbitdo backup --raw` で取得した 2768B ダンプ（SHA-256 `1dca47facfc1c0394a8893ac0a5b7ef80678c51081001886a4bf17ce2f59c600`）の末尾 70B + 72B ゼロ。
+  - 2768B を超える末尾 72B はパディングであり、ホスト側で `CONFIG_SIZE - offset = 70B` に切り詰めてコピーする。パディングは破棄する。
+  - **実装は最終チャンクも 142B 全体で CRC を検証する**（70B に切り詰める前に、受信ペイロード 142B の `crc16` を照合する）。
+- ReadConfig の応答 `offset` は、**最初のデータチャンク応答のみ `0`** を「逐次チャンクの印」として許容し、要求 `offset` に配置する。**2 回目以降は要求 `offset` をエコー**するため、要求値と一致しなければ `UnexpectedResponse` とする。実機の 20 応答では `0, 142, 284, 426, 568, 710, 852, 994, 1136, 1278, 1420, 1562, 1704, 1846, 1988, 2130, 2272, 2414, 2556, 2698` を観測した。
+- 単一応答（ReadVersion）では `offset=0` を前提とし、非 0 は転送範囲外または未完成として失敗する。汎用の `read_transfer` は範囲内の複数フレームを組み立て得るため、この前提は単一応答の読み取りに限る。
+- データ応答の `total_len` は要求した転送長と一致しなければならない（`ReadConfig` は `0x0AD0`、`ReadVersion` は `4`）。`cmd=0x0004` エンベロープだけでなく、`cmd == 要求 cmd` の直接応答でも同じ検査を行い、`total_len = 0` の直接エコーだけは互換のため許容する。
+- データ応答の `crc16` が非ゼロなら、ペイロードの CRC-16/MODBUS（poly `0xA001`、初期値 `0xFFFF`）と一致することを検証する（例: `C8 00 00 00` → `0x443E`、142B チャンク → `0xA971`）。`crc16 = 0` は「未使用」として検査しない。`chunk_len = 0` の ACK（`crc16 = 0xFFFF` を含む）はデータ応答ではないため対象外である。
+- `session` は `0x0007` を有効化するため、読み取り中に `cmd=0x0004, subcmd=0x0003` の入力レポート、`subcmd=0x0007, chunk_len=0` の ACK、`cmd=0x0012`（設定許可完了）などの notice が届く。`ReadVersion` / `ReadConfig` は、`chunk_len=0` の ACK、入力エンベロープ、`RESPONSE`（`0x0004`）以外の `cmd` を読み飛ばす。要求 cmd の直接応答と残った `RESPONSE` エンベロープをデータ応答として扱い、`subcmd` / `total_len` / CRC を検証する。`chunk_len>0` で `subcmd` が要求と異なるデータ応答はエラーにする。
+- 公式 `baseCumstomChannel` は 1 回だけ要求を送り、`readCustomConfig_unfinished`（0x2e3d0）は受信バイト数をログするのみである。実機では 1 チャンクで次の通知が止まるため、CLI 側で offset を進めた再要求ループを実装する。
+
+**ユーザー仮説の検証（USB 併用）**:
+
+- 「PC と USB 有線接続したまま `80ND` へ BLE 接続すると設定モードが持続する」というユーザー仮説について、今回は `057e:2009` の USB 接続がある状態で BLE 接続と `ReadVersion` に成功した（1 回）。
+- ただし、親エージェントの以前の試行も USB 併用状態で、旧 17B 要求の応答待ちにタイムアウトしている。今回の成功は **4B ペイロード修正**によるものであり、USB 併用が設定モード持続に寄与したかは**未検証**である。
+
+**未確定のこと**:
+
+- `ReadConfig` のデータチャンクは実機で 142B (`0x8E`) を 1 要求につき 1 つ返す。`offset` を進めた再要求で 20 要求（19 × 142B + 最終 142B のうち有効 70B）を組み立てる。最終チャンクが 142B 固定で返り、ホスト側で 70B に切り詰めることは実機確認済みである。142B が MTU 依存で変化するかは未確定。応答 `offset` は最初のデータチャンク応答のみ 0、2 回目以降は要求 `offset` をエコーする（§4.3.1 の照合規則）。
+- `getBT2_ReadMacro` の公式 `Generate_CustomDataCmd` 経路は `16 + chunk_len` バイト（ペイロードはゼロ埋め）を送ると読める。本実装はタスク指示に従い 17B の payloadless 要求を送るため、ReadMacro の実機応答は未確認である。
+- 公式アプリは要求ペイロードに直前の `gamepadVersion` を再利用する。本実装は常にゼロを送る。`session` REPL では `monitor` 停止後、同一接続で `info` / `config dump` / `backup` / `monitor` を再実行できる。`monitor` 実行中は `info` / `config dump` / `backup` / `monitor --count` を拒否し、先に `monitor stop` が必要である。`info` は実行ごとに新しい 4B ゼロペイロードで `ReadVersion` を送り直す（実機での 2 回目以降の応答は未確認）。
+- USB 給電併用が BLE 設定モードの持続時間を延ばすかは、1 回の成功では判断できない（ユーザー仮説・未検証）。
 
 ### 4.4 USB HID / 2.4G HID フレーミング（Windows `8BitDoAdvance.dll` / Android USB）
 
@@ -300,11 +422,11 @@ sequenceDiagram
 | `cmd` | `subcmd_or_param` | `total_len` / `offset` | 方向 | 機能・用途 |
 | --- | --- | --- | --- | --- |
 | **`0x0001`** | `0x0000` | `total_len = 0x0AD0`（常に全体長）、`chunk_len` = このパケットの実データ長（例: 部分書込 `0x74` / `0x0C`）、`offset` = 構造体内オフセット | Host → Ctrl | **設定構造体書き込み**（全体 `2768B` または各項目差分書き込み。部分書込でも `total_len` は `0x0AD0` のまま。下記 6.3 参照） |
-| **`0x0002`** | `0x0000` | 全体: `offset=0, total_len=0x0AD0`<br/>ヘッダ: `offset=0, total_len=0x74`<br/>現在スロット: `offset=0x12, total_len=2` | Host → Ctrl | **設定構造体読み出し**。応答は `cumstom_header_t` に続き要求データ片が返る |
+| **`0x0002`** | `0x0000` | 全体: `offset=0, total_len = chunk_len = 0x0AD0`<br/>ヘッダ: `offset=0, total_len = chunk_len = 0x74`<br/>現在スロット: `offset=0x12, total_len = chunk_len = 2` | Host → Ctrl | **設定構造体読み出し**。ペイロードなしだが `chunk_len` に要求長を宣言する（§4.1.1）。**1 要求 = 1 チャンク**（実機 142B）で、`offset += payload.len()` の再要求が必要。最終チャンクも 142B で返り、残り 70B に切り詰める（§4.3.1） |
 | **`0x0003`** | `0x0000` | `total_len=0x0C`, `offset=0x0C` | Ctrl ↔ Host | **リアルタイム入力レポート取得 / 通知**（12 バイト、セクション 7 参照） |
 | **`0x0006`** | **`0x0067`** (BLE)<br/>**`0x0123`** (Windows USB) | `total_len=0, offset=0` | Host → Ctrl | **Save（Flash 永続化）**。書き込み系（`0x0001` / `0x0103`）完了後に必ず発行。**BLE(Android) と USB(Windows) でサブコマンドが異なる点に注意**（6.4 参照） |
 | **`0x0007`** | `0x0000` (無効) / `0x0001` (有効) | `total_len=0, offset=0` | Host → Ctrl | **`SetReportEnable`**。リアルタイム入力通知の開始/停止。発行時にクライアント側 `MAX_ATT_MTU = 0x3F` へ設定 |
-| **`0x000B`** | `0x0000` | `0x600F` (`gamepad_type == 1`): `total_len = 4`, `offset = 0x01017040`<br/>`gamepad_type == 2`: `total_len = offset = 0x01020030` | Host → Ctrl | **`ReadVersion`**。ファームウェアバージョン読み出し。`0x01020030` は `gamepad_type == 2` の variant |
+| **`0x000B`** | `0x0000` | `0x600F` (`gamepad_type == 1`): `total_len = 4`, `chunk_len = 4`, `offset = 0x01017040`, 4B ダミーペイロード（`gamepadVersion`、初回ゼロ。CRC-16/MODBUS = `0x2400`）<br/>`gamepad_type == 2`: `total_len = offset = 0x01020030` | Host → Ctrl | **`ReadVersion`**。ファームウェアバージョン読み出し。`0x01020030` は `gamepad_type == 2` の variant。応答は `cmd=0x0004, subcmd=0x000B` エンベロープ（§4.3.1） |
 | **`0x000C`** | **`0x0067`** | `total_len=4, offset=4` | Host → Ctrl | **`EnterBoot`**。App Mode から Bootloader Mode (`"8bt"`) へ再起動遷移 |
 | **`0x000E`** | — | — | Ctrl → Host | エラー応答通知（`readBleHidData` でエラーコードログ出力） |
 | **`0x000F`** | **`0x000F`** | `total_len=0, offset=4` | Host → Ctrl | **`DisConnectBluetooth`**。Bluetooth 設定接続の明示的切断 |
@@ -313,7 +435,7 @@ sequenceDiagram
 | **`0x0012`** | `0x0000` | — | Ctrl → Host | **`AllowConfigDone`**。コントローラが設定受付可能になった際の非同期通知 |
 | **`0x0013`** | `0x0000` | `total_len=0, offset=0` (Windows `StartConfig` flag=`1`) | Host → Ctrl | **Windows USB HID 用 `StartConfig`**（最大 30 回リトライし `cmd=0x13` ACK を待機） |
 | **`0x0015`** | `slot` (`0..2`) | `total_len=0, offset=0` | Host → Ctrl | **`WriteSLOT`**。アクティブプロファイルスロット切替 |
-| **`0x0102`** | `(mode << 8) \| slot` | `total_len = steps * 10`, `offset = macro_idx << 12` (`macro_idx * 0x1000`) | Host → Ctrl | **`ReadBT2Macro`**。指定スロット・マクロ番号のステップ列を読み出し（1 ステップ = 10B） |
+| **`0x0102`** | `(mode << 8) \| slot` | `total_len = chunk_len = steps * 10`, `offset = macro_idx << 12` (`macro_idx * 0x1000`) | Host → Ctrl | **`ReadBT2Macro`**。指定スロット・マクロ番号のステップ列を読み出し（1 ステップ = 10B）。ペイロードなしだが `chunk_len` に要求長を宣言する（§4.1.1） |
 | **`0x0103`** | `(mode << 8) \| slot` | `total_len = align32(steps * 10)` (`((steps * 10) + 0x1F) & ~0x1F`), `offset = (macro_idx << 12) + chunk_index * chunk_size`（`chunk_index` はパケットごとに進む。プロトコル上限は BLE `0x40` / USB HID `0x20`。本クレートの API は 32B / 64B のみで、46B などは `UnsupportedChunkSize`。64B 超は 64B にクランプ） | Host → Ctrl | **`WriteBT2Macro`**。BLE 最大 **`0x40` (64B)** / USB HID 最大 **`0x20` (32B)** 分割でマクロを書き込み、完了後に `0x0006` (Save) を実行。API の chunk サイズは 32B / 64B のみ（32B アライン保証） |
 | **`0x0104`** | `(mode << 8) \| slot` | `total_len = 0x1000`, `chunk_len = 0x1000`（wire header `+0x04`。公式実装のチャネル設定値。ペイロードなし `len = 0`）, `crc16 = 0xFFFF`（空ペイロードの CRC-16/MODBUS）, `offset = macro_idx << 12` | Host → Ctrl | **`EraseBT2Macro`**。指定スロット・マクロ領域（4KB 単位）を消去 |
 

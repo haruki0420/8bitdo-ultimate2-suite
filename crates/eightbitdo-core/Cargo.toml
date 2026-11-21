@@ -1,0 +1,28 @@
+[package]
+name = "eightbitdo-core"
+description = "Transport abstractions, session management and device I/O for the 8BitDo Ultimate 2 Bluetooth controller"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["ble"]
+ble = ["dep:btleplug", "dep:futures-util"]
+
+[dependencies]
+eightbitdo-protocol = { path = "../eightbitdo-protocol" }
+async-trait = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+uuid = "1"
+btleplug = { version = "0.13", optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+
+[lints]
+workspace = true

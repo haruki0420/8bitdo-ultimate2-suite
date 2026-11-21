@@ -25,6 +25,14 @@ pub mod cmd {
     pub const REPORT_ENABLE: u16 = 0x0007;
     /// Read firmware version.
     pub const READ_VERSION: u16 = 0x000B;
+
+    /// Generic App Mode response envelope (`cmd 0x0004`).
+    ///
+    /// On the observed `0x600F` unit every command response arrives with this
+    /// `cmd`; the request command is echoed in `subcmd` and the transfer size
+    /// in `total_len`. A payload-less acknowledgement uses
+    /// `chunk_len = total_len = 0`.
+    pub const RESPONSE: u16 = 0x0004;
     /// Enter the BLE bootloader.
     pub const ENTER_BOOT: u16 = 0x000C;
     /// Disconnect the Bluetooth configuration link.
@@ -71,8 +79,22 @@ pub mod subcmd {
 /// valid for the Ultimate 2 Bluetooth.
 pub const VERSION_REQUEST_LEN: u32 = 4;
 
-/// `ReadVersion` response payload length (version string + metadata).
-pub const VERSION_RESPONSE_LEN: usize = 0x30;
+/// Dummy payload sent with the `0x600F` `ReadVersion` request.
+///
+/// The official `getVersionChannel` (0x2c7a0) points the channel payload at
+/// the 4-byte `gamepadVersion` buffer and sets both `total_len` and
+/// `chunk_len` to 4. `Generate_CustomDataCmd` (0x27620) copies those 4 bytes
+/// into the request, so the wire request is 21 bytes
+/// (`0x04` + 16-byte header + 4 bytes) rather than the 17-byte payload-less
+/// frame. The buffer is zero-initialised on the first call; this
+/// implementation always sends zeroes and does not cache a previous version.
+pub const VERSION_REQUEST_PAYLOAD: [u8; VERSION_REQUEST_LEN as usize] = [0; 4];
+
+/// `ReadVersion` response payload length on `0x600F` (`total_len = 4`).
+///
+/// The official `getVersion` (0x35700) reads the first four bytes as a
+/// little-endian `i32`; no long version string is transferred.
+pub const VERSION_RESPONSE_LEN: usize = VERSION_REQUEST_LEN as usize;
 
 /// Maximum `WriteBT2Macro` (`cmd 0x0103`) payload per packet (`0x40`).
 pub const MACRO_MAX_CHUNK_SIZE: usize = 0x40;
@@ -125,6 +147,28 @@ impl Request {
         }
     }
 
+    /// Build a payload-less request that declares `chunk_len = total_len`.
+    ///
+    /// Read commands (`ReadConfig` / `ReadMacro`) on `0x600F` use this shape:
+    /// the wire packet contains only the 16-byte header, but `chunk_len`
+    /// carries the requested transfer length. See
+    /// [`read_config`] and [`read_macro`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when `total_len` does not fit in `u16`. All built-in read
+    /// builders are bounded by the 2768-byte config block or one 4 KB macro
+    /// sector, so this cannot happen through the public constructors.
+    #[must_use]
+    pub fn new_payloadless(cmd: u16, subcmd: u16, total_len: u32, offset: u32) -> Self {
+        let chunk_len = u16::try_from(total_len)
+            .expect("payload-less read length must fit in the wire chunk_len field");
+        Self {
+            header: CustomHeader::new(cmd, subcmd, total_len, offset).with_chunk_len(chunk_len),
+            payload: Vec::new(),
+        }
+    }
+
     /// Attach a payload, updating `chunk_len` but not `crc16`.
     #[must_use]
     pub fn with_payload(mut self, payload: &[u8]) -> Self {
@@ -155,42 +199,64 @@ impl Request {
     }
 
     /// Validate the shape accepted by the payload-less encoders.
+    ///
+    /// Two families are allowed:
+    ///
+    /// - `ReadConfig` (`0x0002`) and `ReadMacro` (`0x0102`) with an empty
+    ///   payload and `chunk_len == total_len`;
+    /// - `EraseBT2Macro` (`0x0104`) with `chunk_len = total_len = 0x1000`,
+    ///   `crc16 = 0xFFFF` and a 4 KB-aligned sector offset.
     fn validate_payloadless(&self) -> Result<(), Error> {
         if !self.payload.is_empty() {
             return Err(Error::UnexpectedPayload {
                 actual: self.payload.len(),
             });
         }
-        let expected_len = macro_data::MACRO_SECTOR_SIZE;
-        if self.header.cmd != cmd::ERASE_MACRO
-            || self.header.total_len != expected_len
-            || self.header.chunk_len != expected_len as u16
-        {
-            return Err(Error::InvalidFrame(
-                "payloadless encoding is restricted to EraseBT2Macro \
-                 (cmd 0x0104, total_len = chunk_len = 0x1000)",
-            ));
+        match self.header.cmd {
+            cmd::READ_CONFIG | cmd::READ_MACRO => {
+                if u32::from(self.header.chunk_len) != self.header.total_len {
+                    return Err(Error::InvalidFrame(
+                        "payload-less read chunk_len must equal total_len",
+                    ));
+                }
+                Ok(())
+            }
+            cmd::ERASE_MACRO => {
+                let expected_len = macro_data::MACRO_SECTOR_SIZE;
+                if self.header.total_len != expected_len
+                    || self.header.chunk_len != expected_len as u16
+                {
+                    return Err(Error::InvalidFrame(
+                        "payloadless encoding is restricted to EraseBT2Macro \
+                         (cmd 0x0104, total_len = chunk_len = 0x1000)",
+                    ));
+                }
+                if self.header.crc16 != 0xFFFF {
+                    return Err(Error::InvalidFrame(
+                        "EraseBT2Macro header crc16 must be 0xFFFF",
+                    ));
+                }
+                if !matches!(self.header.offset, 0 | 0x1000 | 0x2000 | 0x3000) {
+                    return Err(Error::InvalidFrame(
+                        "EraseBT2Macro offset must be macro_idx << 12",
+                    ));
+                }
+                Ok(())
+            }
+            _ => Err(Error::InvalidFrame(
+                "payloadless encoding is restricted to ReadConfig, ReadMacro \
+                 and EraseBT2Macro",
+            )),
         }
-        if self.header.crc16 != 0xFFFF {
-            return Err(Error::InvalidFrame(
-                "EraseBT2Macro header crc16 must be 0xFFFF",
-            ));
-        }
-        if !matches!(self.header.offset, 0 | 0x1000 | 0x2000 | 0x3000) {
-            return Err(Error::InvalidFrame(
-                "EraseBT2Macro offset must be macro_idx << 12",
-            ));
-        }
-        Ok(())
     }
 
     /// Encode a payload-less command whose header declares a non-zero
     /// `chunk_len`.
     ///
-    /// This is restricted to `EraseBT2Macro` (`cmd 0x0104`), whose official
-    /// request declares `chunk_len = total_len = 0x1000` while sending no
-    /// payload bytes. All other commands must use
-    /// [`encode_ble`](Self::encode_ble), which enforces
+    /// `ReadConfig` (`0x0002`) and `ReadMacro` (`0x0102`) use this path with
+    /// `chunk_len == total_len` and no payload bytes. `EraseBT2Macro`
+    /// (`0x0104`) uses it with `chunk_len = total_len = 0x1000`. All other
+    /// commands must use [`encode_ble`](Self::encode_ble), which enforces
     /// `chunk_len == payload.len()`.
     ///
     /// # Errors
@@ -207,11 +273,10 @@ impl Request {
         Ok(header::encode_ble_payloadless(kind, &self.header))
     }
 
-    /// Encode a payload-less `EraseBT2Macro` request as a 65-byte App Mode
-    /// USB HID report.
+    /// Encode a payload-less request as a 65-byte App Mode USB HID report.
     ///
     /// See [`encode_ble_payloadless`](Self::encode_ble_payloadless) for the
-    /// accepted command shape.
+    /// accepted command shapes.
     ///
     /// # Errors
     ///
@@ -239,19 +304,46 @@ fn check_config_range(offset: u32, len: u64) -> Result<(), Error> {
 
 /// `ReadConfig` for an arbitrary range.
 ///
+/// The request is payload-less but declares `chunk_len == total_len == len`.
+/// The official `getUT2_ReadCofigChannel` (0x29ea0) loads the 16-byte channel
+/// fields from `0x1d5f0`: `offset = 0`, `total_len = chunk_len = 0x0AD0` for
+/// the full block. `getBT2_head_CofigChannel` (0x2a000) uses `0x74` for the
+/// header read.
+///
 /// # Errors
 ///
 /// Returns [`Error::RangeOutOfBounds`] when `offset + len` exceeds the
 /// 2768-byte configuration block.
 pub fn read_config(offset: u32, len: u32) -> Result<Request, Error> {
     check_config_range(offset, u64::from(len))?;
-    Ok(Request::new(cmd::READ_CONFIG, 0, len, offset))
+    Ok(Request::new_payloadless(cmd::READ_CONFIG, 0, len, offset))
+}
+
+/// Read the full configuration block starting at `offset`.
+///
+/// Every request declares `total_len = chunk_len = 0x0AD0`; only the wire
+/// `offset` advances. The device returns one chunk per request (observed
+/// `chunk_len = 0x8E` = 142 bytes), so callers must re-request at
+/// `offset + payload.len()` until the full block is assembled.
+///
+/// # Errors
+///
+/// Returns [`Error::RangeOutOfBounds`] when `offset` is at or beyond the
+/// 2768-byte configuration block.
+pub fn read_config_from(offset: u32) -> Result<Request, Error> {
+    check_config_range(offset, 1)?;
+    Ok(Request::new_payloadless(
+        cmd::READ_CONFIG,
+        0,
+        CONFIG_SIZE as u32,
+        offset,
+    ))
 }
 
 /// Read the full 2768-byte configuration block.
 #[must_use]
 pub fn read_config_all() -> Request {
-    read_config(0, CONFIG_SIZE as u32).expect("the full configuration range is valid")
+    read_config_from(0).expect("the full configuration range is valid")
 }
 
 /// Read only the 116-byte header (`0x000..0x073`).
@@ -338,8 +430,16 @@ pub fn save(transport: SaveTransport) -> Request {
 /// Read the firmware version.
 ///
 /// For the `0x600F` (`gamepad_type == 1`) the official request uses
-/// `total_len = 4` and `offset = 0x01017040`. The `0x01020030` query value is
-/// the `gamepad_type == 2` variant and must not be used here.
+/// `total_len = chunk_len = 4` and `offset = 0x01017040`. The
+/// `0x01020030` query value is the `gamepad_type == 2` variant and must not
+/// be used here.
+///
+/// The request carries a 4-byte zero payload. The official channel points at
+/// the zero-initialised `gamepadVersion` buffer and `Generate_CustomDataCmd`
+/// copies it into the packet (payload copy and CRC path around
+/// `0x27a37..0x27b72` in `libadvancelib.so`). The packet CRC is computed over
+/// those four bytes, so the wire header has `crc16 = 0x2400`
+/// (CRC-16/MODBUS of `00 00 00 00`), not `0xFFFF`.
 #[must_use]
 pub fn read_version() -> Request {
     Request::new(
@@ -348,6 +448,7 @@ pub fn read_version() -> Request {
         VERSION_REQUEST_LEN,
         boot::VERSION_ADDR,
     )
+    .with_crc_payload(&VERSION_REQUEST_PAYLOAD)
 }
 
 /// Report the host as a phone platform.
@@ -406,6 +507,11 @@ pub const fn macro_subcmd(gamepad_mode: u16, slot: Slot) -> u16 {
 
 /// Read macro steps (`1 step = 10 bytes`, no 32-byte alignment).
 ///
+/// The request is payload-less but declares
+/// `chunk_len == total_len == steps * 10`. The official
+/// `getBT2_ReadMacro` (0x2bd90) sets `+0x40 = +0x44 = +0x48` to that length,
+/// keeps the 4 KB sector base in `+0x38`, and uses `cmd 0x0102`.
+///
 /// # Errors
 ///
 /// Returns [`Error::TooManySteps`] when `steps` exceeds
@@ -432,7 +538,7 @@ pub fn read_macro(
             actual: step_count,
         });
     }
-    Ok(Request::new(
+    Ok(Request::new_payloadless(
         cmd::READ_MACRO,
         macro_subcmd(gamepad_mode, slot),
         total_len,
@@ -815,12 +921,85 @@ mod tests {
         assert_eq!(request.header.cmd, 0x0002);
         assert_eq!(request.header.subcmd, 0);
         assert_eq!(request.header.total_len, 0x0AD0);
+        assert_eq!(request.header.chunk_len, 0x0AD0);
         assert_eq!(request.header.offset, 0);
         assert!(request.payload.is_empty());
 
         let header = read_config_header();
         assert_eq!(header.header.total_len, 0x74);
-        assert_eq!(read_current_slot().header.offset, 0x12);
+        assert_eq!(header.header.chunk_len, 0x74);
+        let slot = read_current_slot();
+        assert_eq!(slot.header.offset, 0x12);
+        assert_eq!(slot.header.chunk_len, 2);
+        assert_eq!(slot.header.total_len, 2);
+    }
+
+    #[test]
+    fn read_config_payloadless_encoding_is_17_bytes_with_declared_chunk_len() {
+        let bytes = read_config_all()
+            .encode_ble_payloadless(PacketKind::App)
+            .unwrap();
+        assert_eq!(
+            bytes,
+            [
+                0x04, // BLE App prefix
+                0x02, 0x00, // cmd = 0x0002
+                0x00, 0x00, // subcmd
+                0xD0, 0x0A, // chunk_len = 0x0AD0
+                0x00, 0x00, // crc16
+                0xD0, 0x0A, 0x00, 0x00, // total_len = 0x0AD0
+                0x00, 0x00, 0x00, 0x00, // offset = 0
+            ]
+        );
+        assert_eq!(bytes.len(), 17);
+    }
+
+    #[test]
+    fn payloadless_read_requires_chunk_len_equal_total_len() {
+        let mut config = read_config_all();
+        config.header.chunk_len = 0;
+        assert!(matches!(
+            config.encode_ble_payloadless(PacketKind::App),
+            Err(Error::InvalidFrame(_))
+        ));
+
+        let mut macro_request = read_macro(3, Slot::S2, MacroIndex::M3, 42).unwrap();
+        macro_request.header.chunk_len = 0;
+        assert!(matches!(
+            macro_request.encode_ble_payloadless(PacketKind::App),
+            Err(Error::InvalidFrame(_))
+        ));
+
+        // The normal encoder still rejects a declared length without payload.
+        assert_eq!(
+            read_config_all().encode_ble(PacketKind::App),
+            Err(Error::ChunkLenMismatch {
+                declared: 0x0AD0,
+                actual: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn read_config_from_advances_only_the_offset() {
+        let request = read_config_from(142).unwrap();
+        assert_eq!(request.header.cmd, 0x0002);
+        assert_eq!(request.header.offset, 142);
+        assert_eq!(request.header.total_len, 0x0AD0);
+        assert_eq!(request.header.chunk_len, 0x0AD0);
+        assert!(request.payload.is_empty());
+
+        let bytes = request.encode_ble_payloadless(PacketKind::App).unwrap();
+        assert_eq!(bytes.len(), 17);
+        let header = CustomHeader::parse(&bytes[1..]).unwrap();
+        assert_eq!(header.offset, 142);
+        assert_eq!(header.total_len, 0x0AD0);
+        assert_eq!(header.chunk_len, 0x0AD0);
+
+        assert!(matches!(
+            read_config_from(0x0AD0),
+            Err(Error::RangeOutOfBounds { .. })
+        ));
     }
 
     #[test]
@@ -903,9 +1082,41 @@ mod tests {
     fn read_version_uses_type_1_parameters() {
         let request = read_version();
         assert_eq!(request.header.cmd, 0x000B);
+        assert_eq!(request.header.subcmd, 0);
+        assert_eq!(request.header.chunk_len, 4);
+        assert_eq!(request.header.crc16, 0x2400);
         assert_eq!(request.header.total_len, 4);
         assert_eq!(request.header.offset, boot::VERSION_ADDR);
         assert_eq!(request.header.offset, 0x0101_7040);
+        assert_eq!(request.payload, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn read_version_golden_request_matches_hardware_shape() {
+        // Evidence: getVersionChannel (0x2c7a0) sets chunk_len = total_len = 4
+        // and points the payload at gamepadVersion; Generate_CustomDataCmd
+        // copies 4 zero bytes and computes CRC-16/MODBUS over them.
+        let bytes = read_version().encode_ble(PacketKind::App).unwrap();
+        assert_eq!(
+            bytes,
+            [
+                0x04, // BLE App prefix
+                0x0B, 0x00, // cmd = 0x000B
+                0x00, 0x00, // subcmd
+                0x04, 0x00, // chunk_len = 4
+                0x00, 0x24, // crc16 = 0x2400
+                0x04, 0x00, 0x00, 0x00, // total_len = 4
+                0x40, 0x70, 0x01, 0x01, // offset = 0x01017040
+                0x00, 0x00, 0x00, 0x00, // payload
+            ]
+        );
+    }
+
+    #[test]
+    fn version_response_envelope_constant_is_not_a_request_command() {
+        assert_eq!(cmd::RESPONSE, 0x0004);
+        assert_ne!(cmd::RESPONSE, cmd::READ_VERSION);
+        assert_ne!(cmd::RESPONSE, cmd::READ_CONFIG);
     }
 
     #[test]
@@ -932,6 +1143,18 @@ mod tests {
         assert_eq!(request.header.subcmd, 0x0301);
         assert_eq!(request.header.offset, 0x2000);
         assert_eq!(request.header.total_len, 420);
+        assert_eq!(request.header.chunk_len, 420);
+        assert!(request.payload.is_empty());
+
+        let bytes = request.encode_ble_payloadless(PacketKind::App).unwrap();
+        assert_eq!(bytes.len(), 17);
+        assert_eq!(bytes[0], 0x04);
+        let parsed = CustomHeader::parse(&bytes[1..]).unwrap();
+        assert_eq!(parsed.cmd, 0x0102);
+        assert_eq!(parsed.subcmd, 0x0301);
+        assert_eq!(parsed.chunk_len, 420);
+        assert_eq!(parsed.total_len, 420);
+        assert_eq!(parsed.offset, 0x2000);
     }
 
     #[test]
