@@ -46,6 +46,8 @@ pub struct BleOptions {
     pub scan_timeout: Duration,
     /// Connection and service-discovery timeout.
     pub connect_timeout: Duration,
+    /// Log every raw TX and RX frame to stderr.
+    pub verbose: bool,
 }
 
 impl Default for BleOptions {
@@ -55,6 +57,7 @@ impl Default for BleOptions {
             address: None,
             scan_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(20),
+            verbose: false,
         }
     }
 }
@@ -82,6 +85,7 @@ pub struct BleTransport {
     write_type: WriteType,
     mtu: u16,
     name: Option<String>,
+    verbose: bool,
     rx: Mutex<mpsc::Receiver<Vec<u8>>>,
 }
 
@@ -160,11 +164,19 @@ impl BleTransport {
 
         let (tx, rx) = mpsc::channel(NOTIFICATION_CHANNEL_DEPTH);
         let characteristic_uuid = characteristic.uuid;
+        let verbose = options.verbose;
         tokio::spawn(async move {
             let mut stream = stream;
             while let Some(notification) = stream.next().await {
                 if notification.uuid != characteristic_uuid {
                     continue;
+                }
+                if verbose {
+                    eprintln!(
+                        "rx {} bytes: {}",
+                        notification.value.len(),
+                        hex_dump(&notification.value)
+                    );
                 }
                 if tx.send(notification.value).await.is_err() {
                     break;
@@ -183,6 +195,7 @@ impl BleTransport {
             write_type,
             mtu,
             name,
+            verbose,
             rx: Mutex::new(rx),
         })
     }
@@ -211,6 +224,9 @@ impl BleTransport {
 #[async_trait]
 impl Transport for BleTransport {
     async fn send(&self, data: &[u8]) -> Result<(), Error> {
+        if self.verbose {
+            eprintln!("tx {} bytes: {}", data.len(), hex_dump(data));
+        }
         self.peripheral
             .write(&self.characteristic, data, self.write_type)
             .await
@@ -365,6 +381,19 @@ fn supports_app_traffic(properties: CharPropFlags) -> bool {
 
 fn ble_error(error: btleplug::Error) -> Error {
     Error::Ble(error.to_string())
+}
+
+fn hex_dump(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(bytes.len() * 3);
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        let _ = write!(out, "{byte:02X}");
+    }
+    out
 }
 
 #[cfg(test)]

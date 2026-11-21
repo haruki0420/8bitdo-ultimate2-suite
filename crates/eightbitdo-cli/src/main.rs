@@ -41,6 +41,10 @@ struct Cli {
     #[arg(long, global = true, default_value_t = 20, value_name = "SECONDS")]
     timeout: u64,
 
+    /// Print every raw BLE TX/RX frame to stderr.
+    #[arg(long, short = 'v', global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -99,6 +103,7 @@ async fn run(cli: Cli) -> Result<(), Error> {
         address: cli.address.clone(),
         scan_timeout: Duration::from_secs(cli.scan_timeout),
         connect_timeout: Duration::from_secs(cli.timeout),
+        verbose: cli.verbose,
     };
 
     match cli.command {
@@ -148,6 +153,11 @@ async fn info(options: &BleOptions) -> Result<(), Error> {
     let mtu = transport.mtu();
     let characteristic = transport.characteristic_uuid();
 
+    println!("address: {address}");
+    println!("name: {name}");
+    println!("mtu: {mtu}");
+    println!("characteristic: {characteristic}");
+
     let session = Session::new(transport);
     let version = session.read_version().await;
     let _ = session.transport().disconnect().await;
@@ -164,10 +174,6 @@ async fn info(options: &BleOptions) -> Result<(), Error> {
         &version.text
     };
 
-    println!("address: {address}");
-    println!("name: {name}");
-    println!("mtu: {mtu}");
-    println!("characteristic: {characteristic}");
     println!("version raw: {raw}");
     println!("version text: {text}");
     Ok(())
