@@ -386,11 +386,35 @@ fn same_file(_a: &std::fs::Metadata, _b: &std::fs::Metadata) -> bool {
     false
 }
 
+/// Mode bits of the file that `rename` is about to replace, if it exists.
+#[cfg(unix)]
+fn replaced_file_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions().mode() & 0o777)
+}
+
+/// Persist the rename itself. Best effort: a directory might not be
+/// openable on every filesystem, and the data file is already fsynced.
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) {
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) {}
+
 /// Write `contents` through a temporary file in the same directory, then
 /// rename it over `path`.
 ///
 /// A crash or a failed write therefore leaves either the previous file or
-/// the complete new one, never a truncated 2768-byte backup.
+/// the complete new one, never a truncated 2768-byte backup. The temporary
+/// file starts at `0600` and adopts the replaced file's mode before the
+/// rename, so rewriting an existing `0600` backup never widens it to `0644`.
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), Error> {
     use std::io::Write as _;
 
@@ -408,6 +432,8 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), Error> {
         })?
         .to_string_lossy()
         .into_owned();
+    #[cfg(unix)]
+    let replaced_mode = replaced_file_mode(path);
 
     let mut attempt = 0u32;
     let (temp_path, mut file) = loop {
@@ -415,11 +441,17 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), Error> {
             ".{file_name}.eightbitdo-{}-{attempt}.tmp",
             std::process::id()
         ));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            // Backups contain personal settings. Create the temporary file
+            // private even under a permissive umask; the mode is adjusted
+            // below when an existing file is being replaced.
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
             Ok(file) => break (candidate, file),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
                 attempt += 1;
@@ -436,6 +468,20 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), Error> {
         }
     };
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = replaced_mode.unwrap_or(0o600);
+        if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(mode)) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(Error::Io(std::io::Error::new(
+                error.kind(),
+                format!("cannot set the mode of {}: {error}", path.display()),
+            )));
+        }
+    }
+
     let result = file
         .write_all(contents)
         .and_then(|()| file.sync_all())
@@ -450,6 +496,7 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), Error> {
             format!("cannot write {}: {error}", path.display()),
         )));
     }
+    sync_parent_directory(parent);
     Ok(())
 }
 
@@ -678,9 +725,10 @@ async fn monitor(options: &BleOptions, count: Option<u64>) -> Result<(), Error> 
 
 /// Run the top-level monitor against an already connected session.
 ///
-/// This mirrors the `session` monitor: enable reports, poll `0x0003` every
-/// `interval`, print each report, then disable reports on the way out. The
-/// connection itself stays owned by the caller.
+/// Unlike the background session monitor, this entry point owns the report
+/// enable: it enables reports, polls `0x0003` every `interval`, prints each
+/// report, then disables reports on every exit path. The connection itself
+/// stays owned by the caller.
 async fn monitor_connection<T: Transport>(
     session: &Session<T>,
     interval: Duration,
@@ -942,15 +990,38 @@ enum SessionOutcome {
     MonitorReports(usize),
 }
 
+/// Parse `--raw FILE` / `--json FILE` pairs.
+///
+/// Options are strict: a repeated option, a missing value, or a value that
+/// looks like another option (`--json`) rejects the whole command instead of
+/// silently letting the later value win.
 fn parse_file_options<'a>(
     mut parts: impl Iterator<Item = &'a str>,
 ) -> Option<(Option<PathBuf>, Option<PathBuf>)> {
+    fn value<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<PathBuf> {
+        let value = parts.next()?;
+        if value.starts_with("--") {
+            return None;
+        }
+        Some(PathBuf::from(value))
+    }
+
     let mut raw = None;
     let mut json = None;
     while let Some(part) = parts.next() {
         match part {
-            "--raw" => raw = Some(PathBuf::from(parts.next()?)),
-            "--json" => json = Some(PathBuf::from(parts.next()?)),
+            "--raw" => {
+                if raw.is_some() {
+                    return None;
+                }
+                raw = Some(value(&mut parts)?);
+            }
+            "--json" => {
+                if json.is_some() {
+                    return None;
+                }
+                json = Some(value(&mut parts)?);
+            }
             _ => return None,
         }
     }
@@ -1011,6 +1082,14 @@ fn print_session_help() {
     println!(
         "monitor --count N returns after N reports; without responses it can wait indefinitely."
     );
+}
+
+/// Format an unknown REPL line for the terminal.
+///
+/// The line is debug-escaped so ANSI escapes and control bytes from a paste
+/// cannot repaint the terminal or forge extra output lines.
+fn unknown_command_message(line: &str) -> String {
+    format!("unknown command: {line:?}; type 'help'")
 }
 
 /// Start the official-style keepalive on a shared session.
@@ -1443,6 +1522,10 @@ fn start_background_monitor<T: Transport + 'static>(
     session: Arc<AsyncMutex<Session<T>>>,
     interval: Duration,
 ) -> SessionMonitor {
+    // The monitor does not own the `0x0007` enable. `start_session_keepalive`
+    // sends it once before the REPL accepts commands, and the keepalive and
+    // this monitor share it. Disabling reports here would silently stop the
+    // keepalive's notifications; `shutdown_session` owns the final disable.
     let stop = Arc::new(Notify::new());
     let task_stop = Arc::clone(&stop);
     let finished = Arc::new(Notify::new());
@@ -1686,7 +1769,7 @@ async fn execute_session_command<T: Transport + 'static>(
         SessionCommand::Quit => Ok(SessionOutcome::Quit),
         SessionCommand::Empty => Ok(SessionOutcome::Continue),
         SessionCommand::Unknown(line) => {
-            eprintln!("unknown command: {line}; type 'help'");
+            eprintln!("{}", unknown_command_message(&line));
             Ok(SessionOutcome::Continue)
         }
     }
@@ -1859,10 +1942,11 @@ where
         };
         match event {
             LoopEvent::CtrlC => {
-                // Ctrl-C while idle: nothing is in flight, so the session has
-                // no resync mark to clear. If a read was running, the REPL
-                // takes the branch below and the session decides for itself
-                // whether a drain is needed (Session::InFlight).
+                // Ctrl-C while idle: no command future is in flight, so there
+                // is no cancelled read to acknowledge. A read that was running
+                // takes the branch below; the `Session` tracks it through
+                // `ResyncGuard` / `InFlight` and the next command drains only
+                // if a read (not an input poll) was abandoned.
                 break;
             }
             LoopEvent::KeepaliveStopped => {
@@ -1911,11 +1995,12 @@ where
                 let outcome = tokio::select! {
                     biased;
                     _ = &mut ctrl_c => {
-                        // The command future is dropped (not aborted), so the
-                        // session unwinds it synchronously: an abandoned read
-                        // leaves its resync mark for the next command, and an
-                        // abandoned input poll leaves none. Correctness is
-                        // preferred over saving one drain.
+                        // The command future is dropped, not aborted. Dropping
+                        // a `Session` read marks it for resync via
+                        // `ResyncGuard` (an abandoned input poll does not), so
+                        // the next command drains only when a response could
+                        // still be in flight. There is no caller-side mark to
+                        // clear; `Session::InFlight` makes that decision.
                         break;
                     }
                     outcome = execute_session_command(
@@ -2512,6 +2597,46 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn parse_session_commands_rejects_ambiguous_file_options() {
+        for line in [
+            "backup --raw a --raw b",
+            "backup --json a --json b",
+            "config dump --raw a --raw b",
+            "config dump --raw",
+            "config dump --json",
+            "backup --raw --json x",
+            "backup --json --raw x",
+            "backup --raw a --bogus b",
+        ] {
+            assert!(
+                matches!(parse_session_command(line), SessionCommand::Unknown(_)),
+                "ambiguous options must be rejected: {line}"
+            );
+        }
+
+        assert_eq!(
+            parse_session_command("backup --raw a --json b"),
+            SessionCommand::Backup {
+                raw: Some(PathBuf::from("a")),
+                json: Some(PathBuf::from("b")),
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_command_message_escapes_terminal_control_bytes() {
+        let message = unknown_command_message("bogus\u{1b}[31m\nforged\u{7}");
+        assert!(
+            !message.contains(['\u{1b}', '\u{7}', '\n']),
+            "control bytes must not reach the terminal: {message:?}"
+        );
+        assert!(message.contains("\\u{1b}[31m"));
+        assert!(message.contains("\\n"));
+        assert!(message.contains("\\u{7}"));
+        assert!(message.contains("type 'help'"));
+    }
+
     #[tokio::test]
     async fn session_monitor_stop_stops_background_monitor_and_resumes_keepalive() {
         let transport = KeepaliveTestTransport::new();
@@ -2603,7 +2728,29 @@ mod tests {
             "keepalive did not resume after monitor stop"
         );
 
+        let report_enable = |subcmd: u16| {
+            transport
+                .sent_frames()
+                .iter()
+                .filter(|frame| {
+                    let header = CustomHeader::parse(&frame[1..]).unwrap();
+                    header.cmd == commands::cmd::REPORT_ENABLE && header.subcmd == subcmd
+                })
+                .count()
+        };
+        assert_eq!(report_enable(1), 1, "the session sends one shared enable");
+        assert_eq!(
+            report_enable(0),
+            0,
+            "stopping the monitor must not disable the keepalive's reports"
+        );
+
         shutdown_session(&session, keepalive).await;
+        assert_eq!(
+            report_enable(0),
+            1,
+            "session shutdown owns the final report disable"
+        );
         assert!(transport.is_disconnected());
     }
 
@@ -2716,6 +2863,17 @@ mod tests {
         assert_eq!(monitor_counters(None), (0, 0));
 
         monitor.stop().await;
+        assert_eq!(
+            transport
+                .sent_frames()
+                .iter()
+                .filter(|frame| {
+                    CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::REPORT_ENABLE
+                })
+                .count(),
+            0,
+            "the background monitor must not send its own 0x0007 enable/disable"
+        );
     }
 
     #[tokio::test]
@@ -3515,6 +3673,32 @@ mod tests {
             .filter(|name| name.to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_preserves_modes_and_creates_private_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = scratch_dir("atomic-mode");
+        let path = dir.join("backup.bin");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        write_atomic(&path, b"first").unwrap();
+        assert_eq!(
+            mode(&path),
+            0o600,
+            "a new backup must not be group/world readable"
+        );
+
+        write_atomic(&path, b"second").unwrap();
+        assert_eq!(mode(&path), 0o600, "rewriting a 0600 backup must keep 0600");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        write_atomic(&path, b"third").unwrap();
+        assert_eq!(mode(&path), 0o640, "an existing mode must be preserved");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
