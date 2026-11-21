@@ -126,6 +126,7 @@ struct Bt2Header {
 
 > **実機観測・未確定（2026-11-21）**:
 > - Ultimate 2 Bluetooth から取得した 2768B バッファでは `slot_flags = [0x20200911, 0x20200911, 0xFFFFFFFF]`、`crc16` は stored `0x2C55` / in-place 再計算 `0x6A05` だった。このバッファの SHA-256 は `1dca47facfc1c0394a8893ac0a5b7ef80678c51081001886a4bf17ce2f59c600` である。
+> - この SHA-256 は `eightbitdo backup --raw <FILE>` で取得した 2768B ダンプ（上記と同じバッファ）に由来する。
 > - `slot_flags` は `1` / `0` ではなく大きな非 0 値である。公式 `deleteCurslot` は `slot_flags[slot]` に `0` を書き、`copyConfig` は値をコピーするだけであるため、有効判定は「非 0」である可能性がある。単純な有効/空フラグとみなす解釈は実機観測と合わない可能性があり、正確な意味は未確定である。
 > - stored CRC と in-place 再計算が一致しないのは、上記のとおり公式 `ANSI_CRC_16_sh` が既存 CRC フィールドを含めて再計算する方式上、直ちに破損を意味しない。CLI はこの 2 値を情報表示するだけにしている。
 

@@ -673,7 +673,7 @@ impl<T: Transport> Session<T> {
     /// The response payload is copied at the requested offset, and the offset
     /// advances by `payload.len()`. `offset = 0` is accepted only for the
     /// first chunk, where it is the device's sequential-chunk convention;
-    /// later chunks must echo the requested offset (the final chunk does), so
+    /// every later chunk must echo the requested offset, so
     /// a re-sent first chunk fails the read instead of shifting the block.
     /// Chunks that overlap bytes already received are rejected.
     ///
@@ -750,13 +750,13 @@ impl<T: Transport> Session<T> {
                     return Err(out_of_range(response_offset, expected_len));
                 }
 
-                // The unit answers offset=0 for sequential chunks and echoes
-                // the request offset for the final chunk. offset=0 is only a
-                // valid sequential marker for the first chunk: after that, a
-                // chunk that still names offset 0 can only be a re-send of the
-                // first chunk. Treating it as "the chunk I asked for" would
-                // splice it at the requested offset, shift every later chunk
-                // by one payload length and still fill the buffer.
+                // The unit reports offset=0 only for the first chunk and
+                // echoes the requested offset for every later chunk. A chunk
+                // after the first that still names offset 0 can only be a
+                // re-send of the first chunk: treating it as "the chunk I
+                // asked for" would splice it at the requested offset, shift
+                // every later chunk by one payload length and still fill the
+                // buffer.
                 let sequential_first = offset == 0 && response_offset == 0;
                 if response_offset != offset && !sequential_first {
                     return Err(Error::UnexpectedResponse(format!(
