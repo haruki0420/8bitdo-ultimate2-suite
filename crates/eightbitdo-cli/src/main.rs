@@ -1184,6 +1184,8 @@ async fn shutdown_session_with_timeout<T: Transport>(
             return;
         }
     };
+    // Every exit path that reaches the lock ends with both steps: a failed
+    // report disable must not skip the disconnect.
     best_effort_disable_reports(&guard, timeout).await;
     best_effort_disconnect(guard.transport(), timeout).await;
 }
@@ -1490,6 +1492,78 @@ fn monitor_counters(monitor: Option<&SessionMonitor>) -> (u64, u64) {
     })
 }
 
+/// How `status` describes the keepalive.
+///
+/// The keepalive takes the operation lock on every tick, so while a
+/// background monitor holds that lock the keepalive makes no progress even
+/// though its task is alive. Reporting that as a plain "running" hid the
+/// difference between a healthy session and one whose keepalive is starved.
+fn keepalive_state_label(monitor_running: bool, degraded: bool) -> &'static str {
+    if degraded {
+        "degraded"
+    } else if monitor_running {
+        "paused (monitor running)"
+    } else {
+        "running"
+    }
+}
+
+/// Build the full `status` report.
+///
+/// Kept as a pure function so the output is testable without capturing stdout.
+#[allow(clippy::too_many_arguments)]
+fn status_report(
+    degraded: bool,
+    mtu: u16,
+    keepalive_sent: u64,
+    keepalive_received: u64,
+    last_error: Option<&str>,
+    keepalive_elapsed: Duration,
+    session_elapsed: Duration,
+    monitor_running: bool,
+    monitor_sent: u64,
+    monitor_received: u64,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "connected: {}",
+        if degraded { "false (degraded)" } else { "true" }
+    );
+    let _ = writeln!(out, "mtu: {mtu}");
+    let _ = writeln!(out, "keepalive sent: {keepalive_sent}");
+    let _ = writeln!(out, "keepalive received: {keepalive_received}");
+    let _ = writeln!(out, "keepalive degraded: {degraded}");
+    let _ = writeln!(
+        out,
+        "keepalive: {}",
+        keepalive_state_label(monitor_running, degraded)
+    );
+    if let Some(error) = last_error {
+        let _ = writeln!(out, "keepalive last_error: {error}");
+    }
+    let _ = writeln!(
+        out,
+        "keepalive elapsed: {:.1}s",
+        keepalive_elapsed.as_secs_f64()
+    );
+    let _ = writeln!(
+        out,
+        "session elapsed: {:.1}s",
+        session_elapsed.as_secs_f64()
+    );
+    let _ = writeln!(
+        out,
+        "monitor: {}",
+        if monitor_running { "running" } else { "idle" }
+    );
+    let _ = writeln!(out, "monitor sent: {monitor_sent}");
+    let _ = writeln!(out, "monitor received: {monitor_received}");
+    out
+}
+
 async fn execute_session_command<T: Transport + 'static>(
     session: &Arc<AsyncMutex<Session<T>>>,
     keepalive: &Arc<SessionKeepaliveState>,
@@ -1590,31 +1664,19 @@ async fn execute_session_command<T: Transport + 'static>(
         SessionCommand::Status => {
             let degraded = keepalive.degraded.load(Ordering::SeqCst);
             let (monitor_sent, monitor_received) = monitor_counters(monitor.as_ref());
-            println!(
-                "connected: {}",
-                if degraded { "false (degraded)" } else { "true" }
+            let report = status_report(
+                degraded,
+                mtu,
+                keepalive.sent.load(Ordering::SeqCst),
+                keepalive.received.load(Ordering::SeqCst),
+                keepalive.last_error().as_deref(),
+                keepalive.started_at.elapsed(),
+                started.elapsed(),
+                monitor.is_some(),
+                monitor_sent,
+                monitor_received,
             );
-            println!("mtu: {mtu}");
-            println!("keepalive sent: {}", keepalive.sent.load(Ordering::SeqCst));
-            println!(
-                "keepalive received: {}",
-                keepalive.received.load(Ordering::SeqCst)
-            );
-            println!("keepalive degraded: {degraded}");
-            if let Some(error) = keepalive.last_error() {
-                println!("keepalive last_error: {error}");
-            }
-            println!(
-                "keepalive elapsed: {:.1}s",
-                keepalive.started_at.elapsed().as_secs_f64()
-            );
-            println!("session elapsed: {:.1}s", started.elapsed().as_secs_f64());
-            println!(
-                "monitor: {}",
-                if monitor.is_some() { "running" } else { "idle" }
-            );
-            println!("monitor sent: {monitor_sent}");
-            println!("monitor received: {monitor_received}");
+            print!("{report}");
             Ok(SessionOutcome::Continue)
         }
         SessionCommand::Help => {
@@ -3038,6 +3100,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_quit_after_monitor_disconnect_disables_and_disconnects() {
+        // M4 regression: quitting while the background monitor has ended with
+        // `Disconnected` must still run the shutdown path, so `0x0007` disable
+        // is sent and the link is closed.
+        let transport = KeepaliveTestTransport::new();
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let keepalive = start_session_keepalive(Arc::clone(&session), Duration::from_millis(1))
+            .await
+            .unwrap();
+        wait_for_keepalive_send(&keepalive.state).await;
+
+        transport.disconnect_receives();
+        let state = Arc::clone(&keepalive.state);
+        let started = Instant::now();
+        let mut monitor_state: Option<SessionMonitor> = None;
+        execute_session_command(
+            &session,
+            &state,
+            started,
+            64,
+            Duration::from_millis(20),
+            &mut monitor_state,
+            SessionCommand::Monitor { count: None },
+        )
+        .await
+        .unwrap();
+        assert!(monitor_state.is_some());
+        for _ in 0..200 {
+            if monitor_state
+                .as_ref()
+                .is_some_and(SessionMonitor::is_finished)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            monitor_state
+                .as_ref()
+                .is_some_and(SessionMonitor::is_finished),
+            "the monitor must fail with Disconnected"
+        );
+        transport.allow_receives();
+
+        let before = transport.sent_frames().len();
+        shutdown_session(&session, keepalive).await;
+        let frames = transport.sent_frames();
+        let shutdown_frames = &frames[before.min(frames.len())..];
+        assert!(
+            shutdown_frames.iter().any(|frame| {
+                let header = CustomHeader::parse(&frame[1..]).unwrap();
+                header.cmd == commands::cmd::REPORT_ENABLE && header.subcmd == 0
+            }),
+            "shutdown after a monitor disconnect must send 0x0007 disable"
+        );
+        assert!(
+            transport.is_disconnected(),
+            "shutdown after a monitor disconnect must disconnect the link"
+        );
+    }
+
+    #[tokio::test]
     async fn repl_detects_background_monitor_error_and_disconnect_without_input() {
         use tokio::io::AsyncWriteExt as _;
 
@@ -3610,6 +3734,111 @@ mod tests {
         drop(guard);
 
         shutdown_session(&session, keepalive).await;
+    }
+
+    #[tokio::test]
+    async fn status_reports_paused_keepalive_while_the_monitor_runs() {
+        // M5: with a background monitor holding the operation lock the
+        // keepalive only waits for it, so `status` must say so instead of
+        // implying it is making progress.
+        let report = status_report(
+            false,
+            64,
+            10,
+            5,
+            None,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            true,
+            20,
+            20,
+        );
+        assert!(
+            report.contains("keepalive: paused (monitor running)"),
+            "status must mark the keepalive as paused:\n{report}"
+        );
+        assert!(report.contains("monitor: running"), "{report}");
+        assert!(!report.contains("keepalive: running"), "{report}");
+
+        // Without a monitor the keepalive is reported as running.
+        let idle = status_report(
+            false,
+            64,
+            10,
+            5,
+            None,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            false,
+            0,
+            0,
+        );
+        assert!(idle.contains("keepalive: running"), "{idle}");
+        assert!(idle.contains("monitor: idle"), "{idle}");
+
+        // A degraded keepalive is reported as degraded, not as paused.
+        let degraded = status_report(
+            true,
+            64,
+            10,
+            5,
+            Some("boom"),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            false,
+            0,
+            0,
+        );
+        assert!(degraded.contains("keepalive: degraded"), "{degraded}");
+        assert!(
+            degraded.contains("keepalive last_error: boom"),
+            "{degraded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_command_accepts_a_running_background_monitor() {
+        // The `status` command itself must return a report (and an observable
+        // paused state) while the background monitor holds the lock.
+        let transport = KeepaliveTestTransport::new();
+        for _ in 0..10 {
+            transport.queue_envelope_input(&sample_input_report());
+        }
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let state = Arc::new(SessionKeepaliveState::new());
+        let started = Instant::now();
+        let mut monitor: Option<SessionMonitor> = None;
+
+        let outcome = execute_session_command(
+            &session,
+            &state,
+            started,
+            64,
+            Duration::from_millis(20),
+            &mut monitor,
+            SessionCommand::Monitor { count: None },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, SessionOutcome::Continue);
+        assert!(monitor.is_some());
+
+        let outcome = execute_session_command(
+            &session,
+            &state,
+            started,
+            64,
+            Duration::from_millis(20),
+            &mut monitor,
+            SessionCommand::Status,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, SessionOutcome::Continue);
+        assert!(keepalive_state_label(true, false).contains("paused"));
+
+        let stopped = monitor.take().unwrap();
+        stopped.stop().await;
     }
 
     #[tokio::test]
