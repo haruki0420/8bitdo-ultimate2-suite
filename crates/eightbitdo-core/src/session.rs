@@ -431,10 +431,9 @@ impl<T: Transport> Session<T> {
     /// The call is bounded in three ways so a caller that drains the input
     /// queue in a loop cannot hold the session lock forever: the `wait`
     /// budget, at most [`MAX_INPUT_DRAIN_FRAMES`] frames consumed per call
-    /// (so at most that many non-input frames are skipped), and a final
-    /// small opportunistic stale-frame drain when the budget ends
-    /// without a report. The whole call therefore settles within roughly
-    /// `wait + 1 ms`.
+    /// (so at most that many non-input frames are skipped), and one final
+    /// small stale-frame drain when the budget ends without a report. The
+    /// whole call therefore settles within roughly `wait + 1 ms`.
     ///
     /// # Errors
     ///
