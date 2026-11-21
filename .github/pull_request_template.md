@@ -43,7 +43,7 @@ Tier 1 の純粋なテスト追加では、レビュアーが 1〜2 件の故障
 
 ## 独立レビュー
 
-各レビュアーは、他のレビュアーの判定を見る前に、同じ diff / head SHA に対して自分の行とレビューコメントを書きます。リードレビュアーは行を代筆せず、全員のコメント URL と SHA を確認して status を付けます。判定欄はレビュアーが記入するまで空のままにしてください。PR 本文を編集できないレビュアーは、役割 / レビューした SHA / 判定を含む standalone review comment を投稿してください。リードレビュアーはその URL を表に記録しますが、判定を代筆しません。
+各レビュアーは、他のレビュアーの判定を見る前に、同じ diff / head SHA に対して自分の行とレビューコメントを書きます。リードレビュアーは行を代筆せず、全員のコメント URL と SHA を確認して status を付けます。判定欄はレビュアーが記入するまで空のままにしてください。PR 本文を編集できないレビュアーは、役割 / セッション ID または氏名 / レビューした SHA / 判定を含む standalone review comment を投稿してください。リードレビュアーはその URL を表に記録しますが、判定を代筆しません。
 
 | 役割 | レビュアー（セッション ID / 氏名） | レビューした SHA | レビューコメント URL | 判定（マージ可 / 要修正） |
 | --- | --- | --- | --- | --- |
@@ -55,9 +55,10 @@ Tier 1 の純粋なテスト追加では、レビュアーが 1〜2 件の故障
 - [ ] レビュアーは著者と別セッションである
 - [ ] Tier 2/3 のレビュアー同士も別セッションである
 - [ ] 全レビュアーが **同じ head SHA** で「マージ可」を出した（Tier 3 で割れた場合は 4 名目の adjudicator を追加し、blocker の撤回または adjudication 理由を記録した）
-- [ ] Tier 1 はレビュアー本人、Tier 2/3 はリードレビュアーが `scripts/post-review-status.sh` で `review-gate` status を付けた（description に Tier と SHA）
-- [ ] Tier 3 パスを Tier 1/2 に下げた場合、整形のみ（`git diff -w --exit-code` が空 / `cargo fmt` のみ）またはコードコメントのみの証跡を記録した（規範仕様・ゲート・プロセス文書は Tier 2 まで）
-- [ ] 故障リスト / Tier 1 故障注入記録に `例:` 行が残っていない
+- [ ] Tier 1 はレビュアー本人、Tier 2/3 はリードレビュアーが `scripts/post-review-status.sh` で `review-gate` の commit status を投稿した（check run でも gate は満たせるが、本手順は commit status。description に Tier と SHA）
+- [ ] Tier 3 パスを Tier 1/2 に下げた場合、base commit で `cargo fmt --all` を実行した tree と head が一致する再現可能な証跡、または非規範散文のレンダリング等価の証跡を記録した（`git diff -w` だけ、コードコメントのみの例外、コメント prefix heuristic は不可。規範仕様・ゲート・プロセス文書は Tier 2 まで）
+- [ ] ダウングレード時、レビュアーが full diff を確認し、意味の変更がないことを記録した
+- [ ] 故障表・注入記録のデータ行に `例:` が残っていない（上の記入例 blockquote は対象外）
 - [ ] レビューコメントをすべて解決した
 - [ ] **この head SHA で Tier を再評価した**
 
@@ -80,7 +81,7 @@ Tier 1 の純粋なテスト追加では、レビュアーが 1〜2 件の故障
 
 ### Tier 3 追加チェック
 
-Tier 3 は以下のサブセクションを削除しないでください。Tier 1/2 も削除せず、該当しないサブセクションには「N/A + 理由」を 1 行記入します（全項目を埋める必要はありません）。Tier 3 では全項目を確認し、該当しないものだけ `N/A + 理由` とします。
+Tier 3 では A-D の全セクションが PR 本文に存在しなければならず、**省略は欠陥（要修正）** です。Tier 1/2 もセクションを削除せず、該当しないサブセクションには「N/A + 理由」を 1 行記入します（全項目を埋める必要はありません）。Tier 3 では全項目を確認し、該当しないものだけ `N/A + 理由` とします。
 
 #### A. 共通証跡
 
@@ -95,16 +96,18 @@ Tier 3 は以下のサブセクションを削除しないでください。Tier
 
 #### B. コード変更を含む場合（プロトコル / Flash / OTA / マクロ）
 
-コード変更がない場合は「N/A（docs/チェックリストのみ）」と理由を記入してください。
+コード変更がない場合は「N/A（docs/チェックリストのみ）」と理由を記入してください。OTA の詳細・正本は `docs/REVIEW_TIERS.md` §6.3 です。
 
 - [ ] モックトランスポートでパケット列・CRC・チャンク境界・リトライを検証した
 - [ ] 4KB セクタ境界、10 秒 erase タイムアウト、erase ACK 待ち、64B 固定チャンク（最終チャンクを含む）を確認した
-- [ ] OTA 前提: `enterBoot 0x000C`（subcmd `0x0067`）→ `"8bt"` 再接続 → `readPID 0x0008`（subcmd `0x0067`, `total_len 2`）→ `readVersionInBoot 0x0005`（subcmd `0x0067`, `total_len 4`, offset `0x01017040` [gamepad_type == 1]）を確認した
-- [ ] OTA 書込: `EraseFlash 0x0004`（`total_len=0x1000`, ACK 待ち）→ `WriteFirmware 0x0003`（`total_len=header[8]`, 64B 固定、CRC-16/MODBUS 付き）→ `WriteVersion 0x00C4`（`total_len=header[8]`, 24B ヘッダ / 3s）→ `WriteFirmwareVersion 0x0002`（type 1: `0x01017040` / それ以外: `0x08014034`, 4B + CRC16）→ `gamepad_type != 1` のときのみ `WriteAPPID`（`0x0801401C`, 12B + CRC16）→ `JumpApp 0x0006`（`0x01018000` [gamepad_type == 1]）の順序を確認した
+- [ ] OTA 前提: `enterBoot 0x000C`（subcmd `0x0067`, `total_len 4`, `offset 4`）→ `"8bt"` 再接続 → `readPID 0x0008`（subcmd `0x0067`, `total_len 2`）→ `readVersionInBoot 0x0005`（subcmd `0x0067`, `total_len 4`, offset `0x01017040` [gamepad_type == 1], 5s timeout）を確認した
+- [ ] OTA 書込: `EraseFlash 0x0004`（`offset=load_base_addr+sector_off`, `total_len=0x1000`, 10s / ACK 待ち）→ `WriteFirmware 0x0003`（`offset=load_base_addr+sector_off+chunk_off`, `total_len=header[8]`, 64B 固定、CRC-16/MODBUS 付き、1s / 各 64B ACK 待ち）→ `WriteVersion 0x00C4`（`total_len=header[8]`, 24B ヘッダ / 3s）→ `WriteFirmwareVersion 0x0002`（type 1: `0x01017040` / それ以外: `0x08014034`, 4B + CRC16）→ `gamepad_type != 1` のときのみ `WriteAPPID`（`0x0801401C`, 12B + CRC16, 5s）→ `JumpApp 0x0006`（`0x01018000` [gamepad_type == 1], 5s）の順序を確認した
+- [ ] OTA `WriteFirmware` は各 64B チャンク送信ごとに `offset` を 64B 進め、チャンク ACK を待った（1 秒タイムアウト、リトライ方針を記録）
 - [ ] 非 gamepad_type == 1 の場合、`readVersionInBoot` / `JumpApp` の offset を推測せず、`docs/PROTOCOL_SPEC.md` / Issue を確認して停止した
 - [ ] OTA 失敗時: `"8bt"` へ再接続 → `readPID` → 全セクタ消去 → 再書き込みで復旧できることを確認した（再接続だけでは復旧とみなさない）
-- [ ] マクロ: `Erase 0x0104`（`cmd=0x0104`, `subcmd=(mode<<8)|slot`, `offset=macro_idx<<12`, `total_len=0x1000`, `chunk_len=0` [payload なし], 4KB）→ `Write 0x0103`（同 subcmd/offset, `total_len=align32(max_steps*10)`, 64B チャンク, 32B アライン, 各チャンク CRC16）→ ヘッダ `0x0001`（`subcmd 0x0000`, `offset=0x68C + slot*0xD8`, `len=0xD8`, `total_len=0xAD0`）→ `Save 0x0006`（BLE `0x0067` / USB `0x0123`）の順序を確認した
+- [ ] マクロ: `Erase 0x0104`（`cmd=0x0104`, `subcmd=(mode<<8)|slot`, `offset=macro_idx<<12`, `total_len=0x1000`, `chunk_len=0` [payload なし], 4KB）→ `Write 0x0103`（subcmd は同じ; `offset=(macro_idx<<12)+chunk_index*64`, `total_len=align32(max_steps*10)`, 64B チャンク, 32B アライン, 各チャンク CRC16）→ ヘッダ `0x0001`（`subcmd 0x0000`, `offset=0x68C + slot*0xD8`, `len=0xD8`, `total_len=0xAD0`）→ `Save 0x0006`（BLE `0x0067` / USB `0x0123`）の順序を確認した
 - [ ] マクロ Erase は `chunk_len=0`（payload なし）。`total_len=0x1000` は消去サイズであり、ペイロード長ではない
+- [ ] マクロ Erase / Write / Header / Save の各 ACK を待ち、特に `Save 0x0006` の ACK 前に成功とみなさない
 - [ ] マクロ 4×3 のバックアップと復元を確認した
 
 #### C. docs / チェックリストのみの場合
@@ -119,9 +122,11 @@ Tier 3 は以下のサブセクションを削除しないでください。Tier
 
 #### D. ゲート / セキュリティ / リリース
 
+- [ ] `bash -n scripts/post-review-status.sh`
+- [ ] `python3 -m json.tool .github/rulesets/main-protection.json`
 - [ ] `.github/rulesets/main-protection.json`（canonical）と live ruleset `27785806` の `conditions` / `bypass_actors` / `current_user_can_bypass` / `required_status_checks` を監査した
 - [ ] `required_approving_review_count` を確認した（現状 0。2 人目のプリンシパルがいる場合の目標 1）
-- [ ] `gh pr view --json statusCheckRollup` と `commits/$SHA/statuses` / `commits/$SHA/check-runs` で status と check run を監査した
+- [ ] `gh pr view --json statusCheckRollup` と `commits/$SHA/statuses` / `commits/$SHA/check-runs?filter=all` で status と check run を監査した
 - [ ] セキュリティ境界 / review-gate script を検証するテスト（stale-SHA refusal、failure overwrite、check-run audit など）の変更・削除を確認した
 - [ ] workflow の権限、status / check-run 偽装の可否、secret の扱いを確認した
 - [ ] action の pin、署名、配布物、ロールバック手順を確認した

@@ -6,14 +6,14 @@ PR のリスクに応じてレビューの深さを変えます。目的は「do
 
 - **Tier 判定・パス別トリガー・レビュー checklist の正本はこのファイル**です。`AGENTS.md` / `CONTRIBUTING.md` は要約、PR テンプレートは実チェックリストの写しです。矛盾した場合はこのファイルを優先してください。
 - **ゲート実装の正本**は `.github/rulesets/main-protection.json`（live: `main-protection`, id `27785806`）、**status 投稿の正本**は `scripts/post-review-status.sh` です。`docs/BRANCH_PROTECTION.md` は説明と監査コマンドを持ち、実装を重複させません。
-- ruleset が強制するのは **`review-gate` status の存在** までです。Tier 判定・レビュー実施・故障リストの内容は手続きであり、write 権限者は迂回できます（§10）。
+- ruleset が強制するのは **`review-gate` required check の成功（commit status または check run）** までです。Tier 判定・レビュー実施・故障リストの内容は手続きであり、write 権限者は迂回できます（§10）。
 
 ## 1. Tier 表
 
 | Tier | 対象 | レビュー | 故障リスト |
 | --- | --- | --- | --- |
 | **1** | コメント・整形、通常の docs（規範仕様・ゲート/プロセス文書を除く）、**純粋なテスト追加のみ**（write-path / Flash / OTA / backup / セキュリティ境界 / review-gate script を検証するものを除く）。**振る舞いは変えない** | 1 名。diff + テスト + リンク/コマンド | 純粋なテスト追加はレビュアー側で 1〜2 件の故障注入を記録。振る舞いを変えない docs/コメント/整形は不要 |
-| **2** | 読み取り専用コード、読み取り系ビルダー、プロセス文書の散文、規範仕様の編集（安全-critical 以外）、依存・ツールチェーン（write-path に影響しないもの）・リポジトリ衛生、テストの変更/削除（write-path / セキュリティ境界 / review-gate script を検証するものを除く）、リファクタ | 2 名（仕様検収 + 実装/回帰）。変更ファイル + 直接の呼び出し側 + テスト | コード 3〜5 件。docs/プロセスは検出方法 3〜5 件。混合 PR は両方 |
+| **2** | 読み取り専用コード、読み取り系ビルダー、プロセス文書の散文、規範仕様の編集（安全-critical 以外）、依存・ツールチェーン（write-path に影響しないもの）・リポジトリ衛生、テストの変更/削除（write-path / セキュリティ境界 / review-gate script を検証するものを除く）、リファクタ（write-path / Flash / OTA / backup / セキュリティ境界に触れないもの） | 2 名（仕様検収 + 実装/回帰）。変更ファイル + 直接の呼び出し側 + テスト | コード 3〜5 件。docs/プロセスは検出方法 3〜5 件。混合 PR は両方 |
 | **3** | 書き込み経路 / Flash / OTA / backup-restore / CRC / offset / framing / マクロ step、セキュリティの振る舞い、ゲート実装・チェックリスト、リリース、大規模な混合差分 | 2 名 + 別セッションの敵対的パス（計 3 セッション）。関連ファイル全体 + 呼び出し側 + モック | コード 10 件以上。docs/ゲートは検出方法 5 件以上。混合 PR は両方 |
 
 ## 2. 判定ルール
@@ -61,11 +61,12 @@ Tier 定義、パス別トリガー、レビュアー数、quorum、故障リス
 
 ### ダウングレードの制限
 
-Tier 3 のパスに対する変更は、原則として Tier 3 のままです。次の **(A1) または (A2)** と **(B)** を満たす場合に限り Tier 1/2 にできます。ただし規範仕様（`PROTOCOL_SPEC` / `STRUCT` / `IMPLEMENTATION_PLAN`）、ゲート文書、プロセス文書は **Tier 2 まで** とし、Tier 1 にはしません。
+Tier 3 のパスに対する変更は、原則として Tier 3 のままです。ダウングレードは次の **スクリーニング** を通過し、レビュアーが full diff を確認した場合に限ります。スクリーニングは証跡ではなく、証跡はレビュアーが記録します。
 
-- **(A1) 整形のみ**: `git diff -w --exit-code "$(git merge-base HEAD origin/main)"..HEAD` が空（空白無視で差分なし）、または `cargo fmt` のみのコミットである。コミット範囲と `git diff --stat` で確認する。
-- **(A2) コードコメントのみ**: `git diff -U0 "$(git merge-base HEAD origin/main)"..HEAD` の追加・削除行がすべてコメント行（`//` / `///` / `//!` / `/*` / `*` など）で、コード・文字列・設定値の変更を含まないことをレビュアーが確認し、diff を PR に記録した。
-- **(B) レビュアーの確認**: レビュアーが「意味の変更なし」を確認し、その証跡（コマンド出力、diff、またはコミット URL）を PR に記録した。
+- **(A1) コードの整形のみ**: `git diff -w` は使わない（文字列・char・複数行文字列内の空白を見逃すため）。base commit（`git merge-base origin/main HEAD`）を別 worktree に checkout し、`cargo fmt --all` を実行した tree と head の tree が **完全一致** することを再現可能な形で確認する。一致しない場合は Tier 3 のまま。
+- **(A2) コードコメントのみ**: 例外は設けない。コメントのみの変更は Tier 3 のまま（token-aware な full diff 確認が必要で、`*` などの prefix heuristic は使わない）。
+- **(A3) ドキュメント**: 非規範の散文のみを対象とする。レンダリング結果（HTML / テキスト）が等価であることを確認できれば Tier 1/2、確認できなければ Tier 2 のまま。規範仕様・ゲート・プロセス文書は常に Tier 2 までとし、Tier 1 にはしない。
+- **(B) レビュアーの確認**: レビュアーは `-w` だけでなく full diff を読み、意味の変更がないことを確認し、証跡（base/tree hash、コマンド出力、diff URL）を PR に記録する。
 
 それ以外は Tier 3 のままです。
 
@@ -163,7 +164,7 @@ Tier 3 のパスに対する変更は、原則として Tier 3 のままです�
   - コスト制約がある場合も、実装レビュアーとは別のセッションで敵対的パスを 1 パス追加する（2 名 + 1 パスを維持）。
 - 範囲は関連ファイル全体 + 呼び出し側 + モックトランスポート。
 - 故障リストをコード 10 件以上、docs/ゲート 5 件以上作る。可能なら `cargo-mutants` などの自動変異も併用する。各項目に証跡を付ける。
-- **Tier 3 のサブセクションは削除しない。** 該当しない項目は `N/A + 理由` を記録する。
+- **PR テンプレートの Tier 3 A-D は PR 本文に存在しなければならない。省略は欠陥（要修正）。** 該当しない項目は `N/A + 理由` を記録する。
 - 実機書き込みを含む場合は、次の **両方** をバックアップし、ファイル名（path）と SHA-256 を記録する。
   - 2768B 設定 (`record_ultimatebt2`)
   - マクロ 4×3 スロットのステップデータ（2768B には含まれない。`slot 0..2` × `macro_idx 0..3` の 12 領域。`macro_idx << 12` の 4KB セクタ）
@@ -206,9 +207,13 @@ enterBoot 0x000C (subcmd 0x0067, total_len 4, offset 4)
 **書き込み**
 
 ```text
-EraseFlash 0x0004 (4KB セクタ単位、10 秒タイムアウト、ACK を待つ)
+EraseFlash 0x0004
+  (offset = load_base_addr + sector_off, 4KB セクタ単位、
+   10 秒タイムアウト、ACK を待つ)
 → WriteFirmware 0x0003
-   (total_len = header[8]（イメージ長）、chunk_len = 64B 固定、CRC-16/MODBUS 付き、1 秒)
+   (offset = load_base_addr + sector_off + chunk_off,
+    total_len = header[8]（イメージ長）、chunk_len = 64B 固定、
+    CRC-16/MODBUS 付き、1 秒、各 64B チャンクの ACK を待つ)
 → WriteVersion 0x00C4
    (24B ヘッダ、chunk_len = 0x18、total_len = header[8]、3 秒)
 → WriteFirmwareVersion 0x0002
@@ -221,8 +226,9 @@ EraseFlash 0x0004 (4KB セクタ単位、10 秒タイムアウト、ACK を待�
 
 - `readVersionInBoot` / `JumpApp` の documented offset は `gamepad_type == 1` 用。非 type 1 では値を推測せず、`docs/PROTOCOL_SPEC.md` / Issue を確認して停止する。
 - `WriteFirmwareVersion` は仕様書に両分岐（type 1: `0x01017040` / それ以外: `0x08014034`）がある。
+- `EraseFlash` の offset は `load_base_addr + sector_off`、`WriteFirmware` の offset は `load_base_addr + sector_off + chunk_off`。`sector_off` は 0x1000 ずつ、`chunk_off` は 0x40 ずつ進める。
 - 4KB セクタ境界、64B チャンク、**最終チャンクの 64B 固定**、CRC の範囲を確認する。
-- `EraseFlash` の ACK 前に `WriteFirmware` を送らない。
+- `EraseFlash` の ACK 前に `WriteFirmware` を送らない。各 64B `WriteFirmware` チャンクの ACK を待ち、ACK 前に次のチャンクを送らない。タイムアウトは 1 秒、リトライ方針を記録する。
 - 失敗時は `"8bt"` へ再接続し、`readPID` → 全セクタ消去 → 再書き込みで復旧する。「再接続だけ」で復旧したとみなさない。
 - `WriteFirmwareVersion` 完了前に電源断しても Bootloader に留まるため再試行できることを確認する。
 - マクロの `Erase 0x0104 → Write 0x0103 → ヘッダ 0x0001 → Save 0x0006` と混同しない。
@@ -235,7 +241,8 @@ Erase 0x0104
    offset = macro_idx << 12, total_len = 0x1000,
    chunk_len = 0、ペイロードなし (len = 0))
 → Write 0x0103
-  (subcmd = (mode << 8) | slot, offset = macro_idx << 12,
+  (subcmd = (mode << 8) | slot,
+   offset = (macro_idx << 12) + chunk_index * 64,
    total_len = align32(max_steps * 10), 64B チャンク,
    32B アライン、各チャンク CRC-16/MODBUS)
 → マクロヘッダ更新 0x0001
@@ -246,7 +253,9 @@ Erase 0x0104
 ```
 
 - `Erase 0x0104` はペイロードを持たないため `chunk_len = 0`。`total_len = 0x1000` は消去サイズであり、ペイロード長ではない。
-- `align32(x) = (x + 31) & ~31 = ((x + 31) / 32) * 32`、`offset = macro_idx << 12`、4KB セクタを確認する。
+- `Write 0x0103` の `offset` は `(macro_idx << 12) + chunk_index * 64`。各 64B チャンク送信ごとに `chunk_index` を進める。
+- `Erase 0x0104`、`Write 0x0103`、ヘッダ `0x0001`、`Save 0x0006` の各コマンドで ACK を待つ。特に `Save 0x0006` の ACK を受けるまで成功とみなさない。
+- `align32(x) = (x + 31) & ~31 = ((x + 31) / 32) * 32`、`Erase 0x0104` の `offset = macro_idx << 12`、4KB セクタを確認する。
 - バックアップは 2768B 設定から `max_steps` を読み、各 `(slot, macro_idx)` を `Read 0x0102`（`subcmd=(mode<<8)|slot`, `offset=macro_idx<<12`, `total_len=max_steps*10`）で取得する。
 - マクロ 4×3（`slot 0..2` × `macro_idx 0..3`）のバックアップと復元を確認する。
 - モックでパケット列・CRC・チャンク境界を検証する。
@@ -254,7 +263,7 @@ Erase 0x0104
 
 ### 6.5 ゲート / セキュリティ / リリース
 
-- **ゲート**: `.github/rulesets/main-protection.json`（canonical）と live ruleset `27785806` の `conditions` / `bypass_actors` / `current_user_can_bypass` / `required_status_checks` / `required_approving_review_count`（現在 0。2 人目のプリンシパルがいる場合の目標 1）を監査する。`gh pr view --json statusCheckRollup`、`commits/$SHA/statuses`、`commits/$SHA/check-runs` で status と check run を確認する。
+- **ゲート**: `.github/rulesets/main-protection.json`（canonical）と live ruleset `27785806` の `conditions` / `bypass_actors` / `current_user_can_bypass` / `required_status_checks` / `required_approving_review_count`（現在 0。2 人目のプリンシパルがいる場合の目標 1）を監査する。`gh pr view --json statusCheckRollup`、`commits/$SHA/statuses`、`commits/$SHA/check-runs?filter=all` で status と check run を確認する。
 - **セキュリティ**: workflow 権限、status / check-run 偽装の可否、secret の扱い、action の pin、署名検証、セキュリティ境界 / review-gate script のテスト（stale-SHA refusal、failure overwrite、check-run audit など）。
 - **リリース**: バージョン（Cargo.toml / ファームウェアバージョン）、署名、配布物、ロールバック。
 
@@ -262,7 +271,7 @@ Erase 0x0104
 
 - レビュアーは **著者とも他のレビュアーとも別セッション** でレビューする。互いの指摘を見る前に、同じ diff / SHA に対して独立に判定する。
 - 各レビュアーは **自分の行/コメント** を書き、セッション ID、レビューした SHA、判定、レビューコメントの URL を残す。リードレビュアーは他のレビュアーの行を代筆せず、全員のコメント URL と SHA を確認する。
-- PR 本文を編集できないレビュアーは、役割 / レビューした SHA / 判定を含む standalone review comment を投稿する。リードレビュアーはその URL を記録するが、判定を代筆しない。
+- PR 本文を編集できないレビュアーは、役割 / セッション ID または氏名 / レビューした SHA / 判定を含む standalone review comment を投稿する。リードレビュアーはその URL を記録するが、判定を代筆しない。
 - Tier 2/3 は **全レビュアーが同じ head SHA で「マージ可」** を出すまでマージしない。
 - 1 名でも blocker / 要修正を出したら `review-gate` の `success` を付けない。必要なら `failure` を付ける。
 - **リードレビュアー**（仕様検収レビュアー）が、全員の判定とコメント URL を確認してから status を付ける。Tier 1 はレビュアー本人が付ける。
@@ -294,11 +303,11 @@ Erase 0x0104
 ## 9. レビュー記録
 
 - レビュー結果は PR のレビューコメントに残す。各レビュアーは自分の行を書き、リードは代筆しない。
-- **`scripts/post-review-status.sh <PR> <reviewed-sha> <TIER> [success|failure]`** で、レビューした head SHA に `review-gate` status を付ける。スクリプトは Tier 引数（1/2/3）を検証する。PR の宣言 Tier と quorum は検証しない（手続き）。呼び出し側は PR の宣言 Tier を渡すこと。投稿直前に head SHA を固定し、投稿後に全 status と check run を監査する。
+- **`scripts/post-review-status.sh <PR> <reviewed-sha> <TIER> [success|failure]`** で、レビューした head SHA に `review-gate` の commit status を投稿する（check run でも gate は満たせるが、本手順は commit status を使う）。スクリプトは Tier 引数（1/2/3）を検証する。PR の宣言 Tier と quorum は検証しない（手続き）。呼び出し側は PR の宣言 Tier を渡すこと。投稿直前に head SHA を固定し、投稿後に全 status と check run（`filter=all`）を監査する。監査が失敗した場合は非 0 で終了する。
 - status の description に Tier と SHA を含める（例: `Tier 3 review of abc1234`）。
 - 修正を push したら新しい SHA で再レビューする。前の SHA の status は引き継がれない。
 - Tier、故障リスト、レビュアー表は PR 本文に残す。Tier は各 push 後に再評価する。
 
 ## 10. 強制範囲
 
-`main-protection` ruleset が強制するのは **`review-gate` status の存在** までです。Tier 判定・レビュー実施・故障リストの内容は手続きであり、write 権限者は迂回できます。同じリポジトリの PR ワークフローは `statuses: write` や `checks: write` で偽装できる可能性があり、check run は commit status とは別に監査する必要があります。`.github/rulesets/main-protection.json` は canonical copy ですが、admin による out-of-band 変更は追加の PAT なしでは定期検知できません。強制力を上げる方法と監査上の限界は [docs/BRANCH_PROTECTION.md](BRANCH_PROTECTION.md) の「セキュリティ上の限界」を参照してください。
+`main-protection` ruleset が強制するのは **`review-gate` required check の成功（commit status または check run）** までです。Tier 判定・レビュー実施・故障リストの内容は手続きであり、write 権限者は迂回できます。同じリポジトリの PR ワークフローは `statuses: write` や `checks: write` で偽装できる可能性があり、`review-gate` は `integration_id` が無いためどちらでも満たせます。`.github/rulesets/main-protection.json` は canonical copy ですが、admin による out-of-band 変更は追加の PAT なしでは定期検知できません。強制力を上げる方法と監査上の限界は [docs/BRANCH_PROTECTION.md](BRANCH_PROTECTION.md) の「セキュリティ上の限界」を参照してください。

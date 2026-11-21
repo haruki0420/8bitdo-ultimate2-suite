@@ -22,7 +22,7 @@ ruleset の **canonical copy** は [`.github/rulesets/main-protection.json`](../
 | Branch deletion | 禁止（`deletion`） |
 | Bypass actors | なし（`current_user_can_bypass: never`） |
 
-`review-gate` は **commit status** です。PR の head SHA に `success` を付けると満たされます。新しいコミットを push すると SHA が変わり、status が無いため自動的にマージできなくなります。
+`review-gate` は **required status check** です。PR の head SHA に context `review-gate` の **commit status** または **check run** の成功があれば満たされます（ruleset に `integration_id` が無いため）。新しいコミットを push すると SHA が変わり、どちらも無い新しいコミットは自動的にマージできなくなります。
 
 レビューの深度（Tier 1〜3）と故障リストの要件は **[docs/REVIEW_TIERS.md](REVIEW_TIERS.md)** を参照してください。
 
@@ -65,17 +65,17 @@ gh pr view <PR> --repo "$REPO" --json mergeStateStatus,statusCheckRollup
 
 `mergeStateStatus: BLOCKED` の主な原因:
 
-- head SHA に `review-gate` status が無い
+- head SHA に成功した `review-gate` の commit status / check run が無い
 - 必須 CI が pending / failure
 - ブランチが `main` より古い（up-to-date 必須）
 - 未解決のレビュースレッドがある
 - `require_extra_approval_for_unattributed_changes` が有効（現在は無効）
 
-## `review-gate` status の付け方
+## `review-gate` を満たす方法
 
-レビューした SHA を固定し、投稿直前に head が動いていないことを確認します。Tier 1 はレビュアー本人、Tier 2/3 は **全レビュアーが同じ SHA で「マージ可」** を出したことを確認したリードレビュアーが付けます。1 名でも要修正なら `success` を付けません。
+レビューした SHA を固定し、投稿直前に head が動いていないことを確認します。Tier 1 はレビュアー本人、Tier 2/3 は **全レビュアーが同じ SHA で「マージ可」** を出したことを確認したリードレビュアーが commit status を投稿します。1 名でも要修正なら `success` を付けません。
 
-status 投稿の正本は **`scripts/post-review-status.sh`** です。インラインの `gh api` をコピーせず、このスクリプトを使ってください。
+本手順では **`scripts/post-review-status.sh`** で commit status を投稿します。インラインの `gh api` をコピーせず、このスクリプトを使ってください。check run でも gate は満たせますが、本リポジトリの標準手順は commit status です。
 
 ```bash
 # success
@@ -85,9 +85,9 @@ scripts/post-review-status.sh <PR> <reviewed-sha> <1|2|3>
 scripts/post-review-status.sh <PR> <reviewed-sha> <1|2|3> failure
 ```
 
-スクリプトは Tier 引数（1/2/3）を検証します。PR の宣言 Tier と quorum は検証しないため（手続き）、呼び出し側が PR の宣言 Tier を渡してください。投稿直前に head SHA を固定し、投稿後に全 status と check run を監査します。
+スクリプトは Tier 引数（1/2/3）を検証します。PR の宣言 Tier と quorum は検証しないため（手続き）、呼び出し側が PR の宣言 Tier を渡してください。投稿直前に head SHA を固定し、投稿後に全 status と check run（`filter=all`）を監査します。監査が失敗した場合、スクリプトは非 0 で終了します。
 
-> `review-gate` は **commit status** です。同じ名前の check run が成功していても、commit status の `success` が無ければゲートは満たされません。
+> `review-gate` は **required status check** です。commit status（`scripts/post-review-status.sh`）または同じ context の check run で満たされます。ruleset に `integration_id` が無いため、どちらも gate-satisfying です。
 
 ## status / check run の監査
 
@@ -99,8 +99,8 @@ SHA=<reviewed-sha>
 gh api "repos/$REPO/commits/$SHA/statuses" \
   --jq '[.[] | {context, state, description, creator: .creator.login, created_at}]'
 
-# check run（commit status とは別）
-gh api "repos/$REPO/commits/$SHA/check-runs" \
+# check run（gate-satisfying。filter=all で latest 以外も監査）
+gh api "repos/$REPO/commits/$SHA/check-runs?filter=all" \
   --jq '[.check_runs[] | {name, status, conclusion, details_url}]'
 
 # PR の rollup
@@ -108,15 +108,15 @@ gh pr view <PR> --repo "$REPO" --json statusCheckRollup
 ```
 
 - `GET /commits/{sha}/status` は **context ごとの最新 status のみ** を返し、`creator` が `null` になることがあります。監査には `GET /commits/{sha}/statuses`（全 status、新しい順）を使ってください。
-- `review-gate` の status は最新のものが有効です。過去の `failure` が `success` で上書きされていないか、`created_at` と `creator` を確認してください。
-- check run は commit status とは別です。同じリポジトリの PR ワークフローが `checks: write` で check run を偽装できるため、`review-gate` の commit status と合わせて監査してください。
+- `review-gate` の commit status は最新のものが有効です。過去の `failure` が `success` で上書きされていないか、`created_at` と `creator` を確認してください。check run も context `review-gate` の成功した run を確認してください。
+- check run も `review-gate` を満たす gate-satisfying な signal です。`commits/$SHA/statuses` と `commits/$SHA/check-runs?filter=all` の **両方** を監査し、context `review-gate` の成功を確認してください。`GET /commits/{sha}/check-runs` は既定で `filter=latest` なので、failure-overwrite を監査するときは `?filter=all` を使います。同じリポジトリの PR ワークフローが `checks: write` で passing な `review-gate` check run を作れるため、これは `integration_id` を trusted app に固定するまで documented bypass です。
 
 ## セキュリティ上の限界
 
 このゲートは **手続き的なゲート** であり、悪意ある write 権限者に対する暗号的な保証ではありません。
 
 - commit status は SHA への紐づきを強制するが、投稿者の身元は強制しない。
-- 同じリポジトリのブランチから実行される PR ワークフローは、`statuses: write` を要求して `review-gate` を偽装できる。PR 内で `ci.yml` を書き換えて `fmt` などを偽装することもできる。check run も `checks: write` で偽装できる。
+- 同じリポジトリのブランチから実行される PR ワークフローは、`statuses: write` で commit status を、`checks: write` で check run を偽装できる。required check `review-gate` は `integration_id` が無いため、どちらでも満たせる。PR 内で `ci.yml` を書き換えて `fmt` などを偽装することもできる。
 - 最新 status が有効なので、`failure` を `success` で上書きできる。
 - canonical ruleset はあくまで版管理されたコピーであり、admin が GitHub 上で out-of-band に変更できる。追加の PAT なしでは定期監査ジョブを置けないため、out-of-band 変更を常時検知できないことを受け入れる。
 - このため、現状は **信頼できるコントリビューター（メンテナ）前提** の運用とする。
