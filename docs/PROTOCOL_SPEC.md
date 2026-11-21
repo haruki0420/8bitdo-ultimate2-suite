@@ -36,6 +36,8 @@ graph LR
    - 解析済み文字列リソース（Android APK）: `"2. Press and hold the Profile button for 3 \nseconds until the Status LED will blink rapidly."`
 3. Status LED の高速点滅開始後、コントローラが BLE アドバタイズ名 **`"80ND"`** を送出するため、クライアントからスキャン・GATT 接続を行う。
 
+> **ユーザー観測（未検証）**: BLE 設定モードは、定期的な通信がないと一定時間で終了する可能性がある（ユーザーが実機で `80ND` が見つからなくなる事象を観測）。keepalive の要否・周期は未検証であり、本リポジトリの CLI には keepalive を実装していない。接続できない場合は設定モードが切れている可能性を考慮する。
+
 ---
 
 ## 2. デバイス VID / PID・モデル対応表
