@@ -183,6 +183,23 @@ impl<T: Transport> Session<T> {
             .await
     }
 
+    /// Send one realtime input request (`cmd 0x0003`) without waiting for a
+    /// report.
+    ///
+    /// This mirrors the official Android app's fire-and-forget
+    /// `ReadKeysAndJoy` poll (about every 20 ms while the app is in the
+    /// foreground). Notifications are consumed separately, for example with
+    /// [`try_next_input`](Self::try_next_input) or the transport's `recv`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport or protocol encoding error.
+    pub async fn request_input(&self) -> Result<(), Error> {
+        self.transport
+            .send(&commands::read_input().encode_ble(PacketKind::App)?)
+            .await
+    }
+
     /// Wait up to `wait` for the next realtime input report.
     ///
     /// Frames whose command is not `0x0003` are skipped. A timeout returns

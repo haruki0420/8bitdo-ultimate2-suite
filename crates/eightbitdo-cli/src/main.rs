@@ -1,19 +1,22 @@
 //! Read-only command-line interface for the 8BitDo Ultimate 2 Bluetooth
 //! controller.
 //!
-//! Phase 2a deliberately exposes only `scan`, `info`, `config dump` and
-//! `monitor`. No configuration write, macro flash, save or OTA command is
+//! The binary exposes `scan`, `info`, `config dump`, `monitor` and
+//! `keepalive`. No configuration write, macro flash, save or OTA command is
 //! reachable from this binary.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use eightbitdo_core::{
     scan_devices, BleOptions, BleTransport, ConfigSnapshot, Error, Session, Transport,
 };
+use eightbitdo_protocol::commands;
 use eightbitdo_protocol::config_bt2::{Slot, CONFIG_SIZE};
+use eightbitdo_protocol::header;
 use eightbitdo_protocol::input_report::InputReport;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -69,6 +72,17 @@ enum Command {
         #[arg(long, value_name = "N")]
         count: Option<u64>,
     },
+
+    /// Keep the BLE configuration mode alive with the official input polling.
+    Keepalive {
+        /// Input poll interval in milliseconds.
+        #[arg(long, default_value_t = 20, value_name = "MILLISECONDS")]
+        interval_ms: u64,
+
+        /// Stop after this many seconds.
+        #[arg(long, default_value_t = 120, value_name = "SECONDS")]
+        duration: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -89,7 +103,7 @@ enum ConfigCommand {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE
@@ -97,7 +111,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Error> {
+async fn run(cli: Cli) -> Result<ExitCode, Error> {
     let options = BleOptions {
         name: cli.name.clone(),
         address: cli.address.clone(),
@@ -107,15 +121,28 @@ async fn run(cli: Cli) -> Result<(), Error> {
     };
 
     match cli.command {
-        Command::Scan => scan(Duration::from_secs(cli.scan_timeout)).await,
-        Command::Info => info(&options).await,
+        Command::Scan => scan(Duration::from_secs(cli.scan_timeout)).await?,
+        Command::Info => info(&options).await?,
         Command::Config { command } => match command {
             ConfigCommand::Dump { raw, json } => {
-                dump_config(&options, raw.as_deref(), json.as_deref()).await
+                dump_config(&options, raw.as_deref(), json.as_deref()).await?;
             }
         },
-        Command::Monitor { count } => monitor(&options, count).await,
+        Command::Monitor { count } => monitor(&options, count).await?,
+        Command::Keepalive {
+            interval_ms,
+            duration,
+        } => {
+            return keepalive(
+                &options,
+                Duration::from_millis(interval_ms),
+                Duration::from_secs(duration),
+            )
+            .await;
+        }
     }
+
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn scan(timeout: Duration) -> Result<(), Error> {
@@ -334,6 +361,134 @@ async fn monitor(options: &BleOptions, count: Option<u64>) -> Result<(), Error> 
     outcome
 }
 
+async fn keepalive(
+    options: &BleOptions,
+    interval: Duration,
+    duration: Duration,
+) -> Result<ExitCode, Error> {
+    if interval.is_zero() {
+        eprintln!("keepalive error after 0.0s: --interval-ms must be greater than zero");
+        return Ok(ExitCode::FAILURE);
+    }
+
+    let started = Instant::now();
+    let transport = match BleTransport::connect(options).await {
+        Ok(transport) => transport,
+        Err(error) => {
+            eprintln!("keepalive error after 0.0s: {error}");
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+    let session = Session::new(transport);
+
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    let result = run_keepalive(&session, interval, duration, shutdown).await;
+    let _ = session.transport().disconnect().await;
+
+    let elapsed = started.elapsed().as_secs_f64();
+    match result {
+        Ok(stats) => {
+            println!(
+                "keepalive finished: elapsed={elapsed:.1}s sent={} received={}",
+                stats.sent, stats.received
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(error) => {
+            eprintln!("keepalive error after {elapsed:.1}s: {error}");
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// Counters for one keepalive run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct KeepaliveStats {
+    /// `ReadKeysAndJoy` (`0x0003`) requests written.
+    sent: u64,
+    /// `0x0003` notifications drained from the transport.
+    received: u64,
+}
+
+/// Enable notifications and run the official foreground polling loop.
+///
+/// This wrapper is deliberately testable without a CLI or Ctrl-C: the
+/// `shutdown` future ends the loop early. A future GUI or long-lived session
+/// should move this idle keepalive into `eightbitdo-core::Session` instead of
+/// duplicating it in each front end.
+async fn run_keepalive<T: Transport>(
+    session: &Session<T>,
+    interval: Duration,
+    duration: Duration,
+    shutdown: impl Future<Output = ()>,
+) -> Result<KeepaliveStats, Error> {
+    session.set_report_enable(true).await?;
+    let result = keepalive_loop(session, interval, duration, shutdown).await;
+    // Best effort: stop notifications even if the loop failed or Ctrl-C
+    // interrupted it. The caller still disconnects the link.
+    let _ = session.set_report_enable(false).await;
+    result
+}
+
+/// Poll `0x0003` at `interval` and drain every incoming notification.
+///
+/// The official Android app sends `ReadKeysAndJoy` every 20 ms in the
+/// foreground, with no response timeout or retry. Notifications are consumed
+/// here so the 64-slot BLE queue cannot fill up.
+async fn keepalive_loop<T: Transport>(
+    session: &Session<T>,
+    interval: Duration,
+    duration: Duration,
+    shutdown: impl Future<Output = ()>,
+) -> Result<KeepaliveStats, Error> {
+    let mut input_ticker = tokio::time::interval(interval);
+    input_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut report_ticker = tokio::time::interval(Duration::from_secs(1));
+    report_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first interval tick is immediate; skip it so the first summary is
+    // printed after one second.
+    report_ticker.tick().await;
+
+    let deadline = tokio::time::sleep(duration);
+    tokio::pin!(deadline);
+    tokio::pin!(shutdown);
+
+    let started = Instant::now();
+    let mut stats = KeepaliveStats::default();
+    loop {
+        tokio::select! {
+            _ = input_ticker.tick() => {
+                session.request_input().await?;
+                stats.sent += 1;
+            }
+            frame = session.transport().recv() => {
+                let frame = frame?;
+                if is_input_notification(&frame)? {
+                    stats.received += 1;
+                }
+            }
+            _ = report_ticker.tick() => {
+                println!(
+                    "keepalive: sent={} received={} elapsed={:.1}s",
+                    stats.sent,
+                    stats.received,
+                    started.elapsed().as_secs_f64()
+                );
+            }
+            _ = &mut deadline => break,
+            _ = &mut shutdown => break,
+        }
+    }
+    Ok(stats)
+}
+
+fn is_input_notification(frame: &[u8]) -> Result<bool, Error> {
+    let (header, _) = header::decode_app_response(frame)?;
+    Ok(header.cmd == commands::cmd::INPUT)
+}
+
 fn print_report(report: &InputReport) {
     println!(
         "keys=0x{:08X} LX={} LY={} RX={} RY={} L2={} R2={} battery={}",
@@ -346,4 +501,125 @@ fn print_report(report: &InputReport) {
         report.trigger_r,
         report.battery
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use eightbitdo_protocol::header::CustomHeader;
+
+    use super::*;
+
+    /// Transport that records writes and replays a finite queue of input
+    /// notifications, then stays pending instead of reporting a disconnect.
+    struct KeepaliveTestTransport {
+        sent: Mutex<Vec<Vec<u8>>>,
+        incoming: Mutex<VecDeque<Vec<u8>>>,
+    }
+
+    impl KeepaliveTestTransport {
+        fn new() -> Self {
+            Self {
+                sent: Mutex::new(Vec::new()),
+                incoming: Mutex::new(VecDeque::new()),
+            }
+        }
+
+        fn queue_input(&self, report: &InputReport) {
+            let payload = report.to_bytes();
+            let header =
+                CustomHeader::new(commands::cmd::INPUT, 0, 0x0C, 0x0C).with_payload(&payload);
+            let mut frame = header.to_bytes().to_vec();
+            frame.extend_from_slice(&payload);
+            self.incoming.lock().unwrap().push_back(frame);
+        }
+
+        fn sent_frames(&self) -> Vec<Vec<u8>> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Transport for KeepaliveTestTransport {
+        async fn send(&self, data: &[u8]) -> Result<(), Error> {
+            self.sent.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }
+
+        async fn recv(&self) -> Result<Vec<u8>, Error> {
+            if let Some(frame) = self.incoming.lock().unwrap().pop_front() {
+                return Ok(frame);
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Err(Error::Disconnected)
+        }
+
+        fn mtu(&self) -> u16 {
+            64
+        }
+
+        async fn disconnect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn keepalive_enables_reports_polls_inputs_and_drains_notifications() {
+        let transport = KeepaliveTestTransport::new();
+        let report = InputReport {
+            keys: 0x0000_2001,
+            left_stick_x: 0x7F,
+            left_stick_y: 0x80,
+            right_stick_x: 0xFF,
+            right_stick_y: 0x00,
+            trigger_r: 0xCC,
+            trigger_l: 0x33,
+            battery: 0x4B,
+            reserved: 0,
+        };
+        for _ in 0..3 {
+            transport.queue_input(&report);
+        }
+
+        let session = Session::new(&transport);
+        let stats = run_keepalive(
+            &session,
+            Duration::from_millis(1),
+            Duration::from_millis(50),
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.received, 3);
+        assert!(
+            stats.sent >= 2,
+            "only {} input requests were sent",
+            stats.sent
+        );
+
+        let frames = transport.sent_frames();
+        assert_eq!(frames.len() as u64, stats.sent + 2);
+        assert_eq!(frames[0][0], 0x04);
+        let enable = CustomHeader::parse(&frames[0][1..]).unwrap();
+        assert_eq!(enable.cmd, commands::cmd::REPORT_ENABLE);
+        assert_eq!(enable.subcmd, 1);
+
+        let disable = CustomHeader::parse(&frames[frames.len() - 1][1..]).unwrap();
+        assert_eq!(disable.cmd, commands::cmd::REPORT_ENABLE);
+        assert_eq!(disable.subcmd, 0);
+
+        for frame in &frames[1..frames.len() - 1] {
+            assert_eq!(frame.len(), 17);
+            assert_eq!(frame[0], 0x04);
+            let header = CustomHeader::parse(&frame[1..]).unwrap();
+            assert_eq!(header.cmd, commands::cmd::INPUT);
+            assert_eq!(header.chunk_len, 0);
+            assert_eq!(header.total_len, 0x0C);
+            assert_eq!(header.offset, 0x0C);
+        }
+    }
 }

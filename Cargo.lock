@@ -294,6 +294,7 @@ dependencies = [
 name = "eightbitdo-cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
  "eightbitdo-core",
  "eightbitdo-protocol",
