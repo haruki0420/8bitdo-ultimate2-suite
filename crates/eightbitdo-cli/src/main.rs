@@ -237,9 +237,15 @@ fn validate_output_paths(raw_path: Option<&Path>, json_path: Option<&Path>) -> R
 
     let raw_key = OutputPathKey::new(raw)?;
     let json_key = OutputPathKey::new(json)?;
+    // `real` keeps the final component unresolved, `spelled` is the lexical
+    // absolute path, and `link_target` is where a dangling symlink points.
+    // Any match means one path names the file the other one targets.
     let same_entry = raw_key.real == json_key.real
-        || raw_key.real.as_os_str() == json_key.spelled.as_os_str()
-        || raw_key.spelled.as_os_str() == json_key.real.as_os_str();
+        || raw_key.spelled == json_key.spelled
+        || raw_key.link_target.as_ref() == Some(&json_key.real)
+        || raw_key.link_target.as_ref() == Some(&json_key.spelled)
+        || json_key.link_target.as_ref() == Some(&raw_key.real)
+        || json_key.link_target.as_ref() == Some(&raw_key.spelled);
     if same_entry {
         return Err(conflicting_output_paths(raw, json));
     }
@@ -267,15 +273,17 @@ struct OutputPathKey {
     /// Path with the existing parent directory canonicalized.
     ///
     /// `.` / `..` components are resolved and symlinked directories are
-    /// followed. The final component itself is compared literally, so a
-    /// symlink there is caught by [`Self::spelled`] and [`Self::existing`].
+    /// followed. The final component itself stays unresolved; symlinks there
+    /// are handled by [`Self::spelled`], [`Self::link_target`] and
+    /// [`Self::existing`].
     real: PathBuf,
     /// Lexically normalized absolute spelling of the final component.
     ///
-    /// [`std::fs::canonicalize`] resolves symlinks, which would hide a
-    /// `link -> other` / `other` pair. Keeping the unresolved spelling
-    /// catches it when only one side exists.
+    /// Keeping the unresolved spelling catches `link -> other` versus
+    /// `other`, which canonicalization would hide.
     spelled: PathBuf,
+    /// Target of a symlink at the final component that does not exist yet.
+    link_target: Option<PathBuf>,
     /// Identity metadata when the path already exists.
     existing: Option<std::fs::Metadata>,
 }
@@ -287,32 +295,93 @@ impl OutputPathKey {
         } else {
             std::env::current_dir()?.join(path)
         };
-
-        let real = match std::fs::canonicalize(&absolute) {
-            Ok(canonical) => canonical,
-            Err(_) => {
-                let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
-                let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
-                    Error::Io(std::io::Error::new(
-                        error.kind(),
-                        format!(
-                            "cannot resolve the directory of {}: {error}",
-                            path.display()
-                        ),
-                    ))
-                })?;
-                match absolute.file_name() {
-                    Some(name) => canonical_parent.join(name),
-                    None => canonical_parent,
-                }
-            }
+        let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
+        let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
+            Error::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot resolve the directory of {}: {error}",
+                    path.display()
+                ),
+            ))
+        })?;
+        let real = match absolute.file_name() {
+            Some(name) => canonical_parent.join(name),
+            None => canonical_parent,
         };
-
+        // An existing symlink resolves to its target (which then also has
+        // inode identity); a dangling one keeps its own name and exposes its
+        // target separately.
+        let link_target = dangling_link_target(real.clone(), 0);
+        let real = if link_target.is_none() {
+            std::fs::canonicalize(&real).unwrap_or(real)
+        } else {
+            real
+        };
         Ok(Self {
+            link_target,
             real,
             spelled: normalize_lexically(&absolute),
             existing: std::fs::symlink_metadata(&absolute).ok(),
         })
+    }
+}
+
+/// Follow a symlink at `path` whose target does not exist.
+///
+/// Returns `None` when `path` is not a symlink. A relative target is resolved
+/// against the link's canonical parent, so `dir/link -> ../missing` yields the
+/// absolute `missing` path even when it does not exist yet.
+fn dangling_link_target(path: PathBuf, depth: usize) -> Option<PathBuf> {
+    if depth > 8 {
+        return None;
+    }
+    let link_target = std::fs::read_link(&path).ok()?;
+    let resolved = if link_target.is_absolute() {
+        link_target
+    } else {
+        path.parent()?.join(link_target)
+    };
+    if std::fs::canonicalize(&resolved).is_ok() {
+        // The link resolves to an existing file; inode identity covers it.
+        return None;
+    }
+    let parent = resolved.parent().unwrap_or_else(|| Path::new("."));
+    let canonical_parent = std::fs::canonicalize(parent).ok()?;
+    let next = match resolved.file_name() {
+        Some(name) => canonical_parent.join(name),
+        None => canonical_parent,
+    };
+    Some(dangling_link_target(next.clone(), depth + 1).unwrap_or(next))
+}
+
+/// Canonicalize the longest existing prefix of `path` and append the rest.
+///
+/// `std::fs::canonicalize` fails on the first missing component, which would
+/// hide everything after it: for a dangling `link -> missing` the missing
+/// target compares equal to `missing`, and `link` compares equal to `target`.
+/// Every final component stays unresolved here; symlinks are handled by
+/// comparing this value against [`normalize_lexically`] and by inode identity.
+fn resolve_existing_prefix(path: &Path) -> std::io::Result<PathBuf> {
+    let mut ancestor = path;
+    let mut remainder: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(ancestor) {
+            let mut resolved = canonical;
+            for part in remainder.iter().rev() {
+                resolved.push(part);
+            }
+            return Ok(resolved);
+        }
+        match (ancestor.file_name(), ancestor.parent()) {
+            (Some(name), Some(parent)) => {
+                remainder.push(name);
+                ancestor = parent;
+            }
+            // Reached the root (or an empty relative path): report the
+            // original failure.
+            _ => return std::fs::canonicalize(path),
+        }
     }
 }
 
@@ -833,6 +902,15 @@ impl SessionKeepaliveState {
     }
 }
 
+/// Per-tick input wait inside the session keepalive drain.
+const KEEPALIVE_INPUT_WAIT: Duration = Duration::from_millis(1);
+
+/// Maximum input reports drained in one session keepalive tick.
+///
+/// The official poll answers at most one report per `0x0003`; the cap only
+/// bounds a backlog so one tick cannot hold the operation lock indefinitely.
+const SESSION_KEEPALIVE_MAX_DRAIN: u64 = 4;
+
 #[derive(Debug, Clone, Copy)]
 struct SessionKeepaliveConfig {
     interval: Duration,
@@ -856,7 +934,12 @@ struct SessionKeepalive {
 
 impl Drop for SessionKeepalive {
     fn drop(&mut self) {
+        // Never leave an orphaned keepalive task behind: cancel it and abort
+        // the handle (every call inside a tick is cancellation-safe).
         self.token.cancel();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -1039,8 +1122,11 @@ async fn session_keepalive_task<T: Transport>(
             guard.request_input().await?;
             state.sent.fetch_add(1, Ordering::SeqCst);
             let mut drained = 0u64;
-            loop {
-                match guard.try_next_input(Duration::from_millis(1)).await {
+            // Bounded per tick: `try_next_input` caps its own frame count and
+            // budget, and this cap keeps a notification flood from stretching
+            // one tick (and the session-lock hold) beyond a few milliseconds.
+            while drained < SESSION_KEEPALIVE_MAX_DRAIN {
+                match guard.try_next_input(KEEPALIVE_INPUT_WAIT).await {
                     Ok(Some(_)) => drained += 1,
                     Ok(None) => break,
                     Err(error) => return Err(error),
@@ -1250,7 +1336,13 @@ struct SessionMonitor {
 
 impl Drop for SessionMonitor {
     fn drop(&mut self) {
+        // Losing the handle must not leave the task polling in the
+        // background: signal a clean stop and abort the handle, which also
+        // drops the operation-lock guard it may hold.
         self.stop.notify_one();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -3291,8 +3383,11 @@ mod tests {
         let missing = dir.join("created.bin");
         let dangling = dir.join("dangling.json");
         symlink(&missing, &dangling).unwrap();
-        let err = validate_output_paths(Some(&missing), Some(&dangling)).unwrap_err();
-        assert!(is_invalid_input(&err), "unexpected error: {err:?}");
+        let err = validate_output_paths(Some(&missing), Some(&dangling)).map(|()| ());
+        assert!(
+            matches!(&err, Err(error) if is_invalid_input(error)),
+            "a dangling symlink to the other path must be rejected: {err:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
