@@ -25,6 +25,43 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Overall deadline for one 2768-byte configuration read.
 pub const CONFIG_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum number of stale frames discarded in a single resync drain.
+const MAX_DRAIN_FRAMES: usize = 64;
+
+/// Overall time budget for discarding stale frames during resync.
+const MAX_DRAIN_DURATION: Duration = Duration::from_millis(50);
+
+/// Idle gap used to decide that no more stale frames are queued.
+const DRAIN_FRAME_WAIT: Duration = Duration::from_millis(1);
+
+/// Marks a session as needing resync when a read operation returns an error or
+/// its future is dropped before completion.
+struct ResyncGuard<'a> {
+    needs_resync: &'a AtomicBool,
+    armed: bool,
+}
+
+impl<'a> ResyncGuard<'a> {
+    fn new(needs_resync: &'a AtomicBool) -> Self {
+        Self {
+            needs_resync,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ResyncGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.needs_resync.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Decoded firmware version response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionInfo {
@@ -97,17 +134,44 @@ impl<T: Transport> Session<T> {
         self.transport
     }
 
+    /// Drain any stale frames if a previous read failed or was cancelled.
+    ///
+    /// Callers using [`Session::read_transfer`] directly after sending a
+    /// custom request should invoke this **before** sending the request so
+    /// stale frames from an earlier failed read are discarded without
+    /// consuming the response to the new request.
+    pub async fn resync(&self) {
+        self.prepare_read().await;
+    }
+
     async fn prepare_read(&self) {
-        if self.needs_resync.swap(false, Ordering::SeqCst) {
+        if self.needs_resync.load(Ordering::SeqCst) {
             self.drain_pending().await;
+            self.needs_resync.store(false, Ordering::SeqCst);
         }
     }
 
     /// Discard frames left over from a timed-out or failed read.
+    ///
+    /// Bounded by both [`MAX_DRAIN_FRAMES`] and [`MAX_DRAIN_DURATION`] so a
+    /// noisy transport cannot livelock the session.
     async fn drain_pending(&self) {
-        while let Ok(Ok(_frame)) =
-            tokio::time::timeout(Duration::from_millis(1), self.transport.recv()).await
-        {}
+        let deadline = Instant::now() + MAX_DRAIN_DURATION;
+        for _ in 0..MAX_DRAIN_FRAMES {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let wait = DRAIN_FRAME_WAIT.min(deadline.saturating_duration_since(now));
+            if tokio::time::timeout(wait, self.transport.recv())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .is_none()
+            {
+                break;
+            }
+        }
     }
 
     /// Read the firmware version (`cmd 0x000B`).
@@ -127,26 +191,21 @@ impl<T: Transport> Session<T> {
     /// transport error.
     pub async fn read_version(&self) -> Result<VersionInfo, Error> {
         self.prepare_read().await;
+        let mut guard = ResyncGuard::new(&self.needs_resync);
         self.transport
             .send(&commands::read_version().encode_ble(PacketKind::App)?)
             .await?;
 
-        let raw = match self
+        let raw = self
             .read_transfer_inner(
                 commands::cmd::READ_VERSION,
                 commands::VERSION_RESPONSE_LEN,
                 self.timeout,
                 self.timeout,
             )
-            .await
-        {
-            Ok(raw) => raw,
-            Err(error) => {
-                self.needs_resync.store(true, Ordering::SeqCst);
-                return Err(error);
-            }
-        };
+            .await?;
 
+        guard.disarm();
         let text = longest_printable_run(&raw);
         Ok(VersionInfo { raw, text })
     }
@@ -264,6 +323,11 @@ impl<T: Transport> Session<T> {
 
     /// Read a transfer of exactly `expected_len` bytes for `cmd`.
     ///
+    /// Callers are expected to have already sent the request (calling
+    /// [`Session::resync`] beforehand if needed). This method does not drain
+    /// pending notifications before reading, so a response already queued for
+    /// that request is never discarded.
+    ///
     /// Both response shapes are accepted:
     ///
     /// - the generic envelope observed on `0x600F`
@@ -289,14 +353,12 @@ impl<T: Transport> Session<T> {
         per_frame_timeout: Duration,
         total_timeout: Duration,
     ) -> Result<Vec<u8>, Error> {
-        self.prepare_read().await;
-        let result = self
+        let mut guard = ResyncGuard::new(&self.needs_resync);
+        let raw = self
             .read_transfer_inner(cmd, expected_len, per_frame_timeout, total_timeout)
-            .await;
-        if result.is_err() {
-            self.needs_resync.store(true, Ordering::SeqCst);
-        }
-        result
+            .await?;
+        guard.disarm();
+        Ok(raw)
     }
 
     async fn read_transfer_inner(
@@ -367,14 +429,18 @@ impl<T: Transport> Session<T> {
         per_frame_timeout: Duration,
         total_timeout: Duration,
     ) -> Result<Vec<u8>, Error> {
-        self.prepare_read().await;
-        let result = self
-            .read_config_chunks_inner(expected_len, per_frame_timeout, total_timeout)
-            .await;
-        if result.is_err() {
-            self.needs_resync.store(true, Ordering::SeqCst);
+        if expected_len != CONFIG_SIZE {
+            return Err(Error::UnexpectedResponse(format!(
+                "chunked ReadConfig expects {CONFIG_SIZE} bytes, got {expected_len}"
+            )));
         }
-        result
+        self.prepare_read().await;
+        let mut guard = ResyncGuard::new(&self.needs_resync);
+        let raw = self
+            .read_config_chunks_inner(expected_len, per_frame_timeout, total_timeout)
+            .await?;
+        guard.disarm();
+        Ok(raw)
     }
 
     async fn read_config_chunks_inner(
@@ -383,12 +449,6 @@ impl<T: Transport> Session<T> {
         per_frame_timeout: Duration,
         total_timeout: Duration,
     ) -> Result<Vec<u8>, Error> {
-        if expected_len != CONFIG_SIZE {
-            return Err(Error::UnexpectedResponse(format!(
-                "chunked ReadConfig expects {CONFIG_SIZE} bytes, got {expected_len}"
-            )));
-        }
-
         let mut buffer = TransferBuffer::new(expected_len);
         let mut offset = 0usize;
         let deadline = Instant::now() + total_timeout;
@@ -482,8 +542,9 @@ impl<T: Transport> Session<T> {
         }
 
         // Input reports may arrive while a read is in progress because the
-        // session enables notifications. They are unrelated to the request.
-        if response.subcmd == commands::cmd::INPUT {
+        // session enables notifications. They are unrelated to non-input
+        // requests.
+        if response.subcmd == commands::cmd::INPUT && request_cmd != commands::cmd::INPUT {
             return Ok(None);
         }
 
@@ -1216,6 +1277,7 @@ mod tests {
         incoming: Mutex<VecDeque<Vec<u8>>>,
         fresh_config: Mutex<Vec<Vec<u8>>>,
         sent: Mutex<Vec<Vec<u8>>>,
+        pending_before_first_config_send: Mutex<Option<usize>>,
     }
 
     impl ResyncTransport {
@@ -1224,6 +1286,7 @@ mod tests {
                 incoming: Mutex::new(VecDeque::new()),
                 fresh_config: Mutex::new(Vec::new()),
                 sent: Mutex::new(Vec::new()),
+                pending_before_first_config_send: Mutex::new(None),
             }
         }
 
@@ -1233,6 +1296,10 @@ mod tests {
 
         fn set_fresh_config(&self, frames: Vec<Vec<u8>>) {
             *self.fresh_config.lock().unwrap() = frames;
+        }
+
+        fn pending_before_first_config_send(&self) -> Option<usize> {
+            *self.pending_before_first_config_send.lock().unwrap()
         }
     }
 
@@ -1246,7 +1313,11 @@ mod tests {
                         let fresh = std::mem::take(&mut *self.fresh_config.lock().unwrap());
                         if !fresh.is_empty() {
                             let mut incoming = self.incoming.lock().unwrap();
-                            incoming.clear();
+                            let mut recorded =
+                                self.pending_before_first_config_send.lock().unwrap();
+                            if recorded.is_none() {
+                                *recorded = Some(incoming.len());
+                            }
                             incoming.extend(fresh);
                         }
                     }
@@ -1272,26 +1343,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn resync_discards_stale_config_chunk_before_next_read() {
-        let transport = ResyncTransport::new();
-        let session = Session::new(&transport).with_timeout(Duration::from_millis(20));
-
-        // Force a timeout so the session records that a resync is needed.
-        assert!(session.read_version().await.is_err());
-
-        let stale = CustomHeader::new(
-            commands::cmd::RESPONSE,
-            commands::cmd::READ_CONFIG,
-            CONFIG_SIZE as u32,
-            0,
-        )
-        .with_payload(&[0xAA; 142]);
-        let mut stale_frame = stale.to_bytes().to_vec();
-        stale_frame.extend_from_slice(&[0xAA; 142]);
-        transport.push_stale(stale_frame);
-
-        let config = sample_config();
+    fn build_fresh_config_frames(config: &Bt2Config) -> Vec<Vec<u8>> {
         let mut fresh = Vec::new();
         for (index, chunk) in config.as_bytes().chunks(142).enumerate() {
             let offset = (index * 142) as u32;
@@ -1306,11 +1358,205 @@ mod tests {
             frame.extend_from_slice(chunk);
             fresh.push(frame);
         }
-        transport.set_fresh_config(fresh);
+        fresh
+    }
+
+    fn build_stale_config_frame() -> Vec<u8> {
+        let stale = CustomHeader::new(
+            commands::cmd::RESPONSE,
+            commands::cmd::READ_CONFIG,
+            CONFIG_SIZE as u32,
+            0,
+        )
+        .with_payload(&[0xAA; 142]);
+        let mut stale_frame = stale.to_bytes().to_vec();
+        stale_frame.extend_from_slice(&[0xAA; 142]);
+        stale_frame
+    }
+
+    #[tokio::test]
+    async fn resync_discards_stale_config_chunk_before_next_read() {
+        let transport = ResyncTransport::new();
+        let session = Session::new(&transport).with_timeout(Duration::from_millis(20));
+
+        // Force a timeout so the session records that a resync is needed.
+        assert!(session.read_version().await.is_err());
+
+        transport.push_stale(build_stale_config_frame());
+
+        let config = sample_config();
+        transport.set_fresh_config(build_fresh_config_frames(&config));
 
         let snapshot = session.read_config_snapshot().await.unwrap();
+        assert_eq!(
+            transport.pending_before_first_config_send(),
+            Some(0),
+            "stale frame must be drained before the first ReadConfig send"
+        );
         assert_eq!(snapshot.config.as_bytes(), config.as_bytes());
         assert_ne!(&snapshot.config.as_bytes()[..8], &[0xAA; 8]);
+    }
+
+    #[tokio::test]
+    async fn drain_pending_is_bounded_against_flooding_transport() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct FloodingTransport {
+            recv_calls: AtomicUsize,
+            delay: Duration,
+        }
+
+        #[async_trait]
+        impl Transport for FloodingTransport {
+            async fn send(&self, _data: &[u8]) -> Result<(), Error> {
+                Ok(())
+            }
+
+            async fn recv(&self) -> Result<Vec<u8>, Error> {
+                if !self.delay.is_zero() {
+                    tokio::time::sleep(self.delay).await;
+                }
+                self.recv_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(OBSERVED_VERSION_ACK.to_vec())
+            }
+
+            fn mtu(&self) -> u16 {
+                64
+            }
+
+            async fn disconnect(&self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        // Frame-count cap: immediate frames stop at MAX_DRAIN_FRAMES.
+        let fast = FloodingTransport {
+            recv_calls: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+        };
+        let session = Session::new(&fast);
+        session.needs_resync.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        session.resync().await;
+        assert_eq!(fast.recv_calls.load(Ordering::SeqCst), MAX_DRAIN_FRAMES);
+        assert!(!session.needs_resync.load(Ordering::SeqCst));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "drain_pending took {:?}",
+            started.elapsed()
+        );
+
+        // Time-budget cap: sub-1ms frames stop once MAX_DRAIN_DURATION elapses.
+        let paced = FloodingTransport {
+            recv_calls: AtomicUsize::new(0),
+            delay: Duration::from_micros(500),
+        };
+        let session = Session::new(&paced);
+        session.needs_resync.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        session.resync().await;
+        let calls = paced.recv_calls.load(Ordering::SeqCst);
+        assert!(calls > 0 && calls <= MAX_DRAIN_FRAMES);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "paced drain_pending took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_transfer_preserves_response_when_needs_resync_is_set() {
+        let transport = ResyncTransport::new();
+        let session = Session::new(&transport).with_timeout(Duration::from_millis(20));
+
+        // Force needs_resync = true.
+        assert!(session.read_version().await.is_err());
+        assert!(session.needs_resync.load(Ordering::SeqCst));
+
+        // Simulate an external caller sending a request and then calling
+        // `read_transfer`: the queued legitimate response must not be drained.
+        session
+            .transport()
+            .send(
+                &commands::read_version()
+                    .encode_ble(PacketKind::App)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let response = envelope_header(
+            commands::cmd::READ_VERSION,
+            commands::VERSION_RESPONSE_LEN as u32,
+            0,
+            4,
+        );
+        let mut frame = response.to_bytes().to_vec();
+        frame.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        transport.push_stale(frame);
+
+        let raw = session
+            .read_transfer(
+                commands::cmd::READ_VERSION,
+                commands::VERSION_RESPONSE_LEN,
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw, [0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_marks_needs_resync_and_discards_stale_response() {
+        let transport = ResyncTransport::new();
+        let session = Session::new(&transport).with_timeout(Duration::from_secs(5));
+
+        // Start a read whose future is dropped mid-flight (cancellation).
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(10), session.read_config_snapshot()).await;
+        assert!(
+            cancelled.is_err(),
+            "read should be cancelled before timeout"
+        );
+        assert!(
+            session.needs_resync.load(Ordering::SeqCst),
+            "dropping an in-flight read future must mark needs_resync"
+        );
+
+        transport.push_stale(build_stale_config_frame());
+        let config = sample_config();
+        transport.set_fresh_config(build_fresh_config_frames(&config));
+
+        let snapshot = session.read_config_snapshot().await.unwrap();
+        assert_eq!(
+            transport.pending_before_first_config_send(),
+            Some(0),
+            "stale frame must be drained before the post-cancel ReadConfig send"
+        );
+        assert_eq!(snapshot.config.as_bytes(), config.as_bytes());
+        assert_ne!(&snapshot.config.as_bytes()[..8], &[0xAA; 8]);
+    }
+
+    #[test]
+    fn classify_response_accepts_input_envelope_when_requesting_input() {
+        let payload = [0x12u8; 12];
+        let header = CustomHeader::new(commands::cmd::RESPONSE, commands::cmd::INPUT, 12, 0)
+            .with_payload(&payload);
+        let mut frame = header.to_bytes().to_vec();
+        frame.extend_from_slice(&payload);
+
+        let classified =
+            Session::<MockTransport>::classify_response(&frame, commands::cmd::INPUT, 12)
+                .unwrap()
+                .expect("INPUT envelope must not be skipped when request_cmd == INPUT");
+        assert_eq!(classified.0.subcmd, commands::cmd::INPUT);
+        assert_eq!(classified.1, &payload);
+
+        // Non-input requests still skip interleaved input envelopes.
+        let skipped =
+            Session::<MockTransport>::classify_response(&frame, commands::cmd::READ_VERSION, 4)
+                .unwrap();
+        assert!(skipped.is_none());
     }
 
     #[tokio::test]
