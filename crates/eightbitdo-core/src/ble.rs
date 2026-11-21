@@ -32,6 +32,13 @@ const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Depth of the notification forwarding channel.
 const NOTIFICATION_CHANNEL_DEPTH: usize = 64;
 
+/// Default ATT MTU used when the BLE stack reports 0 or has not negotiated a
+/// larger MTU.
+const DEFAULT_ATT_MTU: u16 = 23;
+
+/// Upper bound for a single GATT write operation.
+const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Options for finding and connecting to an App Mode peripheral.
 #[derive(Debug, Clone)]
 pub struct BleOptions {
@@ -197,7 +204,7 @@ impl BleTransport {
         });
 
         let mtu = match peripheral.mtu() {
-            0 => 23,
+            0 => DEFAULT_ATT_MTU,
             mtu => mtu,
         };
 
@@ -206,10 +213,9 @@ impl BleTransport {
             characteristic,
             write_type,
             mtu,
-            // Reuse the connection timeout as the upper bound for one GATT
-            // write so Ctrl-C/shutdown can never wait forever on a wedged BLE
-            // stack.
-            write_timeout: options.connect_timeout,
+            // Bound a single GATT write so Ctrl-C/shutdown can never wait
+            // forever on a wedged BLE stack.
+            write_timeout: compute_write_timeout(options.connect_timeout),
             name,
             verbose,
             rx: Mutex::new(rx),
@@ -240,17 +246,18 @@ impl BleTransport {
 #[async_trait]
 impl Transport for BleTransport {
     async fn send(&self, data: &[u8]) -> Result<(), Error> {
+        if let MtuCheck::DelegateToStack { max_frame } = check_tx_frame_len(self.mtu, data.len())? {
+            if self.verbose {
+                eprintln!(
+                    "warn: frame is {} bytes with unnegotiated/default MTU {} (single-write payload {}); delegating to BLE stack",
+                    data.len(),
+                    self.mtu,
+                    max_frame
+                );
+            }
+        }
         if self.verbose {
             eprintln!("tx {} bytes: {}", data.len(), hex_dump(data));
-        }
-        let max_frame = usize::from(self.mtu.saturating_sub(3));
-        if data.len() > max_frame {
-            return Err(Error::Ble(format!(
-                "frame is {} bytes but the negotiated MTU {} allows at most {}",
-                data.len(),
-                self.mtu,
-                max_frame
-            )));
         }
         let write = self
             .peripheral
@@ -410,6 +417,33 @@ fn supports_app_traffic(properties: CharPropFlags) -> bool {
     can_write && can_notify
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MtuCheck {
+    /// Frame fits within a single ATT payload (`mtu - 3`).
+    WithinMtu,
+    /// MTU is unreported or at the default ATT minimum (`<= 23`), so frames
+    /// larger than `mtu - 3` (such as the 21-byte `ReadVersion` request) are
+    /// left to the OS/BlueZ Long Write path instead of being rejected locally.
+    DelegateToStack { max_frame: usize },
+}
+
+fn check_tx_frame_len(mtu: u16, frame_len: usize) -> Result<MtuCheck, Error> {
+    let max_frame = usize::from(mtu.saturating_sub(3));
+    if frame_len <= max_frame {
+        return Ok(MtuCheck::WithinMtu);
+    }
+    if mtu <= DEFAULT_ATT_MTU {
+        return Ok(MtuCheck::DelegateToStack { max_frame });
+    }
+    Err(Error::Ble(format!(
+        "frame is {frame_len} bytes but the negotiated MTU {mtu} allows at most {max_frame}"
+    )))
+}
+
+fn compute_write_timeout(connect_timeout: Duration) -> Duration {
+    DEFAULT_WRITE_TIMEOUT.min(connect_timeout)
+}
+
 fn ble_error(error: btleplug::Error) -> Error {
     Error::Ble(error.to_string())
 }
@@ -460,5 +494,39 @@ mod tests {
         assert!(supports_app_traffic(flags));
         assert!(!supports_app_traffic(CharPropFlags::WRITE));
         assert!(!supports_app_traffic(CharPropFlags::NOTIFY));
+    }
+
+    #[test]
+    fn fallback_mtu_23_allows_21_byte_version_request() {
+        assert_eq!(check_tx_frame_len(23, 20).unwrap(), MtuCheck::WithinMtu);
+        assert_eq!(
+            check_tx_frame_len(23, 21).unwrap(),
+            MtuCheck::DelegateToStack { max_frame: 20 }
+        );
+        assert_eq!(
+            check_tx_frame_len(0, 21).unwrap(),
+            MtuCheck::DelegateToStack { max_frame: 0 }
+        );
+    }
+
+    #[test]
+    fn negotiated_mtu_rejects_oversized_frame() {
+        assert_eq!(check_tx_frame_len(24, 21).unwrap(), MtuCheck::WithinMtu);
+        let err = check_tx_frame_len(24, 22).unwrap_err();
+        assert!(
+            matches!(err, Error::Ble(message) if message.contains("22 bytes") && message.contains("MTU 24") && message.contains("at most 21"))
+        );
+    }
+
+    #[test]
+    fn write_timeout_is_capped_at_five_seconds() {
+        assert_eq!(
+            compute_write_timeout(Duration::from_secs(20)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            compute_write_timeout(Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
     }
 }
