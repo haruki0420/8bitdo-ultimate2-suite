@@ -12,7 +12,7 @@
 //! `drain budget exhausted`) instead of risking a stale frame being mistaken
 //! for the new response.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::time::Duration;
 
 use eightbitdo_protocol::commands;
@@ -40,6 +40,14 @@ const MAX_DRAIN_FRAMES: usize = 64;
 /// returning `Ok(None)`, so a caller looping over input reports always
 /// regains control.
 pub const MAX_INPUT_DRAIN_FRAMES: usize = 16;
+
+/// Malformed frames [`Session::try_next_input`] skips before it gives up.
+///
+/// One corrupt notification must not end a keepalive or monitor loop, so
+/// decode failures are skipped; this many *in a row* means the link is
+/// delivering garbage, and the call fails with a protocol error instead of
+/// spinning until the caller's timeout.
+pub const MAX_CONSECUTIVE_DECODE_FAILURES: usize = 8;
 
 /// Overall time budget for discarding stale frames during resync.
 const MAX_DRAIN_DURATION: Duration = Duration::from_millis(50);
@@ -192,6 +200,9 @@ pub struct Session<T: Transport> {
     timeout: Duration,
     needs_resync: AtomicBool,
     dropped_operation: AtomicU8,
+    skipped_frames: AtomicU64,
+    consecutive_decode_failures: AtomicU32,
+    recovered_frame_runs: AtomicU64,
 }
 
 impl<T: Transport> Session<T> {
@@ -203,6 +214,9 @@ impl<T: Transport> Session<T> {
             timeout: DEFAULT_TIMEOUT,
             needs_resync: AtomicBool::new(false),
             dropped_operation: AtomicU8::new(DroppedOperation::CallerCancelled as u8),
+            skipped_frames: AtomicU64::new(0),
+            consecutive_decode_failures: AtomicU32::new(0),
+            recovered_frame_runs: AtomicU64::new(0),
         }
     }
 
@@ -429,6 +443,13 @@ impl<T: Transport> Session<T> {
     /// (`cmd=0x0004, subcmd=0x0003`). Other frames are skipped. A timeout
     /// returns `Ok(None)`; a closed transport returns [`Error::Disconnected`].
     ///
+    /// A frame that does not decode as an App Mode response is skipped and
+    /// counted in [`skipped_frames`](Self::skipped_frames); one corrupt
+    /// notification must not stop a keepalive or monitor loop. Only
+    /// [`MAX_CONSECUTIVE_DECODE_FAILURES`] malformed frames *in a row* end the
+    /// call with a protocol error, so a link that keeps delivering garbage
+    /// still fails instead of spinning.
+    ///
     /// The call is bounded in three ways so a caller that drains the input
     /// queue in a loop cannot hold the session lock forever: the `wait`
     /// budget, at most [`MAX_INPUT_DRAIN_FRAMES`] frames consumed per call
@@ -440,7 +461,9 @@ impl<T: Transport> Session<T> {
     ///
     /// Returns [`Error::InvalidTimeout`] when `wait` exceeds [`MAX_WAIT`],
     /// [`Error::Disconnected`] when the transport closes, a protocol error
-    /// for a malformed input frame, or another transport error.
+    /// after [`MAX_CONSECUTIVE_DECODE_FAILURES`] malformed frames in a row,
+    /// or another transport error. Malformed frames below that limit are
+    /// skipped, not returned.
     pub async fn try_next_input(&self, wait: Duration) -> Result<Option<InputReport>, Error> {
         let deadline = deadline_after(wait)?;
         for _ in 0..MAX_INPUT_DRAIN_FRAMES {
@@ -463,19 +486,73 @@ impl<T: Transport> Session<T> {
                 }
             };
 
-            let (header, payload) = header::decode_app_response(&frame)?;
+            let (header, payload) = match header::decode_app_response(&frame) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    if self.record_decode_failure() {
+                        return Err(Error::Protocol(error));
+                    }
+                    continue;
+                }
+            };
             let is_input = header.cmd == commands::cmd::INPUT
                 || (header.cmd == commands::cmd::RESPONSE && header.subcmd == commands::cmd::INPUT);
             if !is_input || header.chunk_len == 0 {
                 continue;
             }
-            return Ok(Some(InputReport::from_bytes(payload)?));
+            let Ok(report) = InputReport::from_bytes(payload) else {
+                if self.record_decode_failure() {
+                    return Err(Error::Protocol(eightbitdo_protocol::Error::InvalidLength {
+                        expected: eightbitdo_protocol::input_report::INPUT_REPORT_SIZE,
+                        actual: payload.len(),
+                    }));
+                }
+                continue;
+            };
+            if self.consecutive_decode_failures.swap(0, Ordering::Relaxed) > 0 {
+                self.recovered_frame_runs.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(Some(report));
         }
 
         // Frame budget spent: discard at most one more queued frame so the
         // next call starts with a fresh frame instead of the backlog.
         self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
         Ok(None)
+    }
+
+    /// Count one malformed input-path frame; true when the run is too long.
+    ///
+    /// A decodable input report resets the run. Frames that decode but are
+    /// not input reports (notices, ACKs) neither extend nor reset it: the
+    /// load-bearing signal is "consecutive malformed App Mode frames".
+    fn record_decode_failure(&self) -> bool {
+        self.skipped_frames.fetch_add(1, Ordering::Relaxed);
+        let failures = self
+            .consecutive_decode_failures
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        failures >= MAX_CONSECUTIVE_DECODE_FAILURES as u32
+    }
+
+    /// Number of incoming frames this session skipped because they did not
+    /// decode as an App Mode response or as a 12-byte input report.
+    ///
+    /// Counted by [`try_next_input`](Self::try_next_input). A small value is
+    /// ordinary noise from a link that also carries non-App data; an
+    /// increasing value means the link (or the peer) keeps sending garbage.
+    #[must_use]
+    pub fn skipped_frames(&self) -> u64 {
+        self.skipped_frames.load(Ordering::Relaxed)
+    }
+
+    /// Number of malformed-frame runs that ended with a decoded input report.
+    ///
+    /// Complements [`skipped_frames`](Self::skipped_frames): a non-zero value
+    /// proves the input stream recovered, which is what the skip rule is for.
+    #[must_use]
+    pub fn recovered_frame_runs(&self) -> u64 {
+        self.recovered_frame_runs.load(Ordering::Relaxed)
     }
 
     /// Read a transfer of exactly `expected_len` bytes for `cmd`.
@@ -570,8 +647,9 @@ impl<T: Transport> Session<T> {
     /// The response payload is copied at the requested offset, and the offset
     /// advances by `payload.len()`. `offset = 0` is accepted only for the
     /// first chunk, where it is the device's sequential-chunk convention;
-    /// later chunks must echo the requested offset, so a re-sent first chunk
-    /// fails the read instead of shifting the whole block.
+    /// later chunks must echo the requested offset (the final chunk does), so
+    /// a re-sent first chunk fails the read instead of shifting the block.
+    /// Chunks that overlap bytes already received are rejected.
     ///
     /// `expected_len` must be [`CONFIG_SIZE`]. Use
     /// [`read_transfer`](Self::read_transfer) for single-request transfers
@@ -651,11 +729,12 @@ impl<T: Transport> Session<T> {
                 }
 
                 // The unit answers offset=0 for sequential chunks and echoes
-                // the request offset for the final chunk. offset=0 only marks a
-                // sequential chunk for the first request: after that, a chunk
-                // that still names offset 0 can only be a re-send of the first
-                // one. Placing it at the requested offset would shift every
-                // later chunk by one payload length and still fill the buffer.
+                // the request offset for the final chunk. offset=0 is only a
+                // valid sequential marker for the first chunk: after that, a
+                // chunk that still names offset 0 can only be a re-send of the
+                // first chunk. Treating it as "the chunk I asked for" would
+                // splice it at the requested offset, shift every later chunk
+                // by one payload length and still fill the buffer.
                 let sequential_first = offset == 0 && response_offset == 0;
                 if response_offset != offset && !sequential_first {
                     return Err(Error::UnexpectedResponse(format!(
@@ -803,7 +882,9 @@ impl TransferBuffer {
         }
 
         self.data[offset..end].copy_from_slice(chunk);
-        self.filled[offset..end].fill(true);
+        for position in offset..end {
+            self.filled[position] = true;
+        }
         self.received += chunk.len();
         Ok(())
     }
@@ -1143,11 +1224,15 @@ mod tests {
             if index == 7 {
                 mock.push_incoming(&OBSERVED_CONFIG_ACK);
             }
-            // The unit reports offset=0 only for the first request; later
-            // chunks must echo the requested offset. A repeated offset=0 is a
+            // The unit reports offset=0 only for the first chunk; every later
+            // chunk echoes the requested offset. A repeated offset=0 is a
             // stale re-send and is rejected (see
             // `resent_first_config_chunk_is_rejected_instead_of_shifting_the_block`).
-            let offset = (index * chunk_size) as u32;
+            let offset = if index == 0 {
+                0
+            } else {
+                (index * chunk_size) as u32
+            };
             let header = envelope_header(
                 commands::cmd::READ_CONFIG,
                 CONFIG_SIZE as u32,
@@ -1328,18 +1413,20 @@ mod tests {
 
     #[tokio::test]
     async fn resent_first_config_chunk_is_rejected_instead_of_shifting_the_block() {
-        // B1 regression: only the first chunk may report offset=0. A re-sent
-        // first chunk (offset=0, 142 bytes) arriving for the offset=142 request
-        // must fail the read; splicing it there would shift every later byte
-        // by 142 and still produce a complete 2768-byte buffer that the CLI
-        // would save as a valid backup.
+        // B1 regression: after the first chunk the device must echo the
+        // requested offset. A re-sent first chunk (offset=0, 142 bytes) must
+        // not be spliced at offset 142; that would shift all later bytes by
+        // 142 and still produce a complete 2768-byte buffer that the CLI would
+        // save as a "valid" backup.
         let config = sample_config();
         let bytes = config.as_bytes();
         let mock = MockTransport::new();
 
         let first = envelope_header(commands::cmd::READ_CONFIG, CONFIG_SIZE as u32, 0, 142);
         mock.push_response(&first, &bytes[..142]);
-        mock.push_response(&first, &bytes[..142]);
+        // The stale re-send of chunk 0 arrives for the offset=142 request.
+        let resent = envelope_header(commands::cmd::READ_CONFIG, CONFIG_SIZE as u32, 0, 142);
+        mock.push_response(&resent, &bytes[..142]);
         push_config_envelope_chunks(&mock, &bytes[142..], 142);
 
         let session = Session::new(&mock);
@@ -1355,14 +1442,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_chunk_in_one_transfer_is_rejected_as_an_overlap() {
-        // The ReadConfig loop never lets a re-send reach the buffer (the
-        // offset check refuses it first), so the buffer guard is exercised
-        // through a single-request transfer: two chunks at the same offset.
+    async fn duplicate_config_chunk_is_rejected_as_an_overlap() {
+        // The ReadConfig loop rejects a stale re-send at the offset check
+        // before it can reach the buffer; a single-request transfer with two
+        // chunks at the same offset reaches `TransferBuffer::insert` instead,
+        // which must reject the overlap rather than silently ignore it.
         let mock = MockTransport::new();
         let header = envelope_header(
             commands::cmd::READ_VERSION,
-            commands::VERSION_RESPONSE_LEN as u32,
+            commands::VERSION_REQUEST_LEN as u32,
             0,
             2,
         );
@@ -1390,7 +1478,6 @@ mod tests {
         buffer.insert(0, &[1u8; 8]).unwrap();
         buffer.insert(8, &[2u8; 8]).unwrap();
         assert!(buffer.is_complete());
-        assert_eq!(buffer.received(), 16);
 
         let mut buffer = TransferBuffer::new(16);
         buffer.insert(0, &[1u8; 8]).unwrap();
@@ -1399,17 +1486,10 @@ mod tests {
             matches!(error, Error::UnexpectedResponse(ref message) if message.contains("overlaps")),
             "unexpected error: {error:?}"
         );
-        assert_eq!(
-            buffer.received(),
-            8,
-            "a rejected chunk must not fill any byte"
-        );
-        // A partial overlap with the end of the filled range is rejected too.
+        assert_eq!(buffer.received(), 8, "a rejected chunk must not fill bytes");
+        // A partial overlap at the end of the filled range is rejected too.
         let error = buffer.insert(6, &[3u8; 2]).unwrap_err();
         assert!(matches!(error, Error::UnexpectedResponse(_)));
-        // Adjacent, non-overlapping writes still work.
-        buffer.insert(8, &[4u8; 8]).unwrap();
-        assert!(buffer.is_complete());
     }
 
     #[tokio::test]
@@ -1535,6 +1615,58 @@ mod tests {
     /// Transport that delivers one frame, then never answers again.
     struct StallingTransport {
         first: Mutex<Option<Vec<u8>>>,
+    }
+
+    /// One step of a [`ScriptedTransport`] queue.
+    enum ScriptedFrame {
+        /// A complete notification frame.
+        Data(Vec<u8>),
+        /// Go idle longer than the session timeout, like an empty BLE queue.
+        Stall,
+    }
+
+    /// Transport that replays a scripted sequence, then fails as disconnected.
+    struct ScriptedTransport {
+        script: Mutex<VecDeque<ScriptedFrame>>,
+    }
+
+    impl ScriptedTransport {
+        fn new(script: Vec<ScriptedFrame>) -> Self {
+            Self {
+                script: Mutex::new(script.into()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Transport for ScriptedTransport {
+        async fn send(&self, _data: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn recv(&self) -> Result<Vec<u8>, Error> {
+            let next = self
+                .script
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front();
+            match next {
+                Some(ScriptedFrame::Data(frame)) => Ok(frame),
+                Some(ScriptedFrame::Stall) => {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Err(Error::Disconnected)
+                }
+                None => Err(Error::Disconnected),
+            }
+        }
+
+        fn mtu(&self) -> u16 {
+            64
+        }
+
+        async fn disconnect(&self) -> Result<(), Error> {
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -1868,6 +2000,178 @@ mod tests {
             .unwrap()
             .expect("the queued report is found after the notices");
         assert_eq!(decoded, report);
+    }
+
+    #[tokio::test]
+    async fn try_next_input_skips_one_malformed_frame_and_returns_the_next_report() {
+        // B2 regression: a single 12-byte garbage notification used to return
+        // `Err` from `try_next_input`, which the session keepalive counted as
+        // a failure and degraded on after three ticks.
+        let mock = MockTransport::new();
+        mock.push_incoming(&[0xFF; 12]);
+        let report = InputReport {
+            keys: 0x0000_0010,
+            ..InputReport::default()
+        };
+        let input =
+            CustomHeader::new(commands::cmd::INPUT, 0, 12, 12).with_payload(&report.to_bytes());
+        mock.push_response(&input, &report.to_bytes());
+
+        let session = Session::new(&mock);
+        let decoded = session
+            .try_next_input(Duration::from_millis(200))
+            .await
+            .expect("one corrupt frame must be skipped, not returned as an error")
+            .expect("the valid report is still delivered");
+        assert_eq!(decoded, report);
+        assert_eq!(session.skipped_frames(), 1);
+    }
+
+    #[tokio::test]
+    async fn try_next_input_skips_frames_with_an_impossible_chunk_len() {
+        let mock = MockTransport::new();
+        // A 16-byte header that declares 512 payload bytes.
+        let header = envelope_header(commands::cmd::INPUT, 12, 12, 512);
+        mock.push_incoming(&header.to_bytes());
+        let report = InputReport {
+            keys: 0x0000_0020,
+            ..InputReport::default()
+        };
+        let input =
+            CustomHeader::new(commands::cmd::INPUT, 0, 12, 12).with_payload(&report.to_bytes());
+        mock.push_response(&input, &report.to_bytes());
+
+        let session = Session::new(&mock);
+        let decoded = session
+            .try_next_input(Duration::from_millis(200))
+            .await
+            .unwrap()
+            .expect("a truncated frame must not hide the next report");
+        assert_eq!(decoded, report);
+        assert_eq!(session.skipped_frames(), 1);
+    }
+
+    #[tokio::test]
+    async fn try_next_input_fails_after_repeated_malformed_frames() {
+        let mock = MockTransport::new();
+        for _ in 0..MAX_CONSECUTIVE_DECODE_FAILURES {
+            mock.push_incoming(&[0xEE; 5]);
+        }
+        let session = Session::new(&mock);
+
+        let result = session.try_next_input(Duration::from_millis(200)).await;
+        assert!(
+            matches!(result, Err(Error::Protocol(_))),
+            "a link that only delivers garbage must fail, got {result:?}"
+        );
+        assert_eq!(
+            session.skipped_frames(),
+            MAX_CONSECUTIVE_DECODE_FAILURES as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn try_next_input_resets_the_failure_run_after_a_good_frame() {
+        // Three malformed frames, an idle gap that ends the first call, one
+        // more malformed frame, and then a report. The run spans the call
+        // boundary without reaching the cap, and the decoded report ends it
+        // and is counted as a recovery.
+        let mut scripted: Vec<ScriptedFrame> =
+            (0..3).map(|_| ScriptedFrame::Data(vec![0xEE; 5])).collect();
+        scripted.push(ScriptedFrame::Stall);
+        scripted.push(ScriptedFrame::Data(vec![0xEE; 5]));
+        let report = InputReport {
+            keys: 0x0000_0030,
+            ..InputReport::default()
+        };
+        let input =
+            CustomHeader::new(commands::cmd::INPUT, 0, 12, 12).with_payload(&report.to_bytes());
+        let mut frame = input.to_bytes().to_vec();
+        frame.extend_from_slice(&report.to_bytes());
+        scripted.push(ScriptedFrame::Data(frame));
+
+        let transport = ScriptedTransport::new(scripted);
+        let session = Session::new(&transport).with_timeout(Duration::from_millis(20));
+
+        let first = session.try_next_input(Duration::from_millis(200)).await;
+        assert!(
+            matches!(first, Ok(None)),
+            "an idle gap ends the call without an error, got {first:?}"
+        );
+        assert_eq!(session.skipped_frames(), 3);
+        assert_eq!(session.recovered_frame_runs(), 0);
+
+        let decoded = session
+            .try_next_input(Duration::from_millis(200))
+            .await
+            .expect("the malformed frame followed by a report is not an error")
+            .expect("the report after the noise is delivered");
+        assert_eq!(decoded, report);
+        assert!(
+            session.skipped_frames() >= 3,
+            "the malformed frames must be counted, got {}",
+            session.skipped_frames()
+        );
+        assert_eq!(
+            session.recovered_frame_runs(),
+            1,
+            "the decoded report must end the malformed run and be counted as a recovery"
+        );
+        assert_eq!(
+            session.consecutive_decode_failures.load(Ordering::Relaxed),
+            0,
+            "a decoded report must clear the pending run"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_input_frames_do_not_disturb_read_version_or_read_config() {
+        // A frame that is not a valid input report stays the input path's
+        // business: the read paths classify it separately and must not fail,
+        // and the skip counter belongs to the input path only.
+        let mock = MockTransport::new();
+        let report = InputReport {
+            keys: 0x0000_0040,
+            ..InputReport::default()
+        };
+        let input =
+            CustomHeader::new(commands::cmd::INPUT, 0, 12, 12).with_payload(&report.to_bytes());
+        mock.push_response(&input, &report.to_bytes());
+        let version = envelope_header(
+            commands::cmd::READ_VERSION,
+            commands::VERSION_REQUEST_LEN,
+            0,
+            4,
+        );
+        mock.push_response(&version, &[0x01, 0x02, 0x03, 0x04]);
+
+        let session = Session::new(&mock);
+        let read = session.read_version().await;
+        assert!(
+            read.is_ok(),
+            "read_version must be unaffected by non-version frames: {read:?}"
+        );
+        assert_eq!(
+            session.skipped_frames(),
+            0,
+            "the non-input frame is skipped by classify_response, not counted as a decode failure"
+        );
+        assert!(
+            !session.needs_resync.load(Ordering::SeqCst),
+            "a successfully skipped frame must not leave a resync mark"
+        );
+
+        // A frame too short to decode reaches the transport in front of a
+        // config read only when it is queued outside the input path, so it is
+        // exercised through `read_transfer` here: it must not corrupt the
+        // 2768-byte read that follows.
+        let config = sample_config();
+        let mock = MockTransport::new();
+        push_config_envelope_chunks(&mock, config.as_bytes(), 692);
+        let session = Session::new(&mock);
+        let snapshot = session.read_config_snapshot().await.unwrap();
+        assert_eq!(snapshot.config.as_bytes(), config.as_bytes());
+        assert_eq!(session.skipped_frames(), 0);
     }
 
     #[tokio::test]

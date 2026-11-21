@@ -21,7 +21,10 @@ pub mod ble;
 
 pub use error::Error;
 pub use mock::MockTransport;
-pub use session::{ConfigSnapshot, Session, VersionInfo, CONFIG_TOTAL_TIMEOUT, DEFAULT_TIMEOUT};
+pub use session::{
+    ConfigSnapshot, Session, VersionInfo, CONFIG_TOTAL_TIMEOUT, DEFAULT_TIMEOUT,
+    MAX_CONSECUTIVE_DECODE_FAILURES,
+};
 pub use transport::Transport;
 
 #[cfg(feature = "ble")]
