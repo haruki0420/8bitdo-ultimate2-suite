@@ -65,11 +65,20 @@ pub mod subcmd {
     pub const PHONE_PLATFORM: u16 = 0x0001;
 }
 
-/// Magic `total_len` / `offset` used by `ReadVersion`.
-pub const VERSION_QUERY: u32 = 0x0102_0030;
+/// `total_len` of the `0x600F` (`gamepad_type == 1`) `ReadVersion` request.
+///
+/// The `0x01020030` value used by other controller generations is **not**
+/// valid for the Ultimate 2 Bluetooth.
+pub const VERSION_REQUEST_LEN: u32 = 4;
 
 /// `ReadVersion` response payload length (version string + metadata).
 pub const VERSION_RESPONSE_LEN: usize = 0x30;
+
+/// Maximum `WriteBT2Macro` (`cmd 0x0103`) payload per packet (`0x40`).
+pub const MACRO_MAX_CHUNK_SIZE: usize = 0x40;
+
+/// Maximum encoded macro payload: one 4 KB flash sector.
+pub const MACRO_MAX_PAYLOAD: usize = macro_data::MACRO_SECTOR_SIZE as usize;
 
 /// Which transport will issue a `Save` command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,51 +147,139 @@ impl Request {
     pub fn encode_usb_app(&self) -> Result<[u8; USB_REPORT_SIZE], Error> {
         header::encode_usb_app(&self.header, &self.payload)
     }
+
+    /// Encode a payload-less command whose header declares a non-zero
+    /// `chunk_len`.
+    ///
+    /// This is required by `EraseBT2Macro` (`cmd 0x0104`), whose official
+    /// request declares `chunk_len = 0x1000` while sending no payload bytes.
+    /// All other commands must use [`encode_ble`](Self::encode_ble), which
+    /// enforces `chunk_len == payload.len()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this request carries a payload.
+    pub fn encode_ble_payloadless(&self, kind: PacketKind) -> Vec<u8> {
+        assert!(
+            self.payload.is_empty(),
+            "payloadless encoding requires an empty payload"
+        );
+        header::encode_ble_payloadless(kind, &self.header)
+    }
+
+    /// Encode a payload-less command as a 65-byte App Mode USB HID report.
+    ///
+    /// See [`encode_ble_payloadless`](Self::encode_ble_payloadless) for the
+    /// commands this applies to.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this request carries a payload.
+    pub fn encode_usb_app_payloadless(&self) -> [u8; USB_REPORT_SIZE] {
+        assert!(
+            self.payload.is_empty(),
+            "payloadless encoding requires an empty payload"
+        );
+        header::encode_usb_app_payloadless(&self.header)
+    }
+}
+
+/// Validate a configuration range against the fixed 2768-byte buffer.
+fn check_config_range(offset: u32, len: u64) -> Result<(), Error> {
+    let limit = CONFIG_SIZE as u64;
+    let end = u64::from(offset).saturating_add(len);
+    if end > limit {
+        return Err(Error::RangeOutOfBounds {
+            offset: u64::from(offset),
+            len,
+            limit,
+        });
+    }
+    Ok(())
 }
 
 /// `ReadConfig` for an arbitrary range.
-#[must_use]
-pub fn read_config(offset: u32, len: u32) -> Request {
-    Request::new(cmd::READ_CONFIG, 0, len, offset)
+///
+/// # Errors
+///
+/// Returns [`Error::RangeOutOfBounds`] when `offset + len` exceeds the
+/// 2768-byte configuration block.
+pub fn read_config(offset: u32, len: u32) -> Result<Request, Error> {
+    check_config_range(offset, u64::from(len))?;
+    Ok(Request::new(cmd::READ_CONFIG, 0, len, offset))
 }
 
 /// Read the full 2768-byte configuration block.
 #[must_use]
 pub fn read_config_all() -> Request {
-    read_config(0, CONFIG_SIZE as u32)
+    read_config(0, CONFIG_SIZE as u32).expect("the full configuration range is valid")
 }
 
 /// Read only the 116-byte header (`0x000..0x073`).
 #[must_use]
 pub fn read_config_header() -> Request {
-    read_config(0, 0x0074)
+    read_config(0, 0x0074).expect("the configuration header range is valid")
 }
 
 /// Read the current slot value (`0x012`, 2 bytes).
 #[must_use]
 pub fn read_current_slot() -> Request {
-    read_config(0x0012, 2)
+    read_config(0x0012, 2).expect("the current-slot range is valid")
 }
 
 /// `WriteConfig` for an arbitrary range.
 ///
 /// `total_len` is always the full 2768 bytes, matching the official partial
 /// write path. The payload may be shorter than the total.
-#[must_use]
-pub fn write_config(offset: u32, data: &[u8]) -> Request {
-    Request::new(cmd::WRITE_CONFIG, 0, CONFIG_SIZE as u32, offset).with_payload(data)
+///
+/// The `0x600F` (`gamepad_type == 1`) path computes the packet CRC-16/MODBUS
+/// over every chunk and stores it in the header `crc16` field.
+///
+/// # Errors
+///
+/// Returns [`Error::RangeOutOfBounds`] when `offset + data.len()` exceeds the
+/// 2768-byte configuration block.
+pub fn write_config(offset: u32, data: &[u8]) -> Result<Request, Error> {
+    check_config_range(offset, data.len() as u64)?;
+    Ok(Request::new(cmd::WRITE_CONFIG, 0, CONFIG_SIZE as u32, offset).with_crc_payload(data))
 }
 
 /// Split a configuration write into transport-sized packets.
 ///
-/// Offsets advance by `chunk_size`; `total_len` stays `0x0AD0`.
-#[must_use]
-pub fn write_config_packets(offset: u32, data: &[u8], chunk_size: usize) -> Vec<Request> {
-    assert!(chunk_size > 0, "chunk_size must be positive");
-    data.chunks(chunk_size)
+/// Offsets advance by `chunk_size`; `total_len` stays `0x0AD0`. Every packet
+/// carries the CRC-16/MODBUS of its own payload, as required for `0x600F`
+/// (`gamepad_type == 1`).
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidChunkSize`] when `chunk_size` is zero, or
+/// [`Error::RangeOutOfBounds`] when the whole buffer exceeds the 2768-byte
+/// configuration block.
+pub fn write_config_packets(
+    offset: u32,
+    data: &[u8],
+    chunk_size: usize,
+) -> Result<Vec<Request>, Error> {
+    if chunk_size == 0 {
+        return Err(Error::InvalidChunkSize {
+            max: CONFIG_SIZE,
+            actual: 0,
+        });
+    }
+    check_config_range(offset, data.len() as u64)?;
+    Ok(data
+        .chunks(chunk_size)
         .enumerate()
-        .map(|(i, chunk)| write_config(offset + (i * chunk_size) as u32, chunk))
-        .collect()
+        .map(|(i, chunk)| {
+            Request::new(
+                cmd::WRITE_CONFIG,
+                0,
+                CONFIG_SIZE as u32,
+                offset + (i * chunk_size) as u32,
+            )
+            .with_crc_payload(chunk)
+        })
+        .collect())
 }
 
 /// Commit pending configuration writes to flash.
@@ -192,9 +289,18 @@ pub fn save(transport: SaveTransport) -> Request {
 }
 
 /// Read the firmware version.
+///
+/// For the `0x600F` (`gamepad_type == 1`) the official request uses
+/// `total_len = 4` and `offset = 0x01017040`. The `0x01020030` query value is
+/// the `gamepad_type == 2` variant and must not be used here.
 #[must_use]
 pub fn read_version() -> Request {
-    Request::new(cmd::READ_VERSION, 0, VERSION_QUERY, VERSION_QUERY)
+    Request::new(
+        cmd::READ_VERSION,
+        0,
+        VERSION_REQUEST_LEN,
+        boot::VERSION_ADDR,
+    )
 }
 
 /// Report the host as a phone platform.
@@ -252,15 +358,39 @@ pub const fn macro_subcmd(gamepad_mode: u16, slot: Slot) -> u16 {
 }
 
 /// Read macro steps (`1 step = 10 bytes`, no 32-byte alignment).
-#[must_use]
-pub fn read_macro(gamepad_mode: u16, slot: Slot, macro_idx: MacroIndex, steps: u16) -> Request {
-    let total_len = u32::from(steps) * 10;
-    Request::new(
+///
+/// # Errors
+///
+/// Returns [`Error::TooManySteps`] when `steps` exceeds
+/// [`macro_data::MAX_MACRO_STEPS`], or [`Error::RangeOutOfBounds`] when the
+/// encoded steps would exceed one 4 KB flash sector.
+pub fn read_macro(
+    gamepad_mode: u16,
+    slot: Slot,
+    macro_idx: MacroIndex,
+    steps: u16,
+) -> Result<Request, Error> {
+    let step_count = usize::from(steps);
+    let total_len = u32::from(steps) * macro_data::MACRO_STEP_SIZE as u32;
+    if total_len > macro_data::MACRO_SECTOR_SIZE {
+        return Err(Error::RangeOutOfBounds {
+            offset: u64::from(macro_idx.sector_offset()),
+            len: u64::from(total_len),
+            limit: u64::from(macro_data::MACRO_SECTOR_SIZE),
+        });
+    }
+    if step_count > macro_data::MAX_MACRO_STEPS {
+        return Err(Error::TooManySteps {
+            max: macro_data::MAX_MACRO_STEPS,
+            actual: step_count,
+        });
+    }
+    Ok(Request::new(
         cmd::READ_MACRO,
         macro_subcmd(gamepad_mode, slot),
         total_len,
         macro_idx.sector_offset(),
-    )
+    ))
 }
 
 /// Write macro steps, splitting into packets of at most `chunk_size` bytes.
@@ -276,28 +406,43 @@ pub fn write_macro_steps(
     chunk_size: usize,
 ) -> Result<Vec<Request>, Error> {
     let payload = macro_data::encode_macro_steps(steps)?;
-    Ok(write_macro_payload(
-        gamepad_mode,
-        slot,
-        macro_idx,
-        &payload,
-        chunk_size,
-    ))
+    write_macro_payload(gamepad_mode, slot, macro_idx, &payload, chunk_size)
 }
 
 /// Write a pre-encoded macro payload (already 32-byte aligned).
-#[must_use]
+///
+/// `chunk_size` is clamped to [`MACRO_MAX_CHUNK_SIZE`] (`0x40`), matching the
+/// official BLE limit. USB HID callers normally pass `0x20`. Offsets advance
+/// by the **clamped** chunk size, and every packet carries the CRC-16/MODBUS
+/// of its own payload.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidChunkSize`] when `chunk_size` is zero, or
+/// [`Error::PayloadTooLarge`] when `payload` exceeds one 4 KB flash sector.
 pub fn write_macro_payload(
     gamepad_mode: u16,
     slot: Slot,
     macro_idx: MacroIndex,
     payload: &[u8],
     chunk_size: usize,
-) -> Vec<Request> {
-    assert!(chunk_size > 0, "chunk_size must be positive");
+) -> Result<Vec<Request>, Error> {
+    if chunk_size == 0 {
+        return Err(Error::InvalidChunkSize {
+            max: MACRO_MAX_CHUNK_SIZE,
+            actual: 0,
+        });
+    }
+    if payload.len() > MACRO_MAX_PAYLOAD {
+        return Err(Error::PayloadTooLarge {
+            max: MACRO_MAX_PAYLOAD,
+            actual: payload.len(),
+        });
+    }
+    let chunk_size = chunk_size.min(MACRO_MAX_CHUNK_SIZE);
     let total_len = payload.len() as u32;
     let base = macro_idx.sector_offset();
-    payload
+    Ok(payload
         .chunks(chunk_size)
         .enumerate()
         .map(|(i, chunk)| {
@@ -309,18 +454,27 @@ pub fn write_macro_payload(
             )
             .with_crc_payload(chunk)
         })
-        .collect()
+        .collect())
 }
 
 /// Erase one macro flash sector (`0x1000` bytes).
+///
+/// The official `getBT2_EraseMacro` writes `total_len = chunk_len = 0x1000`
+/// into the request header even though no payload bytes follow. Encode this
+/// request with
+/// [`Request::encode_ble_payloadless`](Request::encode_ble_payloadless) or
+/// [`Request::encode_usb_app_payloadless`](Request::encode_usb_app_payloadless);
+/// the normal encoders correctly reject the declared-length mismatch.
 #[must_use]
 pub fn erase_macro(gamepad_mode: u16, slot: Slot, macro_idx: MacroIndex) -> Request {
-    Request::new(
+    let mut request = Request::new(
         cmd::ERASE_MACRO,
         macro_subcmd(gamepad_mode, slot),
-        0x1000,
+        macro_data::MACRO_SECTOR_SIZE,
         macro_idx.sector_offset(),
-    )
+    );
+    request.header.chunk_len = macro_data::MACRO_SECTOR_SIZE as u16;
+    request
 }
 
 /// Bootloader Mode command builders (`prefix 0x05`, advertise name `"8bt"`).
@@ -369,24 +523,71 @@ pub mod boot {
     }
 
     /// Erase the 4 KB sector containing `addr`.
-    #[must_use]
-    pub fn erase_flash(addr: u32) -> Request {
-        Request::new(CMD_ERASE_FLASH, 0, SECTOR_SIZE, addr)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::Error::UnalignedAddress`] when `addr` is not a
+    /// multiple of [`SECTOR_SIZE`] (`0x1000`).
+    pub fn erase_flash(addr: u32) -> Result<Request, crate::error::Error> {
+        if addr % SECTOR_SIZE != 0 {
+            return Err(crate::error::Error::UnalignedAddress {
+                address: addr,
+                alignment: SECTOR_SIZE,
+            });
+        }
+        Ok(Request::new(CMD_ERASE_FLASH, 0, SECTOR_SIZE, addr))
     }
 
     /// Write one firmware chunk (at most 64 bytes) with CRC-16/MODBUS.
-    #[must_use]
-    pub fn write_firmware(addr: u32, image_len: u32, chunk: &[u8]) -> Request {
-        let mut request = Request::new(CMD_WRITE_FIRMWARE, 0, image_len, addr);
-        request.header.crc16 = crate::crc::packet_crc16(chunk);
-        request.header.chunk_len = chunk.len() as u16;
-        request.payload = chunk.to_vec();
-        request
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::Error::PayloadTooLarge`] when `chunk` exceeds
+    /// [`CHUNK_SIZE`] (`0x40`).
+    pub fn write_firmware(
+        addr: u32,
+        image_len: u32,
+        chunk: &[u8],
+    ) -> Result<Request, crate::error::Error> {
+        if chunk.len() > CHUNK_SIZE {
+            return Err(crate::error::Error::PayloadTooLarge {
+                max: CHUNK_SIZE,
+                actual: chunk.len(),
+            });
+        }
+        Ok(Request::new(CMD_WRITE_FIRMWARE, 0, image_len, addr).with_crc_payload(chunk))
     }
 
     /// Split a firmware image into 64-byte write packets.
-    #[must_use]
-    pub fn write_firmware_packets(addr: u32, image_len: u32, image: &[u8]) -> Vec<Request> {
+    ///
+    /// A short final chunk is rejected rather than padded: the official tool
+    /// only writes full 64-byte chunks, and the padding policy for a real
+    /// image whose length is not a multiple of 64 is still pending hardware
+    /// confirmation. No padding bytes are invented here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::Error::UnalignedImageLength`] when
+    /// `image.len()` is not a multiple of [`CHUNK_SIZE`], or
+    /// [`crate::error::Error::ImageLengthMismatch`] when it disagrees with
+    /// `image_len`.
+    pub fn write_firmware_packets(
+        addr: u32,
+        image_len: u32,
+        image: &[u8],
+    ) -> Result<Vec<Request>, crate::error::Error> {
+        if image.len() % CHUNK_SIZE != 0 {
+            return Err(crate::error::Error::UnalignedImageLength {
+                actual: image.len(),
+                alignment: CHUNK_SIZE,
+            });
+        }
+        if image.len() as u32 != image_len {
+            return Err(crate::error::Error::ImageLengthMismatch {
+                declared: image_len,
+                actual: image.len(),
+            });
+        }
         image
             .chunks(CHUNK_SIZE)
             .enumerate()
@@ -395,12 +596,25 @@ pub mod boot {
     }
 
     /// Write the 24-byte image header (`cmd 0x00C4`).
-    #[must_use]
-    pub fn write_version_header(image_len: u32, header24: &[u8]) -> Request {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::Error::InvalidLength`] unless `header24` is
+    /// exactly 24 bytes.
+    pub fn write_version_header(
+        image_len: u32,
+        header24: &[u8],
+    ) -> Result<Request, crate::error::Error> {
+        if header24.len() != 0x18 {
+            return Err(crate::error::Error::InvalidLength {
+                expected: 0x18,
+                actual: header24.len(),
+            });
+        }
         let mut request = Request::new(CMD_WRITE_VERSION, 0, image_len, 0);
         request.header.chunk_len = header24.len() as u16;
         request.payload = header24.to_vec();
-        request
+        Ok(request)
     }
 
     /// Write the 4-byte firmware version value.
@@ -411,9 +625,19 @@ pub mod boot {
     }
 
     /// Write the 12-byte encrypted APPID (not used for `gamepad_type == 1`).
-    #[must_use]
-    pub fn write_appid(serial: &[u8]) -> Request {
-        Request::new(CMD_WRITE_FIRMWARE_VERSION, 0, 0x0C, APPID_ADDR).with_crc_payload(serial)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::Error::InvalidLength`] unless `serial` is
+    /// exactly 12 bytes.
+    pub fn write_appid(serial: &[u8]) -> Result<Request, crate::error::Error> {
+        if serial.len() != 0x0C {
+            return Err(crate::error::Error::InvalidLength {
+                expected: 0x0C,
+                actual: serial.len(),
+            });
+        }
+        Ok(Request::new(CMD_WRITE_FIRMWARE_VERSION, 0, 0x0C, APPID_ADDR).with_crc_payload(serial))
     }
 
     /// Jump to the application and leave bootloader mode.
@@ -448,20 +672,24 @@ mod tests {
     }
 
     #[test]
-    fn write_config_is_cmd_1_with_full_total_len() {
-        let request = write_config(0x74, &[1, 2, 3, 4]);
+    fn write_config_is_cmd_1_with_full_total_len_and_crc() {
+        let request = write_config(0x74, &[1, 2, 3, 4]).unwrap();
         assert_eq!(request.header.cmd, 0x0001);
         assert_eq!(request.header.subcmd, 0);
         assert_eq!(request.header.total_len, 0x0AD0);
         assert_eq!(request.header.offset, 0x74);
         assert_eq!(request.header.chunk_len, 4);
+        assert_eq!(
+            request.header.crc16,
+            crate::crc::packet_crc16(&[1, 2, 3, 4])
+        );
         assert_eq!(request.payload, [1, 2, 3, 4]);
     }
 
     #[test]
-    fn config_packets_advance_offsets() {
+    fn config_packets_advance_offsets_and_carry_crc() {
         let data = [0xAAu8; 100];
-        let packets = write_config_packets(0x100, &data, 32);
+        let packets = write_config_packets(0x100, &data, 32).unwrap();
         assert_eq!(packets.len(), 4);
         assert_eq!(packets[0].header.offset, 0x100);
         assert_eq!(packets[1].header.offset, 0x120);
@@ -470,7 +698,41 @@ mod tests {
         assert_eq!(packets[3].payload.len(), 4);
         for packet in &packets {
             assert_eq!(packet.header.total_len, 0x0AD0);
+            assert_eq!(packet.header.chunk_len as usize, packet.payload.len());
+            assert_eq!(
+                packet.header.crc16,
+                crate::crc::packet_crc16(&packet.payload)
+            );
+            assert_ne!(packet.header.crc16, 0);
         }
+    }
+
+    #[test]
+    fn config_ranges_are_bounded() {
+        assert!(matches!(
+            read_config(0x0AD0, 1),
+            Err(Error::RangeOutOfBounds {
+                offset: 0x0AD0,
+                len: 1,
+                limit: 0x0AD0,
+            })
+        ));
+        assert!(matches!(
+            read_config(0x0AC0, 0x11),
+            Err(Error::RangeOutOfBounds { .. })
+        ));
+        assert!(matches!(
+            write_config(0x0ACF, &[0, 0]),
+            Err(Error::RangeOutOfBounds { .. })
+        ));
+        assert!(matches!(
+            write_config_packets(0x0AD0, &[1], 1),
+            Err(Error::RangeOutOfBounds { .. })
+        ));
+        assert!(matches!(
+            write_config_packets(0, &[1], 0),
+            Err(Error::InvalidChunkSize { actual: 0, .. })
+        ));
     }
 
     #[test]
@@ -481,11 +743,12 @@ mod tests {
     }
 
     #[test]
-    fn version_query_magic() {
+    fn read_version_uses_type_1_parameters() {
         let request = read_version();
         assert_eq!(request.header.cmd, 0x000B);
-        assert_eq!(request.header.total_len, 0x0102_0030);
-        assert_eq!(request.header.offset, 0x0102_0030);
+        assert_eq!(request.header.total_len, 4);
+        assert_eq!(request.header.offset, boot::VERSION_ADDR);
+        assert_eq!(request.header.offset, 0x0101_7040);
     }
 
     #[test]
@@ -507,11 +770,28 @@ mod tests {
 
     #[test]
     fn read_macro_uses_raw_length_and_sector_offset() {
-        let request = read_macro(3, Slot::S2, MacroIndex::M3, 42);
+        let request = read_macro(3, Slot::S2, MacroIndex::M3, 42).unwrap();
         assert_eq!(request.header.cmd, 0x0102);
         assert_eq!(request.header.subcmd, 0x0301);
         assert_eq!(request.header.offset, 0x2000);
         assert_eq!(request.header.total_len, 420);
+    }
+
+    #[test]
+    fn read_macro_rejects_oversized_requests() {
+        assert!(matches!(
+            read_macro(
+                0,
+                Slot::S1,
+                MacroIndex::M1,
+                macro_data::MAX_MACRO_STEPS as u16 + 1
+            ),
+            Err(Error::TooManySteps { .. })
+        ));
+        assert!(matches!(
+            read_macro(0, Slot::S1, MacroIndex::M1, 0x1000 / 10 + 1),
+            Err(Error::RangeOutOfBounds { .. })
+        ));
     }
 
     #[test]
@@ -545,12 +825,89 @@ mod tests {
     }
 
     #[test]
-    fn erase_macro_is_one_sector() {
+    fn write_macro_payload_clamps_chunk_size_to_64() {
+        let payload = [0x33u8; 160];
+        let packets = write_macro_payload(0, Slot::S2, MacroIndex::M2, &payload, 128).unwrap();
+        // 160 bytes clamped to 64-byte chunks: 64 + 64 + 32.
+        assert_eq!(packets.len(), 3);
+        assert_eq!(packets[0].header.offset, 0x1000);
+        assert_eq!(packets[1].header.offset, 0x1040);
+        assert_eq!(packets[2].header.offset, 0x1080);
+        assert_eq!(packets[2].payload.len(), 32);
+        for packet in &packets {
+            assert!(packet.payload.len() <= 64);
+            assert!(packet.header.chunk_len <= 0x40);
+            assert_eq!(packet.header.chunk_len as usize, packet.payload.len());
+            assert_eq!(
+                packet.header.crc16,
+                crate::crc::packet_crc16(&packet.payload)
+            );
+        }
+    }
+
+    #[test]
+    fn write_macro_payload_rejects_oversized_payload() {
+        let payload = alloc::vec![0u8; MACRO_MAX_PAYLOAD + 1];
+        assert!(matches!(
+            write_macro_payload(0, Slot::S1, MacroIndex::M1, &payload, 64),
+            Err(Error::PayloadTooLarge {
+                max: MACRO_MAX_PAYLOAD,
+                ..
+            })
+        ));
+        assert!(matches!(
+            write_macro_payload(0, Slot::S1, MacroIndex::M1, &payload[..32], 0),
+            Err(Error::InvalidChunkSize { actual: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn erase_macro_declares_one_sector_without_payload() {
         let request = erase_macro(3, Slot::S1, MacroIndex::M2);
         assert_eq!(request.header.cmd, 0x0104);
         assert_eq!(request.header.total_len, 0x1000);
+        assert_eq!(request.header.chunk_len, 0x1000);
         assert_eq!(request.header.offset, 0x1000);
+        assert_eq!(request.header.subcmd, 0x0300);
         assert!(request.payload.is_empty());
+    }
+
+    #[test]
+    fn erase_macro_encodes_payloadless_with_declared_chunk_len() {
+        let request = erase_macro(3, Slot::S1, MacroIndex::M2);
+
+        let ble = request.encode_ble_payloadless(PacketKind::App);
+        assert_eq!(ble.len(), 17);
+        assert_eq!(ble[0], 0x04);
+        let header = CustomHeader::parse(&ble[1..17]).unwrap();
+        assert_eq!(header.chunk_len, 0x1000);
+        assert_eq!(header.total_len, 0x1000);
+        assert_eq!(header.offset, 0x1000);
+        assert_eq!(header.cmd, 0x0104);
+
+        let usb = request.encode_usb_app_payloadless();
+        assert_eq!(usb.len(), 65);
+        assert_eq!(&usb[0..2], &[0x81, 0x04]);
+        let header = CustomHeader::parse(&usb[2..18]).unwrap();
+        assert_eq!(header.chunk_len, 0x1000);
+        assert_eq!(header.total_len, 0x1000);
+        assert!(usb[18..].iter().all(|&byte| byte == 0));
+
+        // The normal encoders must keep rejecting the declared-length mismatch.
+        assert_eq!(
+            request.encode_ble(PacketKind::App),
+            Err(Error::ChunkLenMismatch {
+                declared: 0x1000,
+                actual: 0,
+            })
+        );
+        assert_eq!(
+            request.encode_usb_app(),
+            Err(Error::ChunkLenMismatch {
+                declared: 0x1000,
+                actual: 0,
+            })
+        );
     }
 
     #[test]
@@ -583,16 +940,61 @@ mod tests {
     #[test]
     fn boot_firmware_chunks_have_crc() {
         let image = [0x5Au8; 128];
-        let packets = boot::write_firmware_packets(0x0800_0000, image.len() as u32, &image);
+        let packets =
+            boot::write_firmware_packets(0x0800_0000, image.len() as u32, &image).unwrap();
         assert_eq!(packets.len(), 2);
         assert_eq!(packets[1].header.offset, 0x0800_0040);
         assert_eq!(packets[0].payload, [0x5A; 64]);
         for packet in &packets {
+            assert_eq!(packet.header.chunk_len, 0x40);
             assert_eq!(
                 packet.header.crc16,
                 crate::crc::packet_crc16(&packet.payload)
             );
         }
+    }
+
+    #[test]
+    fn boot_firmware_rejects_short_and_mismatched_images() {
+        for len in [63usize, 65] {
+            let image = alloc::vec![0x5Au8; len];
+            assert!(matches!(
+                boot::write_firmware_packets(0x0800_0000, len as u32, &image),
+                Err(Error::UnalignedImageLength {
+                    actual,
+                    alignment: 0x40,
+                }) if actual == len
+            ));
+        }
+
+        let image = [0x5Au8; 128];
+        assert!(matches!(
+            boot::write_firmware_packets(0x0800_0000, 64, &image),
+            Err(Error::ImageLengthMismatch {
+                declared: 64,
+                actual: 128,
+            })
+        ));
+        assert!(matches!(
+            boot::write_firmware(0x0800_0000, 128, &[0u8; 65]),
+            Err(Error::PayloadTooLarge {
+                max: 0x40,
+                actual: 65,
+            })
+        ));
+    }
+
+    #[test]
+    fn boot_erase_requires_sector_alignment() {
+        assert!(boot::erase_flash(0x0800_0000).is_ok());
+        assert!(boot::erase_flash(0x0800_1000).is_ok());
+        assert!(matches!(
+            boot::erase_flash(0x0800_0040),
+            Err(Error::UnalignedAddress {
+                address: 0x0800_0040,
+                alignment: 0x1000,
+            })
+        ));
     }
 
     #[test]
@@ -607,11 +1009,35 @@ mod tests {
         );
 
         let header = [0x11u8; 24];
-        let request = boot::write_version_header(0x1000, &header);
+        let request = boot::write_version_header(0x1000, &header).unwrap();
         assert_eq!(request.header.cmd, 0x00C4);
         assert_eq!(request.header.chunk_len, 24);
         assert_eq!(request.header.total_len, 0x1000);
         assert_eq!(request.payload, header);
+
+        for len in [23usize, 25] {
+            assert!(matches!(
+                boot::write_version_header(0x1000, &alloc::vec![0u8; len]),
+                Err(Error::InvalidLength {
+                    expected: 24,
+                    actual,
+                }) if actual == len
+            ));
+        }
+
+        let appid = boot::write_appid(&[0x42u8; 12]).unwrap();
+        assert_eq!(appid.header.total_len, 0x0C);
+        assert_eq!(appid.header.offset, 0x0801_401C);
+        assert_eq!(appid.header.crc16, crate::crc::packet_crc16(&[0x42; 12]));
+        for len in [11usize, 13] {
+            assert!(matches!(
+                boot::write_appid(&alloc::vec![0u8; len]),
+                Err(Error::InvalidLength {
+                    expected: 12,
+                    actual,
+                }) if actual == len
+            ));
+        }
     }
 
     #[test]
