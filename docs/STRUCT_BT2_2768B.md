@@ -494,7 +494,7 @@ struct Bt2Header {
     - 例: `max_steps = 4` → `raw_bytes = 40` → `aligned_len = 64`（不足分 24 バイトはホスト側バッファ上のゼロ詰め領域が送られる）
     - 例: `max_steps = 16` → `raw_bytes = 160` → `aligned_len = 160`
   - **Read (`cmd 0x0102`) の `total_len`**: アライメントなしの `max_steps * 10` をそのまま指定。
-  - **Erase (`cmd 0x0104`) の `total_len`**: `0x1000` (4096 バイト = 1 セクタ分)。ペイロードを持たないが、公式実装は `chunk_len` も `0x1000` に設定する（wire header `+0x04` はその値。実ペイロードは `len = 0`）。
+  - **Erase (`cmd 0x0104`) の `total_len` / `chunk_len` / `crc16`**: `total_len` は `0x1000` (4096 バイト = 1 セクタ分)。ペイロードを持たないが、公式実装は `chunk_len` も `0x1000` に設定する（wire header `+0x04` はその値。実ペイロードは `len = 0`）。`gamepad_type == 1` の CRC 計算は空ペイロードに対して行われ、`crc16` は長さ `<= 0` で `0xFFFF` を返すため、wire header `+0x06` は `0xFFFF` となる。
 
 ### 9.3 Flash 読み書き完全シーケンス
 
@@ -506,13 +506,14 @@ struct Bt2Header {
    - `offset = macro_idx << 12`
    - `total_len = 0x1000`（消去サイズ。ペイロード長ではない）
    - `chunk_len = 0x1000`（公式実装のチャネル設定値。wire header `+0x04` に書かれる。ペイロードなし、`len = 0`）
+   - `crc16 = 0xFFFF`（空ペイロードに対する CRC-16/MODBUS。公式 `crc16` は長さ `<= 0` で `0xFFFF`）
 2. **Step 2: マクロステップデータ書込 (`Write`)**
    - `cmd = 0x0103`
    - `subcmd = (gamepad_mode << 8) | slot`
    - `offset = (macro_idx << 12) + chunk_index * chunk_size`（`chunk_index` はパケットごとに進む）
    - `total_len = align32(max_steps * 10)`
-   - `chunk_size` は BLE 64B / USB HID 32B（または交渉済みチャンクサイズ）。最終チャンクは 32B アライン長。`chunk_size` が BLE `0x40` / USB HID `0x20` を超える場合は **拒否または上限へクランプ** し、上限超過をテストする
-   - ペイロード: `max_steps * 10` バイト＋32B アライメント用ゼロパディング（BLE 64B / USB HID 32B または交渉済みサイズで分割送信・`Send_CustomCmdPacket` 準拠で各チャンクヘッダ `CRC-16/MODBUS (0xA001)` 付与）
+   - `chunk_size` は BLE 64B / USB HID 32B（32B アライン。それ以外は拒否。64B 超は 64B にクランプしてから判定）。最終チャンクは 32B アライン長。46B などの交渉済みサイズは将来拡張で、現在の API は `UnsupportedChunkSize` を返す
+   - ペイロード: `max_steps * 10` バイト＋32B アライメント用ゼロパディング（BLE 64B / USB HID 32B で分割送信・`Send_CustomCmdPacket` 準拠で各チャンクヘッダ `CRC-16/MODBUS (0xA001)` 付与）
 3. **Step 3: 2768B コンフィグ内のマクロ管理ヘッダ更新**
    - `max_steps`, `key_map`, `cycles_num`, `interval_ms`, `filename`, `total_cnt`, `flag` 等を `0x68C + slot * 0xD8` に反映し、`ANSI_CRC_16_sh` を再計算する。
    - 部分書込 (`cmd = 0x0001, subcmd = 0x0000, offset = 0x68C + slot * 0xD8, len = 0xD8, total_len = 0x0AD0`) または全体書込を送信する。

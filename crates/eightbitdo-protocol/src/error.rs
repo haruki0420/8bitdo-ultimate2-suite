@@ -39,6 +39,71 @@ pub enum Error {
         /// Payload size supplied.
         actual: usize,
     },
+    /// A required payload was empty.
+    EmptyPayload,
+    /// A required firmware image was empty.
+    EmptyFirmwareImage,
+    /// A chunk size was zero or exceeded the protocol limit.
+    InvalidChunkSize {
+        /// Maximum supported chunk size in bytes.
+        max: usize,
+        /// Chunk size supplied.
+        actual: usize,
+    },
+    /// A macro chunk size was neither 32 nor 64 bytes after clamping.
+    UnsupportedChunkSize {
+        /// Chunk size supplied.
+        actual: usize,
+    },
+    /// A macro payload length was not a multiple of 32 bytes.
+    UnalignedPayloadLength {
+        /// Supplied payload length in bytes.
+        actual: usize,
+        /// Required alignment in bytes.
+        alignment: usize,
+    },
+    /// A payload was supplied for a command that must not carry one.
+    UnexpectedPayload {
+        /// Payload length supplied.
+        actual: usize,
+    },
+    /// A firmware write address overflowed the 32-bit address space.
+    AddressOverflow {
+        /// Base address supplied by the caller.
+        base: u32,
+        /// Chunk offset added to the base address.
+        offset: u64,
+    },
+    /// A read or write range exceeded its fixed-size backing buffer.
+    RangeOutOfBounds {
+        /// Start offset of the requested range.
+        offset: u64,
+        /// Length of the requested range in bytes.
+        len: u64,
+        /// Exclusive upper bound of the backing buffer.
+        limit: u64,
+    },
+    /// A firmware image length was not a multiple of the 64-byte chunk size.
+    UnalignedImageLength {
+        /// Supplied image length in bytes.
+        actual: usize,
+        /// Required alignment in bytes.
+        alignment: usize,
+    },
+    /// The declared firmware image length disagreed with the supplied data.
+    ImageLengthMismatch {
+        /// Length declared by the caller.
+        declared: u32,
+        /// Length read from the supplied image or image header.
+        actual: u32,
+    },
+    /// An address was not aligned to the required boundary.
+    UnalignedAddress {
+        /// Address supplied by the caller.
+        address: u32,
+        /// Required alignment in bytes.
+        alignment: u32,
+    },
     /// The header `chunk_len` field disagreed with the actual payload length.
     ChunkLenMismatch {
         /// Value stored in the header.
@@ -73,6 +138,48 @@ impl fmt::Display for Error {
             Self::EmbeddedNul => write!(f, "string contains a NUL code unit"),
             Self::PayloadTooLarge { max, actual } => {
                 write!(f, "payload too large: max {max} bytes, got {actual}")
+            }
+            Self::EmptyPayload => write!(f, "payload must not be empty"),
+            Self::EmptyFirmwareImage => write!(f, "firmware image must not be empty"),
+            Self::InvalidChunkSize { max, actual } => {
+                write!(
+                    f,
+                    "invalid chunk size: expected 1..={max} bytes, got {actual}"
+                )
+            }
+            Self::UnsupportedChunkSize { actual } => write!(
+                f,
+                "unsupported chunk size {actual}: expected 32 or 64 bytes"
+            ),
+            Self::UnalignedPayloadLength { actual, alignment } => write!(
+                f,
+                "payload length {actual} is not a multiple of {alignment}"
+            ),
+            Self::UnexpectedPayload { actual } => {
+                write!(
+                    f,
+                    "unexpected payload of {actual} bytes for a payloadless command"
+                )
+            }
+            Self::AddressOverflow { base, offset } => write!(
+                f,
+                "firmware write address 0x{base:X} + {offset} overflows u32"
+            ),
+            Self::RangeOutOfBounds { offset, len, limit } => write!(
+                f,
+                "range 0x{offset:X}..0x{:X} exceeds limit 0x{limit:X}",
+                offset.saturating_add(*len)
+            ),
+            Self::UnalignedImageLength { actual, alignment } => write!(
+                f,
+                "firmware image length {actual} is not a multiple of {alignment}"
+            ),
+            Self::ImageLengthMismatch { declared, actual } => write!(
+                f,
+                "declared firmware image length {declared} does not match supplied {actual} bytes"
+            ),
+            Self::UnalignedAddress { address, alignment } => {
+                write!(f, "address 0x{address:X} is not aligned to 0x{alignment:X}")
             }
             Self::ChunkLenMismatch { declared, actual } => write!(
                 f,

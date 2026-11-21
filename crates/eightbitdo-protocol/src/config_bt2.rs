@@ -913,9 +913,15 @@ impl Bt2Config {
     }
 
     /// Encode a profile name (max 16 UTF-16 code units).
+    ///
+    /// The field is only updated when the whole name is valid, so a failed
+    /// call leaves the existing 32 bytes unchanged.
     pub fn set_profile_name(&mut self, slot: Slot, name: &str) -> Result<(), Error> {
         let offset = profile_name_offset(slot);
-        encode_utf16be(name, &mut self.raw[offset..offset + PROFILE_NAME_SIZE])
+        let mut encoded = [0u8; PROFILE_NAME_SIZE];
+        encode_utf16be(name, &mut encoded)?;
+        self.raw[offset..offset + PROFILE_NAME_SIZE].copy_from_slice(&encoded);
+        Ok(())
     }
 
     // --- rumble / sticks / triggers / features --------------------------
@@ -1194,8 +1200,13 @@ impl Bt2Config {
     /// Copy every per-slot section from `src` to `dst`.
     ///
     /// This mirrors the official `copyConfig`: it also copies the legacy
-    /// reserved regions and rewrites the fifth character of the copied name to
-    /// the destination profile number, as the original tool does.
+    /// reserved regions, copies `slot_flags[src]` into `slot_flags[dst]`, and
+    /// rewrites the fifth character of the copied name to the destination
+    /// profile number, as the original tool does.
+    ///
+    /// Only the 2768-byte configuration structure is copied. The host-side
+    /// macro step buffer (`0x1F70` bytes per slot) is not part of this
+    /// structure and is not copied.
     pub fn copy_slot(&mut self, dst: Slot, src: Slot) {
         if dst == src {
             return;
@@ -1219,12 +1230,16 @@ impl Bt2Config {
         copy(OFF_HOTWHEEL, HOTWHEEL_SIZE);
         copy(OFF_SINGLE, SINGLE_SIZE);
 
-        self.set_slot_flag(dst, 1);
+        let flag = self.slot_flag(src);
+        self.set_slot_flag(dst, flag);
         // Official copyConfig writes `buf[dst * 0x20 + 0x1d] = dst + '1'`.
         self.raw[profile_name_offset(dst) + 9] = b'1' + dst.index() as u8;
     }
 
     /// Clear one slot, matching the official `deleteCurslot` behaviour.
+    ///
+    /// The official implementation writes `cur_slot = 4` unconditionally, even
+    /// when a different slot is deleted. This method reproduces that.
     pub fn delete_slot(&mut self, slot: Slot) {
         self.set_slot_flag(slot, 0);
 
@@ -1250,9 +1265,7 @@ impl Bt2Config {
         self.set_u32(OFF_LEGACY_A + slot.index() * LEGACY_A_SLOT_SIZE, 0);
         self.set_u32(OFF_LEGACY_B + slot.index() * LEGACY_B_SLOT_SIZE, 0);
 
-        if self.cur_slot() == Some(slot) {
-            self.set_cur_slot(None);
-        }
+        self.set_cur_slot(None);
     }
 
     // --- raw helpers ----------------------------------------------------
@@ -1300,10 +1313,12 @@ impl Bt2Config {
 }
 
 /// Encode `name` as UTF-16BE into a fixed-size field, zero padded.
+///
+/// Validation completes before `dst` is touched, so an error leaves the
+/// destination buffer unchanged.
 fn encode_utf16be(name: &str, dst: &mut [u8]) -> Result<(), Error> {
     let max_units = dst.len() / 2;
-    let mut units = 0;
-    for unit in name.encode_utf16() {
+    for (units, unit) in name.encode_utf16().enumerate() {
         if unit == 0 {
             return Err(Error::EmbeddedNul);
         }
@@ -1313,10 +1328,11 @@ fn encode_utf16be(name: &str, dst: &mut [u8]) -> Result<(), Error> {
                 actual: name.encode_utf16().count(),
             });
         }
-        dst[units * 2..units * 2 + 2].copy_from_slice(&unit.to_be_bytes());
-        units += 1;
     }
-    dst[units * 2..].fill(0);
+    dst.fill(0);
+    for (i, unit) in name.encode_utf16().enumerate() {
+        dst[i * 2..i * 2 + 2].copy_from_slice(&unit.to_be_bytes());
+    }
     Ok(())
 }
 
@@ -1418,6 +1434,24 @@ mod tests {
             config.set_profile_name(Slot::S1, "ab\0cd"),
             Err(Error::EmbeddedNul)
         );
+    }
+
+    #[test]
+    fn failed_profile_name_leaves_the_field_unchanged() {
+        let mut config = Bt2Config::zeroed();
+        config.set_profile_name(Slot::S1, "KeepMe").unwrap();
+        let before = config.profile_name_raw(Slot::S1).to_vec();
+
+        assert!(config
+            .set_profile_name(Slot::S1, "12345678901234567")
+            .is_err());
+        assert_eq!(config.profile_name_raw(Slot::S1), before);
+
+        assert_eq!(
+            config.set_profile_name(Slot::S1, "ab\0cd"),
+            Err(Error::EmbeddedNul)
+        );
+        assert_eq!(config.profile_name_raw(Slot::S1), before);
     }
 
     #[test]
@@ -1678,15 +1712,29 @@ mod tests {
     }
 
     #[test]
-    fn delete_slot_clears_only_that_slot() {
+    fn copy_slot_copies_the_source_flag() {
+        let mut config = sample();
+        config.set_slot_flag(Slot::S1, 0);
+        config.set_slot_flag(Slot::S2, 1);
+
+        config.copy_slot(Slot::S2, Slot::S1);
+
+        assert_eq!(config.slot_flag(Slot::S2), 0);
+        assert_eq!(config.profile_name(Slot::S2), "Slot2");
+    }
+
+    #[test]
+    fn delete_slot_clears_only_that_slot_and_resets_cur_slot() {
         let mut config = sample();
         config.set_rumble(Slot::S2, &RumbleRecord::from_level(2).unwrap());
-        config.set_cur_slot(Some(Slot::S2));
+        config.set_cur_slot(Some(Slot::S1));
         config.delete_slot(Slot::S2);
 
         assert_eq!(config.slot_flag(Slot::S2), 0);
         assert_eq!(config.profile_name(Slot::S2), "");
         assert_eq!(config.rumble(Slot::S2).flag, 0);
+        // Official deleteCurslot writes cur_slot = 4 unconditionally.
+        assert_eq!(config.cur_slot_raw(), 4);
         assert_eq!(config.cur_slot(), None);
         // Other slots untouched.
         assert_eq!(config.slot_flag(Slot::S1), 1);

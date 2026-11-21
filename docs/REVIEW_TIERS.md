@@ -282,8 +282,8 @@ Erase 0x0104
   (subcmd = (mode << 8) | slot,
    offset = (macro_idx << 12) + chunk_index * chunk_size,
    total_len = align32(max_steps * 10),
-   chunk_size = BLE 64B / USB HID 32B（または交渉済みチャンクサイズ。
-   上限超過は拒否または上限へクランプ）,
+   chunk_size = BLE 64B / USB HID 32B（32B アライン。それ以外は拒否。
+   64B 超は 64B にクランプしてから判定）,
    32B アライン、各チャンク CRC-16/MODBUS)
 → マクロヘッダ更新 0x0001
   (subcmd 0x0000, offset = 0x68C + slot * 0xD8, len 0xD8,
@@ -292,9 +292,9 @@ Erase 0x0104
   (BLE: subcmd 0x0067 / USB: subcmd 0x0123)
 ```
 
-- `Erase 0x0104` はペイロードを持たない。公式実装（`getBT2_EraseMacro`）は `total_len` と `chunk_len` をともに `0x1000` に設定し、`Generate_CustomDataCmd` が wire header `+0x04` にその値を書く。実ペイロードは `len = 0`。`total_len = 0x1000` は消去サイズであり、ペイロード長ではない。`chunk_len = 0` と混同しない（Rust 実装の修正は本 PR に含めない。Issue #2 の追記を参照: `fix/phase1-review-findings` の `be375d1` で実装済み、本 PR の後に別 PR）。
-- `Write 0x0103` の `offset` は `(macro_idx << 12) + chunk_index * chunk_size`。`chunk_size` は BLE 64B / USB HID 32B（または交渉済みサイズ）。各チャンク送信ごとに `chunk_index` を進める。
-- マクロのチャンクは BLE 最大 64B / USB HID 最大 32B（または交渉済みサイズ）。**最終チャンクは 32B アライン長まで** とし、OTA の「最終チャンク 64B 固定」とは混同しない。`chunk_size` が上限（BLE `0x40` / USB HID `0x20`）を超える場合は **拒否または上限へクランプ** し、上限超過のテストを追加する。
+- `Erase 0x0104` はペイロードを持たない。公式実装（`getBT2_EraseMacro`）は `total_len` と `chunk_len` をともに `0x1000` に設定し、`Generate_CustomDataCmd` が wire header `+0x04` にその値を書く。実ペイロードは `len = 0`。`total_len = 0x1000` は消去サイズであり、ペイロード長ではない。`chunk_len = 0` と混同しない。Rust 実装の修正は本 PR に含まれる。
+- `Write 0x0103` の `offset` は `(macro_idx << 12) + chunk_index * chunk_size`。`chunk_size` は BLE 64B / USB HID 32B（32B アライン。それ以外は拒否）。各チャンク送信ごとに `chunk_index` を進める。
+- マクロのチャンクは BLE 最大 64B / USB HID 最大 32B（32B アライン。それ以外は拒否。64B 超は 64B にクランプしてから判定）。**最終チャンクは 32B アライン長まで** とし、OTA の「最終チャンク 64B 固定」とは混同しない。46B などの交渉済みサイズは将来拡張で、現在の API は `UnsupportedChunkSize` を返す。
 - マクロの ACK タイムアウトは OTA と別に扱う。`Erase 0x0104` / `Write 0x0103` / ヘッダ `0x0001` は 2 秒（実装定数 `0x44fa0000`）、マクロ `Save 0x0006` は 3 秒（USB HID の仕様記載。BLE は transport の `wait_ack` 既定値とリトライ方針を記録する）。OTA の 10 秒 erase / 1 秒 chunk / 64B 固定をマクロに適用しない。`Save 0x0006` の ACK を受けるまで成功とみなさない。
 - `align32(x) = (x + 31) & ~31 = ((x + 31) / 32) * 32`、`Erase 0x0104` の `offset = macro_idx << 12`、4KB セクタを確認する。
 - バックアップは 2768B 設定の `max_steps` を読み、各 `(slot, macro_idx)` を `Read 0x0102`（`subcmd=(mode<<8)|slot`, `offset=macro_idx<<12`, `total_len=max_steps*10`）で取得する。`max_steps` は `u16` で、絶対 offset は `0x68C + slot * 0xD8 + 0x08 + macro_idx * 0x34 + 0x22`（= `0x6B6 + slot * 0xD8 + macro_idx * 0x34`）。`+0x08` はスロット内の `records[4]` 先頭、`+0x22` は `MacroFunPro3Record` 内の `max_steps`。
@@ -336,7 +336,7 @@ Erase 0x0104
 | RT/LT を入れ替える | マクロステップのバイト配置テスト | 例: 検出 | なし | テスト名 |
 | BLE RX に `0x04` プレフィックスを要求する | 受信フレーミングテスト | 例: 検出 | なし | テスト名 |
 | `cmd 0x0103` の 64B クランプを外す | チャンク分割テスト | 例: 検出 | なし | テスト名 |
-| 実例（未解決）: OTA の最終チャンクを 64B 未満で送る | ファームウェア分割テスト | **未検出** | 最終チャンクの 64B パディング未実装。Issue #2 に記録済み（修正 PR 未作成） | Issue #2 |
+| OTA の最終チャンクを 64B 未満で送る | ファームウェア分割テスト | 検出・修正済み（本 PR） | 実機 OTA 未実施。パディング方針は実機確認待ち（現状 fail-closed） | `boot_firmware_rejects_empty_short_and_mismatched_images` |
 | docs の相対リンクを壊す | リンクチェック | 例: 検出 | なし | コマンド出力 |
 | Tier 表の記述が 2 箇所でずれる | grep / 目視 | 例: 検出 | なし | grep 出力 |
 | セキュリティトリガーが抜ける | チェックリスト照合 | 例: 検出 | なし | 照合メモ |

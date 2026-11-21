@@ -174,6 +174,36 @@ pub fn encode_ble(
     Ok(out)
 }
 
+/// Encode a BLE write for a payload-less command whose header declares a
+/// non-zero `chunk_len`.
+///
+/// Only commands that declare a logical length without payload bytes may use
+/// this path. The current example is `EraseBT2Macro` (`cmd 0x0104`), whose
+/// official request sets `chunk_len = 0x1000` and sends no payload. Normal
+/// commands must use [`encode_ble`], which enforces
+/// `chunk_len == payload.len()`.
+#[must_use]
+pub fn encode_ble_payloadless(kind: PacketKind, header: &CustomHeader) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + HEADER_SIZE);
+    out.push(kind.ble_prefix());
+    out.extend_from_slice(&header.to_bytes());
+    out
+}
+
+/// Encode a payload-less command as a 65-byte App Mode USB HID report.
+///
+/// The declared `chunk_len` is preserved in the header, but no payload bytes
+/// are written; the remaining report bytes are zero padding. See
+/// [`encode_ble_payloadless`] for the commands this applies to.
+#[must_use]
+pub fn encode_usb_app_payloadless(header: &CustomHeader) -> [u8; USB_REPORT_SIZE] {
+    let mut out = [0u8; USB_REPORT_SIZE];
+    out[0] = USB_APP_TX_PREFIX[0];
+    out[1] = USB_APP_TX_PREFIX[1];
+    out[2..2 + HEADER_SIZE].copy_from_slice(&header.to_bytes());
+    out
+}
+
 /// Decode an App Mode BLE notification (`0x600F`: no prefix byte).
 ///
 /// Returns the header and a slice containing exactly `chunk_len` payload
