@@ -4,7 +4,7 @@
 
 ## 1. `main` の保護
 
-`main` には次のルールを設定します。
+`main` には [docs/BRANCH_PROTECTION.md](docs/BRANCH_PROTECTION.md) の ruleset を適用します（PR #1 のマージ前に有効化・検証）。
 
 - `main` への直接 push 禁止（Pull Request 必須）
 - 必須 CI: `fmt` / `clippy` / `test` / `msrv`
@@ -12,6 +12,7 @@
 - force push・ブランチ削除禁止
 - linear history（squash merge のみ）
 - 未解決のレビューコメントがある限りマージ不可
+- ブランチが `main` より古い場合はマージ不可（up-to-date 必須）
 
 > `review-gate` はラベルではなく **commit status** です。新しいコミットを push すると SHA が変わり、status が無い新しいコミットは自動的にマージできなくなります。これにより「レビュー後にコミットを差し替えて通す」迂回を防ぎます。
 
@@ -26,11 +27,15 @@
    ```sh
    cargo fmt --all -- --check
    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+   cargo clippy -p eightbitdo-protocol --no-default-features --locked -- -D warnings
    cargo test --workspace --locked
    cargo test --workspace --all-features --locked
    cargo test -p eightbitdo-protocol --no-default-features --locked
    cargo check -p eightbitdo-protocol --no-default-features --locked
-   RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+   RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
+   rustup toolchain install 1.85.0
+   cargo +1.85.0 check --workspace --all-targets --all-features --locked
+   cargo +1.85.0 check -p eightbitdo-protocol --no-default-features --locked
    ```
 
 5. PR を作成する。
@@ -41,14 +46,22 @@
    ```sh
    REPO=haruki0420/8bitdo-ultimate2-suite
    PR=123
-   SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)
-   gh api --method POST "repos/$REPO/statuses/$SHA" \
+   REVIEWED_SHA=<レビューした head SHA>
+
+   current=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)
+   if [ "$current" != "$REVIEWED_SHA" ]; then
+     echo "head moved: reviewed=$REVIEWED_SHA current=$current" >&2
+     exit 1
+   fi
+
+   gh api --method POST "repos/$REPO/statuses/$REVIEWED_SHA" \
      -f state=success \
      -f context=review-gate \
-     -f description="Independent review completed"
+     -f description="Independent review of ${REVIEWED_SHA:0:7}" \
+     -f target_url="https://github.com/$REPO/pull/$PR"
    ```
 
-   修正が必要な場合は `state=failure` で同じ context に status を付け、修正後に新しい SHA へ `success` を付ける。
+   修正が必要な場合は `state=failure` で同じ context に status を付け、修正後に新しい SHA へ `success` を付ける。`docs/BRANCH_PROTECTION.md` に確認コマンドと監査方法があります。
 
 9. すべてのレビューコメントを解決し、squash merge する。
 
@@ -70,10 +83,12 @@
 
 ## 4. レビュー status の限界
 
-`review-gate` status は **SHA への紐づき** を強制しますが、**投稿者の身元** までは強制しません。write 権限を持つ者は誰でも status を付けられます。
+`review-gate` status は **SHA への紐づき** を強制しますが、**投稿者の身元** や **レビュー内容** までは強制しません。write 権限を持つ者は誰でも status を付けられます。同じ SHA への最新 status が有効なので、`failure` を `success` で上書きすることも可能です。
 
 - 現状はソロ運用のため承認数 0 とし、独立レビューを手続きとして運用する。
+- 同じリポジトリのブランチから実行される PR ワークフローは `statuses: write` を要求して status を偽装できる。PR 内で `ci.yml` を書き換えることもできる。**CI と status は悪意ある write 権限者に対する security boundary ではない。**
 - 身元まで強制する場合は、2 人目のレビュアーアカウントまたはマシンユーザーを追加し、required approvals を 1 に上げる。
+- または、信頼できる GitHub App の `integration_id` で `review-gate` の expected source を固定する。
 - GitHub Actions の bot 承認は required approvals にカウントされない。
 
 ## 5. コミットメッセージ
