@@ -312,20 +312,21 @@ impl<T: Transport> Session<T> {
             )));
         }
 
-        // Payload-less acknowledgement: the device received the request but
-        // the data response (if any) follows separately.
-        if response.chunk_len == 0 && response.total_len == 0 {
-            return Ok(None);
-        }
-        if response.total_len as usize != expected_len {
+        // Payload-less acknowledgement or "ready" frame. The observed
+        // ReadVersion ACK uses chunk_len = total_len = 0; the config read ACK
+        // uses chunk_len = 0 with the full transfer size in total_len.
+        if response.chunk_len == 0 {
+            if response.total_len == 0 || response.total_len as usize == expected_len {
+                return Ok(None);
+            }
             return Err(Error::UnexpectedResponse(format!(
                 "response envelope total_len {} does not match the expected {expected_len} bytes",
                 response.total_len
             )));
         }
-        if response.chunk_len == 0 {
+        if response.total_len as usize != expected_len {
             return Err(Error::UnexpectedResponse(format!(
-                "response envelope for cmd 0x{request_cmd:04X} declares total_len={} but carries no data",
+                "response envelope total_len {} does not match the expected {expected_len} bytes",
                 response.total_len
             )));
         }
@@ -466,6 +467,20 @@ mod tests {
         0x00,
     ];
 
+    /// The 20-byte data response captured from the FF13 unit for the corrected
+    /// 21-byte ReadVersion request. Payload `C8 00 00 00` is version 200.
+    const OBSERVED_VERSION_DATA: [u8; 20] = [
+        0x04, 0x00, 0x0B, 0x00, 0x04, 0x00, 0x3E, 0x44, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0xC8, 0x00, 0x00, 0x00,
+    ];
+
+    /// The 16-byte "ready" response captured from the FF13 unit for a config
+    /// read: `chunk_len = 0` but `total_len = 0x0AD0`.
+    const OBSERVED_CONFIG_ACK: [u8; 16] = [
+        0x04, 0x00, 0x02, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xD0, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00,
+    ];
+
     /// Exact 21-byte ReadVersion request derived from `getVersionChannel`
     /// (0x2c7a0) and `Generate_CustomDataCmd` (0x27620).
     const READ_VERSION_REQUEST: [u8; 21] = [
@@ -582,18 +597,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn version_envelope_without_data_is_rejected() {
+    async fn read_version_decodes_observed_data_response() {
         let mock = MockTransport::new();
-        // chunk_len = 0 with a non-zero total_len is neither an ACK nor data.
-        let response = envelope_header(commands::cmd::READ_VERSION, 4, 0, 0);
-        mock.push_response(&response, &[]);
+        mock.push_incoming(&OBSERVED_VERSION_DATA);
 
         let session = Session::new(&mock);
+        let version = session.read_version().await.unwrap();
+
+        assert_eq!(version.raw, [0xC8, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            u32::from_le_bytes(version.raw.as_slice().try_into().unwrap()),
+            200
+        );
+        assert!(version.text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn version_ready_frame_without_data_is_skipped_then_times_out() {
+        let response = envelope_header(commands::cmd::READ_VERSION, 4, 0, 0);
+        let transport = StallingTransport {
+            first: Mutex::new(Some(response.to_bytes().to_vec())),
+        };
+
+        let session = Session::new(&transport).with_timeout(Duration::from_millis(20));
         let result = session.read_version().await;
-        assert!(matches!(
-            result,
-            Err(Error::UnexpectedResponse(message)) if message.contains("no data")
-        ));
+        assert!(matches!(result, Err(Error::Timeout { .. })));
     }
 
     #[tokio::test]
@@ -629,6 +657,18 @@ mod tests {
         let snapshot = session.read_config_snapshot().await.unwrap();
         assert_eq!(snapshot.config.as_bytes(), config.as_bytes());
         assert_eq!(snapshot.config.profile_name(Slot::S2), "Fight");
+    }
+
+    #[tokio::test]
+    async fn config_envelope_skips_observed_ready_ack_and_assembles() {
+        let config = sample_config();
+        let mock = MockTransport::new();
+        mock.push_incoming(&OBSERVED_CONFIG_ACK);
+        push_config_envelope_chunks(&mock, config.as_bytes(), 692);
+
+        let session = Session::new(&mock);
+        let snapshot = session.read_config_snapshot().await.unwrap();
+        assert_eq!(snapshot.config.as_bytes(), config.as_bytes());
     }
 
     #[tokio::test]

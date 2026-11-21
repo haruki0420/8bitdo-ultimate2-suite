@@ -36,7 +36,7 @@ graph LR
    - 解析済み文字列リソース（Android APK）: `"2. Press and hold the Profile button for 3 \nseconds until the Status LED will blink rapidly."`
 3. Status LED の高速点滅開始後、コントローラが BLE アドバタイズ名 **`"80ND"`** を送出するため、クライアントからスキャン・GATT 接続を行う。
 
-> **ユーザー観測（未検証）**: BLE 設定モードは、定期的な通信がないと一定時間で終了する可能性がある（ユーザーが実機で `80ND` が見つからなくなる事象を観測）。keepalive の要否・周期は未検証であり、本リポジトリの CLI には keepalive を実装していない。接続できない場合は設定モードが切れている可能性を考慮する。
+> **ユーザー観測（未検証）**: BLE 設定モードは、定期的な通信がないと一定時間で終了する可能性がある（ユーザーが実機で `80ND` が見つからなくなる事象を観測）。keepalive の要否・周期は未検証であり、本リポジトリの CLI には keepalive を実装していない。接続できない場合は設定モードが切れている可能性を考慮する。PC と USB 有線接続したまま BLE 接続すると持続しやすいというユーザー仮説もあるが、1 回の成功のみで因果は未検証である。
 
 ---
 
@@ -196,28 +196,42 @@ Windows の `FindHid` / `enum_hid` は `HidD_GetPreparsedData` + `HidP_GetCaps` 
   ```
   - `cmd=0x0004`（汎用応答エンベロープ）, `subcmd=0x000B`（要求 `cmd` のエコー）, `chunk_len=0`, `crc16=0xFFFF`, `total_len=0`, `offset=0`。
   - これはデータ 0 バイトの **ACK** であり、`ReadVersion` のデータ応答ではない。
+- USB 給電併用（`lsusb` で `057e:2009` を確認）状態で、修正後の 21B 要求を送ったところ、次の **20B データ応答**を取得した:
+  ```text
+  04 00 0B 00 04 00 3E 44 04 00 00 00 00 00 00 00 C8 00 00 00
+  ```
+  - `cmd=0x0004`, `subcmd=0x000B`, `chunk_len=4`, `crc16=0x443E`（`C8 00 00 00` の CRC-16/MODBUS と一致）, `total_len=4`, `offset=0`。
+  - ペイロード `C8 00 00 00` は LE の `i32` で **200**（`0x000000C8`）。CLI 表示は `version value: 0x000000C8`。
 
 **確定したこと**:
 
 - `0x600F` の応答は `cmd=0x0004` の汎用エンベロープで、`subcmd` に要求 `cmd`（この個体では `0x000B` / `0x0002`）が入る。`total_len`（`+0x8`）は要求側チャネルの `total_len` と一致する必要がある（`readBleHidData` 0x29030 の照合）。
-- `chunk_len=0` かつ `total_len=0` のフレームは ACK であり、データ応答として扱ってはならない。データ応答は `chunk_len > 0` かつ `total_len == 要求 total_len`。
+- `chunk_len=0` のフレームはデータを持たない ACK / ready であり、データ応答として扱ってはならない。観測された形状は 2 種類ある:
+  - `ReadVersion`: `total_len=0`
+  - `ReadConfig`: `total_len=0x0AD0`（要求した転送長）
+- データ応答は `chunk_len > 0` かつ `total_len == 要求 total_len`。`ReadVersion` の実測は `chunk_len=4`, `total_len=4`, `offset=0`。
 - `ReadVersion` の要求には **4 バイトのダミーペイロード**が必要である。公式 `getVersionChannel`（0x2c7a0）はチャネル `+0x34 = 4`, `+0x40 = 4`（`total_len`）, `+0x44 = 4`（`chunk_len`）, `+0x50 = gamepadVersion` を設定し、`Generate_CustomDataCmd`（0x27620）は `+0x50` の 4 バイトを要求へコピーする。`gamepadVersion` は初回 0 初期化である。
-- その結果、正しい要求は 21B になる（CRC は 4 バイトのゼロに対して計算され `0x2400`）:
+- その結果、正しい要求は 21B になる（CRC は 4 バイトのゼロに対して計算され `0x2400`）。実機で送信・応答とも確認済み:
   ```text
   04 0B 00 00 04 00 00 24 04 00 00 00 40 70 01 01 00 00 00 00
   ```
   - 内訳: `04` + `cmd=0x000B` + `subcmd=0` + `chunk_len=4` + `crc16=0x2400` + `total_len=4` + `offset=0x01017040` + 4B ゼロ。
-- データ応答の例（`total_len=4`, `chunk_len=4`）:
+- `ReadConfig` の最初の応答は `chunk_len=0`, `total_len=0x0AD0`, `crc16=0xFFFF` の ready ACK である:
   ```text
-  04 00 0B 00 04 00 00 00 04 00 00 00 00 00 00 00 XX XX XX XX
+  04 00 02 00 00 00 FF FF D0 0A 00 00 00 00 00 00
   ```
-  - `cmd=0x0004`, `subcmd=0x000B`, `chunk_len=4`, `crc16=0`（応答側の CRC は未使用）, `total_len=4`, `offset=0`。末尾 4B がバージョン値で、公式 `getVersion`（0x35700）は先頭 4B を LE の `i32` として読む。
+  - このフレームをエラーにせず読み飛ばし、後続のデータチャンクを待つ必要がある。
+
+**ユーザー仮説の検証（USB 併用）**:
+
+- 「PC と USB 有線接続したまま `80ND` へ BLE 接続すると設定モードが持続する」というユーザー仮説について、今回は `057e:2009` の USB 接続がある状態で BLE 接続と `ReadVersion` に成功した（1 回）。
+- ただし、親エージェントの以前の試行も USB 併用状態で、旧 17B 要求の応答待ちにタイムアウトしている。今回の成功は **4B ペイロード修正**によるものであり、USB 併用が設定モード持続に寄与したかは**未検証**である。
 
 **未確定のこと**:
 
-- 4B ペイロード付き要求に対する実機のデータ応答は、本ノート作成時点では未取得である（親エージェントが実機で確認する）。特に、応答ヘッダの `offset` が `0` か要求 `offset`（`0x01017040`）をエコーするかは未確定。現実装は `offset=0` を前提に範囲検査するが、実機で `offset=0x01017040` が観測された場合はこの節と実装を更新する。
-- `config` 読み出しでも同じ `cmd=0x0004, subcmd=0x0002` エンベロープを使うことは解析（`readBleHidData`）で確定しているが、この個体での `config dump` の生フレームは未取得である。
+- `ReadConfig` のデータチャンク自体の実フレーム（`offset` の進み方、`chunk_len`、CRC）は、本ノート作成時点では取得途中である。先頭の ready ACK のみ実測済み。
 - 公式アプリは要求ペイロードに直前の `gamepadVersion` を再利用する。本実装は常にゼロを送るため、同一接続で 2 回目以降の読み出し時にデバイスが同じ応答を返すかは未確認である（今回の CLI は 1 回読みのみ）。
+- USB 給電併用が BLE 設定モードの持続時間を延ばすかは、1 回の成功では判断できない（ユーザー仮説・未検証）。
 
 ### 4.4 USB HID / 2.4G HID フレーミング（Windows `8BitDoAdvance.dll` / Android USB）
 
