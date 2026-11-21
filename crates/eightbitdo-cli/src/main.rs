@@ -1178,7 +1178,9 @@ fn keepalive_degraded_error(state: &SessionKeepaliveState) -> Option<Error> {
         return None;
     }
     Some(Error::Transport(format!(
-        "keepalive degraded (consecutive failures {}): {}",
+        "keepalive degraded (consecutive failures {}): {}. The controller most likely \
+         left BLE configuration mode; this session does not auto-reconnect. Press \
+         Profile on the controller to re-enter `80ND` and start a new `eightbitdo session`",
         state.consecutive_failures.load(Ordering::SeqCst),
         state
             .last_error()

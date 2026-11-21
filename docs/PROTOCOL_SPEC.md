@@ -53,7 +53,7 @@ graph LR
 - 実機実験: `eightbitdo keepalive --interval-ms 20 --duration 120`。測定項目は、維持できた秒数、切断理由、USB 併用の有無、送信数 / 受信数、背面相当（送信停止）との比較である。
 - **実機観測**: 20ms `0x0003` の keepalive では **128.9 秒**維持できた。一方、`config dump` を別プロセスで実行すると BLE 設定モードが切れて `Timeout waiting for reply` になった。BLE は 1 central しか接続できず、プロセスをまたいで接続を共有できないため、複数の読み取りは 1 接続にまとめる必要がある。
 - **1 接続バックアップ**: `eightbitdo backup --raw backup.bin --json backup.json --hold N` は、1 回の接続で `ReadVersion`（`0x000B`）→ `read_config_snapshot()`（20 チャンク）→ 必要なら `0x0007` + 20ms `0x0003` の keepalive を N 秒実行する。`--hold` 中は他のコマンドを送らない。`N=0` なら読み終えて直ちに切断する。
-- **1 接続 REPL (`session`)**: `eightbitdo session [--interval-ms 20]` は 1 回の Profile 長押しで接続を保持し、`info` / `config dump` / `backup` / `monitor` / `status` を同一接続で実行する。アイドル時は `0x0007` enable 1 回 + 20ms `0x0003` + 受信ドレイン。コマンド実行中は operation lock（単一フライト）で keepalive を止め、終了後に再開する。`monitor` は自身が `--interval-ms`（既定 20ms）周期で `0x0003` を送り、その応答（`cmd=0x0004, subcmd=0x0003`, 12B）を表示する。monitor がロックを保持している間は keepalive が止まるため、**monitor が keepalive を兼ねる**。`monitor stop` でバックグラウンド monitor を停止でき、停止後は keepalive が自動再開する。Ctrl-C はセッション終了。トップレベルの `eightbitdo monitor [--count N]` も同じ 20ms `0x0003` ポーリングを共有し、終了時に `0x0007` disable → 切断を行う。なお `monitor --count N`（トップレベル / `session` 共通）は公式の `ReadKeysAndJoy` と同様に投げっぱなしのため、応答が返らない場合は Ctrl-C まで無期限に待機する。連続失敗 3 回または `Disconnected` で keepalive を degraded 停止し、自動再接続はしない（設定モード切れの可能性を案内する）。これは最小構成ではなく、`status` / `monitor stop` / 失敗方針を含む正式設計である。
+- **1 接続 REPL (`session`)**: `eightbitdo session [--interval-ms 20]` は 1 回の Profile 長押しで接続を保持し、`info` / `config dump` / `backup` / `monitor` / `status` を同一接続で実行する。アイドル時は `0x0007` enable 1 回 + 20ms `0x0003` + 受信ドレイン。コマンド実行中は operation lock（単一フライト）で keepalive を止め、終了後に再開する。`monitor` は自身が `--interval-ms`（既定 20ms）周期で `0x0003` を送り、その応答（`cmd=0x0004, subcmd=0x0003`, 12B）を表示する。monitor がロックを保持している間は keepalive が止まるため、**monitor が keepalive を兼ねる**。`monitor stop` でバックグラウンド monitor を停止でき、停止後は keepalive が自動再開する。Ctrl-C はセッション終了。トップレベルの `eightbitdo monitor [--count N]` も同じ 20ms `0x0003` ポーリングを共有し、終了時に `0x0007` disable → 切断を行う。なお `monitor --count N`（トップレベル / `session` 共通）は公式の `ReadKeysAndJoy` と同様に投げっぱなしのため、応答が返らない場合は Ctrl-C まで無期限に待機する。連続失敗 3 回または `Disconnected` で keepalive を degraded 停止し、自動再接続はしない（設定モード切れの可能性を案内する）。1 tick の受信ドレインは最大 4 レポートに固定し、`try_next_input` 自体も 1 回あたり最大 16 フレーム + 1ms で打ち切るため、通知が途切れなくても operation lock を保持し続けない。Ctrl-C はコマンド実行中の future を drop するだけで、実行中に読みかけの行は読み捨てない（キャンセル後も次の行が読める）。これは最小構成ではなく、`status` / `monitor stop` / 失敗方針を含む正式設計である。
 - **これは設計ノートであり、プロトコル要件ではない。**
 
 ---
@@ -180,7 +180,7 @@ Windows の `FindHid` / `enum_hid` は `HidD_GetPreparsedData` + `HidP_GetCaps` 
 
 ```text
 ReadConfig full:  04 02 00 00 00 D0 0A 00 00 D0 0A 00 00 00 00 00 00
-ReadConfig head:  04 02 00 00 00 74 00 00 74 00 00 00 00 00 00 00
+ReadConfig head:  04 02 00 00 00 74 00 00 74 00 00 00 00 00 00 00 00
 ```
 
 応答は 1 要求につき 1 チャンクである。実機の ReadConfig は 142B (`0x8E`) を返し、残りは `offset += payload.len()` で再要求する必要がある（§4.3.1）。
@@ -277,7 +277,9 @@ ReadConfig head:  04 02 00 00 00 74 00 00 74 00 00 00 00 00 00 00
   ```
   - 応答ヘッダは `cmd=0x0004`, `subcmd=0x0002`, `chunk_len=0x008E`, `total_len=0x0AD0`, `offset=0xA8A`。
   - 2768B を超える末尾 72B はパディングであり、ホスト側で `CONFIG_SIZE - offset = 70B` に切り詰めてコピーする。パディングは破棄する。
-- 応答 `offset` は `0` を返す（順次チャンク）。要求 `offset` と一致する場合はそれを優先し、`0` の場合は要求 `offset` に配置する。どちらも受け入れる。
+- 応答 `offset` は `0` を返す（順次チャンク）。要求 `offset` と一致する場合はそれを優先し、`0` の場合は要求 `offset` に配置する。どちらも受け入れ、それ以外の値は `UnexpectedResponse` とする。ReadVersion のような単発転送では `offset` を配置に使わず `0` 前提で扱う。
+- データ応答の `total_len` は要求した転送長と一致しなければならない（`ReadConfig` は `0x0AD0`、`ReadVersion` は `4`）。`cmd=0x0004` エンベロープだけでなく、`cmd == 要求 cmd` の直接応答でも同じ検査を行い、`total_len = 0` の直接エコーだけは互換のため許容する。
+- データ応答の `crc16` が非ゼロなら、ペイロードの CRC-16/MODBUS（poly `0xA001`、初期値 `0xFFFF`）と一致することを検証する（例: `C8 00 00 00` → `0x443E`、142B チャンク → `0xA971`）。`crc16 = 0` は「未使用」として検査しない。`chunk_len = 0` の ACK（`crc16 = 0xFFFF` を含む）はデータ応答ではないため対象外である。
 - `session` は `0x0007` を有効化するため、読み取り中に `cmd=0x0004, subcmd=0x0003` の入力レポートや `subcmd=0x0007, chunk_len=0` の ACK が届く。これらは要求へのデータ応答ではないため、`ReadVersion` / `ReadConfig` は `chunk_len=0` または入力エンベロープを読み飛ばす。`chunk_len>0` で `subcmd` が要求と異なるデータ応答だけをエラーにする。
 - 公式 `baseCumstomChannel` は 1 回だけ要求を送り、`readCustomConfig_unfinished`（0x2e3d0）は受信バイト数をログするのみである。実機では 1 チャンクで次の通知が止まるため、CLI 側で offset を進めた再要求ループを実装する。
 
@@ -288,9 +290,9 @@ ReadConfig head:  04 02 00 00 00 74 00 00 74 00 00 00 00 00 00 00
 
 **未確定のこと**:
 
-- `ReadConfig` のデータチャンクは実機で 142B (`0x8E`) を 1 要求につき 1 つ返す。`offset` を進めた再要求で 20 要求（19 × 142B + 最終 142B のうち有効 70B）を組み立てる。最終チャンクが 142B 固定で返り、ホスト側で 70B に切り詰めることは実機確認済みである。142B が MTU 依存で変化するかは未確定。応答 `offset` は 0 を返すが、要求 offset と一致する場合も受け入れる。
+- `ReadConfig` のデータチャンクは実機で 142B (`0x8E`) を 1 要求につき 1 つ返す。`offset` を進めた再要求で 20 要求（19 × 142B + 最終 142B のうち有効 70B）を組み立てる。最終チャンクが 142B 固定で返り、ホスト側で 70B に切り詰めることは実機確認済みである。142B が MTU 依存で変化するかは未確定。応答 `offset` は 0 を返すが、要求 `offset` と一致する場合も受け入れる（§4.3.1 の照合規則）。
 - `getBT2_ReadMacro` の公式 `Generate_CustomDataCmd` 経路は `16 + chunk_len` バイト（ペイロードはゼロ埋め）を送ると読める。本実装はタスク指示に従い 17B の payloadless 要求を送るため、ReadMacro の実機応答は未確認である。
-- 公式アプリは要求ペイロードに直前の `gamepadVersion` を再利用する。本実装は常にゼロを送るため、同一接続で 2 回目以降の読み出し時にデバイスが同じ応答を返すかは未確認である（今回の CLI は 1 回読みのみ）。
+- 公式アプリは要求ペイロードに直前の `gamepadVersion` を再利用する。本実装は常にゼロを送る。`session` REPL では同一接続で `info` / `config dump` / `backup` / `monitor` を何度でも再実行でき、2 回目以降の `ReadVersion` も新しい 4B ゼロペイロードで送り直す（実機での 2 回目以降の応答は未確認）。
 - USB 給電併用が BLE 設定モードの持続時間を延ばすかは、1 回の成功では判断できない（ユーザー仮説・未検証）。
 
 ### 4.4 USB HID / 2.4G HID フレーミング（Windows `8BitDoAdvance.dll` / Android USB）

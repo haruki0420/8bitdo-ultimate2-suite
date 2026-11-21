@@ -183,21 +183,21 @@ Track C: モバイル
   - BLE `"80ND"` スキャン、`FF10` + `FF11` 優先 / `FF13` フォールバック、`peripheral.mtu()` の読み取り（MTU ネゴシエーション自体は OS/BlueZ 任せ）
   - `Session`: operation lock（keepalive とコマンドの直列化）、ReadVersion（4B ダミーペイロード + `cmd=0x0004` エンベロープ）、ReadConfig（`chunk_len = total_len = 0x0AD0`、1 要求 = 1 チャンク、142B、最終チャンク切り詰め）、入力レポート
   - CLI: `scan` / `info` / `config dump` / `backup` / `monitor` / `keepalive` / **`session`**
-  - `session`: 1 接続、`0x0007` enable + 20ms `0x0003` keepalive + 受信ドレイン、operation lock でコマンド中は keepalive を停止、`info` / `config dump` / `backup` / `monitor` / `monitor stop` / `status` / `help` / `quit`。`monitor` 自身も 20ms `0x0003` を送り、その間は keepalive が止まる（monitor が keepalive を兼ねる）。`monitor stop` 後は keepalive が自動再開。トップレベルの `monitor` も同じ 20ms `0x0003` ポーリングを共有し、終了時に `0x0007` disable → 切断する。なお `monitor --count N` は公式 `ReadKeysAndJoy` と同様に投げっぱなしのため、応答がない場合は Ctrl-C まで無期限に待機する。`status` は `monitor sent` / `monitor received` を表示し、終了時のロック待ち・切断はタイムアウト付きで有界にする。連続失敗 3 回または `Disconnected` で degraded 停止し、自動再接続しない
+  - `session`: 1 接続、`0x0007` enable + 20ms `0x0003` keepalive + 受信ドレイン、operation lock でコマンド中は keepalive を停止、`info` / `config dump` / `backup` / `monitor` / `monitor stop` / `status` / `help` / `quit`。`monitor` 自身も 20ms `0x0003` を送り、その間は keepalive が止まる（monitor が keepalive を兼ねる）。`monitor stop` 後は keepalive が自動再開。トップレベルの `monitor` も同じ 20ms `0x0003` ポーリングを共有し、終了時に `0x0007` disable → 切断する。なお `monitor --count N` は公式 `ReadKeysAndJoy` と同様に投げっぱなしのため、応答がない場合は Ctrl-C まで無期限に待機する。`status` は `monitor sent` / `monitor received` を表示し、終了時のロック待ち・切断はタイムアウト付きで有界にする。連続失敗 3 回または `Disconnected` で degraded 停止し、自動再接続しない（`keepalive degraded ...` のメッセージで、設定モードが切れた可能性と Profile 長押しでの再入を案内する）。1 tick の受信ドレインは最大 4 レポート（`try_next_input` 自体も 1 回最大 16 フレーム + 1ms）に固定し、通知が途切れなくても operation lock を保持し続けない。設定の `--raw` / `--json` は同一ディレクトリの一時ファイルへ書いてから rename するアトミック書込で、同一ファイルを指す 2 つの出力パス（`.` / `..`、symlink、hard link）は端末にアクセスする前に拒否する。REPL の 1 行は最大 4096 バイトで、超過分は読み捨てて次の行を正常に読む。
   - `session` は将来のデーモン化（常駐プロセス）への布石。1 回の Profile 長押しで複数操作を完結させる
   - docs: `FF13` 実機観測、`cmd=0x0004` エンベロープ、ReadConfig の `chunk_len`、keepalive 設計
 - **完了条件**: 1 回の Profile で `session` 内の `info` → `backup` → `monitor` が通り、Tier 3 レビューと CI 4/4 を満たすこと。
 - **状態**: 進行中。
 
 ### Phase 2b: BLE マクロ読み書き（本命）
-- **ゴール**: 4 スロット × 3 マクロのバックアップと、Erase → Write → Header → Save の実機書き込み。
+- **ゴール**: 3 スロット（`slot 0..2`）× 4 マクロ（`macro_idx 0..3`）のバックアップと、Erase → Write → Header → Save の実機書き込み。
 - **実装項目**:
   - `0x0102` ReadBT2Macro（`offset = macro_idx << 12`, `total_len = chunk_len = steps * 10`）
   - `0x0104` Erase（`total_len = chunk_len = 0x1000`, `crc16 = 0xFFFF`, ペイロードなし）
   - `0x0103` Write（BLE 64B / USB 32B、32B アライン、チャンクごと CRC）
   - `0x0001` Header（マクロステップ数更新）
   - `0x0006` Save（BLE `subcmd = 0x0067`）
-  - 4×3 バックアップ（raw + JSON/TOML + SHA-256）
+  - 3×4 バックアップ（raw + JSON/TOML + SHA-256）
   - Mock でパケット列・CRC・チャンク境界・タイムアウト（Erase / Write / Header 2 秒、Save は transport 方針）を固定
   - fail-closed（失敗時に Save しない）、読み戻し検証
 - **完了条件**: 実機で 1 マクロ書き込み → 読み戻し一致 → Switch 側で発動 → 元のマクロへ復元。
@@ -234,7 +234,7 @@ Track C: モバイル
 
 ### Phase 3: `eightbitdo-gui`（デスクトップ ネイティブ GUI：Linux / macOS / Windows）
 - **技術**: `egui` (`eframe`)、Pure Rust。Node.js / WebView / Electron / Tauri は使わない。
-- **Phase 3a（read-only GUI、Phase 2a 後）**: 接続パネル、デバイス情報、ライブ入力、設定ビューア、バックアップ。Tier 2（`crates/eightbitdo-core/**` の `session` 変更を伴う場合は Tier 3）。
+- **Phase 3a（read-only GUI、Phase 2a 後）**: 接続パネル、デバイス情報、ライブ入力、設定ビューア、バックアップ。既定は **Tier 2**、ただし `crates/eightbitdo-core/**`（`session` / transport / mock を含む）の変更を伴う場合は **Tier 3**。GUI 側だけで完結する場合も、`session` の読み取り契約（ドレインの fail-closed、応答 `total_len` / `crc16` 照合、`Instant` 上限）を検証するテストを変えるなら Tier 3。
 - **Phase 3b（マクロエディタ、Phase 2b 後）**: タイムライン / テーブル、リアルタイム録音、1ms、8bit スティック、トリガー、JSON/TOML。Tier 3。
 - **Phase 3c（OTA 画面、Phase 2c 後）**: バージョン確認、進捗、復旧モード。Tier 3。
 - **Phase 3d（設定タブ、Phase 2d 後）**: プロファイル、リマップ、デッドゾーン、振動、6 軸、RGB。Tier 3。
