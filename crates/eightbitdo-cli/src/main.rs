@@ -7,7 +7,7 @@
 
 use std::future::Future;
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -225,13 +225,191 @@ async fn best_effort_disconnect<T: Transport>(transport: &T, timeout: Duration) 
 }
 
 fn validate_output_paths(raw_path: Option<&Path>, json_path: Option<&Path>) -> Result<(), Error> {
-    if let (Some(raw), Some(json)) = (raw_path, json_path) {
-        if raw == json {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "--raw and --json must not point to the same file",
-            )));
+    let (Some(raw), Some(json)) = (raw_path, json_path) else {
+        return Ok(());
+    };
+
+    // Lexical comparison first: it also catches a real path against a
+    // symlink that does not exist yet.
+    if raw == json {
+        return Err(conflicting_output_paths(raw, json));
+    }
+
+    let raw_key = OutputPathKey::new(raw)?;
+    let json_key = OutputPathKey::new(json)?;
+    let same_entry = raw_key.real == json_key.real
+        || raw_key.real.as_os_str() == json_key.spelled.as_os_str()
+        || raw_key.spelled.as_os_str() == json_key.real.as_os_str();
+    if same_entry {
+        return Err(conflicting_output_paths(raw, json));
+    }
+    if let (Some(raw_meta), Some(json_meta)) = (&raw_key.existing, &json_key.existing) {
+        if same_file(raw_meta, json_meta) {
+            return Err(conflicting_output_paths(raw, json));
         }
+    }
+    Ok(())
+}
+
+fn conflicting_output_paths(raw: &Path, json: &Path) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "--raw ({}) and --json ({}) must not point to the same file",
+            raw.display(),
+            json.display()
+        ),
+    ))
+}
+
+/// Filesystem identity of an output path.
+struct OutputPathKey {
+    /// Path with the existing parent directory canonicalized.
+    ///
+    /// `.` / `..` components are resolved and symlinked directories are
+    /// followed. The final component itself is compared literally, so a
+    /// symlink there is caught by [`Self::spelled`] and [`Self::existing`].
+    real: PathBuf,
+    /// Lexically normalized absolute spelling of the final component.
+    ///
+    /// [`std::fs::canonicalize`] resolves symlinks, which would hide a
+    /// `link -> other` / `other` pair. Keeping the unresolved spelling
+    /// catches it when only one side exists.
+    spelled: PathBuf,
+    /// Identity metadata when the path already exists.
+    existing: Option<std::fs::Metadata>,
+}
+
+impl OutputPathKey {
+    fn new(path: &Path) -> Result<Self, Error> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+
+        let real = match std::fs::canonicalize(&absolute) {
+            Ok(canonical) => canonical,
+            Err(_) => {
+                let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
+                let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
+                    Error::Io(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "cannot resolve the directory of {}: {error}",
+                            path.display()
+                        ),
+                    ))
+                })?;
+                match absolute.file_name() {
+                    Some(name) => canonical_parent.join(name),
+                    None => canonical_parent,
+                }
+            }
+        };
+
+        Ok(Self {
+            real,
+            spelled: normalize_lexically(&absolute),
+            existing: std::fs::symlink_metadata(&absolute).ok(),
+        })
+    }
+}
+
+/// Resolve `.` / `..` without touching the filesystem or following symlinks.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// True when both metadata entries describe the same file.
+///
+/// Unix compares `(device, inode)`, which also catches hard links whose paths
+/// differ. Other platforms cannot tell hard links apart from paths alone.
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_a: &std::fs::Metadata, _b: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Write `contents` through a temporary file in the same directory, then
+/// rename it over `path`.
+///
+/// A crash or a failed write therefore leaves either the previous file or
+/// the complete new one, never a truncated 2768-byte backup.
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), Error> {
+    use std::io::Write as _;
+
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} does not name a file", path.display()),
+            ))
+        })?
+        .to_string_lossy()
+        .into_owned();
+
+    let mut attempt = 0u32;
+    let (temp_path, mut file) = loop {
+        let candidate = parent.join(format!(
+            ".{file_name}.eightbitdo-{}-{attempt}.tmp",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
+                attempt += 1;
+            }
+            Err(error) => {
+                return Err(Error::Io(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot create a temporary file next to {}: {error}",
+                        path.display()
+                    ),
+                )))
+            }
+        }
+    };
+
+    let result = file
+        .write_all(contents)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            drop(file);
+            std::fs::rename(&temp_path, path)
+        });
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(Error::Io(std::io::Error::new(
+            error.kind(),
+            format!("cannot write {}: {error}", path.display()),
+        )));
     }
     Ok(())
 }
@@ -306,7 +484,7 @@ fn write_config_outputs(
     let sha256 = sha256_hex(snapshot.config.as_bytes());
 
     if let Some(path) = raw_path {
-        std::fs::write(path, snapshot.config.as_bytes())?;
+        write_atomic(path, snapshot.config.as_bytes())?;
         println!(
             "wrote raw configuration: {} ({CONFIG_SIZE} bytes)",
             path.display()
@@ -316,7 +494,7 @@ fn write_config_outputs(
     if let Some(path) = json_path {
         let summary = json_summary(snapshot, &sha256);
         let encoded = serde_json::to_string_pretty(&summary).map_err(std::io::Error::other)?;
-        std::fs::write(path, format!("{encoded}\n"))?;
+        write_atomic(path, format!("{encoded}\n").as_bytes())?;
         println!("wrote JSON summary: {}", path.display());
     }
 
@@ -3047,5 +3225,350 @@ mod tests {
         let disable = CustomHeader::parse(&frames[2][1..]).unwrap();
         assert_eq!(disable.cmd, commands::cmd::REPORT_ENABLE);
         assert_eq!(disable.subcmd, 0);
+    }
+
+    /// Unique scratch directory for tests that touch the filesystem.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "eightbitdo-{tag}-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn is_invalid_input(error: &Error) -> bool {
+        matches!(error, Error::Io(io) if io.kind() == std::io::ErrorKind::InvalidInput)
+    }
+
+    #[test]
+    fn validate_output_paths_rejects_alias_spellings_of_one_file() {
+        let dir = scratch_dir("alias");
+        let plain = dir.join("x.bin");
+        let dotted = dir.join(".").join("x.bin");
+        let parented = dir.join("sub").join("..").join("x.bin");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+
+        // Lexically different spellings of a path that does not exist yet.
+        let err = validate_output_paths(Some(&plain), Some(&dotted)).unwrap_err();
+        assert!(is_invalid_input(&err), "unexpected error: {err:?}");
+        let err = validate_output_paths(Some(&plain), Some(&parented)).unwrap_err();
+        assert!(is_invalid_input(&err), "unexpected error: {err:?}");
+
+        // A relative spelling of the same file must also be rejected.
+        let cwd = std::env::current_dir().unwrap();
+        if let Ok(relative) = dir.strip_prefix(&cwd) {
+            let relative = relative.join("x.bin");
+            let err = validate_output_paths(Some(&plain), Some(&relative)).unwrap_err();
+            assert!(is_invalid_input(&err), "unexpected error: {err:?}");
+        }
+
+        // Distinct names in the same directory are accepted.
+        assert!(validate_output_paths(Some(&plain), Some(&dir.join("y.bin"))).is_ok());
+        assert!(validate_output_paths(None, Some(&plain)).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_output_paths_rejects_symlink_to_the_other_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch_dir("symlink");
+        let target = dir.join("raw.bin");
+        std::fs::write(&target, b"old backup").unwrap();
+        let link = dir.join("link.json");
+        symlink(&target, &link).unwrap();
+
+        let err = validate_output_paths(Some(&target), Some(&link)).unwrap_err();
+        assert!(is_invalid_input(&err), "unexpected error: {err:?}");
+        let err = validate_output_paths(Some(&link), Some(&target)).unwrap_err();
+        assert!(is_invalid_input(&err), "unexpected error: {err:?}");
+
+        // Dangling symlink pointing at a file that does not exist yet.
+        let missing = dir.join("created.bin");
+        let dangling = dir.join("dangling.json");
+        symlink(&missing, &dangling).unwrap();
+        let err = validate_output_paths(Some(&missing), Some(&dangling)).unwrap_err();
+        assert!(is_invalid_input(&err), "unexpected error: {err:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_output_paths_rejects_hard_link_to_the_other_file() {
+        let dir = scratch_dir("hardlink");
+        let a = dir.join("a.bin");
+        std::fs::write(&a, b"old backup").unwrap();
+        let b = dir.join("b.json");
+        std::fs::hard_link(&a, &b).unwrap();
+
+        let err = validate_output_paths(Some(&a), Some(&b)).unwrap_err();
+        assert!(is_invalid_input(&err), "unexpected error: {err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_replaces_the_file_and_leaves_no_temp_files() {
+        let dir = scratch_dir("atomic");
+        let path = dir.join("config.bin");
+
+        write_atomic(&path, b"first").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        write_atomic(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_config_outputs_writes_both_files_atomically() {
+        let dir = scratch_dir("outputs");
+        let raw = dir.join("config.raw");
+        let json = dir.join("config.json");
+        let snapshot = ConfigSnapshot {
+            config: Bt2Config::zeroed(),
+            stored_crc: 0,
+            computed_crc: 0,
+            crc_valid: true,
+        };
+
+        let digest = write_config_outputs(&snapshot, Some(&raw), Some(&json)).unwrap();
+        assert_eq!(digest, sha256_hex(snapshot.config.as_bytes()));
+        let raw_bytes = std::fs::read(&raw).unwrap();
+        assert_eq!(raw_bytes.len(), CONFIG_SIZE);
+        assert_eq!(raw_bytes, snapshot.config.as_bytes());
+        let text = std::fs::read_to_string(&json).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["sha256"], digest);
+        assert_eq!(value["size"], CONFIG_SIZE);
+        assert!(text.ends_with('\n'));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn repl_reader_keeps_partial_line_across_cancellation() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut pending = Vec::new();
+
+        writer.write_all(b"inf").await.unwrap();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(20),
+            read_session_line(&mut reader, &mut pending),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "no newline yet, so the read must still be pending"
+        );
+        assert_eq!(
+            pending, b"inf",
+            "consumed bytes must survive the cancellation"
+        );
+
+        writer.write_all(b"o\n").await.unwrap();
+        let read = tokio::time::timeout(
+            Duration::from_millis(500),
+            read_session_line(&mut reader, &mut pending),
+        )
+        .await
+        .expect("the rest of the line arrives")
+        .unwrap();
+        assert_eq!(
+            read,
+            LineRead::Line {
+                text: "info".to_string(),
+                cut: false
+            },
+            "the line must be reassembled, not lost or split"
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn repl_reader_handles_crlf_and_eof() {
+        let mut reader =
+            tokio::io::BufReader::new(std::io::Cursor::new(b"info\r\nbogus\n".to_vec()));
+        let mut pending = Vec::new();
+
+        for expected in ["info", "bogus"] {
+            let read = read_session_line(&mut reader, &mut pending).await.unwrap();
+            assert_eq!(
+                read,
+                LineRead::Line {
+                    text: expected.to_string(),
+                    cut: false
+                }
+            );
+        }
+        assert_eq!(
+            read_session_line(&mut reader, &mut pending).await.unwrap(),
+            LineRead::Eof
+        );
+    }
+
+    #[tokio::test]
+    async fn repl_reader_limits_line_length_and_resyncs() {
+        let mut input = vec![b'a'; MAX_SESSION_LINE_BYTES + 10];
+        input.extend_from_slice(b"\ninfo\n");
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input));
+        let mut pending = Vec::new();
+
+        let long = read_session_line(&mut reader, &mut pending).await.unwrap();
+        assert_eq!(long, LineRead::TooLong { discarded: 10 });
+        assert!(pending.is_empty());
+        let next = read_session_line(&mut reader, &mut pending).await.unwrap();
+        assert_eq!(
+            next,
+            LineRead::Line {
+                text: "info".to_string(),
+                cut: false
+            },
+            "the next prompt must see a clean line after an over-long one"
+        );
+    }
+
+    #[tokio::test]
+    async fn repl_reader_cuts_nul_separated_paste_without_losing_lines() {
+        let mut input = vec![b'x'; MAX_SESSION_LINE_BYTES + 5];
+        input.push(0);
+        input.extend_from_slice(b"info\n");
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input));
+        let mut pending = Vec::new();
+
+        let cut = read_session_line(&mut reader, &mut pending).await.unwrap();
+        assert_eq!(cut, LineRead::TooLong { discarded: 5 });
+        let next = read_session_line(&mut reader, &mut pending).await.unwrap();
+        assert_eq!(
+            next,
+            LineRead::Line {
+                text: "info".to_string(),
+                cut: false
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn repl_reader_cuts_at_nul_below_the_limit() {
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(b"fi\0ve\n".to_vec()));
+        let mut pending = Vec::new();
+        assert_eq!(
+            read_session_line(&mut reader, &mut pending).await.unwrap(),
+            LineRead::Line {
+                text: "fi".to_string(),
+                cut: true
+            }
+        );
+        assert_eq!(
+            read_session_line(&mut reader, &mut pending).await.unwrap(),
+            LineRead::Line {
+                text: "ve".to_string(),
+                cut: false
+            }
+        );
+    }
+
+    /// Transport whose notifications never stop.
+    #[derive(Clone)]
+    struct FloodTransport {
+        recv_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Transport for FloodTransport {
+        async fn send(&self, _data: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn recv(&self) -> Result<Vec<u8>, Error> {
+            self.recv_calls.fetch_add(1, Ordering::SeqCst);
+            let payload = sample_input_report().to_bytes();
+            let header = CustomHeader::new(commands::cmd::RESPONSE, commands::cmd::INPUT, 0x0C, 0)
+                .with_payload(&payload);
+            let mut frame = header.to_bytes().to_vec();
+            frame.extend_from_slice(&payload);
+            Ok(frame)
+        }
+
+        fn mtu(&self) -> u16 {
+            64
+        }
+
+        async fn disconnect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn session_keepalive_tick_is_finite_under_endless_notifications() {
+        let transport = FloodTransport {
+            recv_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let keepalive = start_session_keepalive(Arc::clone(&session), Duration::from_millis(1))
+            .await
+            .unwrap();
+
+        // With an endless stream the keepalive must keep making progress:
+        // each tick drains at most SESSION_KEEPALIVE_MAX_DRAIN reports and
+        // releases the operation lock in between.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while keepalive.state.sent.load(Ordering::SeqCst) < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "keepalive could not complete three ticks while flooded"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let sent = keepalive.state.sent.load(Ordering::SeqCst);
+        let received = keepalive.state.received.load(Ordering::SeqCst);
+        assert!(
+            received <= sent * SESSION_KEEPALIVE_MAX_DRAIN,
+            "a tick drained more than the per-tick cap: sent={sent} received={received}"
+        );
+
+        // The lock is released between ticks, so a REPL command can run.
+        let guard = tokio::time::timeout(Duration::from_secs(1), session.lock())
+            .await
+            .expect("operation lock must be releasable while the input stream floods");
+        drop(guard);
+
+        shutdown_session(&session, keepalive).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_session_monitor_releases_the_operation_lock() {
+        let transport = KeepaliveTestTransport::new();
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let monitor = start_background_monitor(Arc::clone(&session), Duration::from_millis(1));
+        for _ in 0..100 {
+            if monitor.stats.sent() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(session.try_lock().is_err(), "monitor must hold the lock");
+        drop(monitor);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while session.try_lock().is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dropping the monitor must release the operation lock"
+            );
+            tokio::task::yield_now().await;
+        }
     }
 }
