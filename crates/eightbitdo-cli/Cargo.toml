@@ -1,0 +1,26 @@
+[package]
+name = "eightbitdo-cli"
+description = "Command-line interface for the 8BitDo Ultimate 2 Bluetooth controller"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "eightbitdo"
+path = "src/main.rs"
+
+[dependencies]
+eightbitdo-core = { path = "../eightbitdo-core" }
+eightbitdo-protocol = { path = "../eightbitdo-protocol", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+
+[lints]
+workspace = true

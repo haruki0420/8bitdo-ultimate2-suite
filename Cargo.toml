@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/eightbitdo-protocol"]
+members = [
+    "crates/eightbitdo-protocol",
+    "crates/eightbitdo-core",
+    "crates/eightbitdo-cli",
+]
 
 [workspace.package]
 version = "0.1.0"

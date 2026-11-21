@@ -100,6 +100,8 @@ Windows の `FindHid` / `enum_hid` は `HidD_GetPreparsedData` + `HidP_GetCaps` 
 - Characteristic (`FF11` / `FF21`) は **Write と Notify の双方**を担う単一キャラクタリスティック。
 - 接続後、必ず CCCD (`00002902-...`) へ `[0x01, 0x00]`（Enable Notification）を書き込んでからコマンド送信を開始する。
 
+> **実機観測メモ（Ultimate 2 Bluetooth、2026-11 時点）**: 検証個体はアドバタイズ名 `"80ND"` と service `FF10` を公開するが、characteristic は **`FF13`**（write + notify）であり、`FF11` は存在しなかった。上表の `_CY` 系レイアウトに該当する。クライアントは `FF11` を優先し、存在しなければ `FF13` にフォールバックして解決すること。これは実装上の観測であり、プロトコル仕様の変更ではない。
+
 ### 3.2 MTU ネゴシエーションとチャンクサイズ制御
 
 `SHBLEUtils` および `libadvancelib_pkt.c`（`Generate_CustomDataCmd` / `Send_CustomCmdPacket`）の制御仕様は以下の通り。
