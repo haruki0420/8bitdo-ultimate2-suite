@@ -180,7 +180,7 @@ Track C: モバイル
 - **ゴール**: 1 回の Profile 長押しで、Switch 接続を維持したまま version / 2768B config / backup / monitor を実行する。
 - **実装項目**:
   - `Transport` トレイト（BLE / Mock、非同期 `send` / `recv` / `mtu` / `disconnect`）
-  - BLE `"80ND"` スキャン、`FF10` + `FF13`（`FF11` フォールバック）、MTU ネゴシエーション
+  - BLE `"80ND"` スキャン、`FF10` + `FF11` 優先 / `FF13` フォールバック、`peripheral.mtu()` の読み取り（MTU ネゴシエーション自体は OS/BlueZ 任せ）
   - `Session`: operation lock（keepalive とコマンドの直列化）、ReadVersion（4B ダミーペイロード + `cmd=0x0004` エンベロープ）、ReadConfig（`chunk_len = total_len = 0x0AD0`、1 要求 = 1 チャンク、142B、最終チャンク切り詰め）、入力レポート
   - CLI: `scan` / `info` / `config dump` / `backup` / `monitor` / `keepalive` / **`session`**
   - `session`: 1 接続、`0x0007` enable + 20ms `0x0003` keepalive + 受信ドレイン、operation lock でコマンド中は keepalive を停止、`info` / `config dump` / `backup` / `monitor` / `monitor stop` / `status` / `help` / `quit`。`monitor` 自身も 20ms `0x0003` を送り、その間は keepalive が止まる（monitor が keepalive を兼ねる）。`monitor stop` 後は keepalive が自動再開。連続失敗 3 回または `Disconnected` で degraded 停止し、自動再接続しない

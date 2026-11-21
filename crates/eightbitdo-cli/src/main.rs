@@ -278,6 +278,14 @@ fn write_config_outputs(
     raw_path: Option<&Path>,
     json_path: Option<&Path>,
 ) -> Result<String, Error> {
+    if let (Some(raw), Some(json)) = (raw_path, json_path) {
+        if raw == json {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--raw and --json must not point to the same file",
+            )));
+        }
+    }
     let sha256 = hex::encode(Sha256::digest(snapshot.config.as_bytes()));
 
     if let Some(path) = raw_path {
@@ -470,6 +478,10 @@ async fn keepalive(
     if interval.is_zero() {
         eprintln!("keepalive error after 0.0s: --interval-ms must be greater than zero");
         return Ok(ExitCode::FAILURE);
+    }
+    if duration.is_zero() {
+        println!("keepalive duration is 0; no poll was sent");
+        return Ok(ExitCode::SUCCESS);
     }
 
     let started = Instant::now();
@@ -835,6 +847,10 @@ async fn session_keepalive_task<T: Transport>(
             Ok(drained) => {
                 state.received.fetch_add(drained, Ordering::SeqCst);
                 state.consecutive_failures.store(0, Ordering::SeqCst);
+                *state
+                    .last_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             }
             Err(error) => {
                 state.record_error(&error);
@@ -853,22 +869,46 @@ async fn session_keepalive_task<T: Transport>(
 }
 
 impl SessionKeepalive {
-    async fn stop(mut self) {
+    async fn stop_with_timeout(mut self, timeout: Duration) {
         self.token.cancel();
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
+        if let Some(mut task) = self.task.take() {
+            if tokio::time::timeout(timeout, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
         }
     }
+}
+
+fn keepalive_degraded_error(state: &SessionKeepaliveState) -> Option<Error> {
+    if !state.degraded.load(Ordering::SeqCst) {
+        return None;
+    }
+    Some(Error::Transport(format!(
+        "keepalive degraded (consecutive failures {}): {}",
+        state.consecutive_failures.load(Ordering::SeqCst),
+        state
+            .last_error()
+            .unwrap_or_else(|| "unknown error".to_string())
+    )))
 }
 
 async fn shutdown_session<T: Transport>(
     session: &Arc<AsyncMutex<Session<T>>>,
     keepalive: SessionKeepalive,
 ) {
-    keepalive.stop().await;
+    shutdown_session_with_timeout(session, keepalive, Duration::from_secs(2)).await;
+}
+
+async fn shutdown_session_with_timeout<T: Transport>(
+    session: &Arc<AsyncMutex<Session<T>>>,
+    keepalive: SessionKeepalive,
+    timeout: Duration,
+) {
+    keepalive.stop_with_timeout(timeout).await;
     let guard = session.lock().await;
-    let _ = guard.set_report_enable(false).await;
-    let _ = guard.transport().disconnect().await;
+    let _ = tokio::time::timeout(timeout, guard.set_report_enable(false)).await;
+    let _ = tokio::time::timeout(timeout, guard.transport().disconnect()).await;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -927,6 +967,7 @@ where
 
 struct SessionMonitor {
     stop: Arc<Notify>,
+    error: Arc<StdMutex<Option<String>>>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -937,10 +978,34 @@ impl Drop for SessionMonitor {
 }
 
 impl SessionMonitor {
+    fn is_finished(&self) -> bool {
+        self.task.as_ref().is_some_and(|task| task.is_finished())
+    }
+
+    fn error(&self) -> Option<String> {
+        self.error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     async fn stop(mut self) {
         self.stop.notify_one();
         if let Some(task) = self.task.take() {
             let _ = task.await;
+        }
+    }
+}
+
+async fn reap_finished_monitor(monitor: &mut Option<SessionMonitor>) {
+    if !monitor.as_ref().is_some_and(SessionMonitor::is_finished) {
+        return;
+    }
+    if let Some(running) = monitor.take() {
+        let error = running.error();
+        running.stop().await;
+        if let Some(error) = error {
+            eprintln!("monitor stopped with error: {error}");
         }
     }
 }
@@ -951,16 +1016,21 @@ fn start_background_monitor<T: Transport + 'static>(
 ) -> SessionMonitor {
     let stop = Arc::new(Notify::new());
     let task_stop = Arc::clone(&stop);
+    let error = Arc::new(StdMutex::new(None));
+    let task_error = Arc::clone(&error);
     let task = tokio::spawn(async move {
         let guard = session.lock().await;
         let never = std::future::pending::<()>();
         tokio::pin!(never);
         if let Err(error) = monitor_poll(&guard, interval, None, &task_stop, &mut never).await {
-            eprintln!("monitor error: {error}");
+            *task_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
         }
     });
     SessionMonitor {
         stop,
+        error,
         task: Some(task),
     }
 }
@@ -974,6 +1044,7 @@ async fn execute_session_command<T: Transport + 'static>(
     monitor: &mut Option<SessionMonitor>,
     command: SessionCommand,
 ) -> Result<SessionOutcome, Error> {
+    reap_finished_monitor(monitor).await;
     match command {
         SessionCommand::Info => {
             if monitor.is_some() {
@@ -1051,17 +1122,18 @@ async fn execute_session_command<T: Transport + 'static>(
             Ok(SessionOutcome::Continue)
         }
         SessionCommand::Status => {
-            println!("connected: true");
+            let degraded = keepalive.degraded.load(Ordering::SeqCst);
+            println!(
+                "connected: {}",
+                if degraded { "false (degraded)" } else { "true" }
+            );
             println!("mtu: {mtu}");
             println!("keepalive sent: {}", keepalive.sent.load(Ordering::SeqCst));
             println!(
                 "keepalive received: {}",
                 keepalive.received.load(Ordering::SeqCst)
             );
-            println!(
-                "keepalive degraded: {}",
-                keepalive.degraded.load(Ordering::SeqCst)
-            );
+            println!("keepalive degraded: {degraded}");
             if let Some(error) = keepalive.last_error() {
                 println!("keepalive last_error: {error}");
             }
@@ -1101,7 +1173,7 @@ async fn session_repl_loop<T: Transport + 'static>(
     let mut line = String::new();
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
-    let interactive = std::io::stdout().is_terminal();
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let mut monitor: Option<SessionMonitor> = None;
     let mut result = Ok(());
 
@@ -1113,31 +1185,40 @@ async fn session_repl_loop<T: Transport + 'static>(
         let read = tokio::select! {
             _ = &mut ctrl_c => break,
             _ = keepalive.stopped_notify.notified() => {
-                eprintln!(
-                    "keepalive stopped (degraded={}): {}",
-                    keepalive.degraded.load(Ordering::SeqCst),
-                    keepalive.last_error().unwrap_or_else(|| "unknown error".to_string())
-                );
+                if let Some(error) = keepalive_degraded_error(keepalive) {
+                    eprintln!("{error}");
+                    result = Err(error);
+                } else {
+                    eprintln!("keepalive stopped");
+                }
                 break;
             }
-            result = reader.read_line(&mut line) => result?,
+            read_result = reader.read_line(&mut line) => match read_result {
+                Ok(read) => read,
+                Err(error) => {
+                    result = Err(Error::Io(error));
+                    break;
+                }
+            },
         };
         if read == 0 {
             break;
         }
         let command = parse_session_command(line.trim());
         line.clear();
-        match execute_session_command(
-            session,
-            keepalive,
-            started,
-            mtu,
-            interval,
-            &mut monitor,
-            command,
-        )
-        .await
-        {
+        let outcome = tokio::select! {
+            _ = &mut ctrl_c => break,
+            outcome = execute_session_command(
+                session,
+                keepalive,
+                started,
+                mtu,
+                interval,
+                &mut monitor,
+                command,
+            ) => outcome,
+        };
+        match outcome {
             Ok(SessionOutcome::Quit) => break,
             Ok(SessionOutcome::Continue | SessionOutcome::MonitorReports(_)) => {}
             Err(error) => {
@@ -1229,6 +1310,7 @@ mod tests {
         incoming: Arc<Mutex<VecDeque<Vec<u8>>>>,
         disconnected: Arc<AtomicBool>,
         fail_input: Arc<AtomicBool>,
+        fail_recv: Arc<AtomicBool>,
     }
 
     impl KeepaliveTestTransport {
@@ -1238,6 +1320,7 @@ mod tests {
                 incoming: Arc::new(Mutex::new(VecDeque::new())),
                 disconnected: Arc::new(AtomicBool::new(false)),
                 fail_input: Arc::new(AtomicBool::new(false)),
+                fail_recv: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -1277,6 +1360,14 @@ mod tests {
         fn fail_inputs(&self) {
             self.fail_input.store(true, Ordering::SeqCst);
         }
+
+        fn fail_receives(&self) {
+            self.fail_recv.store(true, Ordering::SeqCst);
+        }
+
+        fn allow_receives(&self) {
+            self.fail_recv.store(false, Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
@@ -1296,6 +1387,9 @@ mod tests {
         }
 
         async fn recv(&self) -> Result<Vec<u8>, Error> {
+            if self.fail_recv.load(Ordering::SeqCst) {
+                return Err(Error::Transport("monitor receive failure".to_string()));
+            }
             if let Some(frame) = self.incoming.lock().unwrap().pop_front() {
                 return Ok(frame);
             }
@@ -1641,6 +1735,27 @@ mod tests {
         assert!(transport.is_disconnected());
     }
 
+    #[test]
+    fn parse_session_commands_covers_empty_unknown_and_options() {
+        assert_eq!(parse_session_command(""), SessionCommand::Empty);
+        assert_eq!(
+            parse_session_command("monitor --count 0"),
+            SessionCommand::Monitor { count: Some(0) }
+        );
+        assert_eq!(
+            parse_session_command("monitor stop"),
+            SessionCommand::MonitorStop
+        );
+        assert!(matches!(
+            parse_session_command("config dump --raw"),
+            SessionCommand::Unknown(_)
+        ));
+        assert!(matches!(
+            parse_session_command("bogus"),
+            SessionCommand::Unknown(_)
+        ));
+    }
+
     #[tokio::test]
     async fn session_monitor_stop_stops_background_monitor_and_resumes_keepalive() {
         let transport = KeepaliveTestTransport::new();
@@ -1714,6 +1829,65 @@ mod tests {
         assert!(transport.is_disconnected());
     }
 
+    #[tokio::test]
+    async fn monitor_error_is_reaped_and_info_succeeds() {
+        let transport = KeepaliveTestTransport::new();
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let keepalive = start_session_keepalive(Arc::clone(&session), Duration::from_secs(3600))
+            .await
+            .unwrap();
+        wait_for_keepalive_send(&keepalive.state).await;
+
+        transport.fail_receives();
+        let state = Arc::clone(&keepalive.state);
+        let started = Instant::now();
+        let mut monitor_state: Option<SessionMonitor> = None;
+        execute_session_command(
+            &session,
+            &state,
+            started,
+            64,
+            Duration::from_millis(1),
+            &mut monitor_state,
+            SessionCommand::Monitor { count: None },
+        )
+        .await
+        .unwrap();
+        assert!(monitor_state.is_some());
+
+        for _ in 0..100 {
+            if monitor_state
+                .as_ref()
+                .is_some_and(SessionMonitor::is_finished)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(monitor_state
+            .as_ref()
+            .is_some_and(SessionMonitor::is_finished));
+        transport.allow_receives();
+        queue_version_response(&transport);
+
+        let outcome = execute_session_command(
+            &session,
+            &state,
+            started,
+            64,
+            Duration::from_millis(1),
+            &mut monitor_state,
+            SessionCommand::Info,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, SessionOutcome::Continue);
+        assert!(monitor_state.is_none());
+
+        shutdown_session(&session, keepalive).await;
+        assert!(transport.is_disconnected());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn session_keepalive_ticks_follow_20ms_interval() {
         let transport = KeepaliveTestTransport::new();
@@ -1729,10 +1903,60 @@ mod tests {
             }
         }
         let sent = keepalive.state.sent.load(Ordering::SeqCst);
-        assert!(sent >= 3, "only {sent} keepalive polls were sent");
+        assert!(
+            (3..=6).contains(&sent),
+            "unexpected keepalive poll count: {sent}"
+        );
 
         shutdown_session(&session, keepalive).await;
         assert!(transport.is_disconnected());
+    }
+
+    struct HangingTransport;
+
+    #[async_trait]
+    impl Transport for HangingTransport {
+        async fn send(&self, _data: &[u8]) -> Result<(), Error> {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        }
+
+        async fn recv(&self) -> Result<Vec<u8>, Error> {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Err(Error::Disconnected)
+        }
+
+        fn mtu(&self) -> u16 {
+            200
+        }
+
+        async fn disconnect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_bounded_with_hanging_transport() {
+        let session = Arc::new(AsyncMutex::new(Session::new(HangingTransport)));
+        let state = Arc::new(SessionKeepaliveState::new());
+        let token = CancellationToken::new();
+        let task_token = token.clone();
+        let task = tokio::spawn(async move {
+            task_token.cancelled().await;
+        });
+        let keepalive = SessionKeepalive {
+            state,
+            token,
+            task: Some(task),
+        };
+
+        let started = Instant::now();
+        shutdown_session_with_timeout(&session, keepalive, Duration::from_millis(20)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "shutdown took {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -1756,6 +1980,7 @@ mod tests {
         }
         assert!(keepalive.state.degraded.load(Ordering::SeqCst));
         assert!(keepalive.state.last_error().is_some());
+        assert!(keepalive_degraded_error(&keepalive.state).is_some());
 
         shutdown_session(&session, keepalive).await;
         assert!(transport.is_disconnected());

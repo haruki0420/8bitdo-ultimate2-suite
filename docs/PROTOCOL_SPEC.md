@@ -278,6 +278,7 @@ ReadConfig head:  04 02 00 00 00 74 00 00 74 00 00 00 00 00 00 00
   - 応答ヘッダは `cmd=0x0004`, `subcmd=0x0002`, `chunk_len=0x008E`, `total_len=0x0AD0`, `offset=0xA8A`。
   - 2768B を超える末尾 72B はパディングであり、ホスト側で `CONFIG_SIZE - offset = 70B` に切り詰めてコピーする。パディングは破棄する。
 - 応答 `offset` は `0` を返す（順次チャンク）。要求 `offset` と一致する場合はそれを優先し、`0` の場合は要求 `offset` に配置する。どちらも受け入れる。
+- `session` は `0x0007` を有効化するため、読み取り中に `cmd=0x0004, subcmd=0x0003` の入力レポートや `subcmd=0x0007, chunk_len=0` の ACK が届く。これらは要求へのデータ応答ではないため、`ReadVersion` / `ReadConfig` は `chunk_len=0` または入力エンベロープを読み飛ばす。`chunk_len>0` で `subcmd` が要求と異なるデータ応答だけをエラーにする。
 - 公式 `baseCumstomChannel` は 1 回だけ要求を送り、`readCustomConfig_unfinished`（0x2e3d0）は受信バイト数をログするのみである。実機では 1 チャンクで次の通知が止まるため、CLI 側で offset を進めた再要求ループを実装する。
 
 **ユーザー仮説の検証（USB 併用）**:
