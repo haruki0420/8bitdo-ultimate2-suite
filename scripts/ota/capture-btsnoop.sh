@@ -8,14 +8,24 @@
 # script only wraps btmon; it never talks to the controller itself.
 #
 # Usage:
-#   scripts/ota/capture-btsnoop.sh [-o DIR] [-i HCI] [-p a|b]
+#   scripts/ota/capture-btsnoop.sh [-o DIR] [-i HCI] [-p a|b] [--allow-concurrent]
 #
 #   -o, --out-dir DIR   capture directory (default: <repo>/.tmp/ota-capture)
 #   -i, --index HCI     only monitor this adapter (0 or hci0; passed to btmon -i).
 #                       Required when the host has more than one adapter.
 #   -p, --phase a|b     print the stop instructions for Phase A (read-only) or
 #                       Phase B (flash). Without it both are printed.
+#       --allow-concurrent  proceed even if another btmon is already running
+#                       (captures may be split between the two processes)
 #   -h, --help          show this help
+#
+# Exit codes:
+#   0   capture finished and looks valid (btsnoop magic present)
+#   2   usage error / btmon could not start / another btmon without
+#       --allow-concurrent
+#   3   capture finished but is INVALID (empty file, bad btsnoop magic, or
+#       btmon had to be killed with SIGKILL; completeness is not guaranteed)
+#   130 / 143 / 129  interrupted by SIGINT / SIGTERM / SIGHUP
 #
 # Environment:
 #   CAPTURE_DIR     default output directory (overridden by -o)
@@ -38,10 +48,12 @@ BTMON_BIN=${BTMON_BIN:-btmon}
 STOP_TIMEOUT=${STOP_TIMEOUT:-10}
 BTMON_INDEX=''
 PHASE=''
+ALLOW_CONCURRENT=0
+KILLED_HARD=0
 
 usage() {
     cat <<'EOF'
-Usage: scripts/ota/capture-btsnoop.sh [-o DIR] [-i HCI] [-p a|b]
+Usage: scripts/ota/capture-btsnoop.sh [-o DIR] [-i HCI] [-p a|b] [--allow-concurrent]
 
 Start a btmon btsnoop capture, wait for the operator, then stop btmon.
 
@@ -51,7 +63,17 @@ Options:
                       Required when the host has more than one adapter.
   -p, --phase a|b     stop instructions for Phase A (read-only) or Phase B
                       (flash). Without it both variants are printed.
+      --allow-concurrent  proceed even if another btmon is already running
+                      (captures may be split between the two processes)
   -h, --help          show this help
+
+Exit codes:
+  0   capture finished and looks valid (btsnoop magic present)
+  2   usage error / btmon could not start / another btmon without
+      --allow-concurrent
+  3   capture finished but is INVALID (empty file, bad btsnoop magic, or
+      btmon had to be killed with SIGKILL; completeness is not guaranteed)
+  130 / 143 / 129  interrupted by SIGINT / SIGTERM / SIGHUP
 
 Environment:
   CAPTURE_DIR     default output directory (overridden by -o)
@@ -88,6 +110,10 @@ while (( $# > 0 )); do
             if (( $# < 2 )); then die "$1 requires 'a' or 'b'"; fi
             PHASE=$2
             shift 2
+            ;;
+        --allow-concurrent)
+            ALLOW_CONCURRENT=1
+            shift
             ;;
         -h|--help)
             usage
@@ -161,11 +187,29 @@ fi
 if command -v pgrep >/dev/null 2>&1; then
     other_btmon=$(pgrep -x btmon 2>/dev/null || true)
     if [[ -n "$other_btmon" ]]; then
-        log "warning: another btmon is already running (pid: ${other_btmon//$'\n'/ });" \
-            "stop it first or the capture may be split between processes"
+        if (( ALLOW_CONCURRENT == 0 )); then
+            die "another btmon is already running (pid: ${other_btmon//$'\n'/ });" \
+                "stop it first, or pass --allow-concurrent to proceed anyway"
+        fi
+        log "warning: another btmon is running (pid: ${other_btmon//$'\n'/ });" \
+            "--allow-concurrent given, captures may be split between processes"
     fi
 fi
 
+if [[ -L "$CAPTURE_DIR" ]]; then
+    die "capture directory must not be a symlink: $CAPTURE_DIR"
+fi
+if [[ -e "$CAPTURE_DIR" && ! -d "$CAPTURE_DIR" ]]; then
+    die "capture path exists but is not a directory: $CAPTURE_DIR"
+fi
+if [[ -d "$CAPTURE_DIR" ]]; then
+    dir_mode=$(stat -c '%a' -- "$CAPTURE_DIR" 2>/dev/null || true)
+    if [[ -n "$dir_mode" && "$dir_mode" != "700" ]]; then
+        log "tightening capture directory mode from $dir_mode to 700: $CAPTURE_DIR"
+        chmod 700 -- "$CAPTURE_DIR" 2>/dev/null \
+            || die "cannot set mode 700 on the capture directory: $CAPTURE_DIR"
+    fi
+fi
 if ! mkdir -p -- "$CAPTURE_DIR"; then
     die "cannot create capture directory: $CAPTURE_DIR"
 fi
@@ -219,6 +263,7 @@ stop_btmon() {
     done
 
     log "btmon still running; sending SIGKILL"
+    KILLED_HARD=1
     kill -KILL "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
 }
@@ -226,6 +271,8 @@ stop_btmon() {
 finish() {
     local status=$?
     local size
+    local magic=''
+    local invalid=0
 
     trap - EXIT INT TERM HUP
     if [[ -n "$btmon_pid" ]]; then
@@ -239,10 +286,12 @@ finish() {
             log "capture saved: $out (${size} bytes)"
             if command -v od >/dev/null 2>&1; then
                 magic=$(od -An -tx1 -N8 -- "$out" 2>/dev/null | tr -d ' \n')
-                if [[ -n "$magic" && "$magic" != "6274736e6f6f7000" ]]; then
-                    log "warning: capture does not start with the btsnoop magic;" \
-                        "it may be corrupt or truncated"
+                if [[ -z "$magic" || "$magic" != "6274736e6f6f7000" ]]; then
+                    invalid=1
+                    log "INVALID: capture does not start with the btsnoop magic: $out"
                 fi
+            else
+                log "warning: od not found; btsnoop magic was not verified"
             fi
             if command -v sha256sum >/dev/null 2>&1; then
                 log "sha256: $(sha256sum "$out" | awk '{print $1}')"
@@ -253,10 +302,26 @@ finish() {
             log "record size/SHA-256 and redacted excerpts in docs/OTA_BLE_EVIDENCE.md;" \
                 "do not commit the capture"
         else
-            log "warning: capture file is empty (no HCI traffic was recorded): $out"
+            invalid=1
+            log "INVALID: capture file is empty (no HCI traffic was recorded): $out"
         fi
     else
-        log "warning: no capture file was created: $out"
+        invalid=1
+        log "INVALID: no capture file was created: $out"
+    fi
+
+    if (( KILLED_HARD == 1 )); then
+        invalid=1
+        log "INVALID: btmon had to be killed with SIGKILL;" \
+            "capture completeness is not guaranteed (the last frames may be missing)"
+    fi
+
+    if (( invalid == 1 )); then
+        log "capture is INVALID; do not use it as evidence instead of a clean run" \
+            "(docs/OTA_VERIFICATION_PLAN.md §6.4)"
+        if (( status == 0 )); then
+            status=3
+        fi
     fi
 
     exit "$status"
