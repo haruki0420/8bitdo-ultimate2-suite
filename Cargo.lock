@@ -1296,6 +1296,7 @@ dependencies = [
  "eightbitdo-core",
  "eightbitdo-protocol",
  "hex",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",
