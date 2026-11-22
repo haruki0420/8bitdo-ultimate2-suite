@@ -1,0 +1,17 @@
+# UniFFI binding configuration for the mobile front ends.
+#
+# The Kotlin generator writes a JNA-backed binding for Android; the Swift
+# generator writes a plain Swift + C header/modulemap pair. Both are generated
+# by `scripts/mobile/gen-bindings.sh` and are not committed.
+
+[bindings.kotlin]
+package_name = "dev.eightbitdo.mobile.core"
+cdylib_name = "eightbitdo_uniffi"
+# Android runs the generator inside a JNI process; this selects the Android
+# System.loadLibrary + cleaner conventions instead of the desktop JVM ones.
+android = true
+
+[bindings.swift]
+# Name of the high-level Swift module. The generated C module becomes
+# `EightBitdoFFI`, which the app declares as a `.systemLibrary` target.
+module_name = "EightBitdo"

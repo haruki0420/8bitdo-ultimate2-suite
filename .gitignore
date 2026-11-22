@@ -75,6 +75,21 @@ Thumbs.db
 # Local GUI backups (normally under the XDG data directory)
 8bitdo-backups/
 
+# Mobile build artifacts (generated; never commit platform binaries)
+mobile/ios/libs/
+mobile/ios/RustCore/
+mobile/ios/Sources/EightBitDo/Generated/
+mobile/ios/xtool/
+mobile/ios/.build/
+mobile/ios/.bsp/
+mobile/android/app/src/main/jniLibs/
+mobile/android/app/src/main/java/dev/eightbitdo/mobile/core/
+mobile/android/.gradle/
+mobile/android/.kotlin/
+mobile/android/build/
+mobile/android/app/build/
+mobile/android/local.properties
+
 # Local agent scratch (RE / analysis) — keep the repo root clean
 .tmp/
 .re-scratch/

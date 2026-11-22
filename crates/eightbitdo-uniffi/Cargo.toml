@@ -1,0 +1,48 @@
+[package]
+name = "eightbitdo-uniffi"
+description = "UniFFI surface that exposes the 8BitDo Ultimate 2 Rust core to the iOS (Swift) and Android (Kotlin) apps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+# `staticlib` is what the iOS app links; `cdylib` is what Android loads.
+# Build the iOS slice with `cargo rustc --lib --crate-type staticlib` so the
+# Linux host does not try to link a Mach-O dylib (see mobile/README.md).
+crate-type = ["staticlib", "cdylib"]
+
+[features]
+default = []
+# Generates the `uniffi-bindgen` / `uniffi-bindgen-swift` helper binaries and
+# pulls the UniFFI code generator into the build. Not needed by the libraries.
+cli = ["uniffi/cli"]
+
+[dependencies]
+eightbitdo-core = { path = "../eightbitdo-core", default-features = false }
+eightbitdo-protocol = { path = "../eightbitdo-protocol", features = ["serde"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+# Pinned to 0.31.x: 0.32.2 pulls cargo_metadata 0.23 / askama 0.16 /
+# cargo-platform 0.3, whose MSRVs (1.86-1.91) break the workspace's Rust 1.85
+# minimum. 0.31.0 uses cargo_metadata 0.19 and askama 0.14 (MSRV <= 1.85).
+# `scripts/mobile/gen-bindings.sh` must use the matching bindgen version.
+uniffi = { version = "0.31.2" }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "uniffi-bindgen-swift"
+path = "src/bin/uniffi-bindgen-swift.rs"
+required-features = ["cli"]
+
+[lints]
+workspace = true

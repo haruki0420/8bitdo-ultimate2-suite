@@ -5,6 +5,7 @@ members = [
     "crates/eightbitdo-core",
     "crates/eightbitdo-cli",
     "crates/eightbitdo-gui",
+    "crates/eightbitdo-uniffi",
 ]
 
 [workspace.package]
