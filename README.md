@@ -26,6 +26,20 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 
 ---
 
+## CLI（実装済みの設定書き込み・BLE のみ）
+
+`eightbitdo config` は full 2768B 設定の書込みを扱います（USB HID config write は未実装）。
+
+- `config dump [--raw FILE] [--json FILE]` — 読取のみ。
+- `config write --file <2768B>` — `config dump --raw` の編集ファイルを書込み。予約バイトの改変は拒否し、復旧時のみ `--accept-reserved-drift` で device の現在値に合わせる。
+- `config set <field> <value>` — プロファイル名、cur_slot、gamepad_mode、rumble / joy / trigger / gyro / LED、`map_key.flag`。範囲外は I/O 前に拒否。joy / trigger はレコード flag=1、LED color はテーマ flag=1 の副作用あり（help に明記）。
+- `config remap <physical> <target>` — 1 ボタンのみ（4B）変更。`config map show` で 22 index を表示。
+- 安全策: **pre-write backup 必須**（`config.bin` + `config.json`）、`--yes` なしの確認、前後 SHA-256、確認後の TOCTOU 再読込、read-back 検証、マクロヘッダ変更警告。書込 chunk は既定 `min(MTU, 74)`（RE: 公式 74B）で、`--write-chunk` は接続前上限 **180**（観測 MTU 200 のペイロード上限）まで指定可能。
+- raw `config write` の検証: 22 個の `button_mappings`、`gyro.key_map`、全レコードの flag 0/1、マクロ `max_steps`（0/0xFFFF/1..=200）・`total_cnt`、マクロ `key_map`（`macro write --trigger` と同じ任意 KeyMap）を確認。不明な `cur_slot`（実機観測 6 など）は警告して保持。`--force-raw` は未文書値の復旧用（予約領域ガードは維持）。
+- 既知の差: 公式 BLE Save は 2000ms / 最大 2 再送（静的解析）だが、本実装は 3 秒 / リトライなし。USB config write は未実装。
+
+---
+
 ## ドキュメント一覧
 
 公式バイナリの静的解析から検証した完全仕様と実装計画を `docs/` にまとめています。
@@ -52,7 +66,7 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
   - [ ] Phase 2a: 読み取り専用 core / CLI / `session`（`eightbitdo session [--interval-ms 20] [--allow-macro-write] [--no-report-enable]` の REPL は `info` / `config dump` / `backup` / `monitor` / `monitor stop` / `status` / `help` / `quit`。REPL には `macro backup <DIR>`（読み取りのみ、常に利用可）/ `macro write <SLOT> <INDEX> <FILE> [--trigger <KEY>] [--chunk-size <32|64>]` / `macro restore <DIR> [--force]` もあり、書込系は `--allow-macro-write`（既定 OFF）が必要。`session` は既定で起動時に `0x0007 enable(1)` を送る（公式相当）ため REPL の `macro write` は enable 状態で動き（トップレベル `macro write` の既定とは条件が異なる）、`--no-report-enable` 指定時は起動時の enable(1) を送らず `0x0003` keepalive のみを継続する（終了時の disable(0) は best-effort。トップレベル既定と同じ書込条件で A/B するため）。`--allow-macro-write` 時の `macro write` / `macro restore` は、ファイル読込・pre-write/pre-restore backup を含むコマンド全体で Ctrl-C を遅延する（非通常ファイルは読取前に拒否し、デバイス I/O は timeout で有界。SIGKILL・電源断は防げない）。REPL の `macro write` は `--backup-dir`（既定名 `macro-backup-<unix-nanos>-<pid>-<sequence>`）、`macro restore` は `--chunk-size` を指定できず、REPL 経由の実機書込は未検証。設定バックアップは `--raw` / `--json` を同一ディレクトリの一時ファイル経由でアトミックに書き、同一ファイルを指す 2 つの出力パスは拒否する。ただし hard link の同一性検出は Unix のみで、Windows は file identity 未実装のため hard link alias を事前拒否せず、raw 書き込み後の再検証と `rename` semantics で保護する。この再検証は偶発的な alias 用であり、出力ディレクトリに write 権限を持つ攻撃者による TOCTOU / 並行 rename は非保証である）
   - [ ] Phase 2b: マクロ読み書き（実装完了・実機待ち）
   - [ ] Phase 2c: BLE OTA（Linux）
-  - [ ] Phase 2d: 設定書き込み
+  - [ ] Phase 2d: 設定書き込み（BLE のみ実装済み・Mock 検証。`config write` / `set` / `remap` / `map show`、pre-write backup、確認、前後 SHA-256、read-back 検証。USB config write は未実装）
 - [ ] Phase 3: `eightbitdo-gui`（デスクトップネイティブ GUI）
 - [ ] Phase 4: USB OTA（保留）
 - [ ] Phase 5: `eightbitdo-uniffi` + iOS (SwiftUI) / Android (Jetpack Compose) アプリ

@@ -199,6 +199,7 @@ Tier 3 のパスに対する変更は、原則として Tier 3 のままです�
 - 実機書き込みを含む場合は、次の **両方** をバックアップし、ファイル名（path）と SHA-256 を記録する。
   - 2768B 設定 (`record_ultimatebt2`)
   - マクロ 3 スロット × 4 マクロのステップデータ（2768B には含まれない。`slot 0..2` × `macro_idx 0..3` の 12 領域。`macro_idx << 12` の 4KB セクタ）
+- **例外（config write / set / remap）**: 設定書込経路はマクロ step sector を消去・書込しない（`0x0103` / `0x0104` を送らない）。この経路の pre-write backup は **2768B 設定 + `config.json`** を必須とし、マクロ 12 領域の step データは必須としない。ただし 2768B 内のマクロヘッダ領域（`0x68C..0x914`）を変更する `config write --file` は、CLI が明示警告を出し、非空マクロの挙動が変わり得ることを記録する。復元は `config write --file <backup>/config.bin --yes`（予約バイトが device 側で正規化された場合は `--accept-reserved-drift` を追加）で行う。
 - 復元テスト、または文書化された復元手順を確認し、結果を記録する。復元後は全 slot の 216B マクロヘッダと非空マクロの raw を読み戻して比較する。2768B 全体の SHA-256 は device の CRC 再計算で変わり得るため、情報表示に留める。
 - OTA を含む場合は、OTA イメージの SHA-256 と Bootloader 復旧結果を記録する。
 - すべての故障に証跡（テスト名 / コマンド出力 / URL / 目視メモ / 該当箇所の引用 / file:line）を付け、**Tier をレビューした head SHA で再評価**する。

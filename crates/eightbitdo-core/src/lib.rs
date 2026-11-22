@@ -6,13 +6,18 @@
 //! backed by `btleplug`.
 //!
 //! The first slice was read-only (version, configuration and realtime input).
-//! The current core also has macro flash read/write APIs (`macro_ops`); the
-//! write path is fail-closed and currently mock-tested only. Configuration
-//! apply and OTA are still separate phases.
+//! The current core also has macro flash read/write APIs (`macro_ops`) and the
+//! full 2768-byte configuration write path (`config_ops`); both write paths are
+//! fail-closed and currently mock-tested only. OTA is still a separate phase.
+//!
+//! Button remapping (`MapKeyRecord`) is implemented in [`config_ops`] from the
+//! official binary layout: [`config_ops::ConfigEdit::ButtonRemap`] changes one
+//! 4-byte `key[]` entry and [`config_ops::map_key_flag`] reads the record flag.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod config_ops;
 pub mod error;
 pub mod macro_ops;
 pub mod mock;
@@ -22,8 +27,14 @@ pub mod transport;
 #[cfg(feature = "ble")]
 pub mod ble;
 
+pub use config_ops::{
+    button_mapping, button_mappings, config_write_chunk_len, map_key_flag, ConfigCrcStatus,
+    ConfigEdit, ConfigRegion, ConfigWriteOutcome, ConfigWritePlan, ConfigWriteTimeouts,
+    PreparedConfigWrite, CONFIG_SAVE_TIMEOUT, CONFIG_VERIFY_DELAY, CONFIG_WRITE_TIMEOUT,
+    OFFICIAL_WRITE_CHUNK,
+};
 pub use error::Error;
-pub use error::{MacroWriteStage, MacroWriteState};
+pub use error::{ConfigWriteStage, ConfigWriteState, MacroWriteStage, MacroWriteState};
 pub use macro_ops::{
     macro_header_chunk_len, macro_write_chunk_len, macro_write_chunk_len_requested,
     max_protocol_payload, validate_macro_chunk_size, MacroBackup, MacroEntry, MacroHeaderOutcome,

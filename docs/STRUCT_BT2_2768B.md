@@ -70,6 +70,11 @@
 > **※注1 (`getBT2_WriteSixAxis` における Android `.so` のバグと Windows DLL の正しい値)**:
 > Android 版 `libadvancelib.so` の `getBT2_WriteSixAxis` は `.rodata 0x1d6a0` (`{0x0, 0xC, 0xC, 0xC}`) を読み込む実装ミスによりヘッダに `offset = 0, total_len = 0x0C, len = 0x0C` を入れている（ペイロードポインタ自体は `base + slot * 0x0C + 0x92C` を指す）。一方 Windows 版 `8BitDoAdvance.dll` の `_writeUltimateBT2sixaxis@2772` では正しく **`offset = 0x92C + slot * 0x0C`, `total_len = 0x0AD0`, `len = 0x0C`** を送信している。独自実装では Windows DLL 準拠（`offset = 0x92C + slot * 0x0C, total_len = 0x0AD0`）を用いること。
 
+> **書込時の BLE 分割長（RE 再確認・2026-11-22）**:
+> 公式 Android の `Generate_CustomDataCmd` は書込系で `min(残り, MAX_ATT_MTU - 0x12)` を使い、`MAX_ATT_MTU` は初期値 **`0x5C` (92)** のまま `0x600F` 用に変更されない。したがって **公式書込のペイロード上限は 74B**（静的解析。実機書込キャプチャは未確認）。既存の「MTU 200 → 142B」は**読み出し応答側の実機観測値**であり、書込側の分割長ではない。本リポジトリの full config write は既定で **`min(MTU ペイロード, 74)`**（MTU 200 でも 74B）を使い、`--write-chunk <BYTES>` は接続前上限 **180**（観測 MTU 200 のペイロード上限）まで明示指定できる（公式 74B との A/B 用。実機未確認）。
+>
+> **部分書込と Save（RE 確定・2026-11-22）**: `getBT2_Write*` の部分書込も、完了時に共通 onfinished から **`0x0006/0x0067` Save が必ず 1 回**送られる（部分書込専用の Save 関数は無い）。
+
 ### 1.3 `+0x1F4..+0x68B` (3 × 392B) および `+0x914..+0x92B` (3 × 8B) の解析結果
 
 `libadvancelib.so`・`8BitDoAdvance.dll`・`classes.dex` の全関数を走査した結果、この 2 領域に対する解釈は以下の通り確定した。
@@ -157,7 +162,7 @@ struct Bt2Header {
 | `3` | `CONFIG_SLOT_SWIFT_MAX` | スロット数上限マーカー |
 | `4` | `CONFIG_SLOT_SWIFT_NONE` | スロット未選択 / 削除状態（オフ状態） |
 
-> **実機観測・未確定（2026-11-21）**: Ultimate 2 Bluetooth で `cur_slot = 6` を観測した。enum の `0..=2` / `4` の範囲外であり、意味は未確定である。CLI は `0..=2` を `profile N`、`4` を `none`、それ以外を `unknown (6)` のように表示する。`deleteCurslot` が `cur_slot = 4` を書くことは解析済みだが、実機で 6 が観測される理由（別状態・未初期化・ファームウェア固有値など）は断定できない。
+> **実機観測・未確定（2026-11-21）**: Ultimate 2 Bluetooth で `cur_slot = 6` を観測した。enum の `0..=2` / `4` の範囲外であり、意味は未確定である。CLI は `0..=2` を `profile N`、`4` を `none`、それ以外を `unknown (6)` のように表示する。`deleteCurslot` が `cur_slot = 4` を書くことは解析済みだが、実機で 6 が観測される理由（別状態・未初期化・ファームウェア固有値など）は断定できない。**raw `config write` は不明な `cur_slot`（6 等）を拒否せず、警告して保持する。**
 
 ---
 
@@ -203,12 +208,14 @@ struct Bt2Header {
 | 相対オフセット | サイズ | 型 | フィールド名 | 説明・デフォルト値 |
 | :---: | :---: | --- | --- | --- |
 | `+0x00` | 4B | `u32` | `flag` | 有効フラグ (`1` = カスタム有効, `0` = 無効) |
-| `+0x04` | 1B | `u8` | `left_start_value` | 左スティック 内側デッドゾーン (`0..=127`, デフォルト `0`) |
+| `+0x04` | 1B | `u8` | `left_start_value` | 左スティック 内側デッドゾーン (`0..=127`, `createFile`/`deleteFile` 既定 **17** = `0x11`) |
 | `+0x05` | 1B | `u8` | `left_end_value` | 左スティック 外側有効境界 (`0..=128`, デフォルト `128` = `0x80`) |
-| `+0x06` | 1B | `u8` | `right_start_value` | 右スティック 内側デッドゾーン (`0..=127`, デフォルト `0`) |
+| `+0x06` | 1B | `u8` | `right_start_value` | 右スティック 内側デッドゾーン (`0..=127`, `createFile`/`deleteFile` 既定 **17** = `0x11`) |
 | `+0x07` | 1B | `u8` | `right_end_value` | 右スティック 外側有効境界 (`0..=128`, デフォルト `128` = `0x80`) |
 
 > `flag != 1` の場合、`BasicAdvanceUI.getS_Sticks` は `[0, 128, 0, 128]`（デッドゾーンなし・フルレンジ）として扱う。
+>
+> **既定値の訂正（RE・Android v2.01 `createFile`/`deleteFile` bytecode、2026-11-22）**: プロファイル新規作成/削除直後の既定値は start **17 (`0x11`)** / end **128**。旧記述の「start 既定 0」は誤り。17 の意図（Anti-Jitter 等）は未確認。
 
 ### 4.3 トリガー設定 `TriggerRecord` (`+0x0B0..+0x0C7`, 3 × 8B)
 
@@ -217,10 +224,12 @@ struct Bt2Header {
 | 相対オフセット | サイズ | 型 | フィールド名 | 説明・デフォルト値 |
 | :---: | :---: | --- | --- | --- |
 | `+0x00` | 4B | `u32` | `flag` | 有効フラグ (`1` = カスタム有効, `0` = 無効) |
-| `+0x04` | 1B | `u8` | `left_start_value` | LT (L2) 開始デッドゾーン (`0..=255`, デフォルト `0`, ヘアトリガーモード時 `77` = `0x4D`) |
+| `+0x04` | 1B | `u8` | `left_start_value` | LT (L2) 開始デッドゾーン (`0..=255`, `gamepad_mode == 0` (Switch) 時のみ既定 `77` = `0x4D`、それ以外 `0`) |
 | `+0x05` | 1B | `u8` | `left_end_value` | LT (L2) 終了/最大点 (`0..=255`, デフォルト `255` = `0xFF`) |
-| `+0x06` | 1B | `u8` | `right_start_value` | RT (R2) 開始デッドゾーン (`0..=255`, デフォルト `0`, ヘアトリガーモード時 `77` = `0x4D`) |
+| `+0x06` | 1B | `u8` | `right_start_value` | RT (R2) 開始デッドゾーン (`0..=255`, `gamepad_mode == 0` (Switch) 時のみ既定 `77` = `0x4D`、それ以外 `0`) |
 | `+0x07` | 1B | `u8` | `right_end_value` | RT (R2) 終了/最大点 (`0..=255`, デフォルト `255` = `0xFF`) |
+
+> **既定値の条件訂正（RE・Android v2.01 bytecode、2026-11-22）**: 既定 `77` は「ヘアトリガーモード」ではなく **`gamepad_mode == 0`（Switch モード）のときのみ**。それ以外のモードでは `0`。
 
 ### 4.4 特殊機能フラグ `JoyTriggerSpecialRecord` (`+0x0C8..+0x0DF`, 3 × 8B)
 
@@ -267,6 +276,7 @@ struct Bt2Header {
 | `+0x04..+0x5B` | `0x0E4 + s * 0x5C` | 88B | `[u32; 22]` | `key[22]` | 22 個の物理ボタンに対応するマッピング先 `KeyMap` 値 |
 
 - 部分書込 `getBT2_WriteMapKey(slot, key_idx)` は `flag` を除く **`key[key_idx]` 単体（4B）** を `offset = 0x0E4 + slot * 0x5C + key_idx * 4`, `len = 4`, `total_len = 0x0AD0` で書き込む。
+- **書込経路（RE 確定・2026-11-22）**: Android `HIDChannel.writeBT2MAPkEY` は `ANSI_CRC_16_sh(record, 0xAD0)` → `getBT2_WriteMapKey` → 共通 onfinished から **`0x0006/0x0067` Save**。Windows は `_writeUltimateBT2MapKey@2776`（VA `0x10438ED0`）が `offset = 0xE4 + slot*0x5C + idx*4`, `len = 4`, `total_len = 0xAD0` を送り、Save `0x0006/0x0123`（3 秒）。**変更するのは 4B の 1 エントリのみで `flag` は変更しない**。`flag`（`+0xE0 + slot*0x5C`、`0`=無効）を 1 にするのは `setMapKey` の全 22 要素 + flag 一括コピー経由。全体 2768B 書込で同じ領域を更新する経路も有効（本実装はこちらを使用）。`0 = KeyMap_N`（未割当）が実値。`KeyMap_My_NUll = 227` はマッピング書込経路から参照されず、用途未確認のため書かない。
 
 ### 5.2 `key[22]` 配列インデックス対応表（Ultimate 2 / Non-3E レイアウト）
 
@@ -299,6 +309,8 @@ struct Bt2Header {
 
 > **※3E系（8BitDo Ultimate 3-mode / `is3E() == true`）との配列順の違いに注意**:
 > `getMappings()` の Non-3E（Ultimate 2 Bluetooth を含む）分岐は上記の 22 要素順 `[A, B, X, Y, L1, R1, L2, R2, L3, R3, Select, Start, Share, Logo, Up, Down, Left, Right, P1, P2, P3, P4]` である（3E 系は `[L3, R3, P3, P4, Up..]` の 20 要素）。
+>
+> **背面ボタンの物理名（RE 確定・2026-11-22）**: index 18 = P1 = **PL**、19 = P2 = **PR**、20 = P3 = **L4**、21 = P4 = **R4**（DEX `MappingImageEngineer.getMotionKeyString`）。前面マッピング UI の割当先一覧には PL/PR/L4/R4 を出さない設計（`getMapKeyString` は P1/P2 に `null` を返す）。
 
 ### 5.3 32-bit `KeyMap` 定数・ビットマスク完全表
 
@@ -350,6 +362,8 @@ struct Bt2Header {
 | `227` | `0x0000_00E3` | `KeyMap_My_NUll` | 無効化/未定義プレースホルダ（UI内部表現） |
 
 > **マクロとの関連**: マクロをボタンに割り当てる場合、実際の設定ではボタン側のリマップエントリを無効 (`KeyMap_N`) にするか、`MacroFunPro3Record.key_map` に起動トリガーキー（例: `KeyMap_P1`, `KeyMap_L2` 等の 32-bit `KeyMap` 値）を書き込む仕様となっている（UI では最大 4 つのマクロに対し `M1..M4` を割り当て管理する）。
+>
+> **マッピング値の型（RE 確定）**: `MapKeyRecord.key[]` は 1 ボタン = 1 つの 32-bit `KeyMap` 値であり、複数ボタンのビット合成ではない。無効化は `0`。`KeyMap_My_NUll = 227` は定数として存在するが、Android/Windows のリマップ書込・表示経路から参照されず用途は未確認（書かない）。単一エントリ書込は `flag` を変えない。
 
 ---
 
