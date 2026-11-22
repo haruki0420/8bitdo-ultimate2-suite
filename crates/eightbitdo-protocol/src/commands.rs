@@ -6,7 +6,7 @@
 
 use alloc::vec::Vec;
 
-use crate::config_bt2::{MacroIndex, Slot, CONFIG_SIZE};
+use crate::config_bt2::{MacroIndex, Slot, CONFIG_SIZE, MACRO_SLOT_SIZE};
 use crate::error::Error;
 use crate::header::{self, CustomHeader, PacketKind, USB_REPORT_SIZE};
 use crate::macro_data::{self, MacroStep};
@@ -421,7 +421,7 @@ pub fn write_config_packets(
         .collect())
 }
 
-/// Split a 216-byte macro header write into transport-sized packets.
+/// Split a **216-byte** macro header write into transport-sized packets.
 ///
 /// Official evidence (`getBT2_WriteMacroi`, called from `writeBT2Macro`): the
 /// macro header command uses `cmd = 0x0001`, `offset = 0x68C + slot * 0xD8`,
@@ -434,8 +434,10 @@ pub fn write_config_packets(
 ///
 /// # Errors
 ///
-/// Returns [`Error::EmptyPayload`] when `data` is empty,
-/// [`Error::InvalidChunkSize`] when `chunk_size` is zero, or
+/// Returns [`Error::InvalidLength`] when `data` is not exactly
+/// [`MACRO_SLOT_SIZE`], [`Error::EmptyPayload`] when `data` is empty,
+/// [`Error::InvalidChunkSize`] when `chunk_size` is zero (its `max` is the
+/// 216-byte payload length, the largest meaningful chunk), or
 /// [`Error::RangeOutOfBounds`] when `offset + data.len()` exceeds the
 /// 2768-byte configuration block.
 pub fn write_macro_header_packets(
@@ -445,6 +447,12 @@ pub fn write_macro_header_packets(
 ) -> Result<Vec<Request>, Error> {
     if data.is_empty() {
         return Err(Error::EmptyPayload);
+    }
+    if data.len() != MACRO_SLOT_SIZE {
+        return Err(Error::InvalidLength {
+            expected: MACRO_SLOT_SIZE,
+            actual: data.len(),
+        });
     }
     if chunk_size == 0 {
         return Err(Error::InvalidChunkSize {
@@ -1166,6 +1174,20 @@ mod tests {
         assert!(matches!(
             write_macro_header_packets(0x68C, &data, 0),
             Err(Error::InvalidChunkSize { actual: 0, .. })
+        ));
+        assert!(matches!(
+            write_macro_header_packets(0x68C, &data[..215], 32),
+            Err(Error::InvalidLength {
+                expected: 216,
+                actual: 215
+            })
+        ));
+        assert!(matches!(
+            write_macro_header_packets(0x68C, &[0u8; 217], 32),
+            Err(Error::InvalidLength {
+                expected: 216,
+                actual: 217
+            })
         ));
     }
 
