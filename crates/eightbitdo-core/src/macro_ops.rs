@@ -107,11 +107,24 @@ pub const MACRO_HEADER_CHUNK_SIZE: usize = 142;
 /// uncertainty in `docs/PROTOCOL_SPEC.md`.
 pub const MACRO_SAVE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Wait after the Erase ACK before starting Write.
+///
+/// The controller acknowledges Erase before the 4 KB sector is necessarily
+/// ready for the next operation. 100 ms is a provisional settle delay based on
+/// the observed macro-1 read-back failure; tune it from hardware measurements.
+pub const MACRO_ERASE_SETTLE_DELAY: Duration = Duration::from_millis(100);
+
+/// Wait after the final Write chunk ACK before the Header update.
+///
+/// 50 ms is provisional; the flash write completion time is not documented.
+pub const MACRO_WRITE_SETTLE_DELAY: Duration = Duration::from_millis(50);
+
 /// Wait after Save before reading the configuration back.
 ///
-/// The device may still be committing the header when the ACK arrives. 100 ms
-/// is a conservative first value and is **not** confirmed on hardware.
-pub const MACRO_VERIFY_DELAY: Duration = Duration::from_millis(100);
+/// Extended from 100 ms to 300 ms after a hardware restore where all ACKs
+/// arrived but the immediate `0x0102` read returned zeros. 300 ms is still
+/// provisional and must be tuned from hardware measurements.
+pub const MACRO_VERIFY_DELAY: Duration = Duration::from_millis(300);
 
 /// Per-stage ACK timeouts for a macro write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -790,6 +803,8 @@ impl<T: Transport> Session<T> {
         .map_err(|error| macro_write_failure(MacroWriteStage::Erase, error, false))?;
         packets_sent += 1;
 
+        tokio::time::sleep(MACRO_ERASE_SETTLE_DELAY).await;
+
         for request in &write_packets {
             self.send_and_await_ack(
                 request,
@@ -803,6 +818,8 @@ impl<T: Transport> Session<T> {
             .map_err(|error| macro_write_failure(MacroWriteStage::Write, error, false))?;
             packets_sent += 1;
         }
+
+        tokio::time::sleep(MACRO_WRITE_SETTLE_DELAY).await;
 
         for request in &header_request {
             self.send_and_await_ack(
