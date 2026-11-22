@@ -377,9 +377,10 @@ impl MacroEntry {
 
 /// `max_steps` values that mean "no macro data to read".
 ///
-/// `0` is documented as an empty macro. `0xFFFF` occurs in real dumps as an
-/// unset marker (実機未確認); it is skipped rather than turned into a
-/// 655,350-byte read. Both are recorded in the backup JSON.
+/// `0` is documented as an empty macro. `0xFFFF` is an **unconfirmed
+/// candidate for an unset marker** (未確認の未設定マーカー候補); it is skipped
+/// rather than turned into a 655,350-byte read. Both are recorded in the
+/// backup JSON.
 #[must_use]
 pub const fn is_skipped_steps(max_steps: u16) -> bool {
     max_steps == 0 || max_steps == u16::MAX
@@ -629,7 +630,9 @@ impl<T: Transport> Session<T> {
                         ));
                     }
                     OffsetMode::AmbiguousZero if reported != 0 => {
-                        if u64::from(reported) == chunk_offset as u64 {
+                        if reported == requested {
+                            offset_mode = Some(OffsetMode::Absolute);
+                        } else if u64::from(reported) == chunk_offset as u64 {
                             offset_mode = Some(OffsetMode::Relative);
                         } else {
                             return Err(offset_mode_error(
@@ -682,8 +685,11 @@ impl<T: Transport> Session<T> {
     ///
     /// # Errors
     ///
-    /// Returns a protocol error before any packet for empty or oversized
-    /// steps, or [`Error::MacroWrite`] for a failed stage, timeout, CRC error,
+    /// Returns [`Error::EmptyMacroWrite`] for an empty target,
+    /// [`Error::Unsupported`] for `SaveTransport::Usb`, [`Error::MtuTooSmall`]
+    /// when the MTU cannot carry a 32-byte chunk or any header payload, a
+    /// protocol error for oversized steps or `total_cnt > 4`, or
+    /// [`Error::MacroWrite`] for a failed stage, timeout, CRC error,
     /// disconnect or read-back mismatch.
     pub async fn write_macro(
         &self,
@@ -1494,6 +1500,40 @@ mod tests {
         }
         assert_eq!(entry.raw(), raw);
         assert_eq!(entry.read_offsets(), &expected_offsets);
+    }
+
+    #[tokio::test]
+    async fn read_macro_resolves_ambiguous_zero_to_absolute_offsets() {
+        let mut config = config_with_macros();
+        let mut record = config.macro_record(Slot::S1, MacroIndex::M2);
+        record.max_steps = 30;
+        config.set_macro_record(Slot::S1, MacroIndex::M2, &record);
+        config.recompute_crc();
+        let snapshot = snapshot(config);
+
+        let steps = sample_steps(30);
+        let raw = sample_entry_payload(&steps);
+        let mock = MockTransport::new();
+        let response_offsets = [0u32, 0x108E, 0x111C];
+        for (chunk, offset) in raw.chunks(142).zip(response_offsets) {
+            let mut header = envelope(cmd::READ_MACRO, 300, offset, chunk);
+            header.crc16 = packet_crc16(chunk);
+            mock.push_response(&header, chunk);
+        }
+
+        let session = Session::new(&mock);
+        let entry = session
+            .read_macro(&snapshot, Slot::S1, MacroIndex::M2)
+            .await
+            .unwrap();
+
+        let request_offsets = [0x1000u32, 0x108E, 0x111C];
+        let sent = mock.sent_frames();
+        for (frame, offset) in sent.iter().zip(request_offsets) {
+            assert_eq!(CustomHeader::parse(&frame[1..]).unwrap().offset, offset);
+        }
+        assert_eq!(entry.raw(), raw);
+        assert_eq!(entry.read_offsets(), &response_offsets);
     }
 
     #[tokio::test]
