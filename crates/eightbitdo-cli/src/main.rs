@@ -2363,7 +2363,8 @@ fn raw_erased_slot_state(config: &Bt2Config, slot: Slot) -> bool {
     let joy = config.joy(slot);
     let rumble = config.rumble(slot);
     let map_key = config.map_key(slot);
-    joy.flag == u32::MAX
+    config.slot_flag(slot) == u32::MAX
+        && joy.flag == u32::MAX
         && [
             joy.left_start_value,
             joy.left_end_value,
@@ -2399,6 +2400,15 @@ fn raw_config_problems(config: &Bt2Config) -> Vec<String> {
         ));
     }
     for slot in Slot::ALL {
+        let slot_flag = config.slot_flag(slot);
+        if !matches!(slot_flag, 0 | 0x2020_0911 | 0xFFFF_FFFF) {
+            problems.push(format!(
+                "slot_flags[{}] 0x{slot_flag:08X} is not an observed hardware value \
+                 (0, 0x20200911, 0xFFFFFFFF); pass --force-raw only to restore an unknown device \
+                 state",
+                slot.index()
+            ));
+        }
         let erased_slot_state = raw_erased_slot_state(config, slot);
         let joy = config.joy(slot);
         if !raw_flag_is_observed(joy.flag) {
@@ -2470,12 +2480,9 @@ fn raw_config_problems(config: &Bt2Config) -> Vec<String> {
                 ));
             }
         }
-        let gyro_key_ok = gyro.key_map.is_single_documented()
-            || (gyro.key_map.bits() == u32::MAX && gyro.flag == u32::MAX);
-        if !gyro_key_ok {
+        if !gyro.key_map.is_single_documented() {
             problems.push(format!(
-                "gyro[{}].key_map 0x{:08X} is not a documented single KeyMap value (the \
-                 0xFFFFFFFF sentinel is only accepted with an erased 0xFFFFFFFF flag)",
+                "gyro[{}].key_map 0x{:08X} is not a documented single KeyMap value",
                 slot.index(),
                 gyro.key_map.bits()
             ));
@@ -10895,6 +10902,7 @@ mod tests {
         // Mirrors the real slot 2 payload: flag 0xFFFFFFFF, joy all 255,
         // rumble NaN, all 22 map-key entries 0xFFFFFFFF.
         let mut config = config_write_fixture();
+        config.set_slot_flag(Slot::S3, 0xFFFF_FFFF);
         let mut joy = config.joy(Slot::S3);
         joy.flag = 0xFFFF_FFFF;
         joy.left_start_value = 255;
@@ -10932,6 +10940,7 @@ mod tests {
 
         // joy only
         let mut config = config_write_fixture();
+        config.set_slot_flag(Slot::S3, 0xFFFF_FFFF);
         let mut joy = config.joy(Slot::S3);
         joy.flag = 0xFFFF_FFFF;
         joy.left_start_value = 255;
@@ -10947,6 +10956,7 @@ mod tests {
 
         // rumble only
         let mut config = config_write_fixture();
+        config.set_slot_flag(Slot::S3, 0xFFFF_FFFF);
         let mut rumble = config.rumble(Slot::S3);
         rumble.flag = 0xFFFF_FFFF;
         rumble.left = f32::NAN;
@@ -10960,6 +10970,7 @@ mod tests {
 
         // map_key only
         let mut config = config_write_fixture();
+        config.set_slot_flag(Slot::S3, 0xFFFF_FFFF);
         let mut map_key = config.map_key(Slot::S3);
         map_key.flag = 0xFFFF_FFFF;
         map_key.keys = [KeyMap::from_bits(0xFFFF_FFFF); 22];
@@ -10972,6 +10983,7 @@ mod tests {
 
         // joy + rumble but normal map_key
         let mut config = config_write_fixture();
+        config.set_slot_flag(Slot::S3, 0xFFFF_FFFF);
         let mut joy = config.joy(Slot::S3);
         joy.flag = 0xFFFF_FFFF;
         joy.left_start_value = 255;
@@ -10988,11 +11000,56 @@ mod tests {
         assert!(validate_raw_config_for_write(&config, true).is_ok());
     }
 
+    /// Load the local real-device dump used by the opt-in E2E tests.
+    ///
+    /// `CARGO_MANIFEST_DIR` points at `crates/eightbitdo-cli`, so the repository
+    /// root dump is two directories up. `EIGHTBITDO_REAL_DUMP` overrides it.
+    /// The loader verifies the evidence SHA-256 and reports every skip reason;
+    /// the tests are `#[ignore]`d so a missing dump is never a silent pass.
+    fn real_device_dump_bytes() -> Option<Vec<u8>> {
+        const EVIDENCE_SHA256: &str =
+            "1dca47facfc1c0394a8893ac0a5b7ef80678c51081001886a4bf17ce2f59c600";
+        let path = if let Some(path) = std::env::var_os("EIGHTBITDO_REAL_DUMP") {
+            PathBuf::from(path)
+        } else {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/restore-baseline/config.bin")
+        };
+        if !path.is_file() {
+            eprintln!(
+                "skip: real device dump not found at {} (set EIGHTBITDO_REAL_DUMP to override)",
+                path.display()
+            );
+            return None;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!(
+                    "skip: cannot read real device dump {}: {error}",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        let sha256 = sha256_hex(&bytes);
+        if !sha256.eq_ignore_ascii_case(EVIDENCE_SHA256) {
+            eprintln!(
+                "skip: real device dump SHA-256 {sha256} does not match evidence {EVIDENCE_SHA256}"
+            );
+            return None;
+        }
+        eprintln!(
+            "real dump: using {} (sha256 {sha256}, {} bytes)",
+            path.display(),
+            bytes.len()
+        );
+        Some(bytes)
+    }
+
     #[test]
+    #[ignore = "requires the local real-device dump (EIGHTBITDO_REAL_DUMP or .tmp/restore-baseline/config.bin)"]
     fn real_device_dump_is_accepted_when_local_evidence_exists() {
-        // Local-only evidence file (gitignored). The test is a no-op in CI.
-        let path = Path::new(".tmp/restore-baseline/config.bin");
-        let Ok(bytes) = std::fs::read(path) else {
+        let Some(bytes) = real_device_dump_bytes() else {
             return;
         };
         assert_eq!(bytes.len(), CONFIG_SIZE);
@@ -11005,9 +11062,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires the local real-device dump (EIGHTBITDO_REAL_DUMP or .tmp/restore-baseline/config.bin)"]
     async fn config_write_accepts_the_real_device_dump_when_present() {
-        let path = Path::new(".tmp/restore-baseline/config.bin");
-        let Ok(bytes) = std::fs::read(path) else {
+        let Some(bytes) = real_device_dump_bytes() else {
             return;
         };
         let initial = Bt2Config::from_bytes(&bytes).expect("real dump length");
@@ -11041,6 +11098,32 @@ mod tests {
             1
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raw_config_validation_rejects_unobserved_slot_flags() {
+        let mut config = config_write_fixture();
+        config.set_slot_flag(Slot::S1, 0xDEAD_BEEF);
+        assert!(
+            validate_raw_config_for_write(&config, false).is_err(),
+            "an unobserved slot_flags value must require --force-raw"
+        );
+        assert!(validate_raw_config_for_write(&config, true).is_ok());
+    }
+
+    #[test]
+    fn raw_config_validation_rejects_a_gyro_key_map_sentinel() {
+        // The real gyro key_map is 0; 0xFFFFFFFF is not accepted even for an
+        // otherwise fully-erased slot.
+        let mut config = synthetic_observed_dump();
+        let mut gyro = config.six_axis(Slot::S3);
+        gyro.key_map = KeyMap::from_bits(0xFFFF_FFFF);
+        config.set_six_axis(Slot::S3, &gyro);
+        assert!(
+            validate_raw_config_for_write(&config, false).is_err(),
+            "gyro.key_map 0xFFFFFFFF must not be accepted"
+        );
+        assert!(validate_raw_config_for_write(&config, true).is_ok());
     }
 
     #[test]
@@ -11192,10 +11275,7 @@ mod tests {
         record.flag = 0xFFFF_FFFF;
         record.keys = [KeyMap::from_bits(0xFFFF_FFFF); 22];
         config.set_map_key(Slot::S3, &record);
-        let mut gyro = config.six_axis(Slot::S3);
-        gyro.flag = 0xFFFF_FFFF;
-        gyro.key_map = KeyMap::from_bits(0xFFFF_FFFF);
-        config.set_six_axis(Slot::S3, &gyro);
+        config.set_slot_flag(Slot::S3, 0xFFFF_FFFF);
         // The map_key sentinel is slot-wide: joy and rumble must be erased too.
         let mut joy = config.joy(Slot::S3);
         joy.flag = 0xFFFF_FFFF;
@@ -11219,11 +11299,12 @@ mod tests {
         assert!(parse_remap_target("0xFFFFFFFF").is_err());
     }
 
-    #[tokio::test]
-    async fn config_write_restores_an_observed_flag_dump_without_force_raw() {
-        let dir = scratch_dir("config-observed-flags");
-        let initial = config_write_fixture();
-        let mut dump = initial.clone();
+    /// Deterministic synthetic dump carrying the real-device values from
+    /// `DEVICE_CONFIG_EVIDENCE.md` (PII-free): observed flags on every record,
+    /// gyro slot0 `0x20190000`, and the fully-erased slot 3 with slot flag
+    /// `0xFFFFFFFF`, all-255 joy, NaN rumble and 22 erased key-map entries.
+    fn synthetic_observed_dump() -> Bt2Config {
+        let mut dump = config_write_fixture();
         for slot in Slot::ALL {
             let (common, gyro_flag) = match slot {
                 Slot::S1 => (0x2020_0911, 0x2019_0000),
@@ -11247,6 +11328,11 @@ mod tests {
             dump.set_six_axis(slot, &gyro);
             let mut map_key = dump.map_key(slot);
             map_key.flag = common;
+            if slot != Slot::S3 {
+                for (index, button) in ButtonIndex::ALL.into_iter().enumerate() {
+                    map_key.keys[index] = button.default_key();
+                }
+            }
             dump.set_map_key(slot, &map_key);
             let mut dynamic = dump.dynamic_theme(slot);
             dynamic.flag = common;
@@ -11261,8 +11347,9 @@ mod tests {
             macro_slot.flag = common;
             dump.set_macro_slot(slot, &macro_slot);
         }
-        // Mirror the real erased slot: all-255 joy/trigger, NaN rumble and
-        // 0xFFFFFFFF in every map_key entry.
+        // The real erased slot also has an erased slot_flags entry and a
+        // fully erased map_key / joy / rumble state.
+        dump.set_slot_flag(Slot::S3, 0xFFFF_FFFF);
         let mut erased = dump.map_key(Slot::S3);
         erased.keys = [KeyMap::from_bits(0xFFFF_FFFF); 22];
         dump.set_map_key(Slot::S3, &erased);
@@ -11282,6 +11369,24 @@ mod tests {
         rumble.left = f32::NAN;
         rumble.right = f32::NAN;
         dump.set_rumble(Slot::S3, &rumble);
+        dump
+    }
+
+    #[test]
+    fn raw_config_validation_accepts_a_synthetic_real_dump() {
+        let dump = synthetic_observed_dump();
+        assert!(
+            validate_raw_config_for_write(&dump, false).is_ok(),
+            "the synthetic real dump must pass raw validation without --force-raw: {:?}",
+            validate_raw_config_for_write(&dump, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn config_write_restores_an_observed_flag_dump_without_force_raw() {
+        let dir = scratch_dir("config-observed-flags");
+        let initial = config_write_fixture();
+        let dump = synthetic_observed_dump();
 
         assert!(
             validate_raw_config_for_write(&dump, false).is_ok(),
