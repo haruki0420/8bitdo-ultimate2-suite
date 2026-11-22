@@ -6,9 +6,11 @@
 //! backed by `btleplug`.
 //!
 //! The first slice was read-only (version, configuration and realtime input).
-//! The current core also has macro flash read/write APIs (`macro_ops`) and the
-//! full 2768-byte configuration write path (`config_ops`); both write paths are
-//! fail-closed and currently mock-tested only. OTA is still a separate phase.
+//! The current core also has macro flash read/write APIs (`macro_ops`), the
+//! full 2768-byte configuration write path (`config_ops`), and a BLE-only OTA
+//! state machine (`ota`). Every write path is fail-closed and currently
+//! mock-tested only; no front end is wired to OTA yet, and USB OTA is
+//! intentionally absent (USB Boot TX framing is undocumented).
 //!
 //! Button remapping (`MapKeyRecord`) is implemented in [`config_ops`] from the
 //! official binary layout: [`config_ops::ConfigEdit::ButtonRemap`] changes one
@@ -21,6 +23,7 @@ pub mod config_ops;
 pub mod error;
 pub mod macro_ops;
 pub mod mock;
+pub mod ota;
 pub mod session;
 pub mod transport;
 
@@ -34,7 +37,10 @@ pub use config_ops::{
     OFFICIAL_WRITE_CHUNK,
 };
 pub use error::Error;
-pub use error::{ConfigWriteStage, ConfigWriteState, MacroWriteStage, MacroWriteState};
+pub use error::{
+    ConfigWriteStage, ConfigWriteState, MacroWriteStage, MacroWriteState, OtaFailureStage,
+    OtaWriteState,
+};
 pub use macro_ops::{
     macro_header_chunk_len, macro_write_chunk_len, macro_write_chunk_len_requested,
     max_protocol_payload, validate_macro_chunk_size, MacroBackup, MacroEntry, MacroHeaderOutcome,
@@ -42,6 +48,13 @@ pub use macro_ops::{
     MACRO_HEADER_CHUNK_SIZE, MACRO_READ_TOTAL_TIMEOUT,
 };
 pub use mock::MockTransport;
+pub use ota::{
+    gamepad_type_from_pid, FirmwareImage, GamepadType, OtaConfig, OtaOutcome, OtaPhase,
+    OtaProgress, OtaTimeouts, OtaUpdate, OTA_CHUNK_SIZE, OTA_ENTER_BOOT_TIMEOUT, OTA_ERASE_TIMEOUT,
+    OTA_IMAGE_HEADER_LEN, OTA_JUMP_TIMEOUT, OTA_PID_TIMEOUT, OTA_SECTOR_SIZE,
+    OTA_VERSION_HEADER_LEN, OTA_VERSION_TIMEOUT, OTA_WRITE_TIMEOUT, OTA_WRITE_VERSION_TIMEOUT,
+    UT2_BOOT_PID,
+};
 pub use session::{
     ConfigSnapshot, Session, VersionInfo, CONFIG_TOTAL_TIMEOUT, DEFAULT_TIMEOUT,
     MAX_CONSECUTIVE_DECODE_FAILURES,

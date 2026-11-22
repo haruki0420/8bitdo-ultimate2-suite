@@ -224,7 +224,14 @@ Track C: モバイル
   - Mock で正常系・タイムアウト・CRC 不一致・途中切断を固定
 - **完了条件**: 同一バージョン再書き込み → 最新版更新 → 復旧確認。
 - **Tier**: **3**（OTA / Flash / セキュリティ境界）。
-- **状態**: 未着手（Phase 2b 後）。
+- **状態**: **core 実装済み（Mock テストのみ。CLI / GUI / UniFFI 未配線、実機未検証）**。2026-11-23 にブランチ `feat/ble-ota` で追加。
+  - `crates/eightbitdo-core/src/ota.rs`: BLE 専用の状態機械 `OtaUpdate`（`Idle` → `EnteringBoot` → `AwaitingBootReconnect` → `PreparingBoot` → `Ready` → `Erasing` / `Writing` / `Finalizing` → `Complete`）。`enter_boot` は App Mode `Session`、`prepare_boot` / `write_firmware` は Bootloader `Transport` を受ける。
+  - `gamepad_type` ゲート: `readPID 0x0008` の結果が `0x600F` のときだけ type 1 として続行。非 type 1 は `OtaUnsupportedPid` で停止し、`readVersionInBoot` の offset を推測しない。`0x01017040` / `0x01018000` のみ実装（非 type 1 の offset は未実装）。
+  - 書込順序: 全フレームを最初の Erase 前に構築し、4KB セクタごとに `EraseFlash 0x0004`（10s）→ `WriteFirmware 0x0003` 64B + CRC（1s/チャンク）→ 最後に `WriteVersion 0x00C4`（24B、3s）→ `WriteFirmwareVersion 0x0002`（4B、send-only）→ `JumpApp 0x0006`（best-effort）。
+  - `.dat` 検証: 28B ヘッダ、`image_len` 64B 倍数、`load_base_addr` 64B / 4KB アライン、`28 + image_len` の厳密一致。trailing data（マルチセクション）は拒否。
+  - fail-closed: `Error::Ota { stage, state, recovery }`（`OtaWriteState::{Untouched, EraseStarted, PartiallyWritten, Written}`）。進捗は `OtaProgress` コールバック。
+  - MockTransport 23 テスト: 全パケット列・CRC・チャンク境界・セクタ境界・ACK 順序・Erase/Write/WriteVersion 失敗・PID 不一致・ACK タイムアウト・PID ゲート迂回拒否・ローカル検証先行。
+  - **未検証 / 残課題**: `PROTOCOL_SPEC` §8.5 を参照。Bootloader RX フレーミング、`readPID` 応答形状、PID→type 対応（`evidence.md` §5 はキャラクタリスティック index 由来と報告）、Erase/Write のアドレス規約（仕様の `load_base+sector_off` と `evidence.md` §6 のイメージ相対が矛盾）、`WriteVersion` の payload 長（24B vs 16B）、`WriteFirmware` の 64B payload（`evidence.md` §7.3 の 16B 問題）、`EraseFlash` の chunk_len（0 vs 0x1000）、タイムアウト差（5s vs Android 2s）は実機 btsnoop 待ち。USB OTA は `N/A + 理由（USB Boot TX 未文書化）`。バッテリー警告・ファームウェア取得/検証は未実装。
 
 ### Phase 2d: 設定書き込み（config apply）
 - **ゴール**: 2768B 全体の書込み + Save を CLI から安全に実行する。
