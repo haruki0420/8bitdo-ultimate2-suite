@@ -6,7 +6,7 @@
 //! brightest plane on screen is the next action.
 //!
 //! Layout: a 56 px top bar, a 264 px rail, a 40 px tab row with a full-width
-//! hairline, and a content column capped at 760 px with a vertical hairline at
+//! hairline, and a content column capped at 700 px with a vertical hairline at
 //! its right edge. Empty states are asymmetric: a ring on the left, the next
 //! move on the right.
 
@@ -545,7 +545,7 @@ impl App {
             let label = i18n::t(lang, key);
             let width = measure(ui, label, theme::medium(theme::FONT_META)) + theme::SPACE_3;
             ui.add_space(theme::SPACE_1);
-            let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 26.0), Sense::click());
+            let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::click());
             let hover = ui.ctx().animate_bool_with_time(
                 response.id.with("hover"),
                 response.hovered(),
@@ -643,32 +643,9 @@ impl App {
 
     fn rail_body(&mut self, ui: &mut egui::Ui) {
         ui.add_space(theme::SPACE_2);
-        section_label(ui, self.lang, Key::SectionConnection);
-        ui.add_space(theme::SPACE_2);
-        ui.horizontal(|ui| {
-            status_dot(
-                ui,
-                self.connection,
-                self.scan_angle(),
-                ui.ctx().animate_value_with_time(
-                    Id::new("rail-glow"),
-                    if self.connection.is_connected() {
-                        1.0
-                    } else {
-                        0.0
-                    },
-                    self.anim(0.3),
-                ),
-            );
-            ui.add_space(theme::SPACE_2);
-            ui.add(egui::Label::new(theme::text_job(
-                self.text(self.connection.key()),
-                theme::medium(theme::FONT_CONTROL),
-                self.connection.text_color(),
-                0.0,
-                Some(theme::LINE_HEIGHT_CONTROL),
-            )));
-        });
+        // The top bar is the single source of connection state. The rail shows
+        // the device identity only, so the same "未接続" ring is not repeated.
+        section_label(ui, self.lang, Key::SectionDevice);
         ui.add_space(theme::SPACE_2);
         if let Some(device) = &self.device {
             ui.add(egui::Label::new(theme::text_job(
@@ -702,6 +679,7 @@ impl App {
                 "rail-disconnect",
                 self.can_read(),
                 self.text(Key::Disconnect),
+                theme::SURFACE_1,
             )
             .on_hover_text(self.text(Key::HintDisconnect))
             .clicked()
@@ -806,8 +784,14 @@ impl App {
                         theme::TEXT_MUTED,
                     )));
                     ui.add_space(theme::SPACE_2);
-                    if secondary_key(ui, "rail-copy-sha", true, self.text(Key::CopySha256))
-                        .clicked()
+                    if secondary_key(
+                        ui,
+                        "rail-copy-sha",
+                        true,
+                        self.text(Key::CopySha256),
+                        theme::SURFACE_1,
+                    )
+                    .clicked()
                     {
                         ui.output_mut(|output| output.copied_text = report.sha256.clone());
                     }
@@ -864,15 +848,34 @@ impl App {
                     .min(rect.right() - theme::CONTENT_INSET);
                 let content_top = tab_bottom + theme::SPACE_4;
                 let content_bottom = rect.bottom() - theme::SPACE_4;
+                let meta_height = theme::LINE_HEIGHT_META;
+                let scroll_bottom = content_bottom - meta_height - theme::SPACE_2;
                 let content_rect = Rect::from_min_max(
                     Pos2::new(content_left, content_top),
-                    Pos2::new(content_right.max(content_left + 100.0), content_bottom),
+                    Pos2::new(content_right.max(content_left + 100.0), scroll_bottom),
                 );
                 ui.painter().vline(
                     content_right,
                     Rangef::new(content_top, content_bottom),
                     Stroke::new(1.0_f32, theme::HAIRLINE),
                 );
+
+                // A bottom meta line closes the column, so tall windows read as
+                // a bounded sheet of paper rather than unfinished space.
+                let footer = self.text(Key::FooterMeta).to_owned();
+                let meta_rect = Rect::from_min_size(
+                    Pos2::new(content_left, content_bottom - meta_height),
+                    Vec2::new(content_right - content_left, meta_height),
+                );
+                paint_job_left_center(
+                    ui.painter(),
+                    Pos2::new(meta_rect.left(), meta_rect.center().y),
+                    theme::job_meta(&footer),
+                );
+                ui.interact(meta_rect, ui.id().with("footer-meta"), Sense::hover())
+                    .widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &footer)
+                    });
 
                 let mut content_ui = ui.new_child(
                     UiBuilder::new()
@@ -958,7 +961,7 @@ impl App {
                     panel_rect.right() - theme::CONTENT_INSET - 56.0,
                     panel_rect.top() + theme::TAB_HEIGHT / 2.0,
                 ),
-                Vec2::new(112.0, 28.0),
+                Vec2::new(112.0, 32.0),
             );
             if secondary_key_at(
                 ui,
@@ -967,6 +970,7 @@ impl App {
                 !self.log.is_empty(),
                 self.text(Key::Clear),
                 self.anim(0.10),
+                theme::BG,
             )
             .clicked()
             {
@@ -1024,8 +1028,14 @@ impl App {
                     Vec2::new(ui.available_width(), 32.0),
                     Layout::right_to_left(Align::Center),
                     |ui| {
-                        if secondary_key(ui, "error-dismiss", true, self.text(Key::Dismiss))
-                            .clicked()
+                        if secondary_key(
+                            ui,
+                            "error-dismiss",
+                            true,
+                            self.text(Key::Dismiss),
+                            theme::SURFACE_2,
+                        )
+                        .clicked()
                         {
                             self.error = None;
                         }
@@ -1046,8 +1056,14 @@ impl App {
                 Vec2::new(ui.available_width(), 36.0),
                 Layout::right_to_left(Align::Center),
                 |ui| {
-                    if secondary_key(ui, "stale-reconnect", true, self.text(Key::Reconnect))
-                        .clicked()
+                    if secondary_key(
+                        ui,
+                        "stale-reconnect",
+                        true,
+                        self.text(Key::Reconnect),
+                        theme::BG,
+                    )
+                    .clicked()
                     {
                         self.request_connect();
                     }
@@ -1063,7 +1079,7 @@ impl App {
     fn empty_state(&mut self, ui: &mut egui::Ui, tab: Tab) {
         let width = ui.available_width().min(theme::CONTENT_MAX_WIDTH);
         let card_height = match tab {
-            Tab::Device => 232.0,
+            Tab::Device => 224.0,
             Tab::Input | Tab::Config | Tab::Log => 200.0,
         };
         let (rect, _) = ui.allocate_exact_size(Vec2::new(width, card_height), Sense::hover());
@@ -1076,14 +1092,24 @@ impl App {
         );
 
         let inner = rect.shrink(theme::CARD_PADDING);
-        let ring_rect = Rect::from_min_size(inner.min, Vec2::splat(theme::RING_DIAMETER));
+        let ring_rect = Rect::from_center_size(
+            Pos2::new(inner.left() + theme::RING_DIAMETER / 2.0, inner.center().y),
+            Vec2::splat(theme::RING_DIAMETER),
+        );
         let lit = self.connection.is_connected();
         let glow = ui.ctx().animate_value_with_time(
             Id::new("empty-ring-glow"),
             if lit { 1.0 } else { 0.0 },
             self.anim(0.3),
         );
-        large_ring(ui, ring_rect, lit, glow, self.scan_angle());
+        large_ring(
+            ui,
+            ring_rect,
+            lit,
+            glow,
+            self.scan_angle(),
+            self.text(self.connection.key()),
+        );
 
         let center_rect = Rect::from_center_size(
             ring_rect.center(),
@@ -1123,6 +1149,7 @@ impl App {
                 KeyKind::Primary,
                 label,
                 self.anim(0.10),
+                theme::SURFACE_3,
             )
             .on_hover_text(self.text(if self.selected_app_address().is_some() {
                 Key::ConnectUsesSelected
@@ -1146,35 +1173,55 @@ impl App {
                     .max_rect(right_rect)
                     .layout(Layout::top_down(Align::LEFT)),
             );
-            section_label(&mut right, self.lang, Key::SectionNextSteps);
+            let heading = match tab {
+                Tab::Device => Key::SectionConnectSteps,
+                Tab::Log => Key::NavLog,
+                Tab::Input | Tab::Config => Key::SectionNextSteps,
+            };
+            section_label(&mut right, self.lang, heading);
             right.add_space(theme::SPACE_2);
             match tab {
                 Tab::Device => {
-                    for (index, (title, body)) in [
-                        (Key::Step1Title, Key::Step1Body),
-                        (Key::Step2Title, Key::Step2Body),
-                        (Key::Step3Title, Key::Step3Body),
-                    ]
-                    .into_iter()
-                    .enumerate()
+                    let current_step = if self.connection == ConnectionState::Scanning
+                        || !self.scan_entries.is_empty()
                     {
-                        right.horizontal(|ui| {
-                            ui.add(egui::Label::new(theme::job_data(
-                                &format!("{}", index + 1),
-                                theme::LED_DIM,
-                            )));
-                            ui.add_space(theme::SPACE_2);
-                            ui.add(egui::Label::new(theme::text_job(
-                                self.text(title),
-                                theme::medium(theme::FONT_BODY),
-                                theme::TEXT_BODY,
-                                0.0,
-                                Some(theme::LINE_HEIGHT_CONTROL),
-                            )))
-                            .on_hover_text(self.text(body));
-                        });
-                        right.add_space(theme::SPACE_1);
-                    }
+                        2
+                    } else {
+                        0
+                    };
+                    right.scope(|ui| {
+                        // `ui.horizontal` otherwise enforces `interact_size.y`,
+                        // which would push the third step and the Scan key out
+                        // of the 224 pt card.
+                        ui.spacing_mut().interact_size.y = 20.0;
+                        for (index, (title, body)) in [
+                            (Key::Step1Title, Key::Step1Body),
+                            (Key::Step2Title, Key::Step2Body),
+                            (Key::Step3Title, Key::Step3Body),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            ui.horizontal(|ui| {
+                                step_indicator(ui, index == current_step);
+                                ui.add_space(theme::SPACE_2);
+                                ui.add(egui::Label::new(theme::job_data(
+                                    &format!("{}", index + 1),
+                                    theme::TEXT_MUTED,
+                                )));
+                                ui.add_space(theme::SPACE_2);
+                                ui.add(egui::Label::new(theme::text_job(
+                                    self.text(title),
+                                    theme::medium(theme::FONT_BODY),
+                                    theme::TEXT_BODY,
+                                    0.0,
+                                    Some(theme::LINE_HEIGHT_CONTROL),
+                                )))
+                                .on_hover_text(self.text(body));
+                            });
+                            ui.add_space(theme::SPACE_1);
+                        }
+                    });
                 }
                 Tab::Input => {
                     if self.connection.is_connected() {
@@ -1222,6 +1269,7 @@ impl App {
                         "empty-scan",
                         self.connect_enabled(),
                         self.text(Key::Scan),
+                        theme::SURFACE_3,
                     )
                     .on_hover_text(self.text(Key::ScanHint))
                     .clicked()
@@ -1235,6 +1283,7 @@ impl App {
                         "empty-read-config",
                         self.can_read(),
                         self.text(Key::ReadConfigAction),
+                        theme::SURFACE_3,
                     )
                     .clicked()
                     {
@@ -1247,6 +1296,7 @@ impl App {
                         "empty-start-live",
                         self.can_read(),
                         self.text(Key::StartLiveAction),
+                        theme::SURFACE_3,
                     )
                     .clicked()
                     {
@@ -1467,26 +1517,29 @@ impl App {
             return;
         };
 
-        ui.horizontal(|ui| {
-            ui.add(egui::Label::new(theme::job_meta(&i18n::format(
-                self.lang,
-                Key::ReportsRate,
-                &[format!("{:.1}", self.reports_per_second)],
-            ))));
-            if let Some(last) = self.last_input_at {
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = theme::LINE_HEIGHT_META;
+            ui.horizontal(|ui| {
+                ui.add(egui::Label::new(theme::job_meta(&i18n::format(
+                    self.lang,
+                    Key::ReportsRate,
+                    &[format!("{:.1}", self.reports_per_second)],
+                ))));
+                if let Some(last) = self.last_input_at {
+                    ui.add_space(theme::SPACE_3);
+                    ui.add(egui::Label::new(theme::job_meta(&i18n::format(
+                        self.lang,
+                        Key::LastReportAgo,
+                        &[format!("{:.0}", last.elapsed().as_secs_f64() * 1000.0)],
+                    ))));
+                }
                 ui.add_space(theme::SPACE_3);
                 ui.add(egui::Label::new(theme::job_meta(&i18n::format(
                     self.lang,
-                    Key::LastReportAgo,
-                    &[format!("{:.0}", last.elapsed().as_secs_f64() * 1000.0)],
+                    Key::BatteryRaw,
+                    &[input.battery.to_string()],
                 ))));
-            }
-            ui.add_space(theme::SPACE_3);
-            ui.add(egui::Label::new(theme::job_meta(&i18n::format(
-                self.lang,
-                Key::BatteryRaw,
-                &[input.battery.to_string()],
-            ))));
+            });
         });
         ui.add_space(theme::SPACE_4);
 
@@ -1664,31 +1717,34 @@ impl App {
         ui.add_space(theme::SPACE_5);
         section_label(ui, lang, Key::SectionProfiles);
         ui.add_space(theme::SPACE_2);
-        for (index, name) in config.profile_names.iter().enumerate() {
-            let shown = if name.is_empty() {
-                i18n::t(lang, Key::EmptyProfileName)
-            } else {
-                name.as_str()
-            };
-            ui.horizontal(|ui| {
-                ui.add(egui::Label::new(theme::text_job(
-                    &i18n::profile_text(lang, index as u8 + 1),
-                    theme::medium(theme::FONT_BODY),
-                    theme::TEXT,
-                    0.0,
-                    Some(theme::LINE_HEIGHT_CONTROL),
-                )));
-                ui.add_space(theme::SPACE_3);
-                ui.add(egui::Label::new(theme::job_body(shown)));
-                let flag = format_u32_hex(config.slot_flags[index]);
-                let flag_width = measure(ui, &flag, FontId::monospace(theme::FONT_DATA));
-                let remaining = ui.available_width() - flag_width;
-                if remaining > 0.0 {
-                    ui.add_space(remaining);
-                }
-                ui.add(egui::Label::new(theme::job_data(&flag, theme::TEXT_MUTED)));
-            });
-        }
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = theme::LINE_HEIGHT_CONTROL;
+            for (index, name) in config.profile_names.iter().enumerate() {
+                let shown = if name.is_empty() {
+                    i18n::t(lang, Key::EmptyProfileName)
+                } else {
+                    name.as_str()
+                };
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new(theme::text_job(
+                        &i18n::profile_text(lang, index as u8 + 1),
+                        theme::medium(theme::FONT_BODY),
+                        theme::TEXT,
+                        0.0,
+                        Some(theme::LINE_HEIGHT_CONTROL),
+                    )));
+                    ui.add_space(theme::SPACE_3);
+                    ui.add(egui::Label::new(theme::job_body(shown)));
+                    let flag = format_u32_hex(config.slot_flags[index]);
+                    let flag_width = measure(ui, &flag, FontId::monospace(theme::FONT_DATA));
+                    let remaining = ui.available_width() - flag_width;
+                    if remaining > 0.0 {
+                        ui.add_space(remaining);
+                    }
+                    ui.add(egui::Label::new(theme::job_data(&flag, theme::TEXT_MUTED)));
+                });
+            }
+        });
 
         ui.add_space(theme::SPACE_5);
         section_label(ui, lang, Key::SectionMacros);
@@ -1839,6 +1895,7 @@ fn status_dot(ui: &mut egui::Ui, state: ConnectionState, scan_angle: Option<f32>
     match state {
         ConnectionState::Disconnected => {
             painter.circle_stroke(center, 4.0, Stroke::new(1.5_f32, theme::LED_DIM));
+            painter.circle_filled(center, 1.2, theme::LED_DIM);
         }
         ConnectionState::Connecting => {
             painter.circle_filled(center, 3.0, theme::AMBER);
@@ -1867,12 +1924,18 @@ fn status_dot(ui: &mut egui::Ui, state: ConnectionState, scan_angle: Option<f32>
     }
 }
 
-fn large_ring(ui: &mut egui::Ui, rect: Rect, lit: bool, glow: f32, scan_angle: Option<f32>) {
+fn large_ring(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    lit: bool,
+    glow: f32,
+    scan_angle: Option<f32>,
+    label: &str,
+) {
     let center = rect.center();
     let radius = rect.width().min(rect.height()) / 2.0 - 4.0;
     let painter = ui.painter();
     painter.circle_stroke(center, radius, Stroke::new(1.5_f32, theme::LED_DIM));
-    painter.circle_stroke(center, radius - 8.0, Stroke::new(1.0_f32, theme::HAIRLINE));
     if lit {
         for (r, alpha) in [(30.0, 0.03), (22.0, 0.06), (14.0, 0.10)] {
             painter.circle_filled(center, r, theme::LED.linear_multiply(alpha * glow));
@@ -1891,6 +1954,21 @@ fn large_ring(ui: &mut egui::Ui, rect: Rect, lit: bool, glow: f32, scan_angle: O
             Stroke::new(3.0_f32, theme::AMBER),
         ));
     }
+    let response = ui.interact(rect, ui.id().with("empty-ring"), Sense::hover());
+    let label_owned = label.to_owned();
+    response.widget_info(move || {
+        egui::WidgetInfo::labeled(egui::WidgetType::Other, true, &label_owned)
+    });
+}
+
+/// Small unlit ring used as a step marker; only the current step lights up.
+fn step_indicator(ui: &mut egui::Ui, current: bool) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+    let painter = ui.painter();
+    painter.circle_stroke(rect.center(), 3.5, Stroke::new(1.2_f32, theme::LED_DIM));
+    if current {
+        painter.circle_filled(rect.center(), 1.8, theme::LED);
+    }
 }
 
 fn section_label(ui: &mut egui::Ui, lang: Lang, key: Key) {
@@ -1905,6 +1983,10 @@ fn rail_divider(ui: &mut egui::Ui) {
     ui.add_space(theme::SPACE_3);
 }
 
+// Painting a key needs its geometry, identity, enabled/selected state, label,
+// animation time, and the surface it sits on; grouping them into a struct only
+// moves the arguments around.
+#[allow(clippy::too_many_arguments)]
 fn key_at(
     ui: &mut egui::Ui,
     rect: Rect,
@@ -1913,6 +1995,7 @@ fn key_at(
     kind: KeyKind,
     label: &str,
     animation: f32,
+    surface: Color32,
 ) -> egui::Response {
     let id = ui.id().with(id_salt);
     let sense = if enabled {
@@ -1937,13 +2020,21 @@ fn key_at(
                 painter.rect(rect, theme::RADIUS_KEY, fill, Stroke::NONE);
             }
             KeyKind::Secondary => {
-                let fill = theme::lerp_color(theme::SURFACE_1, theme::SURFACE_2, hover);
-                painter.rect(
-                    rect,
-                    theme::RADIUS_KEY,
-                    fill,
-                    Stroke::new(1.0_f32, theme::CONTROL_LINE),
-                );
+                // Secondary keys are transparent at rest; the hover fill fades
+                // in from the surface they sit on, not from a fixed dark tone.
+                let stroke = Stroke::new(1.0_f32, theme::CONTROL_LINE);
+                if hover > 0.001 {
+                    let fill = theme::lerp_color(surface, theme::SURFACE_2, hover);
+                    let alpha = (hover * 255.0).round().clamp(0.0, 255.0) as u8;
+                    painter.rect(
+                        rect,
+                        theme::RADIUS_KEY,
+                        Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), alpha),
+                        stroke,
+                    );
+                } else {
+                    painter.rect_stroke(rect, theme::RADIUS_KEY, stroke);
+                }
             }
         }
         let color = match kind {
@@ -1974,6 +2065,7 @@ fn key(
     kind: KeyKind,
     label: &str,
     animation: f32,
+    surface: Color32,
 ) -> egui::Response {
     let min_width = match kind {
         KeyKind::Primary => theme::KEY_MIN_WIDTH,
@@ -1982,7 +2074,7 @@ fn key(
     let width =
         (measure(ui, label, theme::medium(theme::FONT_CONTROL)) + theme::SPACE_5).max(min_width);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, theme::KEY_HEIGHT), Sense::hover());
-    key_at(ui, rect, id_salt, enabled, kind, label, animation)
+    key_at(ui, rect, id_salt, enabled, kind, label, animation, surface)
 }
 
 fn secondary_key(
@@ -1990,8 +2082,17 @@ fn secondary_key(
     id_salt: impl std::hash::Hash,
     enabled: bool,
     label: &str,
+    surface: Color32,
 ) -> egui::Response {
-    key(ui, id_salt, enabled, KeyKind::Secondary, label, 0.10)
+    key(
+        ui,
+        id_salt,
+        enabled,
+        KeyKind::Secondary,
+        label,
+        0.10,
+        surface,
+    )
 }
 
 fn secondary_key_at(
@@ -2001,6 +2102,7 @@ fn secondary_key_at(
     enabled: bool,
     label: &str,
     animation: f32,
+    surface: Color32,
 ) -> egui::Response {
     key_at(
         ui,
@@ -2010,6 +2112,7 @@ fn secondary_key_at(
         KeyKind::Secondary,
         label,
         animation,
+        surface,
     )
 }
 
@@ -2221,36 +2324,41 @@ fn device_row(
 
 fn data_grid(ui: &mut egui::Ui, rows: &[(String, String, ValueKind)]) {
     let label_width = 150.0;
-    for (label, value, kind) in rows {
-        let job = match kind {
-            ValueKind::Text => theme::text_job(
-                value,
-                theme::regular(theme::FONT_BODY),
-                theme::TEXT_BODY,
-                0.0,
-                Some(theme::LINE_HEIGHT_BODY),
-            ),
-            ValueKind::Data => theme::job_data(value, theme::TEXT_BODY),
-            ValueKind::Strong => theme::job_strong(value),
-        };
-        if value.chars().count() > 48 {
-            // SHA-256 digests and long hex values get the full column width so
-            // the wrap point does not depend on the horizontal layout.
-            ui.add(egui::Label::new(theme::job_meta(label)));
-            ui.add_space(theme::SPACE_1);
-            ui.add(egui::Label::new(job).wrap());
-        } else {
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    [label_width, theme::LINE_HEIGHT_META],
-                    egui::Label::new(theme::job_meta(label)),
-                );
-                ui.add_space(theme::SPACE_2);
+    // A horizontal row otherwise reserves `interact_size.y`, which spreads
+    // measurement rows to 40 pt. Keep the grid at the meta line height.
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = theme::LINE_HEIGHT_META;
+        for (label, value, kind) in rows {
+            let job = match kind {
+                ValueKind::Text => theme::text_job(
+                    value,
+                    theme::regular(theme::FONT_BODY),
+                    theme::TEXT_BODY,
+                    0.0,
+                    Some(theme::LINE_HEIGHT_BODY),
+                ),
+                ValueKind::Data => theme::job_data(value, theme::TEXT_BODY),
+                ValueKind::Strong => theme::job_strong(value),
+            };
+            if value.chars().count() > 48 {
+                // SHA-256 digests and long hex values get the full column width
+                // so the wrap point does not depend on the horizontal layout.
+                ui.add(egui::Label::new(theme::job_meta(label)));
+                ui.add_space(theme::SPACE_1);
                 ui.add(egui::Label::new(job).wrap());
-            });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [label_width, theme::LINE_HEIGHT_META],
+                        egui::Label::new(theme::job_meta(label)),
+                    );
+                    ui.add_space(theme::SPACE_2);
+                    ui.add(egui::Label::new(job).wrap());
+                });
+            }
+            ui.add_space(theme::SPACE_1);
         }
-        ui.add_space(theme::SPACE_1);
-    }
+    });
 }
 
 fn macro_slot(ui: &mut egui::Ui, lang: Lang, slot: &MacroSlotView) {
@@ -2640,7 +2748,7 @@ mod tests {
     #[allow(clippy::assertions_on_constants)]
     fn layout_constants_keep_the_content_column_narrow() {
         assert_eq!(theme::SIDE_PANEL_WIDTH, 264.0);
-        assert!(theme::CONTENT_MAX_WIDTH <= 760.0);
+        assert_eq!(theme::CONTENT_MAX_WIDTH, 700.0);
         assert!(900.0 - theme::SIDE_PANEL_WIDTH - 2.0 * theme::CONTENT_INSET >= 500.0);
         assert!(theme::KEY_HEIGHT >= 40.0);
         assert!(theme::TAB_HEIGHT >= 40.0);
@@ -2706,13 +2814,22 @@ mod tests {
         let _ = ctx.run(input.clone(), |ctx| app.draw(ctx));
     }
 
-    fn text_shapes(output: &egui::FullOutput) -> Vec<(String, Rect)> {
-        fn visit(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+    fn text_shapes(output: &egui::FullOutput) -> Vec<(String, Rect, Color32)> {
+        fn visit(shape: &egui::Shape, out: &mut Vec<(String, Rect, Color32)>) {
             match shape {
-                egui::Shape::Text(text) => out.push((
-                    text.galley.job.text.clone(),
-                    Rect::from_min_size(text.pos, text.galley.size()),
-                )),
+                egui::Shape::Text(text) => {
+                    let color = text
+                        .galley
+                        .job
+                        .sections
+                        .first()
+                        .map_or(text.fallback_color, |section| section.format.color);
+                    out.push((
+                        text.galley.job.text.clone(),
+                        Rect::from_min_size(text.pos, text.galley.size()),
+                        color,
+                    ));
+                }
                 egui::Shape::Vec(shapes) => {
                     for shape in shapes {
                         visit(shape, out);
@@ -2729,6 +2846,72 @@ mod tests {
     }
 
     #[test]
+    fn device_empty_state_keeps_the_scan_key_inside_the_card() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            ..Default::default()
+        };
+
+        let mut app = app();
+        let output = ctx.run(input, |ctx| app.draw(ctx));
+        let texts = text_shapes(&output);
+        let find = |needle: &str| {
+            texts
+                .iter()
+                .find(|(text, _, _)| text == needle)
+                .map(|(_, rect, _)| *rect)
+        };
+
+        // The empty card starts below the tab row and is 224 pt tall.
+        let card_top = theme::TOP_BAR_HEIGHT + theme::TAB_HEIGHT + theme::SPACE_4;
+        let card_bottom = card_top + 224.0;
+
+        let scan = find("スキャン").expect("scan key is painted");
+        let scan_bottom = scan.center().y + theme::KEY_HEIGHT / 2.0;
+        assert!(
+            scan_bottom <= card_bottom + 0.5,
+            "scan key bottom {scan_bottom} escaped the card ({card_top}..={card_bottom})"
+        );
+
+        let last_step = find("80ND を選んで接続する").expect("third step is painted");
+        assert!(
+            last_step.bottom() <= card_bottom + 0.5,
+            "third step bottom {} escaped the card",
+            last_step.bottom()
+        );
+
+        // Step numbers are information, not light: they must use TEXT_MUTED.
+        for number in ["1", "2", "3"] {
+            let (_, _, color) = texts
+                .iter()
+                .find(|(text, _, _)| text == number)
+                .unwrap_or_else(|| panic!("missing step number {number}"));
+            assert_eq!(
+                *color,
+                theme::TEXT_MUTED,
+                "step number {number} must not use the unlit LED color"
+            );
+        }
+        // No text may be painted in LED_DIM (that token is for ring outlines).
+        for (text, _, color) in &texts {
+            assert_ne!(
+                *color,
+                theme::LED_DIM,
+                "text {text:?} uses the unlit LED color"
+            );
+        }
+
+        // The top bar is the single source of the connection state.
+        let status_labels = texts.iter().filter(|(text, _, _)| text == "未接続").count();
+        assert_eq!(
+            status_labels, 1,
+            "connection state must appear exactly once (top bar)"
+        );
+    }
+
+    #[test]
     fn headless_layout_keeps_tabs_horizontal_and_the_log_empty_state_visible() {
         let ctx = egui::Context::default();
         theme::install(&ctx);
@@ -2741,15 +2924,20 @@ mod tests {
         let output = ctx.run(input.clone(), |ctx| app.draw(ctx));
         let texts = text_shapes(&output);
 
-        let find = |needle: &str| {
+        let find_tab = |needle: &str| {
             texts
                 .iter()
-                .find(|(text, _)| text == needle)
-                .map(|(_, rect)| *rect)
+                .find(|(text, rect, _)| {
+                    text == needle
+                        && rect.left() > theme::SIDE_PANEL_WIDTH
+                        && rect.center().y > theme::TOP_BAR_HEIGHT
+                        && rect.center().y < theme::TOP_BAR_HEIGHT + theme::TAB_HEIGHT
+                })
+                .map(|(_, rect, _)| *rect)
         };
         let tabs: Vec<Rect> = ["デバイス", "ライブ入力", "設定値", "ログ"]
             .iter()
-            .map(|label| find(label).unwrap_or_else(|| panic!("missing tab {label}")))
+            .map(|label| find_tab(label).unwrap_or_else(|| panic!("missing tab {label}")))
             .collect();
         for window in tabs.windows(2) {
             assert!(
@@ -2770,13 +2958,23 @@ mod tests {
         let find = |needle: &str| {
             texts
                 .iter()
-                .find(|(text, _)| text == needle)
-                .map(|(_, rect)| *rect)
+                .find(|(text, _, _)| text == needle)
+                .map(|(_, rect, _)| *rect)
         };
         let empty = find("まだ記録がありません。").expect("log empty copy is painted");
         assert!(
             empty.top() > tabs[0].bottom(),
             "empty copy belongs below the tab row"
+        );
+        assert!(
+            !texts.iter().any(|(text, _, _)| text == "次の一手"),
+            "the log tab must not use the device step heading"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|(text, _, _)| text == "読み取り専用 / 設定 2768 バイト / マクロ 4×3"),
+            "the bottom meta line closes the content column"
         );
         let clear = find("ログを消す").expect("clear key is painted");
         let log_tab = find("ログ").expect("log tab label");
@@ -2789,10 +2987,10 @@ mod tests {
             "clear key shares the tab row"
         );
 
-        // Body copy is wrapped inside the 760 px content column.
+        // Body copy is wrapped inside the 700 px content column.
         let widest = texts
             .iter()
-            .map(|(_, rect)| rect.width())
+            .map(|(_, rect, _)| rect.width())
             .fold(0.0_f32, f32::max);
         assert!(
             widest <= theme::CONTENT_MAX_WIDTH + 1.0,

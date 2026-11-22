@@ -5,9 +5,9 @@ without depending on system fonts.
 
 | File | Contents | Glyphs | Size |
 | --- | --- | --- | --- |
-| `NotoSansJP-Regular.otf` | ASCII, punctuation, JIS X 0208 level 1+2, UI strings | 7459 | 1.48 MiB |
-| `NotoSansJP-Medium.otf` | ASCII, punctuation, UI strings only (section labels, controls) | 1052 | 0.11 MiB |
-| `NotoSansJP-Bold.otf` | ASCII, punctuation, UI strings only (page title, strong values) | 1052 | 0.11 MiB |
+| `NotoSansJP-Regular.otf` | ASCII, punctuation, JIS X 0208 level 1+2, UI strings | 7461 | 1.48 MiB |
+| `NotoSansJP-Medium.otf` | ASCII, punctuation, UI strings only (section labels, controls) | 1054 | 0.11 MiB |
+| `NotoSansJP-Bold.otf` | ASCII, punctuation, UI strings only (page title, strong values) | 1054 | 0.11 MiB |
 
 - **Upstream**: Noto Sans CJK JP, version 2.004 (face 0 of
   `/usr/share/fonts/noto-cjk/NotoSansCJK-{Regular,Medium,Bold}.ttc`, package

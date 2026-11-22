@@ -111,8 +111,9 @@ pub const KEY_MIN_WIDTH: f32 = 168.0;
 pub const ROW_HEIGHT: f32 = 36.0;
 /// Device list row height.
 pub const DEVICE_ROW_HEIGHT: f32 = 44.0;
-/// Content column maximum width (45–65 Japanese characters per line).
-pub const CONTENT_MAX_WIDTH: f32 = 760.0;
+/// Content column maximum width. 700 px keeps ~50 Japanese characters per
+/// line and leaves ≥80 px of quiet margin at the measured 1087 pt window.
+pub const CONTENT_MAX_WIDTH: f32 = 700.0;
 /// Gap between the rail boundary and the content column.
 pub const CONTENT_INSET: f32 = 32.0;
 /// Card inner padding.
@@ -628,7 +629,13 @@ mod tests {
         assert!(CONTENT_INSET >= 32.0);
         let central = 900.0 - SIDE_PANEL_WIDTH;
         assert!(central - 2.0 * CONTENT_INSET >= 500.0);
-        assert!(CONTENT_MAX_WIDTH >= 700.0 && CONTENT_MAX_WIDTH <= 800.0);
+        assert_eq!(CONTENT_MAX_WIDTH, 700.0);
+        // The final review measured a 1087 pt logical window. The content
+        // column must leave a quiet margin wide enough that the vertical
+        // hairline does not read as a second window frame.
+        let reviewed_window = 1087.0;
+        let quiet_margin = reviewed_window - (SIDE_PANEL_WIDTH + CONTENT_INSET + CONTENT_MAX_WIDTH);
+        assert!(quiet_margin >= 80.0, "right margin was {quiet_margin} pt");
         assert!(KEY_HEIGHT >= 40.0 && KEY_MIN_WIDTH >= 168.0);
         assert!(TAB_HEIGHT >= 40.0);
         assert!(ROW_HEIGHT >= 36.0);

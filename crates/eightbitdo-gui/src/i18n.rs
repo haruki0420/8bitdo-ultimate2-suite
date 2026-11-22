@@ -92,17 +92,19 @@ define_keys! {
     NavInput => "ライブ入力" | "Live input",
     NavConfig => "設定値" | "Configuration",
     NavLog => "ログ" | "Log",
-    SectionConnection => "接続状態" | "Connection",
+    SectionDevice => "デバイス" | "Device",
     SectionActions => "読み取り操作" | "Read-only actions",
     SectionBackupFolder => "バックアップの保存先" | "Backup folder",
     SectionSafety => "安全上の注意" | "Safety",
-    SectionDeviceInfo => "接続情報" | "Link",
+    SectionDeviceInfo => "接続情報" | "Connection info",
     SectionFirmware => "ファームウェア" | "Firmware",
     SectionProfiles => "プロファイル" | "Profiles",
     SectionMacros => "マクロヘッダー" | "Macro headers",
     SectionScanResults => "デバイス一覧" | "Device list",
     SectionSummary => "設定値の概要" | "Summary",
     SectionNextSteps => "次の一手" | "Next step",
+    SectionConnectSteps => "接続の手順" | "Connection steps",
+    FooterMeta => "読み取り専用 / 設定 2768 バイト / マクロ 4×3" | "Read-only / 2768-byte config / 4×3 macros",
 
     // Connection controls and onboarding.
     Connect => "80ND に接続" | "Connect to 80ND",
@@ -112,12 +114,12 @@ define_keys! {
     SelectedDevice => "接続先 {}" | "Target {}",
     ConnectUsesSelected => "一覧で選んだデバイスに接続します。" | "Connects to the device selected in the list.",
     NotAppMode => "選んだデバイスは App Mode ではありません。80ND を名前で探します。" | "The selected device is not in App Mode; Connect looks for 80ND by name.",
-    NoScanResults => "まだ見つかっていません。「スキャン」を押すと、近くの 80ND が表示されます。" | "Nothing found yet. Press Scan to list nearby 80ND controllers.",
+    NoScanResults => "まだ見つかっていません。「スキャン」を押すと、近くの 80ND が一覧に出ます。" | "Nothing found yet. Press Scan to list nearby 80ND controllers.",
     ScanHint => "周辺の BLE デバイスをスキャンします。" | "Scans for nearby BLE devices.",
     AppModeBadge => "App Mode" | "App Mode",
     OtherModeBadge => "通常モード" | "Other mode",
     DeviceRowHint => "行を選ぶと接続先になります。ダブルクリックでも接続できます。" | "Select a row to set the target; double-click also connects.",
-    ConnectFirstHint => "接続すると読み取り操作が使えます。" | "Read-only actions become available after connecting.",
+    ConnectFirstHint => "接続すると使えるようになります。" | "Available after connecting.",
     BusyHint => "処理が終わると使えます。" | "Available when the current operation finishes.",
     NoDeviceHint => "接続すると、名前・アドレス・MTU が表示されます。" | "Connecting shows the name, address, and MTU.",
     Name => "名前" | "Name",
@@ -126,16 +128,16 @@ define_keys! {
     Characteristic => "キャラクタリスティック" | "Characteristic",
     Step1Title => "USB ケーブルを抜く" | "Unplug the USB cable",
     Step1Body => "有線接続を解除し、Bluetooth で使える状態にします。" | "Disconnect the cable so the controller can be used over Bluetooth.",
-    Step2Title => "Profile ボタンを 3 秒長押し" | "Hold Profile for 3 seconds",
+    Step2Title => "Profile ボタンを 3 秒間押し続ける" | "Hold Profile for 3 seconds",
     Step2Body => "コントローラを App Mode（80ND）に切り替えます。" | "Switch the controller into App Mode (80ND).",
-    Step3Title => "80ND を選んで接続" | "Select 80ND and connect",
+    Step3Title => "80ND を選んで接続する" | "Select 80ND and connect",
     Step3Body => "デバイス一覧から 80ND を選び、「80ND に接続」を押します。" | "Select 80ND in the device list and press Connect to 80ND.",
 
     // Read-only actions.
     ReadVersionAction => "バージョンを読み取る" | "Read version",
     ReadConfigAction => "設定値を読み取る" | "Read configuration",
     BackupConfigAction => "設定を書き出す" | "Write a backup",
-    BackupConfigHint => "設定 2768 バイトの raw と JSON を保存します。" | "Saves the 2768-byte raw block and a JSON summary.",
+    BackupConfigHint => "設定 2768 バイトの raw と JSON を書き出します。" | "Writes the 2768-byte raw block and a JSON summary.",
     StartLiveAction => "ライブ入力を開始" | "Start live input",
     StopLiveAction => "ライブ入力を停止" | "Stop live input",
     LiveStoppedHint => "ライブ入力は停止しています。" | "Live input is stopped.",
@@ -144,7 +146,7 @@ define_keys! {
     HintLive => "ライブ入力を止めると、接続維持の通信も止まります。" | "Stopping live input also pauses the keepalive.",
     HintDisconnect => "接続を切断します。" | "Closes the current connection.",
     LastBackup => "直前のバックアップ" | "Last backup",
-    SafetyText => "設定の書き込み、マクロの保存、復元、ファームウェア更新は行いません。" | "It does not write settings, save macros, restore backups, or update firmware.",
+    SafetyText => "設定の書き込み、マクロの保存、バックアップの復元、ファームウェア更新は行いません。" | "It does not write settings, save macros, restore backups, or update firmware.",
 
     // Device and firmware view.
     NoDeviceInfo => "デバイス情報はまだありません。" | "No device information yet.",
@@ -404,7 +406,7 @@ mod tests {
         assert_eq!(t(Lang::En, Key::Connect), "Connect to 80ND");
         assert_eq!(t(Lang::Ja, Key::NavConfig), "設定値");
         assert_eq!(t(Lang::Ja, Key::SectionActions), "読み取り操作");
-        assert_eq!(t(Lang::Ja, Key::SectionConnection), "接続状態");
+        assert_eq!(t(Lang::Ja, Key::SectionDevice), "デバイス");
     }
 
     #[test]
