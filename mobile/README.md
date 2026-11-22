@@ -197,7 +197,7 @@ cd mobile/ios && xtool dev build -c release --ipa
 ### 実測結果（2026-11-23、この環境・レビュー反映後）
 
 * `xtool dev build --ipa`: `Build complete! (7.44 secs)` → IPA 生成
-* IPA サイズ: 1,550,186 bytes
+* IPA サイズ: 1,550,522 bytes（SHA-256 `e63d7822…b804f`）
 * `Payload/EightBitDo.app/EightBitDo`: `Mach-O 64-bit arm64 executable`
 * `llvm-nm` で `_uniffi_eightbitdo_uniffi_fn_constructor_mobilesession_new` など
   UniFFI シンボル 61 個を確認（Rust staticlib が実際にリンクされている）
@@ -287,8 +287,8 @@ with-response しか広告しない実装があります。フレーム自体は
 | ツールチェーン | AGP **9.5.0** / Gradle **9.8.2**（wrapper 同梱）/ Kotlin **2.4.21**（AGP 9 の built-in Kotlin）/ JDK 21 |
 | Android SDK | `/opt/android-sdk`（platforms;android-36, build-tools;36.0.0） |
 | `./gradlew testDebugUnitTest` | **BUILD SUCCESSFUL**（`FrameQueueTest` 3 + `AppWriteModeTest` 3 + `RustCoreTest` 2 = 8 テスト、失敗 0） |
-| `./gradlew assembleDebug` | **BUILD SUCCESSFUL**（`app/build/outputs/apk/debug/app-debug.apk` = 12,076,864 bytes） |
-| Rust JNI ライブラリ | **未同梱**（NDK / cargo-ndk が無いため `cargo ndk` を実行していない） |
+| `./gradlew assembleDebug` | **BUILD SUCCESSFUL**（`app/build/outputs/apk/debug/app-debug.apk` = 14,551,011 bytes、JNI 同梱） |
+| Rust JNI ライブラリ | **同梱済み**（`lib/arm64-v8a/libeightbitdo_uniffi.so` 1,266,288 bytes / `lib/x86_64/...` 1,193,896 bytes。NDK r29 + cargo-ndk 4.1.2） |
 
 注意: 上記は Kotlin / Compose / リソース / manifest のコンパイル検証です。
 **2026-11-23 に NDK r29 と cargo-ndk 4.1.2 を導入し、`libeightbitdo_uniffi.so` を
@@ -406,10 +406,10 @@ mobile/android/app/src/main/jniLibs/        # cargo-ndk の .so
 
 1. **実機未検証**。iOS / Android とも、`80ND` への接続・2768B 読み出し・
    マクロ読み出しは実機で確認していない。iOS は `xtool devices` が空。
-2. **Android の Rust JNI は未検証**。SDK は `/opt/android-sdk` にあったため
-   Kotlin コンパイル・unit test・debug APK 生成までは実測済みですが、NDK と
-   cargo-ndk が無いため `libeightbitdo_uniffi.so` は APK に含まれていません。
-   実機で Rust コアを動かすには NDK 導入後の完全ビルドが必要です。
+2. **Android の Rust JNI はビルド済み・実機未検証**。NDK 29.0.14206865 と
+   cargo-ndk 4.1.2 を導入し、`libeightbitdo_uniffi.so` を同梱した
+   APK（14,551,011 bytes、arm64-v8a / x86_64）の生成に成功しています。
+   JNI ロードの実機/エミュレータ確認は未実施です。
 3. **設定書き込み・OTA は未公開**。`prepareConfigWrite` まで。
 4. **バックグラウンド書き込み不可**（設計上、前景専用）。
 5. **MTU 161 以上が必須**。交渉に失敗した場合は明確なエラーで停止します

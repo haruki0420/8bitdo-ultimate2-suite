@@ -13,7 +13,7 @@
 | cargo-ndk | 4.1.2 |
 | ビルド | `ANDROID_HOME=/opt/android-sdk ANDROID_NDK_HOME=/opt/android-sdk/ndk/29.0.14206865 ./scripts/mobile/build-android.sh` |
 | APK | `mobile/android/app/build/outputs/apk/debug/app-debug.apk` |
-| サイズ / SHA-256 | 14 MiB / `879e894ccd902ea5987d2be708d006aaf4f58809e507775350571284eaa351f1` |
+| サイズ / SHA-256 | 14,551,011 bytes（13.9 MiB） / `879e894ccd902ea5987d2be708d006aaf4f58809e507775350571284eaa351f1` |
 | package / version | `dev.eightbitdo.mobile` / versionCode 1, versionName 0.1.0 |
 | min / target SDK | 26 / 36 |
 | 権限 | `BLUETOOTH_SCAN`（neverForLocation）、`BLUETOOTH_CONNECT` ほか（AndroidManifest） |
@@ -35,8 +35,8 @@ ELF 64-bit LSB shared object, ARM aarch64, dynamically linked, for Android 21, b
 $ file lib/x86_64/libeightbitdo_uniffi.so
 ELF 64-bit LSB shared object, x86-64, dynamically linked, for Android 21, built by NDK r29
 
-$ nm -D --defined-only lib/arm64-v8a/libeightbitdo_uniffi.so | grep -c uniffi
-122
+$ nm -D --defined-only lib/arm64-v8a/libeightbitdo_uniffi.so | wc -l       # 122（defined dynamic symbols）
+$ nm -D --defined-only lib/arm64-v8a/libeightbitdo_uniffi.so | grep -c uniffi  # 92（うち名前に uniffi を含む）
 ```
 
 JVM ユニットテスト（`./gradlew testDebugUnitTest`）は 8 件成功（FrameQueue 3 / AppWriteMode 3 / RustCore 2）。Kotlin コンパイルと APK パッケージまで確認しています。
@@ -51,7 +51,7 @@ JVM ユニットテスト（`./gradlew testDebugUnitTest`）は 8 件成功（Fr
 | Rust target | `aarch64-apple-ios`（staticlib） |
 | ビルド | `./scripts/mobile/build-ios.sh` |
 | IPA | `mobile/ios/xtool/EightBitDo.ipa` |
-| サイズ / SHA-256 | 1.5 MiB / `e63d7822010b948b4c555c2c561e2183bb4bf9c90599782affdc6f02bedb804f` |
+| サイズ / SHA-256 | 1,550,522 bytes（1.48 MiB） / `e63d7822010b948b4c555c2c561e2183bb4bf9c90599782affdc6f02bedb804f` |
 | 署名 | なし（Linux では署名不可） |
 
 `cargo rustc -p eightbitdo-uniffi --lib --release --target aarch64-apple-ios --crate-type staticlib` で生成した `libeightbitdo_uniffi.a` を `mobile/ios/libs/` に置き、xtool が Swift アプリとリンクしています。
