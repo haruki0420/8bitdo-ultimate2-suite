@@ -403,13 +403,26 @@ pub enum OtaPhase {
     /// The update stopped fail-closed. The controller stays in the bootloader;
     /// create a new [`OtaUpdate`] and attach to `"8bt"` to recover.
     Failed,
+    /// Bench-only (`ota-bench`): stopped at an explicit checkpoint requested by
+    /// [`OtaUpdate::write_firmware_with_checkpoint`]. The device is in the
+    /// bootloader; recovery is a fresh update plus a full erase/rewrite.
+    #[cfg(feature = "ota-bench")]
+    BenchStopped,
 }
 
 impl OtaPhase {
-    /// True for [`OtaPhase::Complete`] and [`OtaPhase::Failed`].
+    /// True for [`OtaPhase::Complete`], [`OtaPhase::Failed`], and (with the
+    /// `ota-bench` feature) `OtaPhase::BenchStopped`.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Complete | Self::Failed)
+        #[cfg(feature = "ota-bench")]
+        {
+            matches!(self, Self::Complete | Self::Failed | Self::BenchStopped)
+        }
+        #[cfg(not(feature = "ota-bench"))]
+        {
+            matches!(self, Self::Complete | Self::Failed)
+        }
     }
 }
 
@@ -607,6 +620,56 @@ pub struct OtaOutcome {
     pub packets_sent: u32,
     /// How the JumpApp reboot was confirmed.
     pub jump: JumpOutcome,
+}
+
+/// Bench-only stop point for [`OtaUpdate::write_firmware_with_checkpoint`].
+///
+/// The normal [`OtaUpdate::write_firmware`] API always runs to completion or
+/// fails closed. This enum exists only with the `ota-bench` feature so a
+/// capture experiment can stop after a specific acknowledged step without
+/// changing the production pipeline. The other safety gates
+/// (`allow_unverified_wire`, PID / `gamepad_type`, expected base, MTU) still
+/// apply unchanged.
+#[cfg(feature = "ota-bench")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtaCheckpoint {
+    /// Stop immediately after the **first EraseFlash ACK**, before any
+    /// WriteFirmware frame. Use this to capture the erase ACK on the wire.
+    AfterFirstErase,
+    /// Stop after every WriteFirmware chunk is acknowledged, before
+    /// WriteVersion.
+    AfterWrites,
+    /// Stop after the WriteVersion ACK, before WriteFirmwareVersion / JumpApp.
+    AfterWriteVersion,
+}
+
+/// Result of [`OtaUpdate::write_firmware_with_checkpoint`].
+#[cfg(feature = "ota-bench")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OtaBenchOutcome {
+    /// The checkpoint that stopped the pipeline, or `None` when the pipeline
+    /// completed (the configured checkpoint is always reached first).
+    pub checkpoint: Option<OtaCheckpoint>,
+    /// 4 KB sectors whose erase was acknowledged.
+    pub sectors_erased: u32,
+    /// 64-byte chunks whose write was acknowledged.
+    pub chunks_written: u32,
+    /// Image bytes acknowledged.
+    pub bytes_written: u32,
+    /// Bootloader frames sent (readPID through the last executed step).
+    pub packets_sent: u32,
+    /// JumpApp result when the pipeline completed; `None` when stopped early.
+    pub jump: Option<JumpOutcome>,
+    /// Recovery state of the flash area at return.
+    ///
+    /// After a checkpoint stop this is [`OtaWriteState::EraseStarted`] for
+    /// `AfterFirstErase`, and [`OtaWriteState::Written`] after the writes or
+    /// WriteVersion. [`OtaWriteState::Untouched`] means no flash frame was
+    /// sent (for example a refusal before the first erase).
+    pub write_state: OtaWriteState,
+    /// Phase at return (`BenchStopped` for a checkpoint, `Complete` on a full
+    /// run, `Failed` for a failed gate).
+    pub phase: OtaPhase,
 }
 
 /// One `.dat` firmware image, validated before the first flash frame.
@@ -825,6 +888,15 @@ const RECOVERY_JUMP: &str =
      version read. If the application is not running correctly, rewrite the whole image from \
      offset 0. Do not repeat JumpApp blindly.";
 
+/// Internal stop point for the shared pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopAt {
+    Never,
+    AfterFirstErase,
+    AfterWrites,
+    AfterWriteVersion,
+}
+
 /// BLE OTA state machine.
 ///
 /// Construct one per update attempt:
@@ -955,6 +1027,26 @@ impl OtaUpdate {
     #[must_use]
     pub const fn packets_sent(&self) -> u32 {
         self.packets_sent
+    }
+
+    /// How far the flash area has got, derived from frames sent and ACKed.
+    ///
+    /// This is the same classification used by [`Error::Ota`]: no flash frame
+    /// (`Untouched`), erase only (`EraseStarted`), some chunks not acknowledged
+    /// (`PartiallyWritten`), or every chunk acknowledged (`Written`). After a
+    /// successful run it returns `Written`; check [`OtaUpdate::phase`] to tell
+    /// success (`Complete`) from a stopped/failed run.
+    #[must_use]
+    pub const fn write_state(&self) -> OtaWriteState {
+        if self.erase_frames_sent == 0 && self.write_frames_sent == 0 {
+            OtaWriteState::Untouched
+        } else if self.write_frames_sent == 0 {
+            OtaWriteState::EraseStarted
+        } else if self.bytes_written < self.image_len {
+            OtaWriteState::PartiallyWritten
+        } else {
+            OtaWriteState::Written
+        }
     }
 
     /// Send App Mode `0x000C` EnterBoot and wait for its ACK or the link close.
@@ -1177,6 +1269,80 @@ impl OtaUpdate {
         image: &FirmwareImage<'_>,
         progress: &mut dyn FnMut(OtaProgress),
     ) -> Result<OtaOutcome, Error> {
+        match self
+            .write_firmware_inner(ready, image, progress, StopAt::Never)
+            .await?
+        {
+            (Some(outcome), _) => Ok(outcome),
+            (None, _) => Err(Error::InvalidRequest(
+                "internal error: the production OTA pipeline stopped at a bench checkpoint"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Bench-only (`ota-bench` feature): run the normal pipeline and stop after
+    /// the requested acknowledged step.
+    ///
+    /// This method is absent from default builds. It shares the exact
+    /// production preflight and packet sequence: [`OtaConfig::allow_unverified_wire`]
+    /// must still be `true`, the PID must map to `gamepad_type 1`, the image
+    /// base must match [`OtaConfig::expected_load_base`], and the negotiated MTU
+    /// must fit the WriteFirmware frame. On a checkpoint stop the phase becomes
+    /// [`OtaPhase::BenchStopped`] and the device remains in the bootloader;
+    /// recovery is a fresh `OtaUpdate` plus a full erase/rewrite.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`OtaUpdate::write_firmware`].
+    #[cfg(feature = "ota-bench")]
+    pub async fn write_firmware_with_checkpoint<T: OtaTransport>(
+        &mut self,
+        ready: BootReady<'_, T>,
+        image: &FirmwareImage<'_>,
+        progress: &mut dyn FnMut(OtaProgress),
+        checkpoint: OtaCheckpoint,
+    ) -> Result<OtaBenchOutcome, Error> {
+        let stop = match checkpoint {
+            OtaCheckpoint::AfterFirstErase => StopAt::AfterFirstErase,
+            OtaCheckpoint::AfterWrites => StopAt::AfterWrites,
+            OtaCheckpoint::AfterWriteVersion => StopAt::AfterWriteVersion,
+        };
+        let (outcome, stopped) = self
+            .write_firmware_inner(ready, image, progress, stop)
+            .await?;
+        debug_assert_eq!(stopped, stop);
+        Ok(match outcome {
+            Some(outcome) => OtaBenchOutcome {
+                checkpoint: None,
+                sectors_erased: self.sectors_erased,
+                chunks_written: self.chunks_written,
+                bytes_written: self.bytes_written,
+                packets_sent: self.packets_sent,
+                jump: Some(outcome.jump),
+                write_state: self.write_state(),
+                phase: self.phase,
+            },
+            None => OtaBenchOutcome {
+                checkpoint: Some(checkpoint),
+                sectors_erased: self.sectors_erased,
+                chunks_written: self.chunks_written,
+                bytes_written: self.bytes_written,
+                packets_sent: self.packets_sent,
+                jump: None,
+                write_state: self.write_state(),
+                phase: self.phase,
+            },
+        })
+    }
+
+    async fn write_firmware_inner<T: OtaTransport>(
+        &mut self,
+        ready: BootReady<'_, T>,
+        image: &FirmwareImage<'_>,
+        progress: &mut dyn FnMut(OtaProgress),
+        stop_at: StopAt,
+    ) -> Result<(Option<OtaOutcome>, StopAt), Error> {
         if ready.owner != self.id {
             return Err(Error::InvalidRequest(
                 "the BootReady guard belongs to a different OtaUpdate; call prepare_boot on this \
@@ -1292,6 +1458,10 @@ impl OtaUpdate {
                 return Err(self.fail(OtaFailureStage::Erase, state, error, RECOVERY_ERASE));
             }
             self.sectors_erased += 1;
+            if sector_index == 0 && stop_at == StopAt::AfterFirstErase {
+                self.stop_for_bench();
+                return Ok((None, StopAt::AfterFirstErase));
+            }
 
             self.phase = OtaPhase::Writing;
             let sector_chunks = (chunk_count - chunk_index).min(chunks_per_sector);
@@ -1328,6 +1498,11 @@ impl OtaUpdate {
             }
         }
 
+        if stop_at == StopAt::AfterWrites {
+            self.stop_for_bench();
+            return Ok((None, StopAt::AfterWrites));
+        }
+
         self.phase = OtaPhase::Finalizing;
         self.emit(
             progress,
@@ -1353,6 +1528,11 @@ impl OtaUpdate {
                 error,
                 RECOVERY_FINALIZE,
             ));
+        }
+
+        if stop_at == StopAt::AfterWriteVersion {
+            self.stop_for_bench();
+            return Ok((None, StopAt::AfterWriteVersion));
         }
 
         // The spec gives WriteFirmwareVersion a zero timeout (send-only), so no
@@ -1400,16 +1580,31 @@ impl OtaUpdate {
             chunk_count,
         );
 
-        Ok(OtaOutcome {
-            pid,
-            gamepad_type,
-            boot_version: ready.boot_version,
-            sectors_erased: self.sectors_erased,
-            chunks_written: self.chunks_written,
-            bytes_written: self.bytes_written,
-            packets_sent: self.packets_sent,
-            jump: jump_outcome,
-        })
+        Ok((
+            Some(OtaOutcome {
+                pid,
+                gamepad_type,
+                boot_version: ready.boot_version,
+                sectors_erased: self.sectors_erased,
+                chunks_written: self.chunks_written,
+                bytes_written: self.bytes_written,
+                packets_sent: self.packets_sent,
+                jump: jump_outcome,
+            }),
+            StopAt::Never,
+        ))
+    }
+
+    fn stop_for_bench(&mut self) {
+        #[cfg(feature = "ota-bench")]
+        {
+            self.phase = OtaPhase::BenchStopped;
+        }
+        #[cfg(not(feature = "ota-bench"))]
+        {
+            // Unreachable: the production wrapper always passes StopAt::Never.
+            self.phase = OtaPhase::Failed;
+        }
     }
 
     fn emit(
@@ -3367,6 +3562,205 @@ mod tests {
 
         assert_eq!(update.phase(), OtaPhase::AwaitingBootReconnect);
         assert!(mock.is_disconnected());
+    }
+
+    #[cfg(feature = "ota-bench")]
+    #[tokio::test]
+    async fn bench_checkpoint_stops_after_first_erase() {
+        let image_bytes = one_sector_image();
+        let image = FirmwareImage::parse(&image_bytes).unwrap();
+        let mock = high_mtu_mock();
+        queue_prepare(&mock, UT2_BOOT_PID, 0x0000_0102);
+        queue_ack(&mock, &boot::erase_flash(TEST_BASE).unwrap());
+        let mut update = new_update();
+        let _ready = update.prepare_boot(&mock).await.unwrap();
+
+        let outcome = update
+            .write_firmware_with_checkpoint(
+                _ready,
+                &image,
+                &mut |_| {},
+                OtaCheckpoint::AfterFirstErase,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.checkpoint, Some(OtaCheckpoint::AfterFirstErase));
+        assert_eq!(outcome.sectors_erased, 1);
+        assert_eq!(outcome.chunks_written, 0);
+        assert_eq!(outcome.bytes_written, 0);
+        assert_eq!(outcome.packets_sent, 3);
+        assert_eq!(outcome.write_state, OtaWriteState::EraseStarted);
+        assert_eq!(outcome.phase, OtaPhase::BenchStopped);
+        assert_eq!(update.phase(), OtaPhase::BenchStopped);
+        assert_eq!(update.write_state(), OtaWriteState::EraseStarted);
+        let sent = sent_boot(&mock);
+        assert_eq!(sent.len(), 3, "readPID + readVersion + one erase");
+        assert_eq!(sent.last().unwrap().0.cmd, boot::CMD_ERASE_FLASH);
+    }
+
+    #[cfg(feature = "ota-bench")]
+    #[tokio::test]
+    async fn bench_checkpoint_stops_after_writes() {
+        let image_bytes = one_sector_image();
+        let image = FirmwareImage::parse(&image_bytes).unwrap();
+        let mock = high_mtu_mock();
+        queue_prepare(&mock, UT2_BOOT_PID, 0x0000_0102);
+        queue_ack(&mock, &boot::erase_flash(TEST_BASE).unwrap());
+        let writes =
+            boot::write_firmware_packets(TEST_BASE, image.image_len(), image.image()).unwrap();
+        for request in &writes {
+            queue_ack(&mock, request);
+        }
+        let mut update = new_update();
+        let _ready = update.prepare_boot(&mock).await.unwrap();
+
+        let outcome = update
+            .write_firmware_with_checkpoint(_ready, &image, &mut |_| {}, OtaCheckpoint::AfterWrites)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.checkpoint, Some(OtaCheckpoint::AfterWrites));
+        assert_eq!(outcome.sectors_erased, 1);
+        assert_eq!(outcome.chunks_written, 64);
+        assert_eq!(outcome.bytes_written, 0x1000);
+        assert_eq!(outcome.write_state, OtaWriteState::Written);
+        assert_eq!(outcome.phase, OtaPhase::BenchStopped);
+        assert_eq!(update.phase(), OtaPhase::BenchStopped);
+        let sent = sent_boot(&mock);
+        assert_eq!(sent.len(), 67);
+        assert_eq!(sent.last().unwrap().0.cmd, boot::CMD_WRITE_FIRMWARE);
+        assert!(sent
+            .iter()
+            .all(|(header, _)| header.cmd != boot::CMD_WRITE_VERSION));
+    }
+
+    #[cfg(feature = "ota-bench")]
+    #[tokio::test]
+    async fn bench_checkpoint_stops_after_write_version() {
+        let image_bytes = one_sector_image();
+        let image = FirmwareImage::parse(&image_bytes).unwrap();
+        let mock = high_mtu_mock();
+        queue_prepare(&mock, UT2_BOOT_PID, 0x0000_0102);
+        queue_ack(&mock, &boot::erase_flash(TEST_BASE).unwrap());
+        let writes =
+            boot::write_firmware_packets(TEST_BASE, image.image_len(), image.image()).unwrap();
+        for request in &writes {
+            queue_ack(&mock, request);
+        }
+        queue_ack(
+            &mock,
+            &boot::write_version_header(image.image_len(), image.version_header()).unwrap(),
+        );
+        let mut update = new_update();
+        let _ready = update.prepare_boot(&mock).await.unwrap();
+
+        let outcome = update
+            .write_firmware_with_checkpoint(
+                _ready,
+                &image,
+                &mut |_| {},
+                OtaCheckpoint::AfterWriteVersion,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.checkpoint, Some(OtaCheckpoint::AfterWriteVersion));
+        assert_eq!(outcome.chunks_written, 64);
+        assert_eq!(outcome.jump, None);
+        assert_eq!(outcome.write_state, OtaWriteState::Written);
+        assert_eq!(outcome.phase, OtaPhase::BenchStopped);
+        assert_eq!(update.phase(), OtaPhase::BenchStopped);
+        let sent = sent_boot(&mock);
+        assert_eq!(sent.len(), 68);
+        assert_eq!(sent.last().unwrap().0.cmd, boot::CMD_WRITE_VERSION);
+        assert!(sent.iter().all(|(header, _)| {
+            header.cmd != boot::CMD_WRITE_FIRMWARE_VERSION && header.cmd != boot::CMD_JUMP_APP
+        }));
+    }
+
+    #[cfg(feature = "ota-bench")]
+    #[tokio::test]
+    async fn bench_checkpoint_requires_unverified_wire_opt_in() {
+        let image_bytes = one_sector_image();
+        let image = FirmwareImage::parse(&image_bytes).unwrap();
+        let mock = high_mtu_mock();
+        queue_prepare(&mock, UT2_BOOT_PID, 0x0000_0102);
+        let mut update = OtaUpdate::with_config(OtaConfig::new(TEST_BASE).unwrap()).unwrap();
+        let _ready = update.prepare_boot(&mock).await.unwrap();
+
+        let error = update
+            .write_firmware_with_checkpoint(
+                _ready,
+                &image,
+                &mut |_| {},
+                OtaCheckpoint::AfterFirstErase,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidRequest(_)));
+        let sent = sent_boot(&mock);
+        assert_eq!(sent.len(), 2, "no flash frame may be sent");
+        assert!(sent
+            .iter()
+            .all(|(header, _)| header.cmd != boot::CMD_ERASE_FLASH));
+    }
+
+    #[cfg(feature = "ota-bench")]
+    #[tokio::test]
+    async fn bench_checkpoint_keeps_the_base_gate() {
+        // The base gate lives inside the shared pipeline, so a bench checkpoint
+        // cannot bypass it. PID / gamepad_type are gated even earlier by
+        // prepare_boot (the BootReady guard cannot be obtained otherwise).
+        let image_bytes = dat(0x1000, TEST_BASE + 0x1000);
+        let image = FirmwareImage::parse(&image_bytes).unwrap();
+        let mock = high_mtu_mock();
+        queue_prepare(&mock, UT2_BOOT_PID, 0x0000_0102);
+        let mut update = new_update();
+        let _ready = update.prepare_boot(&mock).await.unwrap();
+
+        let error = update
+            .write_firmware_with_checkpoint(
+                _ready,
+                &image,
+                &mut |_| {},
+                OtaCheckpoint::AfterFirstErase,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::OtaInvalidFirmware(_)));
+        assert_eq!(update.write_state(), OtaWriteState::Untouched);
+        let sent = sent_boot(&mock);
+        assert_eq!(sent.len(), 2, "no flash frame may be sent");
+        assert!(sent
+            .iter()
+            .all(|(header, _)| header.cmd != boot::CMD_ERASE_FLASH));
+    }
+
+    #[cfg(feature = "ota-bench")]
+    #[tokio::test]
+    async fn bench_checkpoint_keeps_the_mtu_gate() {
+        let image_bytes = one_sector_image();
+        let image = FirmwareImage::parse(&image_bytes).unwrap();
+        let mock = MockTransport::with_mtu(23);
+        queue_prepare(&mock, UT2_BOOT_PID, 0x0000_0102);
+        let mut update = new_update();
+        let _ready = update.prepare_boot(&mock).await.unwrap();
+
+        let error = update
+            .write_firmware_with_checkpoint(
+                _ready,
+                &image,
+                &mut |_| {},
+                OtaCheckpoint::AfterFirstErase,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::MtuTooSmall { mtu: 23, .. }));
+        assert_eq!(sent_boot(&mock).len(), 2);
     }
 
     #[test]
