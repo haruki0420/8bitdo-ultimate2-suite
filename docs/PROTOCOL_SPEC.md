@@ -454,7 +454,7 @@ sequenceDiagram
 
 ### 6.3 Ultimate 2 Bluetooth 設定データ構造体 (`record_ultimatebt2`, `0x0AD0` = 2768 バイト) 部分書き込みオフセット一覧
 
-`cmd = 0x0001` は構造体全体 (`0x0AD0` B) の一括送信だけでなく、機能別の部分オフセット書き込みにも対応している。部分書込でも **`total_len` は常に `0x0AD0`** で、部分的なデータ長は `chunk_len` に載せる。いずれの場合も事前に `ANSI_CRC_16_sh(buf, 0x0AD0)` を計算し `+0x0C` へ格納する。
+`cmd = 0x0001` は構造体全体 (`0x0AD0` B) の一括送信だけでなく、機能別の部分オフセット書き込みにも対応している。部分書込でも **`total_len` は常に `0x0AD0`** で、部分的なデータ長は `chunk_len` に載せる。いずれの場合も事前に `ANSI_CRC_16_sh(buf, 0x0AD0)` を計算し `+0x0C` へ格納する。ただしマクロヘッダの 216B 部分書込の wire には `+0x00C` を含めない（§6.5）。
 
 | 機能 / セッター (`libadvancelib.so`) | 先頭オフセット | サイズ | 備考 |
 | --- | --- | --- | --- |
@@ -515,7 +515,7 @@ sequenceDiagram
 **restore**:
 
 - `macro restore` は `--force` なしで「バックアップでは空、現在は非空」のマクロがあれば、対象を列挙して書き込み前に中止する。
-- `--force` 時は pre-restore backup の path を表示する。pre-restore backup は best-effort で、読めないマクロは `skipped` として記録して続行する。`--force` なしでは不完全な pre-restore backup を検出した時点で中止する。`macro write` の pre-write backup は必須のまま。
+- `--force` 時は pre-restore backup の path を表示する。pre-restore backup は best-effort で、読めないマクロは `skipped` として記録して続行する。`--force` なしでは不完全な pre-restore backup を検出した時点で中止する。`macro write` の pre-write backup は必須のまま。読めないマクロがある場合、pre-restore backup の `config.bin` はそのマクロの `max_steps` だけを 0 にした合成値であり、device の元のヘッダそのものではない。
 - 空エントリのステップデータは書かない（消去もしない）。ただし slot に 1 つでも非空マクロがあれば、その書き込みで **216B ヘッダ全体**がバックアップ値に上書きされ、空エントリの `max_steps` は 0 になる。全マクロが空の slot は、現在のヘッダと差分がある場合だけ `0x0001` + `0x0006` のヘッダのみ書込で上書きする（stale step data は flash に残る）。非空マクロを含む slot に `write_macro_header` を使うことはできない。
 - 216B ヘッダの更新では、既存の予約バイト（slot `+0x05..+0x07`、record `+0x26..+0x27`）を保持する。既知フィールドだけを変更する。`total_cnt` が 5 以上になる更新は拒否する。
 - restore 前には現在の 3 スロット × 4 マクロを pre-restore backup に保存する（`--force` 時は best-effort）。backup dir は既存の非空ディレクトリを拒否する。
