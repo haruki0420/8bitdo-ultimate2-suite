@@ -244,8 +244,9 @@ enum ConfigCommand {
     /// trigger.left_start / left_end / right_start / right_end,
     /// gyro.enabled / trigger_mode / sensitivity / dead_compensate / mapping /
     /// key, led.dynamic.color / bg_color / flag, led.hotwheel.color / bg_color
-    /// / speed / flag, led.single.color / flag, map_key.flag (0 = disabled,
-    /// 1 = enabled; the single-entry `config remap` does not change it).
+    /// / speed / flag, map_key.flag (typed values 0 = disabled, 1 = enabled;
+    /// a raw dump may store opaque observed values such as 0x20200911 or
+    /// 0xFFFFFFFF, which this typed field does not accept).
     ///
     /// Side effects: joy.* and trigger.* set that record's `flag` to 1
     /// (custom settings enabled), and led.*.color sets that theme's `flag` to
@@ -2008,16 +2009,15 @@ fn button_label(button: ButtonIndex) -> &'static str {
 fn mapping_lines(config: &Bt2Config, slot: Slot) -> Vec<String> {
     let record = config.map_key(slot);
     let mut lines = Vec::with_capacity(24);
+    let flag_display = match record.flag {
+        0 => "0 (typed 0 = disabled; a raw dump may store other values)".to_string(),
+        1 => "1 (typed 1 = enabled; a raw dump may store other values)".to_string(),
+        observed => format!("0x{observed:08X} (observed on hardware; meaning unconfirmed/opaque)"),
+    };
     lines.push(format!(
-        "slot {} (profile {}): map_key flag {} ({})",
+        "slot {} (profile {}): map_key flag {flag_display}",
         slot.index(),
-        slot.number(),
-        record.flag,
-        if record.flag == 1 {
-            "enabled"
-        } else {
-            "disabled/default"
-        }
+        slot.number()
     ));
     lines.push("index  physical   key".to_string());
     let mappings = button_mappings(config, slot);
@@ -2321,6 +2321,16 @@ fn raw_config_warnings(config: &Bt2Config) -> Vec<String> {
     warnings
 }
 
+/// True for key-map values acceptable in a raw dump.
+///
+/// The documented single values plus the erased `0xFFFFFFFF` sentinel observed
+/// on unused hardware slots (all 22 keys of slot 2 in the real dump). The
+/// typed `config remap` / `config set gyro.key` paths stay stricter and reject
+/// `0xFFFFFFFF`.
+fn raw_key_map_is_acceptable(key: KeyMap) -> bool {
+    key.is_single_documented() || key.bits() == u32::MAX
+}
+
 /// Validate the known fields of a complete raw configuration file.
 ///
 /// Every field the official writers interpret must pass the same checks the
@@ -2340,13 +2350,6 @@ fn raw_config_problems(config: &Bt2Config) -> Vec<String> {
     }
     for slot in Slot::ALL {
         let joy = config.joy(slot);
-        if joy.flag > 1 {
-            problems.push(format!(
-                "joy[{}].flag {} is outside 0..=1",
-                slot.index(),
-                joy.flag
-            ));
-        }
         if joy.flag == 1 {
             for (name, value, max) in [
                 ("left_start_value", joy.left_start_value, 127u8),
@@ -2363,23 +2366,10 @@ fn raw_config_problems(config: &Bt2Config) -> Vec<String> {
             }
         }
 
-        let trigger = config.trigger(slot);
-        if trigger.flag > 1 {
-            problems.push(format!(
-                "trigger[{}].flag {} is outside 0..=1",
-                slot.index(),
-                trigger.flag
-            ));
-        }
-
         let gyro = config.six_axis(slot);
-        if gyro.flag > 1 {
-            problems.push(format!(
-                "gyro[{}].flag {} is outside 0..=1",
-                slot.index(),
-                gyro.flag
-            ));
-        }
+        // All record flags are opaque in raw dumps: hardware stores values
+        // such as 0x20200911 / 0x20190000 / 0xFFFFFFFF and their meaning is
+        // unconfirmed. Only the typed `config set` field paths validate 0/1.
         if gyro.flag == 1 {
             if !(1..=15).contains(&gyro.sensitivity) {
                 problems.push(format!(
@@ -2403,27 +2393,24 @@ fn raw_config_problems(config: &Bt2Config) -> Vec<String> {
                 ));
             }
         }
-        if !gyro.key_map.is_single_documented() {
+        if !raw_key_map_is_acceptable(gyro.key_map) {
             problems.push(format!(
-                "gyro[{}].key_map 0x{:08X} is not a documented single KeyMap value",
+                "gyro[{}].key_map 0x{:08X} is not a documented single KeyMap value or the erased                  0xFFFFFFFF sentinel",
                 slot.index(),
                 gyro.key_map.bits()
             ));
         }
 
         let map_key = config.map_key(slot);
-        if map_key.flag > 1 {
-            problems.push(format!(
-                "map_key[{}].flag {} is outside 0..=1",
-                slot.index(),
-                map_key.flag
-            ));
-        }
+        // `map_key.flag` is opaque in raw dumps: hardware stores
+        // 0x20200911 / 0xFFFFFFFF (same values as slot_flags) and the meaning is
+        // unconfirmed. Only the typed `config set map_key.flag` path restricts
+        // it to 0/1.
         for (button, key) in ButtonIndex::ALL.into_iter().zip(map_key.keys) {
-            if !key.is_single_documented() {
+            if !raw_key_map_is_acceptable(key) {
                 problems.push(format!(
                     "button mapping slot {} index {} ({}): 0x{:08X} is not a documented single \
-                     KeyMap value",
+                     KeyMap value or the erased 0xFFFFFFFF sentinel",
                     slot.index(),
                     button.index(),
                     button.label(),
@@ -2433,13 +2420,6 @@ fn raw_config_problems(config: &Bt2Config) -> Vec<String> {
         }
 
         let hotwheel = config.hotwheel_theme(slot);
-        if hotwheel.flag > 1 {
-            problems.push(format!(
-                "hotwheel[{}].flag {} is outside 0..=1",
-                slot.index(),
-                hotwheel.flag
-            ));
-        }
         if hotwheel.flag == 1 && hotwheel.speed > 15 {
             problems.push(format!(
                 "hotwheel[{}].speed {} is outside 0..=15",
@@ -2447,29 +2427,7 @@ fn raw_config_problems(config: &Bt2Config) -> Vec<String> {
                 hotwheel.speed
             ));
         }
-        if config.dynamic_theme(slot).flag > 1 {
-            problems.push(format!(
-                "dynamic[{}].flag {} is outside 0..=1",
-                slot.index(),
-                config.dynamic_theme(slot).flag
-            ));
-        }
-        if config.single_theme(slot).flag > 1 {
-            problems.push(format!(
-                "single[{}].flag {} is outside 0..=1",
-                slot.index(),
-                config.single_theme(slot).flag
-            ));
-        }
-
         let rumble = config.rumble(slot);
-        if rumble.flag > 1 {
-            problems.push(format!(
-                "rumble[{}].flag {} is outside 0..=1",
-                slot.index(),
-                rumble.flag
-            ));
-        }
         if rumble.flag == 1 {
             for (name, value) in [("left", rumble.left), ("right", rumble.right)] {
                 if !value.is_finite() || !(0.0..=1.0).contains(&value) {
@@ -2481,23 +2439,7 @@ fn raw_config_problems(config: &Bt2Config) -> Vec<String> {
             }
         }
 
-        let special = config.special(slot);
-        if special.flag > 1 {
-            problems.push(format!(
-                "special[{}].flag {} is outside 0..=1",
-                slot.index(),
-                special.flag
-            ));
-        }
-
         let macro_slot = config.macro_slot(slot);
-        if macro_slot.flag > 1 {
-            problems.push(format!(
-                "macro[{}].flag {} is outside 0..=1",
-                slot.index(),
-                macro_slot.flag
-            ));
-        }
         if usize::from(macro_slot.total_cnt) > MACROS_PER_SLOT {
             problems.push(format!(
                 "macro[{}].total_cnt {} exceeds {MACROS_PER_SLOT}",
@@ -10388,9 +10330,14 @@ mod tests {
     fn mapping_lines_list_all_22_indices_with_back_button_labels() {
         let mut config = config_write_fixture();
         config.set_map_key_entry(Slot::S1, ButtonIndex::P1, KeyMap::L2);
+        let mut record = config.map_key(Slot::S1);
+        record.flag = 0x2020_0911;
+        config.set_map_key(Slot::S1, &record);
         let lines = mapping_lines(&config, Slot::S1);
         assert_eq!(lines.len(), 24, "header + column header + 22 rows");
         assert!(lines[0].contains("slot 0 (profile 1)"), "{}", lines[0]);
+        assert!(lines[0].contains("observed"), "{}", lines[0]);
+        assert!(lines[0].contains("0x20200911"), "{}", lines[0]);
         assert!(lines[1].contains("index"));
         let a = lines.iter().find(|line| line.contains("  0  ")).unwrap();
         assert!(a.contains('A'), "{a}");
@@ -10753,27 +10700,6 @@ mod tests {
             .contains("gyro[0].key_map"));
 
         let mut edited = config.clone();
-        let mut map_key = edited.map_key(Slot::S1);
-        map_key.flag = 2;
-        edited.set_map_key(Slot::S1, &map_key);
-        assert!(validate_raw_config(&edited)
-            .unwrap_err()
-            .to_string()
-            .contains("map_key[0].flag"));
-
-        let mut edited = config.clone();
-        let mut dynamic = edited.dynamic_theme(Slot::S1);
-        dynamic.flag = 2;
-        edited.set_dynamic_theme(Slot::S1, &dynamic);
-        assert!(validate_raw_config(&edited).is_err());
-
-        let mut edited = config.clone();
-        let mut single = edited.single_theme(Slot::S2);
-        single.flag = 2;
-        edited.set_single_theme(Slot::S2, &single);
-        assert!(validate_raw_config(&edited).is_err());
-
-        let mut edited = config.clone();
         let mut record = edited.macro_record(Slot::S1, MacroIndex::M1);
         record.max_steps = 300;
         edited.set_macro_record(Slot::S1, MacroIndex::M1, &record);
@@ -10808,87 +10734,169 @@ mod tests {
     }
 
     #[test]
-    fn raw_config_validation_rejects_record_flags_above_one() {
-        let config = config_write_fixture();
-        assert!(validate_raw_config(&config).is_ok());
-
-        // joy.flag
-        let mut edited = config.clone();
-        let mut joy = edited.joy(Slot::S1);
-        joy.flag = 2;
-        edited.set_joy(Slot::S1, &joy);
-        assert!(validate_raw_config(&edited)
-            .unwrap_err()
-            .to_string()
-            .contains("joy[0].flag 2"));
-
-        // trigger.flag (previously not checked at all)
-        let mut edited = config.clone();
-        let mut trigger = edited.trigger(Slot::S2);
-        trigger.flag = 2;
-        edited.set_trigger(Slot::S2, &trigger);
-        assert!(validate_raw_config(&edited)
-            .unwrap_err()
-            .to_string()
-            .contains("trigger[1].flag 2"));
-
-        // rumble.flag
-        let mut edited = config.clone();
-        let mut rumble = edited.rumble(Slot::S3);
-        rumble.flag = 2;
-        edited.set_rumble(Slot::S3, &rumble);
-        assert!(validate_raw_config(&edited)
-            .unwrap_err()
-            .to_string()
-            .contains("rumble[2].flag 2"));
-
-        // gyro.flag
-        let mut edited = config.clone();
-        let mut gyro = edited.six_axis(Slot::S1);
-        gyro.flag = 2;
-        edited.set_six_axis(Slot::S1, &gyro);
-        assert!(validate_raw_config(&edited)
-            .unwrap_err()
-            .to_string()
-            .contains("gyro[0].flag 2"));
-
-        // special.flag
-        let mut edited = config.clone();
-        let mut special = edited.special(Slot::S2);
-        special.flag = 2;
-        edited.set_special(Slot::S2, &special);
-        assert!(validate_raw_config(&edited)
-            .unwrap_err()
-            .to_string()
-            .contains("special[1].flag 2"));
-
-        // 0 and 1 are accepted for every record flag.
-        let mut edited = config.clone();
+    fn raw_config_validation_accepts_observed_record_flags() {
+        // Real hardware stores opaque flag values in every record
+        // (DEVICE_CONFIG_EVIDENCE): 0x20200911 on populated slots,
+        // 0xFFFFFFFF on the erased slot, and 0x20190000 for gyro slot 0.
+        let mut config = config_write_fixture();
         for slot in Slot::ALL {
-            let mut joy = edited.joy(slot);
-            joy.flag = 1;
-            edited.set_joy(slot, &joy);
-            let mut trigger = edited.trigger(slot);
-            trigger.flag = 1;
-            edited.set_trigger(slot, &trigger);
-            let mut rumble = edited.rumble(slot);
-            rumble.flag = 1;
-            edited.set_rumble(slot, &rumble);
-            let mut gyro = edited.six_axis(slot);
-            gyro.flag = 1;
-            gyro.sensitivity = 5;
-            gyro.trigger_mode = 0;
-            gyro.mapping_type = 0;
-            edited.set_six_axis(slot, &gyro);
-            let mut special = edited.special(slot);
-            special.flag = 1;
-            edited.set_special(slot, &special);
+            let (common, gyro_flag) = match slot {
+                Slot::S1 => (0x2020_0911, 0x2019_0000),
+                Slot::S2 => (0x2020_0911, 0x2020_0911),
+                Slot::S3 => (0xFFFF_FFFF, 0x2020_0911),
+            };
+            let mut joy = config.joy(slot);
+            joy.flag = common;
+            config.set_joy(slot, &joy);
+            let mut trigger = config.trigger(slot);
+            trigger.flag = common;
+            config.set_trigger(slot, &trigger);
+            let mut rumble = config.rumble(slot);
+            rumble.flag = common;
+            config.set_rumble(slot, &rumble);
+            let mut special = config.special(slot);
+            special.flag = common;
+            config.set_special(slot, &special);
+            let mut gyro = config.six_axis(slot);
+            gyro.flag = gyro_flag;
+            config.set_six_axis(slot, &gyro);
+            let mut map_key = config.map_key(slot);
+            map_key.flag = common;
+            config.set_map_key(slot, &map_key);
+            let mut dynamic = config.dynamic_theme(slot);
+            dynamic.flag = common;
+            config.set_dynamic_theme(slot, &dynamic);
+            let mut hotwheel = config.hotwheel_theme(slot);
+            hotwheel.flag = common;
+            config.set_hotwheel_theme(slot, &hotwheel);
+            let mut single = config.single_theme(slot);
+            single.flag = common;
+            config.set_single_theme(slot, &single);
+            let mut macro_slot = config.macro_slot(slot);
+            macro_slot.flag = common;
+            config.set_macro_slot(slot, &macro_slot);
         }
         assert!(
-            validate_raw_config(&edited).is_ok(),
-            "{:?}",
-            validate_raw_config(&edited)
+            validate_raw_config(&config).is_ok(),
+            "hardware-observed record flags must pass raw validation: {:?}",
+            validate_raw_config(&config)
         );
+        // No --force-raw needed on the write-path wrapper either.
+        assert!(validate_raw_config_for_write(&config, false).is_ok());
+
+        // The typed flag field keeps its 0/1 restriction.
+        assert!(parse_config_set("map_key.flag", "0x20200911", Slot::S1).is_err());
+        assert!(parse_config_set("map_key.flag", "0xFFFFFFFF", Slot::S1).is_err());
+    }
+
+    #[test]
+    fn raw_config_validation_accepts_the_erased_map_key_sentinel() {
+        // The real erased slot (slot 2) stores 0xFFFFFFFF in all 22 entries;
+        // raw restore must accept that sentinel, while the typed remap path
+        // stays strict.
+        let mut config = config_write_fixture();
+        let mut record = config.map_key(Slot::S3);
+        record.flag = 0xFFFF_FFFF;
+        record.keys = [KeyMap::from_bits(0xFFFF_FFFF); 22];
+        config.set_map_key(Slot::S3, &record);
+        let mut gyro = config.six_axis(Slot::S3);
+        gyro.key_map = KeyMap::from_bits(0xFFFF_FFFF);
+        config.set_six_axis(Slot::S3, &gyro);
+
+        assert!(
+            validate_raw_config(&config).is_ok(),
+            "erased-slot key maps must pass raw validation: {:?}",
+            validate_raw_config(&config)
+        );
+        assert!(validate_raw_config_for_write(&config, false).is_ok());
+        assert!(parse_remap_target("0xFFFFFFFF").is_err());
+    }
+
+    #[tokio::test]
+    async fn config_write_restores_an_observed_flag_dump_without_force_raw() {
+        let dir = scratch_dir("config-observed-flags");
+        let initial = config_write_fixture();
+        let mut dump = initial.clone();
+        for slot in Slot::ALL {
+            let (common, gyro_flag) = match slot {
+                Slot::S1 => (0x2020_0911, 0x2019_0000),
+                Slot::S2 => (0x2020_0911, 0x2020_0911),
+                Slot::S3 => (0xFFFF_FFFF, 0x2020_0911),
+            };
+            let mut joy = dump.joy(slot);
+            joy.flag = common;
+            dump.set_joy(slot, &joy);
+            let mut trigger = dump.trigger(slot);
+            trigger.flag = common;
+            dump.set_trigger(slot, &trigger);
+            let mut rumble = dump.rumble(slot);
+            rumble.flag = common;
+            dump.set_rumble(slot, &rumble);
+            let mut special = dump.special(slot);
+            special.flag = common;
+            dump.set_special(slot, &special);
+            let mut gyro = dump.six_axis(slot);
+            gyro.flag = gyro_flag;
+            dump.set_six_axis(slot, &gyro);
+            let mut map_key = dump.map_key(slot);
+            map_key.flag = common;
+            dump.set_map_key(slot, &map_key);
+            let mut dynamic = dump.dynamic_theme(slot);
+            dynamic.flag = common;
+            dump.set_dynamic_theme(slot, &dynamic);
+            let mut hotwheel = dump.hotwheel_theme(slot);
+            hotwheel.flag = common;
+            dump.set_hotwheel_theme(slot, &hotwheel);
+            let mut single = dump.single_theme(slot);
+            single.flag = common;
+            dump.set_single_theme(slot, &single);
+            let mut macro_slot = dump.macro_slot(slot);
+            macro_slot.flag = common;
+            dump.set_macro_slot(slot, &macro_slot);
+        }
+        // The erased slot also stores 0xFFFFFFFF in every map_key entry.
+        let mut erased = dump.map_key(Slot::S3);
+        erased.keys = [KeyMap::from_bits(0xFFFF_FFFF); 22];
+        dump.set_map_key(Slot::S3, &erased);
+
+        assert!(
+            validate_raw_config_for_write(&dump, false).is_ok(),
+            "the observed dump must pass raw validation without --force-raw: {:?}",
+            validate_raw_config_for_write(&dump, false)
+        );
+
+        let transport = ConfigDeviceTransport::new(initial.clone());
+        let session = Session::new(&transport);
+        config_write_session(
+            &session,
+            &dump,
+            Some(&dir.join("backup")),
+            false,
+            ConfigConfirmation::AssumeYes,
+            None,
+        )
+        .await
+        .expect("the observed dump must be restorable without --force-raw");
+
+        let device = transport.config();
+        assert_eq!(map_key_flag(&device, Slot::S1), 0x2020_0911);
+        assert_eq!(map_key_flag(&device, Slot::S3), 0xFFFF_FFFF);
+        assert_eq!(device.six_axis(Slot::S1).flag, 0x2019_0000);
+        assert_eq!(
+            device.map_key(Slot::S3).keys[0],
+            KeyMap::from_bits(0xFFFF_FFFF)
+        );
+        assert_eq!(
+            transport
+                .sent()
+                .iter()
+                .filter(|frame| {
+                    CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::SAVE
+                })
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -74,6 +74,8 @@
 > 公式 Android の `Generate_CustomDataCmd` は書込系で `min(残り, MAX_ATT_MTU - 0x12)` を使い、`MAX_ATT_MTU` は初期値 **`0x5C` (92)** のまま `0x600F` 用に変更されない。したがって **公式書込のペイロード上限は 74B**（静的解析。実機書込キャプチャは未確認）。既存の「MTU 200 → 142B」は**読み出し応答側の実機観測値**であり、書込側の分割長ではない。本リポジトリの full config write は既定で **`min(MTU ペイロード, 74)`**（MTU 200 でも 74B）を使い、`--write-chunk <BYTES>` は接続前上限 **180**（観測 MTU 200 のペイロード上限）まで明示指定できる（公式 74B との A/B 用。実機未確認）。
 >
 > **部分書込と Save（RE 確定・2026-11-22）**: `getBT2_Write*` の部分書込も、完了時に共通 onfinished から **`0x0006/0x0067` Save が必ず 1 回**送られる（部分書込専用の Save 関数は無い）。
+>
+> **各レコードの `flag` は実機で opaque（2026-11-23 実機 dump 証跡）**: joy / trigger / rumble / special / map_key / macro / gyro / dynamic / hotwheel / single の先頭 `u32` は `0/1` ではなく、`0x20200911`（slot 0/1）、`0xFFFFFFFF`（slot 2）、gyro slot0 のみ `0x20190000` を観測した。raw 2768B 書込はこれらを **opaque な `u32` としてそのまま保持**し、flag の値検証は行わない。typed `config set` の flag フィールドのみ 0/1 制限を維持する。
 
 ### 1.3 `+0x1F4..+0x68B` (3 × 392B) および `+0x914..+0x92B` (3 × 8B) の解析結果
 
@@ -272,11 +274,11 @@ struct Bt2Header {
 
 | 相対オフセット | 全体オフセット (slot `s`) | サイズ | 型 | フィールド名 | 説明 |
 | :---: | :---: | :---: | --- | --- | --- |
-| `+0x00` | `0x0E0 + s * 0x5C` | 4B | `u32` | `flag` | 有効フラグ (`1` = リマップ有効, `0` = デフォルト) |
+| `+0x00` | `0x0E0 + s * 0x5C` | 4B | `u32` | `flag` | 実機では `0x20200911`（slot 0/1）/ `0xFFFFFFFF`（slot 2）を観測。意味は未確定（opaque）。typed `config set map_key.flag` は 0/1 のみ受け付ける |
 | `+0x04..+0x5B` | `0x0E4 + s * 0x5C` | 88B | `[u32; 22]` | `key[22]` | 22 個の物理ボタンに対応するマッピング先 `KeyMap` 値 |
 
 - 部分書込 `getBT2_WriteMapKey(slot, key_idx)` は `flag` を除く **`key[key_idx]` 単体（4B）** を `offset = 0x0E4 + slot * 0x5C + key_idx * 4`, `len = 4`, `total_len = 0x0AD0` で書き込む。
-- **書込経路（RE 確定・2026-11-22）**: Android `HIDChannel.writeBT2MAPkEY` は `ANSI_CRC_16_sh(record, 0xAD0)` → `getBT2_WriteMapKey` → 共通 onfinished から **`0x0006/0x0067` Save**。Windows は `_writeUltimateBT2MapKey@2776`（VA `0x10438ED0`）が `offset = 0xE4 + slot*0x5C + idx*4`, `len = 4`, `total_len = 0xAD0` を送り、Save `0x0006/0x0123`（3 秒）。**変更するのは 4B の 1 エントリのみで `flag` は変更しない**。`flag`（`+0xE0 + slot*0x5C`、`0`=無効）を 1 にするのは `setMapKey` の全 22 要素 + flag 一括コピー経由。全体 2768B 書込で同じ領域を更新する経路も有効（本実装はこちらを使用）。`0 = KeyMap_N`（未割当）が実値。`KeyMap_My_NUll = 227` はマッピング書込経路から参照されず、用途未確認のため書かない。
+- **書込経路（RE 確定・2026-11-22）**: Android `HIDChannel.writeBT2MAPkEY` は `ANSI_CRC_16_sh(record, 0xAD0)` → `getBT2_WriteMapKey` → 共通 onfinished から **`0x0006/0x0067` Save**。Windows は `_writeUltimateBT2MapKey@2776`（VA `0x10438ED0`）が `offset = 0xE4 + slot*0x5C + idx*4`, `len = 4`, `total_len = 0xAD0` を送り、Save `0x0006/0x0123`（3 秒）。**変更するのは 4B の 1 エントリのみで `flag` は変更しない**。`flag`（`+0xE0 + slot*0x5C`）は実機で `0x20200911` / `0xFFFFFFFF` を観測しており、`0/1` の有効フラグとして解釈できない（opaque・意味未確定）。typed `config set map_key.flag` だけが 0/1 を扱う。全体 2768B 書込で同じ領域を更新する経路も有効（本実装はこちらを使用）。MTU 200・74B 既定では **38 write + 1 Save = 合計 39 packets**。`0 = KeyMap_N`（未割当）が実値。`KeyMap_My_NUll = 227` はマッピング書込経路から参照されず、用途未確認のため書かない。
 
 ### 5.2 `key[22]` 配列インデックス対応表（Ultimate 2 / Non-3E レイアウト）
 
