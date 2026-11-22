@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  xtool merges this dictionary over its generated Info.plist, so only the keys
+  that differ from the defaults need to be here (CFBundleIdentifier, version
+  numbers, orientation, launch screen, ... are generated from xtool.yml and
+  Package.swift).
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>Ultimate2 Mobile</string>
+	<!-- Required by iOS before CBCentralManager is created; the app crashes
+	     on launch without it. Describe the actual purpose, not marketing copy. -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Connects to your 8BitDo Ultimate 2 controller to read its settings and enable live input.</string>
+	<!-- iOS 12 and earlier key; harmless on current iOS. -->
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>Connects to your 8BitDo Ultimate 2 controller to read its settings and enable live input.</string>
+	<!-- Reads while backgrounded are allowed for a connected central. Writes and
+	     firmware updates stay foreground-only (see mobile/README.md). -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+	</array>
+</dict>
+</plist>
