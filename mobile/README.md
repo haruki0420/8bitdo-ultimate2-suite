@@ -146,6 +146,16 @@ Kotlin は `Dispatchers.IO`、Swift は専用キューから呼んでくださ�
 送信予定バッファで、フラッシュへの書き込み経路には接続していません。
 `write_full_config` を FFI に公開するのは上記 1〜3 が揃った後です。
 
+## main の BLE 単一所有（`ble_lock`）との関係
+
+`origin/main` の BLE 単一所有／ロックファイル（`eightbitdo_core::ble_lock`,
+`BleOptions` の lock_path）は **GUI / CLI の BLE トランスポート用**です。
+モバイルは CoreBluetooth / BluetoothGatt を `NativeTransport` callback として
+注入し、Rust コアは BLE スタックに直接触れません（`eightbitdo-core` を
+`default-features = false` でビルド）。そのため `BleOptions` の初期化変更は
+モバイル側に影響せず、整合確認も不要です。`ble_lock` は「1 プロセス 1 リンク」
+を守るためのもので、モバイルでは OS の BLE API が同じ役割を担います。
+
 ## iOS（`mobile/ios/`）
 
 ### 前提（Linux ホスト）
