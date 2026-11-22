@@ -321,7 +321,7 @@ Track C: モバイル
 2. ~~Phase 2b マクロ書き込み → Tier 3 レビュー → マージ~~ **完了（実機確認済み）**
 3. **Phase 2c BLE OTA: 実機 btsnoop で wire / ACK を確定 → ACK `offset` / `total_len` 照合とマルチセクション `.dat` 対応 → Tier 3 → CLI / GUI / UniFFI 配線 → 実機書込**
 4. ~~Phase 2d 設定書き込み → Tier 3 レビュー → マージ~~ **完了（実機確認済み）**
-5. ~~Phase 3a GUI 読み取り専用~~ **完了** → ~~Phase 3b / 3d GUI 書き込み UI~~ **PR #16 で実装済み（実機未検証）** → 実機確認 → Phase 3c OTA 画面
+5. ~~Phase 3a GUI 読み取り専用~~ **完了** / ~~Phase 3b / 3d GUI 書き込み UI~~ **PR #16 で実装済み（実機未検証）**。次に着手するのは **Phase 3c OTA 画面**（Phase 2c の実機 wire 確定後）と、GUI 書込の実機確認（Tier 3）
 6. Phase 5 モバイル: Android JNI 同梱 APK → 実機確認 → 配布（書き込み・OTA は後続）
 7. Phase 2e / 4（USB / 2.4G）: 実機証跡と USB Boot TX フレーミングが揃うまで保留
 
@@ -333,7 +333,7 @@ Track C: モバイル
 | 2 | OTA ACK の `offset` / `total_len` 照合（現状は cmd/subcmd のみ。遅延・重複 ACK を誤帰属し得る） | フラッシュ破損リスク | 3 |
 | 3 | マルチセクション `.dat` 対応（公式 `.dat` がマルチセクションなら現実装は拒否する） | 公式ファーム更新の blocker | 3 |
 | 4 | OTA の CLI / GUI / UniFFI 配線、バッテリー警告、バージョン / ダウングレード判定、SHA-256 検証 | OTA 未提供 | 3 |
-| 5 | GUI 書き込み UI（PR #16）の実機確認、backup 復元 UI・JSON/TOML 入出力 | GUI 書込が実機未検証 | 3 |
+| 5 | GUI 書込み UI（PR #16）の実機確認と、Phase 3c OTA 画面。backup 復元 UI・JSON/TOML 入出力 | GUI 書込が実機未検証 | 3 |
 | 6 | Android NDK + cargo-ndk による Rust JNI 同梱 APK | Android 実機でコア不可 | 2–3 |
 | 7 | iOS / Android 実機での BLE 読み取り確認、App Store 配布（macOS 必須） | モバイル未実証 | 3 |
 | 8 | macOS / Windows の BLE 実機確認（現状は Linux のみ） | クロスプラットフォーム未実証 | 2–3 |
