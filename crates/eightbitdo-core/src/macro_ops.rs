@@ -15,7 +15,7 @@ use eightbitdo_protocol::config_bt2::{
     macro_slot_offset, Bt2Config, MacroIndex, MacroRecord, MacroSlot, Slot, CONFIG_SIZE,
     MACROS_PER_SLOT, MACRO_RECORD_SIZE, MACRO_SLOT_SIZE, SLOT_COUNT,
 };
-use eightbitdo_protocol::header::PacketKind;
+use eightbitdo_protocol::header::{CustomHeader, PacketKind, HEADER_SIZE};
 use eightbitdo_protocol::macro_data::{self, MacroStep};
 use eightbitdo_protocol::KeyMap;
 use tokio::time::Instant;
@@ -1023,12 +1023,27 @@ impl<T: Transport> Session<T> {
                 Err(_) => return Err(ack_timeout(description, ack_cmd, timeout)),
             };
 
-            let (response, payload) = eightbitdo_protocol::header::decode_app_response(&frame)
-                .map_err(|error| {
-                    Error::UnexpectedResponse(format!(
-                        "malformed frame while waiting for {description} ACK: {error}"
-                    ))
-                })?;
+            // ACK frames may be a bare 16-byte header even when the header
+            // echoes a non-zero `chunk_len` (observed Erase ACK:
+            // cmd=0x0004, subcmd=0x0104, chunk_len=0x1000, no payload).
+            // Parse the header first and do not require a payload for ACKs.
+            let primary = CustomHeader::parse(&frame).map_err(|error| {
+                Error::UnexpectedResponse(format!(
+                    "malformed frame while waiting for {description} ACK: {error}"
+                ))
+            })?;
+            let mut response = primary;
+            let mut payload = &frame[HEADER_SIZE..];
+            if frame.len() > HEADER_SIZE && frame[0] == 0x04 {
+                if let Ok(prefixed) = CustomHeader::parse(&frame[1..]) {
+                    let prefixed_is_ack =
+                        prefixed.cmd == 0x000E || ack_matches(&prefixed, ack_cmd, ack_subcmd);
+                    if prefixed_is_ack {
+                        response = prefixed;
+                        payload = &frame[HEADER_SIZE + 1..];
+                    }
+                }
+            }
 
             if response.cmd == 0x000E {
                 return Err(Error::UnexpectedResponse(format!(
@@ -1037,19 +1052,10 @@ impl<T: Transport> Session<T> {
                 )));
             }
 
-            let matched = response.cmd == ack_cmd
-                || (response.cmd == cmd::RESPONSE
-                    && (response.subcmd == ack_cmd || response.subcmd == ack_subcmd));
-            if !matched {
-                continue;
+            if ack_matches(&response, ack_cmd, ack_subcmd) {
+                // Accept the ACK regardless of echoed chunk_len / total_len.
+                return Ok(());
             }
-            if response.chunk_len != 0 {
-                return Err(Error::UnexpectedResponse(format!(
-                    "{description} ACK carried {} data bytes",
-                    response.chunk_len
-                )));
-            }
-            return Ok(());
         }
     }
 }
@@ -1138,6 +1144,12 @@ fn ack_timeout(description: &str, ack_cmd: u16, timeout: Duration) -> Error {
     Error::Timeout {
         operation: format!("{description} ACK (cmd=0x{ack_cmd:04X}) within {timeout:?}"),
     }
+}
+
+fn ack_matches(response: &CustomHeader, ack_cmd: u16, ack_subcmd: u16) -> bool {
+    response.cmd == ack_cmd
+        || (response.cmd == cmd::RESPONSE
+            && (response.subcmd == ack_cmd || response.subcmd == ack_subcmd))
 }
 
 fn header_field_name(offset: usize) -> &'static str {
@@ -1795,6 +1807,44 @@ mod write_tests {
 
     fn frame_cmd(frame: &[u8]) -> u16 {
         CustomHeader::parse(&frame[1..]).unwrap().cmd
+    }
+
+    #[tokio::test]
+    async fn write_macro_accepts_payloadless_acks_with_declared_chunk_len() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(4);
+        let plan = MacroWritePlan::new(steps.clone());
+
+        let mock = MockTransport::with_mtu(200);
+        // Observed Erase ACK: cmd=0x0004, subcmd=0x0104, chunk_len=0x1000,
+        // total_len=0x1000, no payload.
+        let mut erase_ack = CustomHeader::new(cmd::RESPONSE, cmd::ERASE_MACRO, 0x1000, 0);
+        erase_ack.chunk_len = 0x1000;
+        erase_ack.crc16 = 0x0101;
+        mock.push_response(&erase_ack, &[]);
+        // Write ACK declares 64 bytes but has no payload; send it with a
+        // BLE 0x04 prefix to cover the 17-byte form too.
+        let write_ack =
+            CustomHeader::new(cmd::RESPONSE, cmd::WRITE_MACRO, 64, 0).with_chunk_len(64);
+        let mut write_frame = write_ack.to_bytes().to_vec();
+        write_frame.insert(0, 0x04);
+        mock.push_incoming(&write_frame);
+        // Header ACKs declare 142 bytes but have no payload.
+        let header_ack =
+            CustomHeader::new(cmd::RESPONSE, cmd::WRITE_CONFIG, 0x0AD0, 0x68C).with_chunk_len(142);
+        mock.push_response(&header_ack, &[]);
+        mock.push_response(&header_ack, &[]);
+        mock.push_response(&CustomHeader::new(cmd::RESPONSE, cmd::SAVE, 0, 0), &[]);
+        let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
+        push_config(&mock, &expected);
+        push_readback(&mock, &steps);
+
+        let session = Session::new(&mock);
+        let outcome = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await
+            .expect("payloadless ACKs with echoed chunk_len must be accepted");
+        assert_eq!(outcome.readback.steps(), steps);
     }
 
     #[tokio::test]
