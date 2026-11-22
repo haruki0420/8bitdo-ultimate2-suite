@@ -147,6 +147,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 | **[docs/PROTOCOL_SPEC.md](docs/PROTOCOL_SPEC.md)** | デバイス VID/PID、BLE GATT UUID・MTU、16B カスタムヘッダ、BLE/USB HID フレーミング、2 種の CRC-16、全コマンド、リアルタイム入力ストリーム、BLE OTA ブートローダー＆ファームウェア API 仕様 |
 | **[docs/STRUCT_BT2_2768B.md](docs/STRUCT_BT2_2768B.md)** | 2768 バイト（`0xAD0`）設定構造体 (`record_ultimatebt2`) の全バイトオフセット、32-bit `KeyMap`、10 バイト `MacroDatas` ステップ構造、Flash 書き込みシーケンス |
 | **[docs/DEVICE_CONFIG_EVIDENCE.md](docs/DEVICE_CONFIG_EVIDENCE.md)** | 実機 2768B ダンプ（SHA-256 `1dca47fa…`）の実バイト証跡: `slot_flags` / `map_key.flag` の非 0/1 値、`config remap` の差分、raw 検証エラーと再現コマンド |
+| **[docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md)** | 公式 Windows / Android ソフトの機能ごとのカバレッジ: RE 証拠ラベル、本リポジトリの実装状況（core / CLI / GUI）、実機検証状況（Linux BLE のみ）、残作業と追加 RE 項目 |
 | **[docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)** | Rust + SwiftUI + Jetpack Compose のアーキテクチャ設計、ワークスペース構成、Phase 1〜5 ロードマップ、現在の状態・残課題、安全検証手順 |
 | **[docs/OTA_BLE_EVIDENCE.md](docs/OTA_BLE_EVIDENCE.md)** | BLE OTA の解析証跡（確定した順序・タイムアウト・`.dat` ヘッダ）と未確認事項の優先順 |
 | **[docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)** | クロスプラットフォームのビルド確認状況（Windows クロス `check` の結果と警告 4 件、MSRV 1.85 が Windows で通らない理由、iOS target check、macOS 未確認の理由、CI 追加提案） |
