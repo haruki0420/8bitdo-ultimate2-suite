@@ -515,6 +515,7 @@ struct Bt2Header {
    - `total_len = 0x1000`（消去サイズ。ペイロード長ではない）
    - `chunk_len = 0x1000`（公式実装のチャネル設定値。wire header `+0x04` に書かれる。ペイロードなし、`len = 0`）
    - `crc16 = 0xFFFF`（空ペイロードに対する CRC-16/MODBUS。公式 `crc16` は長さ `<= 0` で `0xFFFF`）
+   - ACK 後 **100ms** 待ってから Write を送る（`MACRO_ERASE_SETTLE_DELAY`、実機の Erase 完了待ち。暫定値）
 2. **Step 2: マクロステップデータ書込 (`Write`)**
    - `cmd = 0x0103`
    - `subcmd = (gamepad_mode << 8) | slot`
@@ -522,6 +523,7 @@ struct Bt2Header {
    - `total_len = align32(max_steps * 10)`
    - `chunk_size` は MTU 連動: `max_payload = mtu - 3 - 17` が `64` 以上なら 64B、`32` 以上なら 32B、それ未満は `Error::MtuTooSmall`（32B アライン不能）。最終チャンクは 32B アライン長。46B などの交渉済みサイズは将来拡張で、現在の API は `UnsupportedChunkSize` を返す
    - ペイロード: `max_steps * 10` バイト＋32B アライメント用ゼロパディング（BLE 64B / USB HID 32B で分割送信・`Send_CustomCmdPacket` 準拠で各チャンクヘッダ `CRC-16/MODBUS (0xA001)` 付与）
+   - **最終チャンクの ACK 後 50ms** 待ってから Header を送る（`MACRO_WRITE_SETTLE_DELAY`、暫定値）
 3. **Step 3: 2768B コンフィグ内のマクロ管理ヘッダ更新**
    - `max_steps`, `key_map`, `cycles_num`, `interval_ms`, `filename`, `total_cnt`, `flag` 等を `0x68C + slot * 0xD8` に反映し、`ANSI_CRC_16_sh` を再計算する。
    - 部分書込 (`cmd = 0x0001, subcmd = 0x0000, offset = 0x68C + slot * 0xD8, len = 0xD8, total_len = 0x0AD0`) または全体書込を送信する。216B は `chunk_len = min(142, mtu - 3 - 17)` で分割する（`total_len` は各パケットで `0x0AD0` のまま、`offset` は実チャンク長だけ進む）。MTU 200 なら 142 + 74、MTU 64 なら 44×4 + 40、MTU 23 なら 3×72。
@@ -529,12 +531,13 @@ struct Bt2Header {
    - **BLE**: `cmd = 0x0006, subcmd = 0x0067, offset = 0, len = 0, total_len = 0`
    - **USB**: `cmd = 0x0006, subcmd = 0x0123, offset = 0, len = 0, total_len = 0`
 5. **Step 5: 読み戻し検証 (`Read`)**
-   - `cmd = 0x0002` で 2768B config を読み、対象 slot の **216B ヘッダ**が送信した `header_bytes` と一致することを確認する。
+   - Save ACK 後 **300ms** 待ってから `cmd = 0x0002` で 2768B config を読み、対象 slot の **216B ヘッダ**が送信した `header_bytes` と一致することを確認する（`MACRO_VERIFY_DELAY`、暫定値）。
    - 続けて `cmd = 0x0102` で `(slot, macro_idx)` を読み、`max_steps * 10` バイトが書き込んだ `MacroDatas` と一致することを確認する。
 
 > ACK は各コマンド送信後の transport `wait_ack` で待つ。マクロの `Erase` / `Write` / ヘッダは 2 秒（実装定数 `0x44fa0000`）。マクロ `Save` は 3 秒で **リトライしない**（USB HID の仕様記載。BLE は未文書化のため暫定で 3 秒を使う）。OTA の 10 秒 erase / 1 秒 chunk / 64B 固定はマクロに適用しない。
 
 > **実装ノート（Mock 検証済み・実機書き込み未検証）**:
+> - **実機観測（2026-11-22）**: slot 0 macro 0（500B）の restore は成功したが、macro 1（460B）は Erase → Write 8 chunks → Header → Save の ACK がすべて返った後、100ms 後の `0x0102` が zeros で Verify 失敗した。216B ヘッダは一致（`max_steps = 46`, `offset = 0x1000`）。Erase ACK 直後に Write を送っていたため、Erase settle 100ms と Save 後 verify 300ms の仮説を採用した（実測で調整）。
 > - **Fail-closed**: Erase / Write / Header のいずれかが失敗したら Save を送らない。ただし Erase 済み・Write 途中のセクタは変更されている可能性がある。Save 後の ACK または読み戻しが失敗した場合だけ `saved = true` として報告する。どちらも 3 スロット × 4 マクロの完全バックアップから復元する。
 > - **空きマクロ拒否**: `max_steps == 0` / `0xFFFF` への `macro write` は `Error::EmptyMacroWrite` で拒否する。step data の clear が未実装で、`macro write` では新規作成できない。`macro restore` はバックアップが非空なら現在のマクロが空でも書ける（pre-restore backup と 216B ヘッダ更新を使う）。
 > - **ヘッダ値**: `max_steps` は新しいステップ数。`key_map` / `cycles_num` / `interval_ms` / `flag` / `total_cnt` は指定がなければ既存値を保持する。既存の予約バイト（slot `+0x05..+0x07`、record `+0x26..+0x27`）も保持する。

@@ -201,6 +201,7 @@ Track C: モバイル
   - Mock でパケット列・CRC・チャンク境界・タイムアウト・fail-closed・読み戻し不一致を固定
   - CLI: `macro backup --dir <DIR>` / `macro write --slot N --index N --file <JSON/TOML> [--trigger M1..M4]` / `macro restore --dir <DIR> [--force]`
   - fail-closed（Erase / Write / Header 失敗時に Save しない）、`0x0002` の 216B ヘッダ検証 + `0x0102` の raw 検証、`--trigger` のヘッダ反映
+  - 実機の部分復元観測を受け、Erase ACK 後 100ms、Write 最終チャンク後 50ms、Save 後 verify 300ms の暫定 delay を追加
   - 空きマクロ（`max_steps == 0` / `0xFFFF`）への write を拒否（step data clear 未実装）
   - `macro write` は 12 マクロ完全バックアップ必須。対象 slot に読めないマクロがあれば `unreadable macro in target slot` で拒否
   - backup dir は空 path / symlink（末尾 `/` 含む）/ 既存の非空ディレクトリ / `.` を拒否（pre-write / pre-restore 含む）。失敗した `macro backup` / `macro write` の早期失敗は作成した空ディレクトリを削除
