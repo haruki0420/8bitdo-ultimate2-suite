@@ -29,16 +29,15 @@ cat > "$STUB" <<'STUB_BODY'
 #!/usr/bin/env bash
 set -u
 if [[ "${1:-}" == "scan" ]]; then
-    printf '%s\n' "$*" >> "$LOOP_TEST_SCAN_INVOCATIONS"
+    printf '%s %s\n' "$(date +%s%N)" "$*" >> "$LOOP_TEST_SCAN_INVOCATIONS"
     case "${LOOP_TEST_SCAN_MODE:-visible}" in
         visible)
-            printf '%s\n' "NAME                 ADDRESS              RSSI  MODE"
-            printf '%s\n' "80ND                 aa:bb:cc:dd:ee:ff      -40  App Mode"
+            printf '%s\n' "App Mode device found: 80ND aa:bb:cc:dd:ee:ff"
             exit 0
             ;;
         absent)
-            printf '%s\n' "no BLE devices found within 1 seconds"
-            exit 0
+            printf '%s\n' "no App Mode (80ND) device found within 1 seconds" >&2
+            exit 3
             ;;
         error)
             printf '%s\n' "error: another process is using the BLE adapter (lock file /tmp/x)" >&2
@@ -140,6 +139,10 @@ gap_ms() {
     echo $(( (second - first) / 1000000 ))
 }
 
+scan_timestamp_ms() {
+    sed -n "${1}p" "$SCAN_INVOCATIONS" | awk '{print $1}'
+}
+
 # 1. Degraded exit: stop at once, no scan, no restart, no 2 second wait.
 start=$(date +%s)
 set +e
@@ -156,7 +159,7 @@ grep -q "WAITING FOR PHYSICAL ACTION" "$TMP_DIR/loop.out" \
 grep -q "NOT retried automatically" "$TMP_DIR/loop.out" \
     || fail "degraded log must say the loop does not retry"
 
-# 2. Normal exit + 80ND visible: exactly one 2 second+ restart gap.
+# 2. Normal exit + 80ND visible: wait >= 2s before scanning, then restart.
 set +e
 run_loop LOOP_TEST_EXIT_1=0 LOOP_TEST_EXIT_2=3
 code=$?
@@ -165,18 +168,27 @@ set -e
 [[ "$(invocations)" -eq 2 ]] || fail "expected exactly two invocations, saw $(invocations)"
 [[ "$(scan_invocations)" -eq 1 ]] || fail "expected one post-exit scan, saw $(scan_invocations)"
 gap=$(gap_ms 1 2)
-((gap >= 1900)) || fail "restart gap must be at least 2s, was ${gap}ms"
+((gap >= 3900)) || fail "restart gap must include 2s teardown + 2s backoff, was ${gap}ms"
+session_start=$(sed -n '1p' "$INVOCATIONS")
+scan_at=$(scan_timestamp_ms 1)
+scan_delay_ms=$(( (scan_at - session_start) / 1000000 ))
+((scan_delay_ms >= 1900)) || fail "scan must run >= 2s after the session exited, was ${scan_delay_ms}ms"
+grep -q -- '--check' "$SCAN_INVOCATIONS" \
+    || fail "the loop must use the machine-readable scan --check contract"
 grep -q "80ND' is still advertising" "$TMP_DIR/loop.out" \
     || fail "a visible 80ND must be logged before restarting"
 
 # 3. Normal exit + 80ND absent: press guidance, no restart.
+start=$(date +%s)
 set +e
 run_loop LOOP_TEST_EXIT_1=0 LOOP_TEST_SCAN_MODE=absent
 code=$?
 set -e
+elapsed=$(( $(date +%s) - start ))
 [[ "$code" -eq 3 ]] || fail "missing 80ND must exit with the press-required code, got $code"
 [[ "$(invocations)" -eq 1 ]] || fail "missing 80ND must not restart, saw $(invocations) invocations"
 [[ "$(scan_invocations)" -eq 1 ]] || fail "expected one scan, saw $(scan_invocations)"
+((elapsed >= 2)) || fail "the post-exit scan must wait for teardown (took ${elapsed}s)"
 grep -q "'80ND' is not advertising" "$TMP_DIR/loop.out" \
     || fail "missing 80ND must be logged"
 grep -q "WAITING FOR PHYSICAL ACTION" "$TMP_DIR/loop.out" \
@@ -203,7 +215,8 @@ set -e
 grep -q "not restarting automatically" "$TMP_DIR/loop.out" \
     || fail "ordinary failure must log that it does not restart"
 
-# 6. Backoff grows after consecutive quick normal exits (2s then 4s).
+# 6. Backoff grows after consecutive quick normal exits (2s then 4s, plus the
+#    2 second teardown wait before every scan).
 set +e
 run_loop LOOP_TEST_EXIT_1=0 LOOP_TEST_EXIT_2=0 LOOP_TEST_EXIT_N=3
 code=$?
@@ -212,10 +225,11 @@ set -e
 [[ "$(invocations)" -eq 3 ]] || fail "expected three invocations, saw $(invocations)"
 first_gap=$(gap_ms 1 2)
 second_gap=$(gap_ms 2 3)
-((first_gap >= 1900)) || fail "first backoff must be >= 2s, was ${first_gap}ms"
-((second_gap >= 3900)) || fail "second backoff must grow to >= 4s, was ${second_gap}ms"
+((first_gap >= 3900)) || fail "first restart must be >= 2s teardown + 2s backoff, was ${first_gap}ms"
+((second_gap >= 5900)) || fail "second backoff must grow to >= 2s teardown + 4s, was ${second_gap}ms"
 
-# 7. A long-enough session resets the backoff to the initial 2s.
+# 7. A long-enough session resets the backoff to the initial 2s (so the second
+#    gap stays at 2s teardown + 2s instead of growing to 4s).
 set +e
 run_loop \
     SESSION_LOOP_STABLE_SECONDS=1 \
@@ -226,8 +240,9 @@ set -e
 [[ "$code" -eq 3 ]] || fail "reset run must end with 3, got $code"
 first_gap=$(gap_ms 1 2)
 second_gap=$(gap_ms 2 3)
-((second_gap < 3900)) || fail "a stable session must reset the backoff, gap was ${second_gap}ms"
-((first_gap >= 1900)) || fail "first backoff must stay >= 2s, was ${first_gap}ms"
+((first_gap >= 3900)) || fail "first restart must wait for teardown + 2s, was ${first_gap}ms"
+((second_gap >= 4500)) || fail "second gap too short for the 1.2s run + teardown + backoff, was ${second_gap}ms"
+((second_gap < 6200)) || fail "a stable session must reset the backoff (gap was ${second_gap}ms)"
 
 # 8. Commands appended during backoff reach the next session.
 reset_state

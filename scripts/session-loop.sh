@@ -10,17 +10,18 @@
 #     A disconnected controller does not advertise `80ND`, so retrying cannot
 #     succeed; the loop prints that and does not restart.
 #   * exit 0 (`quit` / EOF / SIGINT inside the REPL): the BLE link is already
-#     gone, so `80ND` may be gone too. Scan first; restart only when `80ND` is
-#     still advertising (with backoff >= 2 s), otherwise print the press
+#     gone, so `80ND` may be gone too. Wait at least 2 seconds for the old link
+#     to finish tearing down, then run `scan --check`; restart only when `80ND`
+#     is still advertising (with backoff >= 2 s), otherwise print the press
 #     guidance and stop. A failed scan (another BLE process holds the lock, or
 #     the adapter is unavailable) also stops instead of restarting blindly.
 #   * any other exit code: STOP. A failed connect usually means the controller
 #     is not in App Mode, which also needs the physical press.
 #
 # The session owns the per-user single-owner BLE lock
-# (`$XDG_RUNTIME_DIR/8bitdo-ble.lock`, else a per-user cache directory) for its
-# whole lifetime; this loop must not start a second BLE operation while it
-# runs.
+# (`~/.cache/8bitdo/8bitdo-ble.lock` from the passwd home, or a per-user temp
+# directory when no home is available) for its whole lifetime; this loop must
+# not start a second BLE operation while it runs.
 #
 # The control channel (`.tmp/sess.cmd`) is read by one `tail -f` for the whole
 # supervisor lifetime, so commands appended during a restart backoff are not
@@ -128,18 +129,18 @@ coproc SESSION_INPUT { exec tail -n 0 -f -- "$SESSION_CMD_FILE"; }
 TAIL_PID=$SESSION_INPUT_PID
 input_fd=${SESSION_INPUT[0]}
 
-# Return 0 when the scan lists `80ND` / an App Mode device, 1 when the scan
-# succeeded but saw no App Mode device, 2 when the scan itself failed (usually
-# another process holds the BLE lock, or the adapter is unavailable).
+# Return 0 when `scan --check` sees an App Mode device, 1 when it succeeded but
+# saw none (exit 3), and 2 when the scan itself failed (usually another process
+# holds the BLE lock, or the adapter is unavailable).
 scan_sees_app_mode() {
-    local output
-    if ! output=$("$EIGHTBITDO_BIN" scan --scan-timeout "$SCAN_TIMEOUT" 2>>"$SESSION_ERR"); then
-        return 2
-    fi
-    if grep -qE '(^|[[:space:]])80ND([[:space:]]|$)|App Mode' <<<"$output"; then
-        return 0
-    fi
-    return 1
+    "$EIGHTBITDO_BIN" scan --check --scan-timeout "$SCAN_TIMEOUT" \
+        >>"$SESSION_OUT" 2>>"$SESSION_ERR"
+    local status=$?
+    case "$status" in
+        0) return 0 ;;
+        3) return 1 ;;
+        *) return 2 ;;
+    esac
 }
 
 backoff=$BACKOFF_INITIAL
@@ -160,9 +161,14 @@ while :; do
     { exec 3<&-; } 2>/dev/null || true
 
     if ((code == 0)); then
-        # A normal exit still dropped the BLE link. Verify that the controller
-        # is still in App Mode before reconnecting; if it is not, no retry can
-        # succeed and only a physical Profile press can restore `80ND`.
+        # A normal exit still dropped the BLE link. Give the old link time to
+        # finish tearing down before probing: a scan immediately after exit can
+        # race the teardown and produce a false "80ND absent" result.
+        log "session exited normally after ${elapsed}s; waiting ${MIN_RESTART_DELAY}s for BLE teardown before checking for '80ND'"
+        sleep "$MIN_RESTART_DELAY"
+        # Verify that the controller is still in App Mode before reconnecting;
+        # if it is not, no retry can succeed and only a physical Profile press
+        # can restore `80ND`.
         scan_sees_app_mode
         scan_status=$?
         if ((scan_status == 2)); then

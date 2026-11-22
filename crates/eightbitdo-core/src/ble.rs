@@ -677,6 +677,7 @@ mod tests {
             matches!(error, Error::BleBusy { path: ref held } if held == &path),
             "expected BleBusy before the adapter is touched, got {error:?}"
         );
+        drop(_held);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -703,6 +704,7 @@ mod tests {
             "expected BleBusy, got {error:?}"
         );
         FileExt::unlock(&file).expect("unlock");
+        drop(file);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -726,7 +728,8 @@ mod tests {
 
         // A successful retry releases it.
         release_ble_lock_after_teardown(&lock, &Ok(())).expect("successful teardown releases");
-        let _reacquired = BleLock::acquire_at(&path).expect("lock must be free after teardown");
+        let reacquired = BleLock::acquire_at(&path).expect("lock must be free after teardown");
+        drop(reacquired);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -736,7 +739,8 @@ mod tests {
         let lock = std::sync::Mutex::new(Some(BleLock::acquire_at(&path).expect("hold the lock")));
         release_ble_lock_after_teardown(&lock, &Ok(())).expect("release");
         assert!(lock.lock().expect("lock mutex").is_none());
-        let _reacquired = BleLock::acquire_at(&path).expect("lock must be free");
+        let reacquired = BleLock::acquire_at(&path).expect("lock must be free");
+        drop(reacquired);
         let _ = std::fs::remove_file(&path);
     }
 }

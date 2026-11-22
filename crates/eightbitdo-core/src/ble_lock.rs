@@ -14,24 +14,28 @@
 //! new inode and take an "unlocked" lock while the first holder still owns the
 //! old one.
 //!
-//! ## Path (per-user, private directory)
+//! ## Path (per-user and environment-independent)
 //!
-//! 1. [`BLE_LOCK_PATH_ENV`] (`EIGHTBITDO_BLE_LOCK`) when set, for tests and
-//!    wrappers;
-//! 2. `$XDG_RUNTIME_DIR/8bitdo-ble.lock` when `XDG_RUNTIME_DIR` is absolute;
-//! 3. `$XDG_CACHE_HOME/8bitdo/8bitdo-ble.lock` or
-//!    `$HOME/.cache/8bitdo/8bitdo-ble.lock` when those are absolute/non-empty;
-//! 4. `<platform temp dir>/8bitdo-ble-<euid>/8bitdo-ble.lock` as a last resort
-//!    (`TMPDIR` is honoured through [`std::env::temp_dir`]).
+//! 1. `EIGHTBITDO_BLE_LOCK` ([`BLE_LOCK_PATH_ENV`]) when set. This is a trusted
+//!    override for tests and wrappers; the parent-directory policy below is
+//!    skipped for it (the file itself is still validated).
+//! 2. `$HOME/.cache/8bitdo/8bitdo-ble.lock` on Unix, where the home directory
+//!    is taken from the passwd entry for the effective uid and only falls back
+//!    to `$HOME` when there is no passwd entry. Deriving it from the uid makes
+//!    the path identical for a desktop session, an SSH shell, cron and systemd
+//!    (they often differ only in `XDG_RUNTIME_DIR`/`HOME`), so the same user
+//!    always uses the same lock file.
+//! 3. `<platform temp dir>/8bitdo-ble-<euid>/8bitdo-ble.lock` only when no home
+//!    directory can be determined (`TMPDIR` is honoured through
+//!    [`std::env::temp_dir`]).
 //!
-//! No path is placed directly in a shared `/tmp`: the lock lives in a per-user
-//! directory that is created with mode `0700` when missing. Every component of
-//! the fallback is per-user, so two users do **not** exclude each other (the
-//! lock is per-user, not system-wide).
+//! `XDG_RUNTIME_DIR` and `XDG_CACHE_HOME` are deliberately **not** consulted:
+//! they differ between login contexts and would split the lock into separate
+//! files for the same user.
 //!
 //! ## Validation
 //!
-//! The file is opened with `O_NOFOLLOW` on Unix and validated as a regular
+//! The lock file is opened with `O_NOFOLLOW` on Unix and validated as a regular
 //! file owned by the effective user before it is truncated or locked. A
 //! symlink, directory, FIFO or another user's file is refused with
 //! [`crate::Error::BleLockInvalid`], so a pre-created path in a shared
@@ -39,12 +43,18 @@
 //! descriptor is validated as well (not just the path), so a race between the
 //! pre-check and the open cannot redirect the truncate/set-permissions calls.
 //!
+//! For the default path, an **existing** parent directory must also be owned by
+//! the effective user and must not be group/other-writable
+//! (`mode & 0o022 == 0`). A pre-created `0777` directory in a shared temp
+//! directory is refused instead of being used for a second lock/DoS.
+//! Directories created here are mode `0700`.
+//!
 //! ## Scope
 //!
-//! The lock is advisory: it stops cooperating processes (this CLI, the future
-//! GUI, `scripts/session-loop.sh` users) from fighting over the adapter. It is
-//! not a security boundary and it does not stop an unrelated program from
-//! scanning.
+//! The lock is advisory and **per-user**: it stops cooperating processes of the
+//! same user (this CLI, the future GUI, `scripts/session-loop.sh` users) from
+//! fighting over the adapter. It is not a system-wide lock, not a security
+//! boundary, and it does not stop an unrelated program from scanning.
 
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::Write;
@@ -55,13 +65,28 @@ use fs2::FileExt;
 use crate::Error;
 
 /// Environment variable that overrides the lock file path.
+///
+/// This is a trusted override for tests and wrappers: the parent-directory
+/// policy is skipped for it. The lock file itself is still checked for
+/// symlinks, regular-file type and (on Unix) ownership.
 pub const BLE_LOCK_PATH_ENV: &str = "EIGHTBITDO_BLE_LOCK";
 
-/// Lock file name used below the runtime/cache directory.
+/// Lock file name used below the cache/temp directory.
 pub const BLE_LOCK_FILE_NAME: &str = "8bitdo-ble.lock";
 
-/// Per-user subdirectory below `XDG_CACHE_HOME` / `$HOME/.cache`.
+/// Per-user subdirectory below `$HOME/.cache`.
 const CACHE_SUBDIR: &str = "8bitdo";
+
+/// Whether the lock's parent directory is validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentPolicy {
+    /// Default path: an existing parent must be ours and not group/other
+    /// writable.
+    Enforce,
+    /// Explicit `EIGHTBITDO_BLE_LOCK` / [`BleLock::acquire_at`]: trusted
+    /// override for tests and tools.
+    Override,
+}
 
 /// A held single-owner BLE lock.
 ///
@@ -81,27 +106,36 @@ impl BleLock {
     /// # Errors
     ///
     /// Returns [`Error::BleBusy`] when another process holds the lock,
-    /// [`Error::BleLockInvalid`] when the path is a symlink, is not a regular
-    /// file, or is owned by another user, and [`Error::Io`] when the lock file
-    /// cannot be created or locked.
+    /// [`Error::BleLockInvalid`] when the path or its parent directory is
+    /// unsafe (symlink, non-regular file, foreign owner, group/other-writable
+    /// parent), and [`Error::Io`] when the lock file cannot be created or
+    /// locked.
     pub fn acquire() -> Result<Self, Error> {
-        Self::acquire_at(default_ble_lock_path())
+        match std::env::var_os(BLE_LOCK_PATH_ENV).filter(|value| !value.is_empty()) {
+            Some(path) => Self::acquire_with_policy(PathBuf::from(path), ParentPolicy::Override),
+            None => Self::acquire_with_policy(default_ble_lock_path(), ParentPolicy::Enforce),
+        }
     }
 
     /// Acquire the lock at an explicit path.
     ///
     /// Tests use this with a temporary path so they never contend with the
     /// developer's real session; tools can use it to share a lock with the
-    /// CLI by setting [`BLE_LOCK_PATH_ENV`] to the same path. The same symlink,
-    /// regular-file and owner checks apply to an explicit path.
+    /// CLI by setting [`BLE_LOCK_PATH_ENV`] to the same path. This is the
+    /// trusted-override policy: the parent directory is not validated, but the
+    /// lock file itself is (symlink, regular file, owner).
     ///
     /// # Errors
     ///
-    /// Same as [`BleLock::acquire`].
+    /// Same as [`BleLock::acquire`], except that the parent-directory policy
+    /// is not applied.
     pub fn acquire_at(path: impl Into<PathBuf>) -> Result<Self, Error> {
-        let path = path.into();
+        Self::acquire_with_policy(path.into(), ParentPolicy::Override)
+    }
+
+    fn acquire_with_policy(path: PathBuf, policy: ParentPolicy) -> Result<Self, Error> {
         precheck_lock_path(&path)?;
-        ensure_lock_directory(&path)?;
+        prepare_lock_directory(&path, policy)?;
         let file = open_lock_file(&path)?;
         validate_lock_file(&path, &file)?;
 
@@ -146,62 +180,35 @@ impl BleLock {
     }
 }
 
-/// Default lock path: per-user runtime/cache directory, never a shared `/tmp`
-/// file. See the module documentation for the full resolution order.
+/// Default lock path: a per-user cache directory derived from the effective
+/// uid, never a shared `/tmp` file and never an XDG directory.
 ///
-/// [`BLE_LOCK_PATH_ENV`], when set to a non-empty value, wins.
+/// [`BLE_LOCK_PATH_ENV`], when set to a non-empty value, wins (the caller
+/// decides the parent-directory policy; [`BleLock::acquire`] treats it as a
+/// trusted override).
 #[must_use]
 pub fn default_ble_lock_path() -> PathBuf {
-    resolve_lock_path(
-        std::env::var_os(BLE_LOCK_PATH_ENV),
-        std::env::var_os("XDG_RUNTIME_DIR"),
-        std::env::var_os("XDG_CACHE_HOME"),
-        std::env::var_os("HOME"),
-        std::env::temp_dir(),
-        current_euid(),
-    )
+    if let Some(path) = std::env::var_os(BLE_LOCK_PATH_ENV).filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+    resolve_default_lock_path(current_user_home(), std::env::temp_dir(), current_euid())
 }
 
 /// Pure path-resolution helper, separated so every fallback branch is testable
 /// without mutating the process environment.
-fn resolve_lock_path(
-    override_path: Option<std::ffi::OsString>,
-    runtime_dir: Option<std::ffi::OsString>,
-    cache_home: Option<std::ffi::OsString>,
-    home: Option<std::ffi::OsString>,
-    temp_dir: PathBuf,
-    euid: u32,
-) -> PathBuf {
-    if let Some(path) = override_path.filter(|value| !value.is_empty()) {
-        return PathBuf::from(path);
-    }
-    if let Some(directory) = runtime_dir
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-    {
-        return directory.join(BLE_LOCK_FILE_NAME);
-    }
-    if let Some(directory) = cache_home
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-    {
-        return directory.join(CACHE_SUBDIR).join(BLE_LOCK_FILE_NAME);
-    }
-    if let Some(directory) = home
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        return directory
+///
+/// The signature deliberately carries no XDG values: the lock must not move
+/// between login environments for the same user.
+fn resolve_default_lock_path(home: Option<PathBuf>, temp_dir: PathBuf, euid: u32) -> PathBuf {
+    match home.filter(|path| !path.as_os_str().is_empty()) {
+        Some(home) => home
             .join(".cache")
             .join(CACHE_SUBDIR)
-            .join(BLE_LOCK_FILE_NAME);
+            .join(BLE_LOCK_FILE_NAME),
+        None => temp_dir
+            .join(format!("8bitdo-ble-{euid}"))
+            .join(BLE_LOCK_FILE_NAME),
     }
-    // Last resort when HOME/XDG are unavailable (containers, CI sandboxes).
-    // Keep it per-user: a shared directory plus a fixed file name would let
-    // another user pre-create/symlink the path.
-    temp_dir
-        .join(format!("8bitdo-ble-{euid}"))
-        .join(BLE_LOCK_FILE_NAME)
 }
 
 #[cfg(unix)]
@@ -212,6 +219,55 @@ fn current_euid() -> u32 {
 #[cfg(not(unix))]
 fn current_euid() -> u32 {
     0
+}
+
+#[cfg(unix)]
+fn current_user_home() -> Option<PathBuf> {
+    // Prefer the passwd home for the effective uid: `$HOME` can point at `/`
+    // or a service-specific directory under cron/systemd and would split the
+    // lock for the same user.
+    passwd_home_for(current_euid()).or_else(env_home)
+}
+
+#[cfg(not(unix))]
+fn current_user_home() -> Option<PathBuf> {
+    env_home()
+}
+
+fn env_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(unix)]
+fn passwd_home_for(uid: u32) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string("/etc/passwd").ok()?;
+    parse_passwd_home(&contents, uid)
+}
+
+/// Parse the home directory for `uid` out of `/etc/passwd` contents.
+///
+/// Kept separate from the file read so the field parsing is testable. NSS
+/// (LDAP etc.) is not consulted; when the entry is absent the caller falls
+/// back to `$HOME`.
+#[cfg(unix)]
+fn parse_passwd_home(contents: &str, uid: u32) -> Option<PathBuf> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let _name = fields.next()?;
+        let _password = fields.next()?;
+        let uid_field = fields.next()?;
+        let _gid = fields.next()?;
+        let _gecos = fields.next()?;
+        let home = fields.next()?;
+        if uid_field.parse::<u32>().ok()? == uid && !home.is_empty() {
+            Some(PathBuf::from(home))
+        } else {
+            None
+        }
+    })
 }
 
 /// Reject an existing symlink or non-regular file before opening it.
@@ -239,11 +295,12 @@ fn precheck_lock_path(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// Create the lock's parent directory with mode `0700` when it is missing.
+/// Create the lock's parent directory with mode `0700` when missing.
 ///
-/// Existing directories (including `/tmp` for explicit test paths) are never
-/// chmod-ed: only directories this function creates are made private.
-fn ensure_lock_directory(path: &Path) -> Result<(), Error> {
+/// Existing directories are validated for the default path (owner + no
+/// group/other write) and accepted as-is for the trusted override. Only
+/// directories this function creates are chmod-ed.
+fn prepare_lock_directory(path: &Path, policy: ParentPolicy) -> Result<(), Error> {
     let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -251,6 +308,9 @@ fn ensure_lock_directory(path: &Path) -> Result<(), Error> {
         return Ok(());
     };
     if parent.is_dir() {
+        if policy == ParentPolicy::Enforce {
+            validate_lock_directory(parent)?;
+        }
         return Ok(());
     }
     let mut builder = DirBuilder::new();
@@ -261,6 +321,55 @@ fn ensure_lock_directory(path: &Path) -> Result<(), Error> {
         builder.mode(0o700);
     }
     builder.create(parent)?;
+    if policy == ParentPolicy::Enforce {
+        validate_lock_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn validate_lock_directory(path: &Path) -> Result<(), Error> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(Error::BleLockInvalid {
+            path: path.to_path_buf(),
+            reason: "lock parent is not a directory".to_string(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        validate_lock_directory_permissions(path, metadata.uid(), current_euid(), metadata.mode())?;
+    }
+    Ok(())
+}
+
+/// Owner/mode check split out so a pre-created `0777` directory is testable
+/// without changing umask or chown.
+#[cfg(unix)]
+fn validate_lock_directory_permissions(
+    path: &Path,
+    owner: u32,
+    euid: u32,
+    mode: u32,
+) -> Result<(), Error> {
+    if owner != euid {
+        return Err(Error::BleLockInvalid {
+            path: path.to_path_buf(),
+            reason: format!(
+                "lock directory is owned by uid {owner}, not the current user (uid {euid})"
+            ),
+        });
+    }
+    if mode & 0o022 != 0 {
+        return Err(Error::BleLockInvalid {
+            path: path.to_path_buf(),
+            reason: format!(
+                "lock directory is group/other-writable (mode {:o}); refusing a shared, \
+                 predictable directory",
+                mode & 0o777
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -353,6 +462,22 @@ mod tests {
         ))
     }
 
+    fn temp_parent_dir(label: &str, mode: u32) -> PathBuf {
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "eightbitdo-lock-dir-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create temp directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(mode))
+                .expect("set directory mode");
+        }
+        directory
+    }
+
     #[test]
     fn second_acquire_is_rejected_with_ble_busy() {
         let path = temp_lock_path("busy");
@@ -368,11 +493,17 @@ mod tests {
 
     #[test]
     fn dropping_the_guard_releases_the_lock() {
+        // Repeated acquire/drop catches a delayed release. The file is not
+        // unlinked between iterations: unlinking a locked file could let the
+        // kernel reuse its inode for an unrelated lock file.
         let path = temp_lock_path("release");
-        {
-            let _guard = BleLock::acquire_at(&path).expect("first acquire");
+        for _ in 0..50 {
+            {
+                let _guard = BleLock::acquire_at(&path).expect("first acquire");
+            }
+            let guard = BleLock::acquire_at(&path).expect("lock must be released on drop");
+            drop(guard);
         }
-        let _guard = BleLock::acquire_at(&path).expect("lock must be released on drop");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -392,85 +523,126 @@ mod tests {
         let error = BleLock::acquire_at(&path).expect_err("external holder must win");
         assert!(matches!(error, Error::BleBusy { .. }), "got {error:?}");
         FileExt::unlock(&file).expect("unlock");
-        let _guard = BleLock::acquire_at(&path).expect("lock must be free after unlock");
+        let guard = BleLock::acquire_at(&path).expect("lock must be free after unlock");
+        drop(guard);
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn default_path_resolution_prefers_the_override_then_runtime_then_cache() {
-        let name = BLE_LOCK_FILE_NAME;
+    fn default_path_is_environment_independent() {
+        // The resolver has no XDG inputs: the same home always maps to the
+        // same path, so changing XDG_RUNTIME_DIR/XDG_CACHE_HOME between a
+        // desktop session and cron cannot split the lock.
+        let home = Some(PathBuf::from("/home/alice"));
+        let temp = PathBuf::from("/tmp");
+        let first = resolve_default_lock_path(home.clone(), temp.clone(), 1000);
+        let second = resolve_default_lock_path(home, temp, 1000);
+        assert_eq!(first, second);
         assert_eq!(
-            resolve_lock_path(
-                Some("/custom/lock".into()),
-                Some("/run/user/1000".into()),
-                Some("/cache".into()),
-                Some("/home/user".into()),
-                PathBuf::from("/tmp"),
-                1000,
-            ),
-            PathBuf::from("/custom/lock")
+            first,
+            PathBuf::from("/home/alice/.cache/8bitdo/8bitdo-ble.lock")
         );
-        assert_eq!(
-            resolve_lock_path(
-                None,
-                Some("/run/user/1000".into()),
-                Some("/cache".into()),
-                Some("/home/user".into()),
-                PathBuf::from("/tmp"),
-                1000,
-            ),
-            PathBuf::from("/run/user/1000").join(name)
-        );
-        assert_eq!(
-            resolve_lock_path(
-                None,
-                Some("relative/dir".into()),
-                Some("/cache".into()),
-                Some("/home/user".into()),
-                PathBuf::from("/tmp"),
-                1000,
-            ),
-            PathBuf::from("/cache").join(CACHE_SUBDIR).join(name)
-        );
-        assert_eq!(
-            resolve_lock_path(
-                None,
-                None,
-                Some("relative".into()),
-                Some("/home/user".into()),
-                PathBuf::from("/tmp"),
-                1000,
-            ),
-            PathBuf::from("/home/user")
-                .join(".cache")
-                .join(CACHE_SUBDIR)
-                .join(name)
+        assert!(
+            !first.to_string_lossy().contains("XDG"),
+            "the default path must not depend on XDG directories"
         );
     }
 
     #[test]
     fn default_path_falls_back_to_a_per_user_temp_directory() {
         assert_eq!(
-            resolve_lock_path(None, None, None, None, PathBuf::from("/var/tmp"), 1000,),
+            resolve_default_lock_path(None, PathBuf::from("/var/tmp"), 1000),
             PathBuf::from("/var/tmp")
+                .join("8bitdo-ble-1000")
+                .join(BLE_LOCK_FILE_NAME)
+        );
+        assert_eq!(
+            resolve_default_lock_path(Some(PathBuf::new()), PathBuf::from("/tmp"), 1000),
+            PathBuf::from("/tmp")
                 .join("8bitdo-ble-1000")
                 .join(BLE_LOCK_FILE_NAME)
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn explicit_override_wins_even_when_xdg_is_set() {
+    fn passwd_home_parsing_uses_the_uid_field() {
+        let contents = "\
+root:x:0:0:root:/root:/bin/bash
+alice:x:1000:1000:Alice:/home/alice:/bin/bash
+";
         assert_eq!(
-            resolve_lock_path(
-                Some("/explicit.lock".into()),
-                Some("/run/user/1000".into()),
-                None,
-                None,
-                PathBuf::from("/tmp"),
-                1000,
-            ),
-            PathBuf::from("/explicit.lock")
+            parse_passwd_home(contents, 1000),
+            Some(PathBuf::from("/home/alice"))
         );
+        assert_eq!(parse_passwd_home(contents, 0), Some(PathBuf::from("/root")));
+        assert_eq!(parse_passwd_home(contents, 4242), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_policy_rejects_a_world_writable_parent() {
+        let parent = temp_parent_dir("parent-0777", 0o777);
+        let path = parent.join(BLE_LOCK_FILE_NAME);
+        let error = BleLock::acquire_with_policy(path, ParentPolicy::Enforce)
+            .expect_err("a 0777 parent must be refused");
+        assert!(
+            matches!(error, Error::BleLockInvalid { ref reason, .. }
+                if reason.contains("group/other-writable")),
+            "expected a parent-mode rejection, got {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_policy_accepts_a_private_parent() {
+        let parent = temp_parent_dir("parent-0700", 0o700);
+        let path = parent.join(BLE_LOCK_FILE_NAME);
+        let guard = BleLock::acquire_with_policy(path.clone(), ParentPolicy::Enforce)
+            .expect("a 0700 parent is accepted");
+        assert_eq!(guard.path(), path);
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_override_skips_the_parent_policy() {
+        // `EIGHTBITDO_BLE_LOCK` / `acquire_at` are documented test/tool
+        // exceptions, so a lock directly in a shared temp directory works.
+        let parent = temp_parent_dir("parent-override", 0o777);
+        let path = parent.join(BLE_LOCK_FILE_NAME);
+        let guard = BleLock::acquire_at(path.clone()).expect("override policy accepts it");
+        assert_eq!(guard.path(), path);
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn directory_permission_check_rejects_foreign_owner_and_group_write() {
+        #[cfg(unix)]
+        {
+            let path = Path::new("/tmp/example");
+            let error = validate_lock_directory_permissions(path, 1001, 1000, 0o700)
+                .expect_err("a foreign owner must be refused");
+            assert!(
+                matches!(error, Error::BleLockInvalid { ref reason, .. }
+                    if reason.contains("owned by uid")),
+                "got {error:?}"
+            );
+            let error = validate_lock_directory_permissions(path, 1000, 1000, 0o770)
+                .expect_err("group-writable must be refused");
+            assert!(
+                matches!(error, Error::BleLockInvalid { ref reason, .. }
+                    if reason.contains("group/other-writable")),
+                "got {error:?}"
+            );
+            validate_lock_directory_permissions(path, 1000, 1000, 0o700)
+                .expect("0700 and owned is accepted");
+            validate_lock_directory_permissions(path, 1000, 1000, 0o755)
+                .expect("0755 has no group/other write and is accepted");
+        }
     }
 
     #[cfg(unix)]
@@ -512,16 +684,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fifo_lock_path_is_rejected_without_blocking() {
+        use rustix::fs::{Mode, CWD};
         let path = temp_lock_path("fifo");
-        let created = std::process::Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .is_ok_and(|status| status.success());
-        if !created {
-            // `mkfifo` is absent on this test host; the directory/non-regular
-            // coverage above still exercises the reject path.
-            return;
-        }
+        // `mkfifoat` instead of `Command::new("mkfifo")`: a fork+exec child can
+        // briefly inherit another test's flock descriptor and make its next
+        // acquisition fail spuriously.
+        rustix::fs::mkfifoat(CWD, &path, Mode::from_bits_truncate(0o600)).expect("create FIFO");
         let error = BleLock::acquire_at(&path).expect_err("FIFO must be refused");
         assert!(
             matches!(error, Error::BleLockInvalid { path: ref held, .. } if held == &path),
@@ -563,6 +731,7 @@ mod tests {
             contents.contains(&format!("pid={}", std::process::id())),
             "lock file must name its holder: {contents:?}"
         );
+        drop(guard);
         let _ = std::fs::remove_file(&path);
     }
 }
