@@ -8,7 +8,7 @@
 
 - **目的**: **8BitDo Ultimate 2 Bluetooth Controller**（内部 PID `0x600F` / 2.4G レシーバー `0x6011`）を、Nintendo Switch と接続したまま **Linux / macOS / Windows / Android / iOS** から BLE GATT（および USB/2.4G HID）でフル設定・マクロ編集・ファームウェアアップデートできるクロスプラットフォーム OSS ツール群を構築する。
 - **現在のフェーズ（2026-11-23、main `4004757`）**: **Phase 1・2a・2b（マクロ）・2d（設定書き込み / リマップ）・3a（読み取り専用 GUI）完了。加えて PR #16（`feat/gui-write`）で GUI の Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）を実装済みだが、GUI 書込は実機未検証・Tier 3。** Phase 2c は core 実装済み（実機未検証・未配線）、Phase 3c（OTA 画面）は未着手。Phase 5 は UniFFI と iOS / Android 雛形まで。Phase 2e / 4（USB / 2.4G）は保留。詳細と残課題は §6 と [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) を参照。
-- **ライセンス／公開方針**: パブリックリポジトリ。公式バイナリ（`.apk`, `.exe`, `.dll`, `.so` 等）や公式ファームウェアファイル自体は `.gitignore` で除外しており、**絶対にコミットしないこと**。
+- **ライセンス／公開方針**: パブリックリポジトリ。公式バイナリ（`.apk`, `.exe`, `.dll`, `.so` 等）や公式ファームウェアファイル自体は `.gitignore` で除外しており、**絶対にコミットしないこと**。リポジトリ公開・コードライセンス（`MIT OR Apache-2.0`）・商標・同梱フォント・ストア配布・マネタイズの決定は [docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md)（決定日 2026-11-23）を正本とする。
 
 ---
 
