@@ -1297,6 +1297,27 @@ mod tests {
     }
 
     #[test]
+    fn write_macro_32_byte_chunks_are_uniform_for_460_and_500_bytes() {
+        for (steps, chunks) in [(46usize, 15usize), (50, 16)] {
+            let data = alloc::vec![MacroStep::neutral(1); steps];
+            let packets = write_macro_steps(0, Slot::S1, MacroIndex::M1, &data, 32).unwrap();
+            assert_eq!(packets.len(), chunks);
+            let total_len = ((steps * 10 + 31) & !31) as u32;
+            for (index, packet) in packets.iter().enumerate() {
+                assert_eq!(packet.header.total_len, total_len);
+                assert_eq!(packet.header.chunk_len, 32);
+                assert_eq!(packet.header.offset, (index * 32) as u32);
+                assert_eq!(packet.payload.len(), 32);
+                assert_eq!(
+                    packet.header.crc16,
+                    crate::crc::packet_crc16(&packet.payload)
+                );
+            }
+            assert_eq!(packets.last().unwrap().header.chunk_len, 32);
+        }
+    }
+
+    #[test]
     fn write_macro_payload_rejects_oversized_payload() {
         let payload = alloc::vec![0u8; MACRO_MAX_PAYLOAD + 1];
         assert!(matches!(
