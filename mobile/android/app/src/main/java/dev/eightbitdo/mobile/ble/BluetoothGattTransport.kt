@@ -64,6 +64,14 @@ class BluetoothGattTransport(
     @Volatile
     private var pendingWrite: PendingWrite? = null
 
+    /**
+     * Set after a with-response write times out or fails: a late
+     * `onCharacteristicWrite` could otherwise be attributed to the next write.
+     * Further writes are refused until the link is reconnected.
+     */
+    @Volatile
+    private var writeNeedsReconnect = false
+
     @Volatile
     private var mtuValue: UShort = 23u
 
@@ -218,6 +226,7 @@ class BluetoothGattTransport(
             released = true
         }
         closed = true
+        writeNeedsReconnect = false
         frames.close()
         failAllSignals("GATT link closed")
         val current = gatt
@@ -279,6 +288,11 @@ class BluetoothGattTransport(
         characteristic: BluetoothGattCharacteristic,
         data: ByteArray,
     ) {
+        if (writeNeedsReconnect) {
+            throw NativeTransportException.Failure(
+                "a previous write response was lost; reconnect before writing again",
+            )
+        }
         val pending = PendingWrite()
         pendingWrite = pending
         val issued = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -302,9 +316,11 @@ class BluetoothGattTransport(
         val completed = pending.done.await(WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         pendingWrite = null
         if (!completed) {
+            writeNeedsReconnect = true
             throw NativeTransportException.Failure("timed out waiting for the ATT write response")
         }
         if (pending.status != BluetoothGatt.GATT_SUCCESS) {
+            writeNeedsReconnect = true
             throw NativeTransportException.Failure("GATT write failed (status ${pending.status})")
         }
     }

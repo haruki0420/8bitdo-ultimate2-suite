@@ -51,7 +51,7 @@ final class CoreBluetoothTransport: NSObject, NativeTransport, @unchecked Sendab
     private var frames: [Data] = []
     private var droppedFrames: UInt64 = 0
     private var closed = false
-    private var pendingWrite = false
+    private var ackTracker = WriteAckTracker()
     private var pendingWriteError: Error?
 
     init(
@@ -109,10 +109,20 @@ final class CoreBluetoothTransport: NSObject, NativeTransport, @unchecked Sendab
             }
 
         case .withResponse:
-            // Wait for `didWriteValueFor` so a failed or slow ATT write is
-            // reported instead of silently losing a frame.
+            // Wait for `didWriteValueFor`; a timeout must fail the send (the
+            // Rust layer then fails the read) and marks the link unusable for
+            // further with-response writes so a late callback cannot be
+            // attributed to the next write.
             condition.lock()
-            pendingWrite = true
+            guard let generation = ackTracker.begin() else {
+                let reason = ackTracker.needsReconnect
+                    ? "a previous write response was lost; reconnect before writing again"
+                    : "another write is already in flight"
+                condition.unlock()
+                throw NativeTransportError.Failure(
+                    detail: "BLE write with response refused: \(reason)"
+                )
+            }
             pendingWriteError = nil
             condition.unlock()
             callbackQueue.async { [peripheral, characteristic] in
@@ -120,18 +130,28 @@ final class CoreBluetoothTransport: NSObject, NativeTransport, @unchecked Sendab
             }
             condition.lock()
             let deadline = Date(timeIntervalSinceNow: 2.0)
-            while pendingWrite && !closed {
+            while ackTracker.isPending(generation) && !closed {
                 if !condition.wait(until: deadline) {
                     break
                 }
             }
-            let failed = closed || pendingWriteError != nil
+            let timedOut = ackTracker.isPending(generation)
+            let failed = closed || pendingWriteError != nil || timedOut
             let writeError = pendingWriteError
-            pendingWrite = false
+            if timedOut {
+                ackTracker.timeOut(generation)
+            }
             pendingWriteError = nil
             condition.unlock()
             if failed {
-                let reason = writeError?.localizedDescription ?? "link closed"
+                let reason: String
+                if timedOut {
+                    reason = "timed out waiting for the ATT write response"
+                } else if let writeError {
+                    reason = writeError.localizedDescription
+                } else {
+                    reason = "link closed"
+                }
                 throw NativeTransportError.Failure(
                     detail: "BLE write with response failed: \(reason)"
                 )
@@ -163,7 +183,7 @@ final class CoreBluetoothTransport: NSObject, NativeTransport, @unchecked Sendab
         condition.lock()
         closed = true
         frames.removeAll()
-        pendingWrite = false
+        ackTracker.reset()
         condition.broadcast()
         condition.unlock()
     }
@@ -222,8 +242,11 @@ extension CoreBluetoothTransport: CBPeripheralDelegate {
     ) {
         guard characteristic.uuid == self.characteristic.uuid else { return }
         condition.lock()
-        pendingWrite = false
-        pendingWriteError = error
+        // A late callback from a timed-out write finds no pending generation
+        // and is ignored instead of completing the next write.
+        if ackTracker.completeCurrent() != nil {
+            pendingWriteError = error
+        }
         condition.broadcast()
         condition.unlock()
     }

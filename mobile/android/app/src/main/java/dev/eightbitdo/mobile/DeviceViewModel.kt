@@ -28,6 +28,8 @@ data class UiState(
     val busy: Boolean = false,
     val connected: Boolean = false,
     val error: String? = null,
+    val coreUnavailable: Boolean = false,
+    val coreMessage: String? = null,
 )
 
 /**
@@ -43,6 +45,18 @@ class DeviceViewModel(application: Application) : AndroidViewModel(application) 
     private val scanner = BleScanner(application)
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
+
+    private val coreAvailability = RustCore.availability()
+
+    init {
+        if (coreAvailability != RustCore.Availability.AVAILABLE) {
+            _state.value = UiState(
+                status = "Rust コアが利用できません",
+                coreUnavailable = true,
+                coreMessage = RustCore.message(coreAvailability),
+            )
+        }
+    }
 
     private var scanJob: Job? = null
     private var session: MobileSession? = null
@@ -76,6 +90,17 @@ class DeviceViewModel(application: Application) : AndroidViewModel(application) 
     fun connect(device: DiscoveredDevice) {
         scanJob?.cancel()
         scanJob = null
+        val coreMessage = RustCore.message(coreAvailability)
+        if (coreAvailability != RustCore.Availability.AVAILABLE) {
+            _state.value = _state.value.copy(
+                status = "Rust コアが利用できません",
+                coreUnavailable = true,
+                coreMessage = coreMessage,
+                error = coreMessage,
+                busy = false,
+            )
+            return
+        }
         viewModelScope.launch {
             // A reconnect must never leave the previous session attached.
             closeCurrentSession()
@@ -101,16 +126,25 @@ class DeviceViewModel(application: Application) : AndroidViewModel(application) 
                     devices = emptyList(),
                 )
                 readAll()
-            } catch (error: Exception) {
+            } catch (error: Throwable) {
+                // The JNI library may be missing (UnsatisfiedLinkError is an
+                // Error, not an Exception) or the session constructor may fail.
                 _state.value = _state.value.copy(
                     status = "未接続",
                     connected = false,
                     busy = false,
-                    error = error.message ?: error.toString(),
+                    error = describe(error),
                 )
             }
         }
     }
+
+    private fun describe(error: Throwable): String =
+        if (error is UnsatisfiedLinkError) {
+            RustCore.message(RustCore.Availability.MISSING_LIBRARY) ?: error.toString()
+        } else {
+            error.message ?: error.toString()
+        }
 
     fun readAll() {
         val current = session ?: return

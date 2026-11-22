@@ -40,6 +40,22 @@ if [ ! -f "$HOST_LIB" ]; then
   exit 1
 fi
 
+# The bindgen binary and the uniffi crate must be the same version: a mismatch
+# is a runtime crash risk, not a compile error.
+echo "==> verifying uniffi bindgen/crate version match"
+LOCK_VERSION="$(awk '/^name = "uniffi"$/{getline; print $3}' "$ROOT/Cargo.lock" | tr -d '"')"
+if [ -z "$LOCK_VERSION" ]; then
+  echo "could not find uniffi in Cargo.lock" >&2
+  exit 1
+fi
+KOTLIN_BINDGEN_VERSION="$(cargo run -q -p "$CRATE" --features cli --bin uniffi-bindgen -- --version | awk '{print $NF}')"
+SWIFT_BINDGEN_VERSION="$(cargo run -q -p "$CRATE" --features cli --bin uniffi-bindgen-swift -- --version | awk '{print $NF}')"
+if [ "$LOCK_VERSION" != "$KOTLIN_BINDGEN_VERSION" ] || [ "$LOCK_VERSION" != "$SWIFT_BINDGEN_VERSION" ]; then
+  echo "uniffi version mismatch: Cargo.lock=$LOCK_VERSION kotlin-bindgen=$KOTLIN_BINDGEN_VERSION swift-bindgen=$SWIFT_BINDGEN_VERSION" >&2
+  exit 1
+fi
+echo "    uniffi $LOCK_VERSION (kotlin + swift bindgen match)"
+
 rm -rf "$STAGING_DIR"
 mkdir -p "$STAGING_DIR/swift"
 

@@ -60,8 +60,32 @@ fun HomeScreen(viewModel: DeviceViewModel) {
                             OutlinedButton(onClick = viewModel::readAll) { Text("再読み込み") }
                             OutlinedButton(onClick = viewModel::disconnect) { Text("切断") }
                         } else {
-                            OutlinedButton(onClick = viewModel::startScan) { Text("スキャン") }
+                            OutlinedButton(
+                                onClick = viewModel::startScan,
+                                enabled = !state.coreUnavailable,
+                            ) { Text("スキャン") }
                         }
+                    }
+                }
+            }
+        }
+
+        if (state.coreUnavailable) {
+            item {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(
+                            "Rust コアがありません",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                        Text(
+                            state.coreMessage ?: "NDK ビルド版の APK が必要です。",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
                     }
                 }
             }

@@ -20,6 +20,8 @@ crates/eightbitdo-core     … Session / config / macro
 crates/eightbitdo-protocol … フレーム・CRC・構造体
 ```
 
+変更履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。
+
 ## 現在の到達点（M0 + 読み取り API）
 
 | 項目 | 状態 |
@@ -30,7 +32,7 @@ crates/eightbitdo-protocol … フレーム・CRC・構造体
 | iOS: SwiftUI 雛形 + CoreBluetooth transport | 実装済み |
 | iOS: `xtool dev build --ipa`（署名なし IPA） | **成功**（Linux / xtool 1.24.0） |
 | Android: Gradle + Compose + GATT transport 雛形 | 実装済み |
-| Android: `assembleDebug` / JVM unit test | **成功**（Kotlin/Compose 検証。Rust JNI は NDK 不在のため未同梱） |
+| Android: `assembleDebug` / JVM unit test | **成功**（unit test 8 件。Kotlin/Compose 検証。Rust JNI は NDK 不在のため未同梱） |
 | 実機での動作確認 | 未実施（実機なし） |
 | 設定書き込み・OTA | 未公開（意図的。後述） |
 
@@ -193,8 +195,8 @@ cd mobile/ios && xtool dev build -c release --ipa
 
 ### 実測結果（2026-11-23、この環境・レビュー反映後）
 
-* `xtool dev build --ipa`: `Build complete! (6.64 secs)` → IPA 生成
-* IPA サイズ: 1,548,642 bytes
+* `xtool dev build --ipa`: `Build complete! (7.44 secs)` → IPA 生成
+* IPA サイズ: 1,550,186 bytes
 * `Payload/EightBitDo.app/EightBitDo`: `Mach-O 64-bit arm64 executable`
 * `llvm-nm` で `_uniffi_eightbitdo_uniffi_fn_constructor_mobilesession_new` など
   UniFFI シンボル 61 個を確認（Rust staticlib が実際にリンクされている）
@@ -214,6 +216,12 @@ with-response しか広告しない実装があります。フレーム自体は
   Android `onCharacteristicWrite`）を待ってから次のフレームへ進む。
 * どちらの書き込みプロパティも無い場合のみ、接続時に明示エラー。
   iOS は MTU 不足時と同じく `cancelPeripheralConnection` でリンクを閉じます。
+* with-response の応答待ち（2 秒）がタイムアウトした場合、**成功にはせず
+  エラー**にします。iOS は `WriteAckTracker` の世代番号で遅延
+  `didWriteValueFor` の誤帰属を防ぎ、タイムアウト後は再接続まで書き込みを
+  拒否します（Android も遅延 `onCharacteristicWrite` を次の write に
+  帰属させず再接続を要求）。純ロジックは
+  `scripts/mobile/test-write-ack-tracker.sh` で検証できます。
 
 ### 接続ライフサイクルと transport の責務
 
@@ -277,7 +285,7 @@ with-response しか広告しない実装があります。フレーム自体は
 | --- | --- |
 | ツールチェーン | AGP **9.5.0** / Gradle **9.8.2**（wrapper 同梱）/ Kotlin **2.4.21**（AGP 9 の built-in Kotlin）/ JDK 21 |
 | Android SDK | `/opt/android-sdk`（platforms;android-36, build-tools;36.0.0） |
-| `./gradlew testDebugUnitTest` | **BUILD SUCCESSFUL**（`FrameQueueTest` 3 + `AppWriteModeTest` 3 = 6 テスト、失敗 0） |
+| `./gradlew testDebugUnitTest` | **BUILD SUCCESSFUL**（`FrameQueueTest` 3 + `AppWriteModeTest` 3 + `RustCoreTest` 2 = 8 テスト、失敗 0） |
 | `./gradlew assembleDebug` | **BUILD SUCCESSFUL**（`app/build/outputs/apk/debug/app-debug.apk` = 12,076,864 bytes） |
 | Rust JNI ライブラリ | **未同梱**（NDK / cargo-ndk が無いため `cargo ndk` を実行していない） |
 
@@ -288,6 +296,12 @@ cargo-ndk を導入し、下記の通常ビルドを実行してください。
 AGP 9 では `org.jetbrains.kotlin.android` プラグインを適用できません（built-in
 Kotlin が標準）。本プロジェクトは `com.android.application` +
 `org.jetbrains.kotlin.plugin.compose` のみを適用しています。
+
+Kotlin-only APK（Rust JNI 非同梱）では、UniFFI の生成コードが最初に
+`System.loadLibrary` を呼んだ時点で `UnsatisfiedLinkError`（`Error` であり
+`Exception` ではない）が発生します。`RustCore.availability()` が `Throwable` を
+捕捉して UI に「NDK ビルド版の APK が必要」と表示し、プロセスは落ちません
+（`RustCoreTest` で JVM 上でも検証）。
 
 また UniFFI 0.31.2 が生成する Kotlin のエラークラスは、フィールド名が
 `message` だと Kotlin 2.4 で `override val message` と衝突するため、Rust 側の
@@ -313,8 +327,11 @@ rustup target add aarch64-linux-android x86_64-linux-android
 cargo install cargo-ndk --locked
 ```
 
-Gradle wrapper は同梱済みです（`mobile/android/gradlew`、Gradle 9.8.2）。
-グローバルな Gradle は不要です。
+Gradle wrapper は同梱済みです（`mobile/android/gradlew`、Gradle 9.8.2、
+`gradle-wrapper.properties` に `distributionSha256Sum` を固定）。
+グローバルな Gradle は不要です。`gen-bindings.sh` は生成前に
+`Cargo.lock` の uniffi と bindgen バイナリのバージョン一致を検証し、
+不一致なら停止します。
 
 ### ビルド
 
