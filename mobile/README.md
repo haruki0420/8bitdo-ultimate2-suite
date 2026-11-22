@@ -32,7 +32,8 @@ crates/eightbitdo-protocol … フレーム・CRC・構造体
 | iOS: SwiftUI 雛形 + CoreBluetooth transport | 実装済み |
 | iOS: `xtool dev build --ipa`（署名なし IPA） | **成功**（Linux / xtool 1.24.0） |
 | Android: Gradle + Compose + GATT transport 雛形 | 実装済み |
-| Android: `assembleDebug` / JVM unit test | **成功**（unit test 8 件。Kotlin/Compose 検証。Rust JNI は NDK 不在のため未同梱） |
+| Android: `assembleDebug` / JVM unit test | **成功**（unit test 8 件 + JNI 同梱 APK。NDK r29 で `libeightbitdo_uniffi.so` を arm64-v8a / x86_64 に同梱） |
+| Android: JNI 同梱 APK | **成功**（14 MiB、SHA-256 `879e894c…a351f1`、[ビルド証跡](../docs/MOBILE_BUILD_EVIDENCE.md)） |
 | 実機での動作確認 | 未実施（実機なし） |
 | 設定書き込み・OTA | 未公開（意図的。後述） |
 
@@ -289,9 +290,11 @@ with-response しか広告しない実装があります。フレーム自体は
 | `./gradlew assembleDebug` | **BUILD SUCCESSFUL**（`app/build/outputs/apk/debug/app-debug.apk` = 12,076,864 bytes） |
 | Rust JNI ライブラリ | **未同梱**（NDK / cargo-ndk が無いため `cargo ndk` を実行していない） |
 
-注意: 生成できた APK は Kotlin / Compose / リソース / manifest のコンパイル検証であり、
-`libeightbitdo_uniffi.so` を含みません。実機で Rust コアを動かすには NDK と
-cargo-ndk を導入し、下記の通常ビルドを実行してください。
+注意: 上記は Kotlin / Compose / リソース / manifest のコンパイル検証です。
+**2026-11-23 に NDK r29 と cargo-ndk 4.1.2 を導入し、`libeightbitdo_uniffi.so` を
+同梱した APK（arm64-v8a / x86_64）のビルドに成功しました**。手順と APK の
+SHA-256・ELF・uniffi シンボル数は [docs/MOBILE_BUILD_EVIDENCE.md](../docs/MOBILE_BUILD_EVIDENCE.md)
+に記録しています。
 
 AGP 9 では `org.jetbrains.kotlin.android` プラグインを適用できません（built-in
 Kotlin が標準）。本プロジェクトは `com.android.application` +
