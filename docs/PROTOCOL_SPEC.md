@@ -136,7 +136,7 @@ Windows の `FindHid` / `enum_hid` は `HidD_GetPreparsedData` + `HidP_GetCaps` 
      - 例: `MAX_ATT_MTU = 100` のとき最大ペイロード `82` バイト。`MAX_ATT_MTU = 64` のとき `46` バイト。
    - **`cmd == 0x0103`（マクロデータ書き込み）**:
      - プロトコル上の `chunk_len` 上限は BLE **`0x40`（64 バイト）** / USB HID **`0x20`（32 バイト）**。BLE は `min(chunk_len, 0x40)` でクランプされる。
-     - 呼び出し元の `getBT2_WriteMacro(slot, macro_idx)` では、マクロの `total_len` を `0x20`（32 バイト）単位に切り上げて転送する。
+     - 呼び出し元の `getBT2_WriteMacro(slot, macro_idx)` では、マクロの `total_len` を `0x20`（32 バイト）単位に切り上げて転送する。**実機 2026-11-22 確認（BLE・slot S1・`macro_idx=0/1`）**: wire `total_len` は `(macro_idx << 12) + align32(steps * 10)`（絶対終端）でなければ永続化されない（§6.5 手順 4）。静的解析では `getBT2_WriteMacro` が 32B 切り上げのみを行うように見えるが、公式が sector base を別経路（呼び出し元や `Generate_CustomDataCmd`）で足している可能性があり、静的解析だけでは断定できない。
      - 本クレートの `write_macro_payload` API は **32B / 64B のみ**を受け付ける（最終チャンクを 32B アラインに保つため）。46B などの交渉済みサイズは将来拡張であり、現在は `UnsupportedChunkSize` を返す。
    - **`cmd == 0x0104`（マクロデータ消去）**:
      - チャンク上限クランプをスキップし、`bVar5 = true` としてそのまま送信する。
@@ -297,8 +297,8 @@ ReadConfig head:  04 02 00 00 00 74 00 00 00 74 00 00 00 00 00 00 00
 
 - `ReadConfig` のデータチャンクは実機で 142B (`0x8E`) を 1 要求につき 1 つ返す。`offset` を進めた再要求で 20 要求（19 × 142B + 最終 142B のうち有効 70B）を組み立てる。最終チャンクが 142B 固定で返り、ホスト側で 70B に切り詰めることは実機確認済みである。142B が MTU 依存で変化するかは未確定。応答 `offset` は最初のデータチャンク応答のみ 0、2 回目以降は要求 `offset` をエコーする（§4.3.1 の照合規則）。
 - `getBT2_ReadMacro` の公式 `Generate_CustomDataCmd` 経路は `16 + chunk_len` バイト（ペイロードはゼロ埋め）を送ると読める。本実装は 17B の payloadless 要求を送る。実機（2026-11-22、slot 0）では次の 2 マクロを確認した：
-  - macro 0（sector base `0x0000`、`max_steps = 50`、500B）: 応答 `chunk_len = 0x8E (142)`, `total_len = 500`、応答 offset は **`[0, 142, 284, 426]`**。
-  - macro 1（sector base `0x1000`、`max_steps = 46`、460B）: 応答 `chunk_len = 0x8E (142)`, `total_len = 460`、応答 offset は **`[4096, 4238, 4380, 4522]`**。
+  - `macro_idx=0 (M1)`（sector base `0x0000`、`max_steps = 50`、500B）: 応答 `chunk_len = 0x8E (142)`, `total_len = 500`、応答 offset は **`[0, 142, 284, 426]`**。
+  - `macro_idx=1 (M2)`（sector base `0x1000`、`max_steps = 46`、460B）: 応答 `chunk_len = 0x8E (142)`, `total_len = 460`、応答 offset は **`[4096, 4238, 4380, 4522]`**。
   - したがって **1 要求 = 1 チャンク（142B）** であり、2 チャンク目以降の応答 `offset` は **要求した絶対 offset をエコー**する。`total_len` は `steps * 10` のまま変化しない。
   - 要求は `offset = (macro_idx << 12) + chunk_offset` で 1 チャンクずつ前進させ、`total_len` / `chunk_len` は全長のまま維持する。実装は互換のため 0（逐次）とセクタ相対 offset も受け入れるが、`macro backup` のログと `macros.json` の `response_offsets` に実際の値を記録する。
   - 142B が MTU 依存で変化するかは未確定。
@@ -444,7 +444,7 @@ sequenceDiagram
 | **`0x0013`** | `0x0000` | `total_len=0, offset=0` (Windows `StartConfig` flag=`1`) | Host → Ctrl | **Windows USB HID 用 `StartConfig`**（最大 30 回リトライし `cmd=0x13` ACK を待機） |
 | **`0x0015`** | `slot` (`0..2`) | `total_len=0, offset=0` | Host → Ctrl | **`WriteSLOT`**。アクティブプロファイルスロット切替 |
 | **`0x0102`** | `(mode << 8) \| slot` | `total_len = chunk_len = steps * 10`, `offset = macro_idx << 12` (`macro_idx * 0x1000`) | Host → Ctrl | **`ReadBT2Macro`**。指定スロット・マクロ番号のステップ列を読み出し（1 ステップ = 10B）。ペイロードなしだが `chunk_len` に要求長を宣言する（§4.1.1） |
-| **`0x0103`** | `(mode << 8) \| slot` | `total_len = align32(steps * 10)` (`((steps * 10) + 0x1F) & ~0x1F`), `offset = (macro_idx << 12) + chunk_index * chunk_size`（`chunk_index` はパケットごとに進む。プロトコル上限は BLE `0x40` / USB HID `0x20`。本クレートの API は 32B / 64B のみで、46B などは `UnsupportedChunkSize`。64B 超は 64B にクランプ） | Host → Ctrl | **`WriteBT2Macro`**。BLE 最大 **`0x40` (64B)** / USB HID 最大 **`0x20` (32B)** 分割でマクロを書き込み、完了後に `0x0006` (Save) を実行。API の chunk サイズは 32B / 64B のみ（32B アライン保証） |
+| **`0x0103`** | `(mode << 8) \| slot` | `total_len = (macro_idx << 12) + align32(steps * 10)`（絶対終端。`align32(x) = (x + 0x1F) & ~0x1F`。**BLE・slot S1・`macro_idx=0/1 (M1/M2)` で実機確認**。`macro_idx=2/3` と他 slot は外挿、USB HID は未実装・未検証）, `offset = (macro_idx << 12) + chunk_index * chunk_size`（`chunk_index` はパケットごとに進む。プロトコル上限は BLE `0x40` / USB HID `0x20`。本クレートの API は 32B / 64B のみで、46B などは `UnsupportedChunkSize`。64B 超は 64B にクランプ） | Host → Ctrl | **`WriteBT2Macro`**。BLE 最大 **`0x40` (64B)** / USB HID 最大 **`0x20` (32B)** 分割でマクロを書き込み、完了後に `0x0006` (Save) を実行。API の chunk サイズは 32B / 64B のみ（32B アライン保証） |
 | **`0x0104`** | `(mode << 8) \| slot` | `total_len = 0x1000`, `chunk_len = 0x1000`（wire header `+0x04`。公式実装のチャネル設定値。ペイロードなし `len = 0`）, `crc16 = 0xFFFF`（空ペイロードの CRC-16/MODBUS）, `offset = macro_idx << 12` | Host → Ctrl | **`EraseBT2Macro`**。指定スロット・マクロ領域（4KB 単位）を消去 |
 
 > ※ `mode` は `record_ultimatebt2` 内オフセット `+0x10` の `GamepadMode` 値。
@@ -486,9 +486,9 @@ sequenceDiagram
 - **Windows USB HID (`8BitDoAdvance.dll::saveUltimateBT2`)**: `cmd = 0x0006`, **`subcmd = 0x0123`** を使用（**USB HID の Save タイムアウトは `3` 秒**）。
 - いずれも応答で `cmd == 0x0006` と対応する `subcmd` の ACK が返る。プラットフォームやトランスポートに応じて適切な `subcmd` を選択すること（誤った `subcmd` では Flash 保存が確定しない可能性がある）。**USB の 3 秒は Windows USB HID の値であり、BLE の正式値ではない。BLE は §6.5 の暫定 3 秒・リトライなしを使う。**
 
-### 6.5 マクロ書き込み / restore 実装ノート（新順序は実機試行済み・データ未永続）
+### 6.5 マクロ書き込み / restore 実装ノート（Write `total_len` は絶対終端。BLE・slot S1・`macro_idx=0/1` で実機確認）
 
-`eightbitdo-core` の `write_macro` と `write_macro_slot` は次の順序を固定する。`macro restore` は slot ごとに 1 回の `write_macro_slot` を呼び、**ヘッダ × N → Save → 各マクロの Erase/Write → 最終 Save 1 回** とする。旧順序（Erase → Write → Header → Save）は実機で試行済み（macro 0 は成功、macro 1 の 460B は verify 失敗）。新順序は 2026-11-22 に実機で試行し、**全 ACK は成功したが読み戻したステップデータが 0x00 のままで未永続**（原因未確定。差分節と未確定点を参照）。
+`eightbitdo-core` の `write_macro` と `write_macro_slot` は次の順序を固定する。`macro restore` は slot ごとに 1 回の `write_macro_slot` を呼び、**ヘッダ × N → Save → 各マクロの Erase/Write → 最終 Save 1 回** とする。旧順序（Erase → Write → Header → Save）は実機で試行済み（`macro_idx=0 (M1)` は成功、`macro_idx=1 (M2)` の 460B は verify 失敗）。新順序 + Write `total_len = (macro_idx << 12) + align32(steps * 10)`（絶対終端）で **2026-11-22 に実機で永続化を確認**した（確認範囲は **BLE・slot S1・`macro_idx=0/1 (M1/M2)` のみ**。`macro_idx=2/3 (M3/M4)` と slot S2/S3 は式からの外挿で未確認。USB HID の Write は未実装・未検証）。詳細は手順 4 と実機結果。
 
 1. **Header (`0x0001`)**: `offset = 0x68C + slot * 0xD8`, `len = 0xD8`, **`total_len = 0xD8` (216)**。公式 `getBT2_WriteMacroi`（`writeBT2Macro` から呼ばれる）は descriptor `+0x40` に 216 を設定し、`Generate_CustomDataCmd` の `cmd 0x0001` 特例で `+0x04` の descriptor offset を使う。216B は `chunk_len = min(142, max_payload)` で分割し、`offset` を実チャンク長だけ進める。各チャンクの ACK は 2 秒。
    - MTU 200: `max_payload = 180` → **142 + 74**（159B / 91B フレーム）
@@ -498,11 +498,11 @@ sequenceDiagram
 2. **Header Save (`0x0006`)**: BLE `subcmd = 0x0067` のみ。ACK は 3 秒・リトライなし。公式は `writeBT2Macro_onfinished` でヘッダ書込完了時に Save を送る。Header またはこの Save が失敗した場合、**Erase は送らない**（データを消さない）。Header Save 成功後、Erase までの settle delay は **0ms**（現行公式実装に合わせる）。
 3. **Erase (`0x0104`)**: `total_len = chunk_len = 0x1000`, `offset = macro_idx << 12`, `crc16 = 0xFFFF`, ペイロードなし。ACK は 2 秒。ACK 後 **100ms** の settle delay を置いてから Write を送る（`MACRO_ERASE_SETTLE_DELAY`。Erase 完了を待つための暫定値で、実測で調整する）。
    - 実機 Erase ACK（2026-11-22）は **16B ヘッダのみ**で、`04 00 04 01 00 10 01 01 00 10 00 00 00 00 00 00`（`cmd=0x0004`, `subcmd=0x0104`, `chunk_len=0x1000`, `crc16=0x0101`, `total_len=0x1000`, `offset=0`）。`chunk_len` をエコーしていてもペイロードはない。ACK 判定はヘッダ先行で行い、`chunk_len` / `total_len` のエコーを許容する（`decode_app_response` のペイロード長検査を ACK に適用しない）。
-4. **Write (`0x0103`)**: `total_len = align32(steps * 10)`、`offset = (macro_idx << 12) + chunk_index * chunk_size`、各チャンクの CRC-16/MODBUS。ACK は 2 秒。チャンクは MTU 連動で、`max_payload = mtu - 3 - 17` が `64` 以上なら 64B、`32` 以上なら 32B、それ未満は `Error::MtuTooSmall`。`MacroWritePlan.chunk_size` / CLI `--chunk-size 32` で **32B 均一**を明示できる（460B → 480B = 15 × 32B、500B → 512B = 16 × 32B、最終も 32B）。`--chunk-size 64` は 64B 基本で、最終チャンクが 32B になることがある（**均一になるのは 32B 指定のみ**）。32/64 以外は `UnsupportedChunkSize`、MTU 不足は `MtuTooSmall`。**全マクロの最終 Write ACK 後 50ms** 待ってから最終 Save を送る（`MACRO_WRITE_SETTLE_DELAY`、暫定値）。
+4. **Write (`0x0103`)**: **`total_len = (macro_idx << 12) + align32(steps * 10)`（絶対終端）**、`offset = (macro_idx << 12) + chunk_index * chunk_size`、各チャンクの CRC-16/MODBUS。ACK は 2 秒。`total_len` が `align32(steps * 10)` だけ（相対値）だと **ACK は返るが Flash に永続化されない**（`macro_idx=0` は sector base 0 のため一致して成功する）。**実機確認範囲は BLE・slot S1・`macro_idx=0/1 (M1/M2)` のみ**で、`macro_idx=2/3 (M3/M4)` と slot S2/S3 は式からの外挿、USB HID は未実装・未検証。実機確認済みフレーム: `macro_idx=1 (M2)`・46 steps (460B → 0x1E0) → `total_len = 0x11E0`, `offset = 0x1000`（read-back SHA 一致）／`macro_idx=1 (M2)`・2 steps → `0x1020`。一般式による算術例: 115 steps (1150B → 0x480) → `0x1480`。チャンクは MTU 連動で、`max_payload = mtu - 3 - 17` が `64` 以上なら 64B、`32` 以上なら 32B、それ未満は `Error::MtuTooSmall`。`MacroWritePlan.chunk_size` / CLI `--chunk-size 32` で **32B 均一**を明示できる（460B → 480B = 15 × 32B、500B → 512B = 16 × 32B、最終も 32B）。`--chunk-size 64` は 64B 基本で、最終チャンクが 32B になることがある（**均一になるのは 32B 指定のみ**）。32/64 以外は `UnsupportedChunkSize`、MTU 不足は `MtuTooSmall`。**全マクロの最終 Write ACK 後 50ms** 待ってから最終 Save を送る（`MACRO_WRITE_SETTLE_DELAY`、暫定値）。実験用の `--write-total-relative` は旧 `align32(steps * 10)` に戻す（A/B 用。`macro_idx=1` では永続化されない）。Write offset の相対モードは提供しない（Erase は `macro_idx << 12` の sector を消すため、0 起点の Write は別 sector を破壊する）。
 5. **Final Save (`0x0006`)**: BLE `subcmd = 0x0067` のみ。slot バッチ内の全マクロを Erase/Write した後に **1 回だけ**送る。ACK は 3 秒・リトライなし。公式は `EraseMacroDataDone` / `WriteMacroDataDone` の連鎖後に Save を送る。
 6. **Read-back**: 最終 Save ACK 後に **300ms** 待ってから `0x0002` で 2768B config を読み、対象 slot の **216B ヘッダ**を送信した `header_bytes` とバイト比較する。続けて `0x0102` でバッチ内の各 `(slot, macro_idx)` を読み、`steps * 10` バイトが一致することを確認する。ヘッダ + データを書いた `macro write` / 非空 slot の restore では、どちらの不一致も `Error::MacroWrite { stage: Verify, state: DataSaved }` になる。ヘッダのみを書く空 slot の restore は step data を送っていないため、Verify 不一致は `state: HeaderSaved` になる。ヘッダ不一致のメッセージは、flag / total_cnt / 予約バイトのどこが違うかと「device が正規化した可能性、Save 送信済みなので再書き込みしない」を含む。300ms は暫定値で実機未確認。
    - 公式順序の RE 根拠: `writeCustomConfig`（ヘッダ書込）→ `writeCustomConfig_onfinished` で **Save** → Java `writeCustomConfigDone` → `Erase(0) → Write(0) → Erase(1) → Write(1) …` → 最後に Save（`EraseMacroDataDone` / `WriteMacroDataDone`）。本実装はこの順序に合わせた。
-   - 実機観測（2026-11-22）: 旧順序（Erase → Write → Header(total_len=0x0AD0) → Save）で macro 0（500B）は成功し、macro 1（460B）だけが全 ACK 後に `0x0102` zeros で Verify 失敗した。216B ヘッダは一致していた。公式の **Header(total_len=0xD8) → Save → Erase/Write → Save** との差分を原因候補とし、本 PR で順序を変更した（新順序は 2026-11-22 に実機試行: 全 ACK 成功、ステップデータは 0x00 のまま）。最終 32B チャンク仮説に対しては `--chunk-size 32` も指定できる。
+   - 実機観測（2026-11-22、BLE・slot S1）: 旧順序（Erase → Write → Header(total_len=0x0AD0) → Save）で `macro_idx=0 (M1)`（500B）は成功し、`macro_idx=1 (M2)`（460B）だけが全 ACK 後に `0x0102` zeros で Verify 失敗した。216B ヘッダは一致していた。新順序でも step data が `0x00` のままだった原因は **Write `0x0103` の `total_len`** と特定した。`align32(steps * 10)`（相対値）では `macro_idx=1` の sector base が載らず、ACK は返るが永続化されない。`total_len = (macro_idx << 12) + align32(steps * 10)`（絶対終端）に変えたところ **read-back SHA が期待値と一致**した（`macro_idx=1 (M2)`・46 steps: `0x11E0`。`macro_idx=0 (M1)` は base 0 のため従来値と一致）。`macro_idx=2/3` と他 slot は未検証の外挿。最終 32B チャンク仮説に対しては `--chunk-size 32` も指定できる。
 
 **公式実装との差分（2026-11-22、Android APK の静的解析。実機での `0x0003` 送出有無は未検証 / btsnoop 未取得）**:
 
@@ -511,7 +511,7 @@ sequenceDiagram
 - **タイムアウトと再送**: 公式のマクロ系（Header `0x0001` / Erase `0x0104` / Write `0x0103` / Save `0x0006`）はすべて **2 秒**で、タイムアウト時は最大 **2 回**まで同一チャネルを再送する〔静的解析ノート（2026-11-22）でタイムアウト 2 秒・再送上限 2 を確認。実機で再送が実際に発火するかは未検証〕。本実装は Header / Erase / Write が 2 秒で一致するが、Save のみ **3 秒・リトライなし**で相違（未確定。実害は不明）。
 - **読み戻し検証は本プロジェクト独自**: 公式は最終 Save の完了コールバックでカウンタと `m_isshow` を戻すだけで、書込後の読み戻し検証を行わない（手順 6 の検証は独自拡張）。
 - **ACK 照合**: 公式は `(subcmd, total_len)` の 2 要素で照合する。本実装は cmd/subcmd のみで `total_len` を照合せず、`offset` / `chunk_len` も見ない（残存リスク。未確定点の ACK 項目）。
-- **実機結果（2026-11-22）**: 新順序で全 ACK は成功したが、読み戻したステップデータは `0x00` のままだった（原因未確定）。`0x0007` enable の有無が次の実験候補（CLI `--report-enable` / `--poll-interval-ms` の A/B）。
+- **実機結果（2026-11-22、BLE・slot S1・`macro_idx=0/1 (M1/M2)` のみ）**: 新順序（Header 0xD8 → Save → Erase/Write → Save）に加えて Write `total_len` を絶対終端 `(macro_idx << 12) + align32(steps * 10)` にしたところ、`macro_idx=1 (M2)`（46 steps）の read-back SHA が期待値と一致し、永続化を確認した。`align32(steps * 10)` だけでは ACK のみで永続化されない（`macro_idx=0 (M1)` は base 0 のため差が出ない）。`macro_idx=2/3 (M3/M4)`・slot S2/S3 は式からの外挿で未確認、USB HID は未実装・未検証。CLI `--write-total-relative` はこの旧 framing に戻す A/B 用。
 
 **Fail-closed / 状態**: `Error::MacroWrite` は `MacroWriteState` で 3 段階を区別する。
 
@@ -547,7 +547,7 @@ Header または最初の Save が失敗した場合、Erase は送らない。�
 
 **未確定点**:
 
-- Header / Write のチャンク長は MTU 連動（`max_payload = mtu - 3 - 17`）。実機書き込みで使う想定は MTU 200（Header 142B / Write 64B）。**新順序（Header 0xD8 → Save → Erase/Write → Save）は 2026-11-22 に実機試行し、全 ACK 成功後もステップデータが `0x00` のままで未永続**（原因未確定。旧順序は macro0 成功、macro1 は Verify 失敗）。次の実験は `0x0007` enable の有無（`--report-enable`）と書込中の `0x0003` 送出（`--poll-interval-ms`）の A/B。MTU 64 / 23 は Mock のみ。
+- Header / Write のチャンク長は MTU 連動（`max_payload = mtu - 3 - 17`）。実機書き込みで使う想定は MTU 200（Header 142B / Write 64B）。**Write `0x0103` の `total_len` は絶対終端 `(macro_idx << 12) + align32(steps * 10)` が必須**（2026-11-22、BLE・slot S1・`macro_idx=0/1` で実機確認。相対値では ACK のみで永続化されない。`macro_idx=2/3` と他 slot は外挿、USB HID は未実装・未検証）。新順序（Header 0xD8 → Save → Erase/Write → Save）は 2026-11-22 に実機で永続化まで確認した（旧順序は `macro_idx=0` 成功、`macro_idx=1` は Verify 失敗）。`--write-total-relative` は旧 framing に戻す実験用フラグで、既定は絶対終端。MTU 64 / 23 は Mock のみ。
 - BLE Save のタイムアウトは公式 2 秒・再送最大 2 回だが〔静的解析ノート（2026-11-22）〕、本実装は 3 秒・リトライなし（相違。実害は未確定）。Save ACK の実際の `cmd` / `subcmd` 形状（`0x0006` 直か `0x0004, subcmd=0x0006/0x0067` か）。
 - Erase / Write / Header の ACK 形状（`0x0004` エンベロープか直接エコーか）。実装は両方を受け入れる。`0x600F` の BLE App チャネルでは受信フレームに prefix は付かない（§4.3）。USB HID の `[0x02,0x04]` や BLE Boot の `0x05` は別 framing である。先頭 16B をヘッダとして解析し、payload が付いていても ACK 判定に影響させない。`0x04` で始まる frame は先頭 2 バイトで cmd が決まり、`04 00` は `cmd=0x0004`（RESPONSE）、`04 01` は `cmd=0x0104`（Erase の直接 ACK）である。ACK は cmd/subcmd で判定し、envelope は `subcmd = 要求コマンド ID`（Header `0x0001` / Erase `0x0104` / Write `0x0103`）、Save は `0x0067` も許容する。envelope の `subcmd` として `macro_subcmd` は受理しない（Switch slot 0 の裸 envelope と区別できないため）。direct ACK は `cmd` のみで判定し、`subcmd` を見ない。実機観測は Erase の `cmd=0x0004, subcmd=0x0104` のみで、Header / Write の envelope 形状は未確認。公式は `(subcmd, total_len)` の 2 要素で照合するが、本実装は cmd/subcmd のみで `total_len` を照合せず、`offset` / `chunk_len` も見ないため重複・遅延 ACK を区別しない（残存リスク）。実機で ACK が offset を echo するなら照合追加を検討する。
 - Save 時の device による config CRC 再計算。

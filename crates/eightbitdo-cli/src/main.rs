@@ -22,7 +22,7 @@ use eightbitdo_core::{
     BleTransport, ConfigSnapshot, Error, MacroBackup, MacroEntry, MacroWritePlan, Session,
     Transport, VersionInfo,
 };
-use eightbitdo_protocol::commands::SaveTransport;
+use eightbitdo_protocol::commands::{MacroWriteLayout, SaveTransport};
 use eightbitdo_protocol::config_bt2::{
     macro_record_offset, macro_slot_offset, Bt2Config, MacroIndex, MacroSlot, Slot, CONFIG_SIZE,
     MACROS_PER_SLOT, MACRO_SLOT_SIZE, SLOT_COUNT,
@@ -212,6 +212,19 @@ enum MacroCommand {
         #[arg(long, value_name = "32|64")]
         chunk_size: Option<u16>,
 
+        /// EXPERIMENT: revert WriteBT2Macro `total_len` to the pre-2026-11-22
+        /// framing `align32(steps * 10)` instead of the default absolute end
+        /// address `(macro_index << 12) + align32(steps * 10)`.
+        ///
+        /// Device evidence is limited to **BLE, slot S1, `macro_idx=0 (M1)` and
+        /// `macro_idx=1 (M2)`**: `macro_idx=0` is unaffected (sector base 0),
+        /// while `macro_idx=1` ACKs but does not persist without the sector
+        /// base. `macro_idx=2/3 (M3/M4)` and slots S2/S3 are extrapolated and
+        /// unverified. Use with `--backup-dir` and the mandatory pre-write
+        /// backup.
+        #[arg(long)]
+        write_total_relative: bool,
+
         /// Input poll interval in milliseconds while the operation runs.
         /// Experimental: the official app does not poll during a macro write,
         /// so the default is 0 (disabled).
@@ -241,6 +254,12 @@ enum MacroCommand {
         /// Force 32- or 64-byte write chunks. Omit to select from the MTU.
         #[arg(long, value_name = "32|64")]
         chunk_size: Option<u16>,
+
+        /// EXPERIMENT: relative `total_len` for every restored macro (see
+        /// `macro write --write-total-relative`). Applies to all per-macro
+        /// plans built by this restore.
+        #[arg(long)]
+        write_total_relative: bool,
 
         /// Input poll interval in milliseconds while the operation runs.
         /// Experimental: the official app does not poll during a macro write,
@@ -300,6 +319,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                 trigger,
                 backup_dir,
                 chunk_size,
+                write_total_relative,
                 poll_interval_ms,
                 report_enable,
             } => {
@@ -311,6 +331,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                     trigger.as_deref(),
                     backup_dir.as_deref(),
                     chunk_size,
+                    macro_write_layout(write_total_relative),
                     poll_interval_ms,
                     report_enable,
                 )
@@ -320,6 +341,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                 dir,
                 force,
                 chunk_size,
+                write_total_relative,
                 poll_interval_ms,
                 report_enable,
             } => {
@@ -328,6 +350,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                     &dir,
                     force,
                     chunk_size,
+                    macro_write_layout(write_total_relative),
                     poll_interval_ms,
                     report_enable,
                 )
@@ -1292,6 +1315,33 @@ fn build_macro_write_plan(
     Ok(plan)
 }
 
+/// Build the Write layout from the two CLI/REPL flags.
+///
+/// The default is the absolute `total_len` (BLE, slot S1, `macro_idx=0/1`
+/// device-confirmed; other indices/slots extrapolated); the experiment flag
+/// opts into the pre-2026-11-22 framing.
+///
+/// Write chunk offsets are always sector-based (`macro_index << 12`); a
+/// relative-offset mode is not exposed because `Erase` always clears
+/// `macro_index << 12` and a 0-based write would destroy another macro sector.
+fn macro_write_layout(total_relative: bool) -> MacroWriteLayout {
+    MacroWriteLayout {
+        absolute_total_len: !total_relative,
+    }
+}
+
+/// One-line description of the `WriteBT2Macro` `total_len` framing.
+///
+/// Printed at the start of `macro write` / `macro restore` so a device log
+/// records which framing was used (A/B evidence).
+fn macro_write_layout_label(layout: MacroWriteLayout) -> &'static str {
+    if layout.absolute_total_len {
+        "absolute (sector base + aligned)"
+    } else {
+        "relative (align32 only)"
+    }
+}
+
 /// A validated `macro write` request, parsed before any device I/O.
 ///
 /// Parsing and file reading happen before the connection (CLI) or before the
@@ -1303,6 +1353,7 @@ struct PreparedMacroWrite {
     index: MacroIndex,
     file: MacroFile,
     trigger: Option<KeyMap>,
+    layout: MacroWriteLayout,
 }
 
 fn prepare_macro_write(
@@ -1310,12 +1361,14 @@ fn prepare_macro_write(
     index: u8,
     file: &Path,
     trigger: Option<&str>,
+    layout: MacroWriteLayout,
 ) -> Result<PreparedMacroWrite, Error> {
     Ok(PreparedMacroWrite {
         slot: parse_slot(slot)?,
         index: parse_macro_index(index)?,
         file: read_macro_file(file)?,
         trigger: trigger.map(parse_trigger).transpose()?,
+        layout,
     })
 }
 
@@ -1350,7 +1403,7 @@ async fn run_macro_write<T: Transport>(
         "warning: do not press Ctrl-C during the macro write; a failure can leave a sector \
          partially updated."
     );
-    macro_write_session(
+    macro_write_session_with_layout(
         session,
         request.slot,
         request.index,
@@ -1358,6 +1411,7 @@ async fn run_macro_write<T: Transport>(
         request.trigger,
         backup_dir,
         chunk_size,
+        request.layout,
     )
     .await
 }
@@ -1371,10 +1425,11 @@ async fn macro_write(
     trigger: Option<&str>,
     backup_dir: Option<&Path>,
     chunk_size: Option<u16>,
+    layout: MacroWriteLayout,
     poll_interval_ms: u64,
     report_enable: bool,
 ) -> Result<(), Error> {
-    let request = prepare_macro_write(slot, index, file, trigger)?;
+    let request = prepare_macro_write(slot, index, file, trigger, layout)?;
     let backup_dir = resolve_write_backup_dir(backup_dir);
 
     let transport = BleTransport::connect(options).await?;
@@ -1385,6 +1440,11 @@ async fn macro_write(
     result
 }
 
+/// Default-layout wrapper for tests and older callers.
+///
+/// Production goes through [`macro_write_session_with_layout`] so the
+/// experimental flags are explicit.
+#[cfg(test)]
 async fn macro_write_session<T: Transport>(
     session: &Session<T>,
     slot: Slot,
@@ -1394,10 +1454,35 @@ async fn macro_write_session<T: Transport>(
     backup_dir: &Path,
     chunk_size: Option<u16>,
 ) -> Result<(), Error> {
+    macro_write_session_with_layout(
+        session,
+        slot,
+        index,
+        file,
+        trigger,
+        backup_dir,
+        chunk_size,
+        MacroWriteLayout::default_ble(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn macro_write_session_with_layout<T: Transport>(
+    session: &Session<T>,
+    slot: Slot,
+    index: MacroIndex,
+    file: &MacroFile,
+    trigger: Option<KeyMap>,
+    backup_dir: &Path,
+    chunk_size: Option<u16>,
+    layout: MacroWriteLayout,
+) -> Result<(), Error> {
     let created = !backup_dir.exists();
-    let result =
-        macro_write_session_inner(session, slot, index, file, trigger, backup_dir, chunk_size)
-            .await;
+    let result = macro_write_session_inner(
+        session, slot, index, file, trigger, backup_dir, chunk_size, layout,
+    )
+    .await;
     if result.is_err() && created {
         // Do not leave an empty directory behind on an early failure (empty
         // macro, MTU too small, config read failure).
@@ -1406,6 +1491,7 @@ async fn macro_write_session<T: Transport>(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn macro_write_session_inner<T: Transport>(
     session: &Session<T>,
     slot: Slot,
@@ -1414,6 +1500,7 @@ async fn macro_write_session_inner<T: Transport>(
     trigger: Option<KeyMap>,
     backup_dir: &Path,
     chunk_size: Option<u16>,
+    layout: MacroWriteLayout,
 ) -> Result<(), Error> {
     let mtu = session.transport().mtu();
     // Fail before creating a pre-write backup directory if this MTU cannot
@@ -1479,8 +1566,10 @@ async fn macro_write_session_inner<T: Transport>(
 
     let mut plan = build_macro_write_plan(file, trigger, &backup, slot, index)?;
     plan.chunk_size = chunk_size;
+    plan.absolute_total_len = layout.absolute_total_len;
     plan.save_transport = SaveTransport::Ble;
 
+    println!("write total_len: {}", macro_write_layout_label(layout));
     println!(
         "writing slot {} (profile {}) macro {} ({}): {} steps (chunk size {effective_chunk_size}B, MTU {mtu})",
         slot.index(),
@@ -1705,14 +1794,15 @@ fn ensure_backup_gamepad_mode(
 /// Shared by the top-level `macro restore` command and the `session` REPL.
 /// The pre-restore backup, the gamepad-mode check, the `--force` conflict
 /// rules, the symlink/complete-backup validation and the read-back
-/// verification all stay in [`macro_restore_session`].
+/// verification all stay in `macro_restore_session_core`.
 async fn run_macro_restore<T: Transport>(
     session: &Session<T>,
     dir: &Path,
     force: bool,
     chunk_size: Option<u16>,
+    layout: MacroWriteLayout,
 ) -> Result<(), Error> {
-    macro_restore_session(session, dir, force, chunk_size).await
+    macro_restore_session_with_layout(session, dir, force, chunk_size, layout).await
 }
 
 async fn macro_restore(
@@ -1720,12 +1810,13 @@ async fn macro_restore(
     dir: &Path,
     force: bool,
     chunk_size: Option<u16>,
+    layout: MacroWriteLayout,
     poll_interval_ms: u64,
     report_enable: bool,
 ) -> Result<(), Error> {
     let transport = BleTransport::connect(options).await?;
     let session = macro_session(transport, poll_interval_ms, report_enable);
-    let result = run_macro_restore(&session, dir, force, chunk_size).await;
+    let result = run_macro_restore(&session, dir, force, chunk_size, layout).await;
     print_poll_stats(options, &session);
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
@@ -1740,6 +1831,7 @@ fn restore_macro_plan(
     entry: &MacroEntry,
     header: &MacroSlot,
     chunk_size: Option<u16>,
+    layout: MacroWriteLayout,
 ) -> MacroWritePlan {
     let mut plan = MacroWritePlan::new(entry.steps().to_vec())
         .with_key_map(entry.record().key_map)
@@ -1748,6 +1840,7 @@ fn restore_macro_plan(
         .with_header_state(header.flag, header.total_cnt)
         .with_save_transport(SaveTransport::Ble);
     plan.chunk_size = chunk_size;
+    plan.absolute_total_len = layout.absolute_total_len;
     plan
 }
 
@@ -1841,16 +1934,38 @@ async fn read_current_macros_best_effort<T: Transport>(
     Ok((MacroBackup::new(config_snapshot(config), entries)?, skipped))
 }
 
+/// Default-layout restore wrapper for tests.
+#[cfg(test)]
 async fn macro_restore_session<T: Transport>(
     session: &Session<T>,
     dir: &Path,
     force: bool,
     chunk_size: Option<u16>,
 ) -> Result<(), Error> {
-    let pre_dir = pre_restore_dir(dir);
-    macro_restore_session_with_pre_dir(session, dir, force, pre_dir, chunk_size).await
+    macro_restore_session_with_layout(
+        session,
+        dir,
+        force,
+        chunk_size,
+        MacroWriteLayout::default_ble(),
+    )
+    .await
 }
 
+async fn macro_restore_session_with_layout<T: Transport>(
+    session: &Session<T>,
+    dir: &Path,
+    force: bool,
+    chunk_size: Option<u16>,
+    layout: MacroWriteLayout,
+) -> Result<(), Error> {
+    let pre_dir = pre_restore_dir(dir);
+    macro_restore_session_with_pre_dir_and_layout(session, dir, force, pre_dir, chunk_size, layout)
+        .await
+}
+
+/// Default-layout restore wrapper with an injected pre-restore directory.
+#[cfg(test)]
 async fn macro_restore_session_with_pre_dir<T: Transport>(
     session: &Session<T>,
     dir: &Path,
@@ -1858,8 +1973,28 @@ async fn macro_restore_session_with_pre_dir<T: Transport>(
     pre_dir: PathBuf,
     chunk_size: Option<u16>,
 ) -> Result<(), Error> {
+    macro_restore_session_with_pre_dir_and_layout(
+        session,
+        dir,
+        force,
+        pre_dir,
+        chunk_size,
+        MacroWriteLayout::default_ble(),
+    )
+    .await
+}
+
+async fn macro_restore_session_with_pre_dir_and_layout<T: Transport>(
+    session: &Session<T>,
+    dir: &Path,
+    force: bool,
+    pre_dir: PathBuf,
+    chunk_size: Option<u16>,
+    layout: MacroWriteLayout,
+) -> Result<(), Error> {
     let pre_created = !pre_dir.exists();
-    let result = macro_restore_session_core(session, dir, force, &pre_dir, chunk_size).await;
+    let result =
+        macro_restore_session_core(session, dir, force, &pre_dir, chunk_size, layout).await;
     if result.is_err() && pre_created {
         // Keep a non-empty incomplete backup for recovery; remove only an
         // empty directory created before the failure.
@@ -1907,6 +2042,7 @@ async fn macro_restore_session_core<T: Transport>(
     force: bool,
     pre_dir: &Path,
     chunk_size: Option<u16>,
+    layout: MacroWriteLayout,
 ) -> Result<(), Error> {
     let mtu = session.transport().mtu();
     if let Some(requested) = chunk_size {
@@ -1916,6 +2052,10 @@ async fn macro_restore_session_core<T: Transport>(
     }
     let backup = read_restore_backup(dir)?;
     println!("loaded backup: {}", dir.display());
+    println!(
+        "write total_len: {} (all restored macros)",
+        macro_write_layout_label(layout)
+    );
 
     println!("taking a fresh pre-restore backup of the current controller...");
     let current_snapshot = session.read_config_snapshot().await?;
@@ -2028,7 +2168,7 @@ async fn macro_restore_session_core<T: Transport>(
                 }
                 Some((
                     *index,
-                    restore_macro_plan(entry, &header, effective_chunk_size),
+                    restore_macro_plan(entry, &header, effective_chunk_size, layout),
                 ))
             })
             .collect();
@@ -2689,6 +2829,7 @@ enum SessionCommand {
         file: PathBuf,
         trigger: Option<String>,
         chunk_size: Option<u16>,
+        layout: MacroWriteLayout,
     },
     MacroRestore {
         dir: PathBuf,
@@ -2831,6 +2972,7 @@ fn parse_macro_session_command<'a>(
             let file = PathBuf::from(session_plain_value(&mut parts)?);
             let mut trigger = None;
             let mut chunk_size = None;
+            let mut write_total_relative = false;
             while let Some(part) = parts.next() {
                 match part {
                     "--trigger" if trigger.is_none() => {
@@ -2843,6 +2985,9 @@ fn parse_macro_session_command<'a>(
                         }
                         chunk_size = Some(requested);
                     }
+                    "--write-total-relative" if !write_total_relative => {
+                        write_total_relative = true;
+                    }
                     _ => return None,
                 }
             }
@@ -2852,6 +2997,7 @@ fn parse_macro_session_command<'a>(
                 file,
                 trigger,
                 chunk_size,
+                layout: macro_write_layout(write_total_relative),
             })
         }
         _ => None,
@@ -2890,7 +3036,10 @@ fn print_session_help(allow_macro_write: bool) {
     println!("  backup [--raw FILE] [--json FILE]");
     println!("  macro backup <DIR>");
     if allow_macro_write {
-        println!("  macro write <SLOT> <INDEX> <FILE> [--trigger <KEY>] [--chunk-size 32|64]");
+        println!(
+            "  macro write <SLOT> <INDEX> <FILE> [--trigger <KEY>] [--chunk-size 32|64] \
+             [--write-total-relative]"
+        );
         println!("  macro restore <DIR> [--force]");
     } else {
         println!("  macro write ... (disabled; restart with --allow-macro-write)");
@@ -2919,6 +3068,13 @@ fn print_session_help(allow_macro_write: bool) {
     println!(
         "note: REPL 'macro restore' has no --chunk-size; the write chunk size is selected from \
          the MTU. Use top-level 'eightbitdo macro restore --chunk-size 32|64' to force it."
+    );
+    println!(
+        "experiment: Write total_len defaults to the absolute end address \
+         (macro_index << 12) + align32(steps*10) (BLE, macro_idx=0/1 on slot S1 \
+         device-confirmed; other indices/slots extrapolated); '--write-total-relative' reverts \
+         to align32(steps*10). Write offsets are always sector-based; a relative-offset mode is \
+         not offered because Erase clears (macro_index << 12)."
     );
 }
 
@@ -3536,7 +3692,7 @@ async fn run_session_macro_restore<T: Transport>(
     force: bool,
 ) -> Result<(), Error> {
     let guard = session.lock().await;
-    run_macro_restore(&guard, dir, force, None).await
+    run_macro_restore(&guard, dir, force, None, MacroWriteLayout::default_ble()).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3617,6 +3773,7 @@ async fn execute_session_command<T: Transport + 'static>(
             file,
             trigger,
             chunk_size,
+            layout,
         } => {
             if monitor.is_some() {
                 eprintln!("monitor is running; use 'monitor stop' first");
@@ -3624,7 +3781,7 @@ async fn execute_session_command<T: Transport + 'static>(
             }
             // Parse the file and validate slot/index/trigger before the lock:
             // a bad request must not stall (or touch) the controller.
-            let request = prepare_macro_write(slot, index, &file, trigger.as_deref())?;
+            let request = prepare_macro_write(slot, index, &file, trigger.as_deref(), layout)?;
             let backup_dir = resolve_write_backup_dir(None);
             // `run_session_macro_write` holds the operation lock from the first
             // configuration read to the final Save, so the 20 ms keepalive
@@ -4962,6 +5119,7 @@ mod tests {
                 file: macro_file,
                 trigger: None,
                 chunk_size: None,
+                layout: MacroWriteLayout::default_ble(),
             },
         )
         .await
@@ -5359,6 +5517,7 @@ mod tests {
                 file: PathBuf::from("file.toml"),
                 trigger: None,
                 chunk_size: None,
+                layout: MacroWriteLayout::default_ble(),
             }
         );
         assert_eq!(
@@ -5369,6 +5528,7 @@ mod tests {
                 file: PathBuf::from("file.json"),
                 trigger: Some("0x00000008".to_string()),
                 chunk_size: Some(32),
+                layout: MacroWriteLayout::default_ble(),
             }
         );
         assert_eq!(
@@ -5379,6 +5539,18 @@ mod tests {
                 file: PathBuf::from("file.toml"),
                 trigger: None,
                 chunk_size: Some(64),
+                layout: MacroWriteLayout::default_ble(),
+            }
+        );
+        assert_eq!(
+            parse_session_command("macro write 1 0 file.toml --write-total-relative"),
+            SessionCommand::MacroWrite {
+                slot: 1,
+                index: 0,
+                file: PathBuf::from("file.toml"),
+                trigger: None,
+                chunk_size: None,
+                layout: MacroWriteLayout::relative_total_len(),
             }
         );
         assert_eq!(
@@ -5412,6 +5584,12 @@ mod tests {
             "macro write 0 1 file.toml --chunk-size",
             "macro write 0 1 file.toml --chunk-size 48",
             "macro write 0 1 file.toml --bogus x",
+            "macro write 0 1 file.toml --write-total-relative --write-total-relative",
+            "macro write 0 1 file.toml --write-total-relative true",
+            // Removed flags: absolute is the default and a relative Write
+            // offset would erase one sector and write another.
+            "macro write 0 1 file.toml --write-total-absolute",
+            "macro write 0 1 file.toml --write-offset-relative",
             "macro write 256 1 file.toml",
             "macro restore",
             "macro restore --force",
@@ -5426,6 +5604,20 @@ mod tests {
     }
 
     #[test]
+    fn macro_write_layout_flags_map_to_protocol_layout() {
+        // No flags: the absolute total_len (device-confirmed for macro_idx=0/1
+        // on slot S1, BLE).
+        assert_eq!(macro_write_layout(false), MacroWriteLayout::default_ble());
+        assert!(macro_write_layout(false).absolute_total_len);
+        // --write-total-relative reverts only the total_len theory.
+        assert_eq!(
+            macro_write_layout(true),
+            MacroWriteLayout::relative_total_len()
+        );
+        assert!(!macro_write_layout(true).absolute_total_len);
+    }
+
+    #[test]
     fn macro_write_disabled_message_names_the_opt_in_flag() {
         assert_eq!(
             macro_write_disabled_message(&SessionCommand::MacroWrite {
@@ -5434,6 +5626,7 @@ mod tests {
                 file: PathBuf::from("f.toml"),
                 trigger: None,
                 chunk_size: None,
+                layout: MacroWriteLayout::default_ble(),
             }),
             Some("macro write is disabled; restart with --allow-macro-write")
         );
@@ -5458,6 +5651,7 @@ mod tests {
             file: PathBuf::from("f"),
             trigger: None,
             chunk_size: None,
+            layout: MacroWriteLayout::default_ble(),
         }));
         assert!(is_macro_flash_command(&SessionCommand::MacroRestore {
             dir: PathBuf::from("b"),
@@ -5484,6 +5678,7 @@ mod tests {
                 file: PathBuf::from("/nonexistent/macro.toml"),
                 trigger: None,
                 chunk_size: None,
+                layout: MacroWriteLayout::default_ble(),
             },
             SessionCommand::MacroRestore {
                 dir: PathBuf::from("/nonexistent/backup"),
@@ -8300,6 +8495,16 @@ mod tests {
             })
             .unwrap();
         assert_eq!(&first_write[17..17 + m1.raw().len()], m1.raw());
+        // Per-macro absolute `total_len` on the wire: macro_idx=0 (M1) is
+        // 0x20 (base 0), macro_idx=1 (M2) is 0x1020 (0x1000 + 0x20).
+        let write_total_lens: Vec<u32> = sent
+            .iter()
+            .filter(|frame| {
+                CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::WRITE_MACRO
+            })
+            .map(|frame| CustomHeader::parse(&frame[1..]).unwrap().total_len)
+            .collect();
+        assert_eq!(write_total_lens, vec![0x20, 0x1020]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8411,7 +8616,9 @@ mod tests {
         assert_eq!(writes.len(), 15);
         for (index, frame) in writes.iter().enumerate() {
             let header = CustomHeader::parse(&frame[1..]).unwrap();
-            assert_eq!(header.total_len, 480);
+            // Macro 2 is sector 0x1000, so the default total_len is the
+            // absolute end address 0x1000 + 480 = 0x11E0.
+            assert_eq!(header.total_len, 0x11E0);
             assert_eq!(header.chunk_len, 32);
             assert_eq!(header.offset, 0x1000 + (index * 32) as u32);
             assert_eq!(frame[17..].len(), 32);
@@ -8824,17 +9031,32 @@ mod tests {
     }
 
     #[test]
+    fn restore_plan_propagates_the_experimental_write_layout() {
+        let dir = scratch_dir("macro-restore-layout");
+        let (_, backup) = backup_fixture(&dir);
+        let entry = backup.get(Slot::S1, MacroIndex::M1).unwrap();
+        let header = backup.snapshot().config.macro_slot(Slot::S1);
+        let layout = MacroWriteLayout::relative_total_len();
+        let plan = restore_macro_plan(entry, &header, None, layout);
+        assert_eq!(plan.layout(), layout);
+        // The restore default is the absolute layout.
+        let default = restore_macro_plan(entry, &header, None, MacroWriteLayout::default_ble());
+        assert!(default.absolute_total_len);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn restore_plan_does_not_reencode_name() {
         let dir = scratch_dir("macro-restore-name");
         let (_, backup) = backup_fixture(&dir);
         let entry = backup.get(Slot::S1, MacroIndex::M1).unwrap();
         let header = backup.snapshot().config.macro_slot(Slot::S1);
-        let plan = restore_macro_plan(entry, &header, Some(32));
+        let plan = restore_macro_plan(entry, &header, Some(32), MacroWriteLayout::default_ble());
         assert_eq!(plan.name, None);
         assert_eq!(plan.chunk_size, Some(32));
         assert_eq!(plan.cycles_num, Some(entry.record().cycles_num));
         assert_eq!(plan.interval_ms, Some(entry.record().interval_ms));
-        let default = restore_macro_plan(entry, &header, None);
+        let default = restore_macro_plan(entry, &header, None, MacroWriteLayout::default_ble());
         assert_eq!(default.chunk_size, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9033,6 +9255,139 @@ mod tests {
         assert!(read_restore_backup(Path::new(".")).is_err());
         assert!(read_restore_backup(Path::new("./")).is_err());
     }
+    /// The default absolute `total_len` reaches the wire: `macro_idx=1 (M2)`
+    /// (sector 0x1000, slot S1, BLE) with 2 steps sends `total_len = 0x1020`,
+    /// `offset = 0x1000`. `macro_idx=0 (M1)` is unaffected and is covered by
+    /// the protocol unit test.
+    #[tokio::test]
+    async fn macro_write_default_absolute_total_len_reaches_the_wire() {
+        let root = scratch_dir("macro-absolute-total");
+        let fixture_dir = root.join("fixture");
+        let (snapshot, backup) = backup_fixture_with_macros(
+            &fixture_dir,
+            &[
+                (MacroIndex::M1, "One", vec![MacroStep::neutral(10); 2]),
+                (
+                    MacroIndex::M2,
+                    "Two",
+                    vec![MacroStep::neutral(10), MacroStep::neutral(20)],
+                ),
+            ],
+        );
+        let backup_dir = root.join("prewrite");
+
+        let mock = MockTransport::with_mtu(200);
+        push_config_responses(&mock, &snapshot.config);
+        push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M1);
+        push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M2);
+        push_ack(&mock, commands::cmd::WRITE_CONFIG);
+        push_ack(&mock, commands::cmd::WRITE_CONFIG);
+        push_ack(&mock, commands::cmd::SAVE);
+        push_ack(&mock, commands::cmd::ERASE_MACRO);
+        push_ack(&mock, commands::cmd::WRITE_MACRO);
+        push_ack(&mock, commands::cmd::SAVE);
+        push_config_responses(&mock, &snapshot.config);
+        push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M2);
+
+        let session = Session::new(&mock);
+        // The default wrapper uses MacroWriteLayout::default_ble(), i.e. no
+        // experimental flag: this is the production frame.
+        macro_write_session(
+            &session,
+            Slot::S1,
+            MacroIndex::M2,
+            &test_macro_file(),
+            None,
+            &backup_dir,
+            None,
+        )
+        .await
+        .expect("default absolute-total write must succeed against the mock");
+
+        let sent = mock.sent_frames();
+        let write = sent
+            .iter()
+            .find(|frame| {
+                CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::WRITE_MACRO
+            })
+            .map(|frame| CustomHeader::parse(&frame[1..]).unwrap())
+            .expect("one WriteBT2Macro frame");
+        // 2 steps = 20 bytes -> 32-byte alignment; macro_idx=1 (M2) sector
+        // base 0x1000.
+        assert_eq!(write.total_len, 0x1020);
+        assert_eq!(write.offset, 0x1000);
+        assert_eq!(write.chunk_len, 32);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The relative framing is still reachable for A/B work and reaches the
+    /// wire unchanged: 115 steps (1150B -> 0x480) send
+    /// `total_len = 0x480` (no sector base) while the Write offsets keep the
+    /// macro sector base (`0x1000` for `macro_idx=1 (M2)`).
+    #[tokio::test]
+    async fn macro_write_relative_total_len_keeps_the_sector_offsets() {
+        let root = scratch_dir("macro-relative-total");
+        let fixture_dir = root.join("fixture");
+        let steps = vec![MacroStep::neutral(10); 115];
+        let (snapshot, backup) =
+            backup_fixture_with_macros(&fixture_dir, &[(MacroIndex::M2, "Long", steps.clone())]);
+        let backup_dir = root.join("prewrite");
+        let file = MacroFile {
+            name: None,
+            gamepad_mode: 0,
+            key_map: KeyMap::NONE,
+            cycles_num: None,
+            interval_ms: None,
+            steps,
+        };
+
+        let mock = MockTransport::with_mtu(200);
+        push_config_responses(&mock, &snapshot.config);
+        push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M2);
+        push_ack(&mock, commands::cmd::WRITE_CONFIG);
+        push_ack(&mock, commands::cmd::WRITE_CONFIG);
+        push_ack(&mock, commands::cmd::SAVE);
+        push_ack(&mock, commands::cmd::ERASE_MACRO);
+        // 1150B -> 0x480 aligned -> 18 x 64B chunks.
+        for _ in 0..18 {
+            push_ack(&mock, commands::cmd::WRITE_MACRO);
+        }
+        push_ack(&mock, commands::cmd::SAVE);
+        push_config_responses(&mock, &snapshot.config);
+        push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M2);
+
+        let session = Session::new(&mock);
+        macro_write_session_with_layout(
+            &session,
+            Slot::S1,
+            MacroIndex::M2,
+            &file,
+            None,
+            &backup_dir,
+            None,
+            MacroWriteLayout::relative_total_len(),
+        )
+        .await
+        .expect("relative-total write must succeed against the mock");
+
+        let writes: Vec<_> = mock
+            .sent_frames()
+            .iter()
+            .filter(|frame| {
+                CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::WRITE_MACRO
+            })
+            .cloned()
+            .collect();
+        assert_eq!(writes.len(), 18);
+        for (index, frame) in writes.iter().enumerate() {
+            let header = CustomHeader::parse(&frame[1..]).unwrap();
+            assert_eq!(header.total_len, 0x480);
+            assert_eq!(header.chunk_len, 64);
+            assert_eq!(header.offset, 0x1000 + (index * 64) as u32);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn macro_write_session_backs_up_all_macros_then_writes_and_verifies() {
         let root = scratch_dir("macro-write-success");

@@ -285,7 +285,8 @@ EraseFlash 0x0004
 → Write 0x0103
   (subcmd = (mode << 8) | slot,
    offset = (macro_idx << 12) + chunk_index * chunk_size,
-   total_len = align32(max_steps * 10),
+   total_len = (macro_idx << 12) + align32(max_steps * 10)（絶対終端。BLE・slot S1・
+   macro_idx=0/1 で実機確認、macro_idx=2/3 と他 slot は外挿、USB HID 未検証）,
    chunk_size = 32/64B（32B アライン。--chunk-size 32 で 32B 均一）,
    各チャンク CRC-16/MODBUS)
 → Save 0x0006 (BLE: subcmd 0x0067)

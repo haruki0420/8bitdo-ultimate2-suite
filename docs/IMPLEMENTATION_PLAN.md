@@ -193,15 +193,15 @@ Track C: モバイル
 ### Phase 2b: BLE マクロ読み書き（本命）
 - **ゴール**: 3 スロット（`slot 0..2`）× 4 マクロ（`macro_idx 0..3`）のバックアップと、Header (`total_len=0xD8`) → Save → Erase → Write → Save の実機書き込み。slot 単位バッチ restore ではヘッダ + 最初の Save を 1 回、最終 Save を全マクロの後に 1 回送る。
 - **実装項目**:
-  - `0x0102` ReadBT2Macro（1 要求 = 1 チャンク 142B、`offset = (macro_idx << 12) + chunk_offset`, `total_len = chunk_len = steps * 10`。実機で macro 0 / 500B と macro 1 / 460B の応答 offset を確認）
+  - `0x0102` ReadBT2Macro（1 要求 = 1 チャンク 142B、`offset = (macro_idx << 12) + chunk_offset`, `total_len = chunk_len = steps * 10`。実機で `macro_idx=0 (M1)` / 500B と `macro_idx=1 (M2)` / 460B の応答 offset を確認）
   - 公式順序: **Header `0x0001` (`total_len = 0xD8`) → Save → Erase `0x0104` → Write `0x0103` → Save**
   - `0x0001` Header（`offset = 0x68C + slot * 0xD8`, `len = 0xD8`, `total_len = 0xD8`、216B を `min(142, max_payload)` で分割、2 秒/チャンク）
   - `0x0104` Erase（`total_len = chunk_len = 0x1000`, `crc16 = 0xFFFF`, ペイロードなし、2 秒）
-  - `0x0103` Write（`max_payload = mtu - 3 - 17` に応じて 64B / 32B、`--chunk-size 32|64` で明示指定可能、32B アライン、チャンクごと CRC、2 秒）
+  - `0x0103` Write（`max_payload = mtu - 3 - 17` に応じて 64B / 32B、`--chunk-size 32|64` で明示指定可能、32B アライン、チャンクごと CRC、2 秒、**`total_len = (macro_idx << 12) + align32(steps * 10)`（絶対終端、2026-11-22 実機確認。相対値では ACK のみで永続化されない）**）
   - `0x0006` Save（BLE `subcmd = 0x0067`、slot バッチごとにヘッダ後 1 回 + 全マクロ後 1 回、3 秒・リトライなし）
   - 3 スロット × 4 マクロのバックアップ（raw `.bin` + JSON/TOML + SHA-256 + config snapshot）
   - Mock でパケット列・CRC・チャンク境界・タイムアウト・fail-closed・読み戻し不一致を固定
-  - CLI: `macro backup --dir <DIR>` / `macro write --slot N --index N --file <JSON/TOML> [--trigger M1..M4]` / `macro restore --dir <DIR> [--force]`。実験用フラグ `--poll-interval-ms <MS>`（既定 **0**。書込中に `0x0003` を送る間隔。公式はマクロ書込中に送らない）と `--report-enable`（既定 false。`0x0007` を送る）を `macro backup` / `macro write` / `macro restore` で受け付ける
+  - CLI: `macro backup --dir <DIR>` / `macro write --slot N --index N --file <JSON/TOML> [--trigger M1..M4]` / `macro restore --dir <DIR> [--force]`。実験用フラグ `--poll-interval-ms <MS>`（既定 **0**。書込中に `0x0003` を送る間隔。公式はマクロ書込中に送らない）と `--report-enable`（既定 false。`0x0007` を送る）を `macro backup` / `macro write` / `macro restore` で受け付ける。`macro write` / `macro restore` は `--write-total-relative`（既定は絶対終端 `total_len`。旧 `align32` framing に戻す A/B 用）を持つ。Write offset の相対モードは提供しない（Erase は `macro_idx << 12` の sector を消すため、0 起点の Write は別 sector を破壊する。unit test で混在拒否を固定）
   - fail-closed（`MacroWriteState::{NotSaved, HeaderSaved, DataSaved}`: Header 失敗は Save/Erase 未送信、最初の Save 失敗は Erase/Write 未送信、Erase/Write 失敗はヘッダ Save 済みとして復元を案内、空 slot のヘッダのみ restore で Verify が失敗した場合は `HeaderSaved` として復元を案内）、`0x0002` の 216B ヘッダ検証 + `0x0102` の raw 検証、`--trigger` のヘッダ反映
   - 実機の旧順序 macro1 verify 失敗（部分書込）を受け、Erase ACK 後 100ms、全 Write 後 50ms、最終 Save 後 verify 300ms の暫定 delay を追加（Header Save → Erase は 0ms）
   - 空きマクロ（`max_steps == 0` / `0xFFFF`）への write を拒否（step data clear 未実装）
@@ -211,7 +211,7 @@ Track C: モバイル
   - `MacroFile.cycles_num` / `interval_ms` は省略可能（未指定は既存値保持）。`gamepad_mode` は無視
 - **完了条件**: 実機で 1 マクロ書き込み → 読み戻し一致 → Switch 側で発動 → 元のマクロへ復元。
 - **Tier**: **3**（write-path / Flash / CRC / マクロ）。
-- **状態**: 読み取り・バックアップは実機確認済み（142B チャンク、offset エコー）。書き込み・restore は Mock 実装と CLI まで完了。**新順序の実機書込（2026-11-22）は全 ACK 成功したが、読み戻したステップデータが 0x00 のままで未永続（原因調査中）**。次は `--report-enable`（`0x0007` enable の有無）と `--poll-interval-ms`（書込中の `0x0003` 送出）の A/B。この A/B は公式の完全再現ではない（既定は enable を送らず、`--report-enable` も接続時 disable(0) を送らない）ため、各アームの前に再接続して enable 状態をリセットして比較する。残る未確定点は `PROTOCOL_SPEC.md` §6.5（ACK 形状 / total_len 照合、Save タイムアウト、config CRC 再計算、MTU 200 以外での実機挙動）。
+- **状態**: 読み取り・バックアップは実機確認済み（142B チャンク、offset エコー）。書き込み・restore は Mock 実装と CLI まで完了。**2026-11-22 実機（BLE・slot S1・`macro_idx=0/1 (M1/M2)` のみ）: Write `0x0103` の `total_len` を絶対終端 `(macro_idx << 12) + align32(steps * 10)` にすることで `macro_idx=1` の永続化を確認**（相対値 `align32(steps * 10)` では ACK のみで未永続。`macro_idx=0` は base 0 のため両者一致）。`macro_idx=2/3 (M3/M4)` と slot S2/S3 は式からの外挿で未確認。これが既定。CLI `--write-total-relative` は旧 framing に戻す A/B 用。USB HID の Write は未実装・未検証（BLE のみ実装）。残る未確定点は `PROTOCOL_SPEC.md` §6.5（ACK 形状 / total_len 照合、Save タイムアウト、config CRC 再計算、MTU 200 以外での実機挙動）。
 
 ### Phase 2c: Linux BLE OTA
 - **ゴール**: Linux から BLE Bootloader 経由でファームウェア更新・復旧を行う。

@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use eightbitdo_protocol::commands::{self, cmd, SaveTransport};
+use eightbitdo_protocol::commands::{self, cmd, MacroWriteLayout, SaveTransport};
 use eightbitdo_protocol::config_bt2::{
     macro_slot_offset, Bt2Config, MacroIndex, MacroRecord, MacroSlot, Slot, CONFIG_SIZE,
     MACROS_PER_SLOT, MACRO_RECORD_SIZE, MACRO_SLOT_SIZE, SLOT_COUNT,
@@ -221,6 +221,20 @@ pub struct MacroWritePlan {
     /// uniform 32-byte chunks (including the final chunk); `Some(64)` forces
     /// 64-byte chunks. Other values are rejected.
     pub chunk_size: Option<u16>,
+    /// `WriteBT2Macro` `total_len` framing.
+    ///
+    /// Default `true`: the absolute end address
+    /// `(macro_index << 12) + align32(steps * 10)` (BLE, `macro_idx=0/1` on
+    /// slot S1 device-confirmed 2026-11-22; `macro_idx=2/3` and other slots are
+    /// extrapolated from the formula and unverified). `macro_idx=1` ACKs but
+    /// does not persist with `align32(steps * 10)`. Set `false` only for the
+    /// pre-2026-11-22 experiment. All macros in one per-slot batch must use the
+    /// same value.
+    ///
+    /// Write chunk offsets are always sector-based (`macro_index << 12`);
+    /// a sector-relative offset is not supported because `Erase` always clears
+    /// `macro_index << 12`, so a 0-based write would target another sector.
+    pub absolute_total_len: bool,
     /// Save sub-command variant.
     ///
     /// Only [`SaveTransport::Ble`] is implemented; the USB path is rejected
@@ -243,6 +257,7 @@ impl MacroWritePlan {
             flag: None,
             total_cnt: None,
             chunk_size: None,
+            absolute_total_len: true,
             save_transport: SaveTransport::Ble,
             timeouts: MacroTimeouts::default(),
         }
@@ -296,6 +311,24 @@ impl MacroWritePlan {
     pub fn with_chunk_size(mut self, chunk_size: u16) -> Self {
         self.chunk_size = Some(chunk_size);
         self
+    }
+
+    /// Select the `WriteBT2Macro` `total_len` layout.
+    ///
+    /// [`MacroWriteLayout::default_ble`] is already the plan default; this is
+    /// for the relative-total experiment and tests.
+    #[must_use]
+    pub fn with_layout(mut self, layout: MacroWriteLayout) -> Self {
+        self.absolute_total_len = layout.absolute_total_len;
+        self
+    }
+
+    /// The protocol-level layout described by this plan.
+    #[must_use]
+    pub const fn layout(&self) -> MacroWriteLayout {
+        MacroWriteLayout {
+            absolute_total_len: self.absolute_total_len,
+        }
     }
 
     /// Override the ACK timeouts (used by tests and future tuning).
@@ -907,8 +940,14 @@ impl<T: Transport> Session<T> {
         for (index, plan) in plans {
             apply_macro_write_plan_to(&mut updated, slot, *index, plan)?;
             let erase = commands::erase_macro(mode, slot, *index);
-            let writes =
-                commands::write_macro_steps(mode, slot, *index, &plan.steps, write_chunk_size)?;
+            let writes = commands::write_macro_steps_with_layout(
+                mode,
+                slot,
+                *index,
+                &plan.steps,
+                write_chunk_size,
+                plan.layout(),
+            )?;
             erase_write.push((erase, writes));
         }
         updated.recompute_crc();
@@ -1264,7 +1303,7 @@ impl<T: Transport> Session<T> {
     /// on `cmd`: `04 00` is `cmd=0x0004` (`RESPONSE`) and `04 01` is
     /// `cmd=0x0104` (direct Erase ACK). A 17-byte ACK carrying one payload
     /// byte is parsed the same way and accepted.
-    async fn send_and_await_ack(
+    pub(crate) async fn send_and_await_ack(
         &self,
         request: &commands::Request,
         payloadless: bool,
@@ -1443,6 +1482,12 @@ fn validate_macro_slot_plans(
     if plans.iter().any(|(_, plan)| plan.chunk_size != chunk_size) {
         return Err(Error::InvalidRequest(
             "all macros in one slot batch must use the same chunk_size".to_string(),
+        ));
+    }
+    let layout = plans[0].1.layout();
+    if plans.iter().any(|(_, plan)| plan.layout() != layout) {
+        return Err(Error::InvalidRequest(
+            "all macros in one slot batch must use the same Write layout".to_string(),
         ));
     }
     Ok(())
@@ -2093,6 +2138,19 @@ mod write_tests {
 
     fn raw_steps(steps: &[MacroStep]) -> Vec<u8> {
         macro_data::encode_macro_steps(steps).unwrap()[..steps.len() * 10].to_vec()
+    }
+
+    #[test]
+    fn macro_write_plan_layout_defaults_to_absolute_total_and_is_settable() {
+        let plan = MacroWritePlan::new(sample_steps(2));
+        assert!(plan.absolute_total_len);
+        assert_eq!(plan.layout(), MacroWriteLayout::default_ble());
+
+        let experiment = MacroWriteLayout::relative_total_len();
+        let plan = plan.with_layout(experiment);
+        assert!(!plan.absolute_total_len);
+        assert_eq!(plan.layout(), experiment);
+        assert_eq!(MacroWriteLayout::default(), MacroWriteLayout::default_ble());
     }
 
     fn config_with_existing_macro() -> Bt2Config {
@@ -2758,7 +2816,10 @@ mod write_tests {
         assert_eq!(CustomHeader::parse(&sent[3][1..]).unwrap().offset, 0x1000);
         let write = CustomHeader::parse(&sent[4][1..]).unwrap();
         assert_eq!(write.offset, 0x1000);
-        assert_eq!(write.total_len, 64);
+        // 4 steps = 40 bytes -> 64 aligned; macro_idx=1 (M2) is sector 0x1000,
+        // so the absolute total_len is 0x1000 + 64 = 0x1040 (formula confirmed
+        // for macro_idx=0/1 on slot S1, BLE; this frame is not device-tested).
+        assert_eq!(write.total_len, 0x1040);
         assert_eq!(count_cmd(&sent, cmd::SAVE), 2);
     }
 
@@ -4288,6 +4349,15 @@ mod write_tests {
             .map(|frame| CustomHeader::parse(&frame[1..]).unwrap().offset)
             .collect();
         assert_eq!(offsets, vec![0, 0, 0x1000, 0x1000, 0x1040]);
+        // Every Write chunk carries its own macro's absolute `total_len`:
+        // macro_idx=0 (M1) = 0 + align32(6*10) = 0x40;
+        // macro_idx=1 (M2) = 0x1000 + align32(8*10) = 0x1060.
+        let write_total_lens: Vec<u32> = sent
+            .iter()
+            .filter(|frame| frame_cmd(frame) == cmd::WRITE_MACRO)
+            .map(|frame| CustomHeader::parse(&frame[1..]).unwrap().total_len)
+            .collect();
+        assert_eq!(write_total_lens, vec![0x40, 0x1060, 0x1060]);
         assert_eq!(count_cmd(&sent, cmd::SAVE), 2);
         assert_eq!(outcome.packets_sent, 9);
         assert_eq!(outcome.readbacks.len(), 2);
@@ -4423,7 +4493,10 @@ mod write_tests {
             } else {
                 chunk
             };
-            assert_eq!(header.total_len, 480);
+            // Macro 2 is sector 0x1000; the absolute total_len is
+            // 0x1000 + 480 = 0x11E0 (formula confirmed for macro_idx=0/1 on
+            // slot S1, BLE; macro_idx=2/3 extrapolated).
+            assert_eq!(header.total_len, 0x11E0);
             assert_eq!(header.chunk_len as usize, expected_len);
             assert_eq!(header.offset, 0x1000 + (i * chunk) as u32);
             let payload = &frame[17..];
@@ -4483,7 +4556,25 @@ mod write_tests {
                 .await,
             Err(Error::InvalidRequest(message)) if message.contains("same chunk_size")
         ));
-        assert!(transport.sent().is_empty());
+        // A batch mixing absolute and relative `total_len` must be rejected
+        // before any device I/O: the header and Erase phase would otherwise
+        // run with one framing and the Write phase with another.
+        let absolute = plan.clone();
+        let relative = plan.with_layout(MacroWriteLayout::relative_total_len());
+        assert!(matches!(
+            session
+                .write_macro_slot(
+                    &backup,
+                    Slot::S1,
+                    &[(MacroIndex::M1, absolute), (MacroIndex::M2, relative)],
+                )
+                .await,
+            Err(Error::InvalidRequest(message)) if message.contains("same Write layout")
+        ));
+        assert!(
+            transport.sent().is_empty(),
+            "layout validation must run before any frame is sent"
+        );
     }
 
     #[tokio::test]
