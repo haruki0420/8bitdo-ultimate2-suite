@@ -202,8 +202,8 @@ Track C: モバイル
   - CLI: `macro backup --dir <DIR>` / `macro write --slot N --index N --file <JSON/TOML> [--trigger M1..M4]` / `macro restore --dir <DIR> [--force]`
   - fail-closed（Erase / Write / Header 失敗時に Save しない）、`0x0002` の 216B ヘッダ検証 + `0x0102` の raw 検証、`--trigger` のヘッダ反映
   - 空きマクロ（`max_steps == 0` / `0xFFFF`）への write を拒否（clear 未実装）
-  - backup dir は既存の非空ディレクトリを拒否（pre-write / pre-restore 含む）
-  - restore は「backup で空、現在は非空」を `--force` なしで拒否。全空 slot は 216B ヘッダのみ書込
+  - backup dir は空 path / symlink（末尾 `/` 含む）/ 既存の非空ディレクトリを拒否（pre-write / pre-restore 含む）。失敗した `macro backup` は作成した空ディレクトリを削除
+  - restore は「backup で空、現在は非空」を `--force` なしで拒否。`--force` の pre-restore backup は best-effort で、読めないマクロを skipped として続行。全空 slot は 216B ヘッダのみ書込
   - `MacroFile.cycles_num` / `interval_ms` は省略可能（未指定は既存値保持）。`gamepad_mode` は無視
 - **完了条件**: 実機で 1 マクロ書き込み → 読み戻し一致 → Switch 側で発動 → 元のマクロへ復元。
 - **Tier**: **3**（write-path / Flash / CRC / マクロ）。

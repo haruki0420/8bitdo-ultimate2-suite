@@ -199,7 +199,7 @@ Tier 3 のパスに対する変更は、原則として Tier 3 のままです�
 - 実機書き込みを含む場合は、次の **両方** をバックアップし、ファイル名（path）と SHA-256 を記録する。
   - 2768B 設定 (`record_ultimatebt2`)
   - マクロ 3 スロット × 4 マクロのステップデータ（2768B には含まれない。`slot 0..2` × `macro_idx 0..3` の 12 領域。`macro_idx << 12` の 4KB セクタ）
-- 復元テスト、または文書化された復元手順を確認し、結果を記録する。復元後は 2768B と各マクロを読み戻し、SHA-256 を比較する。
+- 復元テスト、または文書化された復元手順を確認し、結果を記録する。復元後は全 slot の 216B マクロヘッダと非空マクロの raw を読み戻して比較する。2768B 全体の SHA-256 は device の CRC 再計算で変わり得るため、情報表示に留める。
 - OTA を含む場合は、OTA イメージの SHA-256 と Bootloader 復旧結果を記録する。
 - すべての故障に証跡（テスト名 / コマンド出力 / URL / 目視メモ / 該当箇所の引用 / file:line）を付け、**Tier をレビューした head SHA で再評価**する。
 
@@ -295,7 +295,7 @@ Erase 0x0104
 - `Erase 0x0104` はペイロードを持たない。公式実装（`getBT2_EraseMacro`）は `total_len` と `chunk_len` をともに `0x1000` に設定し、`Generate_CustomDataCmd` が wire header `+0x04` にその値を書く。実ペイロードは `len = 0`。`total_len = 0x1000` は消去サイズであり、ペイロード長ではない。`chunk_len = 0` と混同しない。Rust 実装の修正は本 PR に含まれる。
 - `Write 0x0103` の `offset` は `(macro_idx << 12) + chunk_index * chunk_size`。`chunk_size` は BLE 64B / USB HID 32B（32B アライン。それ以外は拒否）。各チャンク送信ごとに `chunk_index` を進める。
 - マクロのチャンクは BLE 最大 64B / USB HID 最大 32B（32B アライン。それ以外は拒否。64B 超は 64B にクランプしてから判定）。**最終チャンクは 32B アライン長まで** とし、OTA の「最終チャンク 64B 固定」とは混同しない。46B などの交渉済みサイズは将来拡張で、現在の API は `UnsupportedChunkSize` を返す。
-- マクロの ACK タイムアウトは OTA と別に扱う。`Erase 0x0104` / `Write 0x0103` / ヘッダ `0x0001` は 2 秒（実装定数 `0x44fa0000`）、マクロ `Save 0x0006` は 3 秒（USB HID の仕様記載。BLE は transport の `wait_ack` 既定値とリトライ方針を記録する）。OTA の 10 秒 erase / 1 秒 chunk / 64B 固定をマクロに適用しない。`Save 0x0006` の ACK を受けるまで成功とみなさない。
+- マクロの ACK タイムアウトは OTA と別に扱う。`Erase 0x0104` / `Write 0x0103` / ヘッダ `0x0001` は 2 秒（実装定数 `0x44fa0000`）、マクロ `Save 0x0006` は **3 秒・リトライなし**（BLE の正式値は未文書化。USB HID は 3 秒）。OTA の 10 秒 erase / 1 秒 chunk / 64B 固定をマクロに適用しない。`Save 0x0006` の ACK を受けるまで成功とみなさない。
 - `align32(x) = (x + 31) & ~31 = ((x + 31) / 32) * 32`、`Erase 0x0104` の `offset = macro_idx << 12`、4KB セクタを確認する。
 - バックアップは 2768B 設定の `max_steps` を読み、各 `(slot, macro_idx)` を `Read 0x0102`（`subcmd=(mode<<8)|slot`, `offset=macro_idx<<12`, `total_len=max_steps*10`）で取得する。`max_steps` は `u16` で、絶対 offset は `0x68C + slot * 0xD8 + 0x08 + macro_idx * 0x34 + 0x22`（= `0x6B6 + slot * 0xD8 + macro_idx * 0x34`）。`+0x08` はスロット内の `records[4]` 先頭、`+0x22` は `MacroFunPro3Record` 内の `max_steps`。
 - マクロ 3 スロット × 4 マクロ（`slot 0..2` × `macro_idx 0..3`）のバックアップと復元を確認する。

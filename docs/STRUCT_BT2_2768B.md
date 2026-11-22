@@ -536,7 +536,7 @@ struct Bt2Header {
 
 > **実装ノート（Mock 検証済み・実機書き込み未検証）**:
 > - **Fail-closed**: Erase / Write / Header のいずれかが失敗したら Save を送らない。ただし Erase 済み・Write 途中のセクタは変更されている可能性がある。Save 後の ACK または読み戻しが失敗した場合だけ `saved = true` として報告する。どちらも 3 スロット × 4 マクロの完全バックアップから復元する。
-> - **空きマクロ拒否**: `max_steps == 0` / `0xFFFF` への書き込みは `Error::EmptyMacroWrite` で拒否する。clear が未実装で restore できないため、既存の非空マクロだけを対象にする。
+> - **空きマクロ拒否**: `max_steps == 0` / `0xFFFF` への `macro write` は `Error::EmptyMacroWrite` で拒否する。step data の clear が未実装で、`macro write` では新規作成できない。`macro restore` はバックアップが非空なら現在のマクロが空でも書ける（pre-restore backup と 216B ヘッダ更新を使う）。
 > - **ヘッダ値**: `max_steps` は新しいステップ数。`key_map` / `cycles_num` / `interval_ms` / `flag` / `total_cnt` は指定がなければ既存値を保持する。既存の予約バイト（slot `+0x05..+0x07`、record `+0x26..+0x27`）も保持する。
 > - **CRC**: 216B の Header 部分書込には config CRC (`+0x00C`) を含めない（公式の部分書込と同じ）。Save 時に device が CRC を再計算するかは実機未確認。
 > - Header / Write のチャンク長は **MTU 連動**。`max_payload = mtu - 3 - 17` とし、Header は `min(142, max_payload)`、Write は `max_payload >= 64` → 64B、`>= 32` → 32B、それ未満は書き込み開始前に `Error::MtuTooSmall`。MTU 200 は 142 + 74 / 64B、MTU 64 は 44×4 + 40 / 32B、MTU 23 は Header 3×72 だが Write 不可。Mock で全フレームが `mtu - 3` 以下であることを固定済み。実機は MTU 200 のみを想定検証する。
