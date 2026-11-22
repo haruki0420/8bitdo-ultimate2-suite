@@ -93,9 +93,9 @@ Tier 3 では A-E の全セクションが PR 本文に存在しなければな�
 
 - [ ] 故障リストの各項目に証跡（テスト名 / コマンド出力 / URL / 目視メモ / 該当箇所の引用 / file:line）を記録した
 - [ ] 実機書き込みを含む場合: 2768B 設定のバックアップ path と SHA-256 を記録した: `path=... sha256=...`
-- [ ] 実機書き込みを含む場合: マクロ 4×3（`slot 0..2` × `macro_idx 0..3`）のバックアップ path と SHA-256 を記録した: `path=... sha256=...`
+- [ ] 実機書き込みを含む場合: マクロ 3 スロット × 4 マクロ（`slot 0..2` × `macro_idx 0..3`）のバックアップ path と SHA-256 を記録した: `path=... sha256=...`
 - [ ] 復元テストまたは文書化された復元手順を確認し、結果を記録した: `result=...`
-- [ ] 復元後、2768B 設定と各マクロを読み戻し、SHA-256 が一致することを確認した
+- [ ] 復元後、全 slot の 216B マクロヘッダと非空マクロの raw を読み戻して比較した（2768B 全体の SHA-256 は device の CRC 再計算で変わり得るため情報表示のみ）
 - [ ] OTA を含む場合: OTA イメージの SHA-256 を記録した: `sha256=...`
 - [ ] OTA を含む場合: Bootloader 復旧結果（全セクタ消去 → 再書き込み → 起動確認）を記録した: `result=...`
 - [ ] **この head SHA で Tier を再評価した**
@@ -113,12 +113,13 @@ Tier 3 では A-E の全セクションが PR 本文に存在しなければな�
 - [ ] OTA `WriteFirmware` は各 64B チャンク送信ごとに `offset` を 64B 進め、チャンク ACK を待った（1 秒タイムアウト、リトライ方針を記録）
 - [ ] 非 gamepad_type == 1 の場合、`readVersionInBoot` / `JumpApp` の offset を推測せず、`docs/PROTOCOL_SPEC.md` / Issue を確認して停止した
 - [ ] OTA 失敗時: BLE は `"8bt"` へ再接続 → `readPID` → 全セクタ消去 → 再書き込みで復旧できることを確認した。USB は再列挙 / 再接続で Bootloader に入り直す（BLE の `"8bt"` を流用しない）。再接続だけでは復旧とみなさない
-- [ ] 設定書き込み: `cmd 0x0001` の CRC / offset / chunking（`total_len` は部分書込でも `0x0AD0`、部分長は `chunk_len`）、`Save 0x0006` の ACK（BLE `0x0067` / USB `0x0123`）を確認した
-- [ ] マクロ: `Erase 0x0104`（`cmd=0x0104`, `subcmd=(mode<<8)|slot`, `offset=macro_idx<<12`, `total_len=0x1000`, `chunk_len=0x1000` [wire header 値。payload なし `len=0`], 4KB）→ `Write 0x0103`（subcmd は同じ; `offset=(macro_idx<<12)+chunk_index*chunk_size`, `chunk_size=BLE 64B / USB HID 32B（32B アライン。それ以外は拒否。64B 超は 64B にクランプしてから判定）`, `total_len=align32(max_steps*10)`, 32B アライン, 各チャンク CRC16, 最終チャンクは 32B アライン長）→ ヘッダ `0x0001`（`subcmd 0x0000`, `offset=0x68C + slot*0xD8`, `len=0xD8`, `total_len=0xAD0`）→ `Save 0x0006`（BLE `0x0067` / USB `0x0123`）の順序を確認した
+- [ ] 設定書き込み: `cmd 0x0001` の CRC / offset / chunking（`total_len` は部分書込でも `0x0AD0`、部分長は `chunk_len`。マクロヘッダ `0xD8` を除く）、`Save 0x0006` の ACK（BLE `0x0067` / USB `0x0123`）を確認した
+- [ ] マクロ: ヘッダ `0x0001`（`subcmd 0x0000`, `offset=0x68C + slot*0xD8`, `len=total_len=0xD8`）→ `Save 0x0006`（BLE `0x0067`）→ `Erase 0x0104`（`offset=macro_idx<<12`, `total_len=chunk_len=0x1000`, payload なし）→ `Write 0x0103`（`offset=(macro_idx<<12)+chunk_index*chunk_size`, `chunk_size=32/64B（32B アライン）`, `total_len=align32(max_steps*10)`, 各チャンク CRC16, 最終チャンクは 32B アライン長）→ 最終 `Save 0x0006` の公式順序を確認した。`macro restore` は slot 単位でヘッダ + Save を 1 回、全マクロの後に最終 Save を 1 回だけ送る
+- [ ] マクロヘッダは **`total_len=0xD8`** で送り、**Header → Save → Erase → Write → Save** の公式順序を確認した（旧 Erase → Write → Header(total_len=0x0AD0) → Save ではない）
 - [ ] マクロ Erase は `total_len = chunk_len = 0x1000`（wire header `+0x04` は公式実装の設定値）、ペイロードなし（`len=0`）。`total_len=0x1000` は消去サイズであり、ペイロード長ではない
-- [ ] マクロ ACK: `Erase` / `Write` / ヘッダは 2s、`Save` は 3s（USB HID。BLE は transport の `wait_ack` 既定値と retry を記録）。OTA の 10s erase / 1s chunk / 64B 固定をマクロに適用していない
+- [ ] マクロ ACK: `Erase` / `Write` / ヘッダは 2s、`Save` は **3s・リトライなし**（BLE の正式値は未文書化。USB HID は 3s）。OTA の 10s erase / 1s chunk / 64B 固定をマクロに適用していない
 - [ ] マクロ `Write 0x0103` の `chunk_size` が BLE `0x40` / USB HID `0x20` を超える場合、拒否または上限へクランプし、上限超過をテストした
-- [ ] マクロ 4×3 のバックアップと復元を確認した。`max_steps` は `0x68C + slot * 0xD8 + 0x08 + macro_idx * 0x34 + 0x22`（`u16`）から読んだ
+- [ ] マクロ 3 スロット × 4 マクロのバックアップと復元を確認した。`max_steps` は `0x68C + slot * 0xD8 + 0x08 + macro_idx * 0x34 + 0x22`（`u16`）から読んだ
 
 #### C. docs / チェックリストのみの場合
 

@@ -171,18 +171,34 @@ pub struct MacroFile {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub name: Option<alloc::string::String>,
-    /// Target `gamepad_mode` (`0` = Switch, `1` = J/M, `2` = macOS, `3` = XInput, ...).
+    /// Target `gamepad_mode`.
+    ///
+    /// **Ignored by the current CLI and core write path**: the macro command
+    /// `subcmd` is derived from the device's current configuration mode, not
+    /// from this file field. The CLI warns when this is non-zero.
     #[cfg_attr(feature = "serde", serde(default))]
     pub gamepad_mode: u16,
     /// Button that triggers the macro (`0` = unassigned).
     #[cfg_attr(feature = "serde", serde(default))]
     pub key_map: KeyMap,
     /// Number of loop cycles (`0` = hold / infinite).
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub cycles_num: u32,
+    ///
+    /// `None` means "not specified"; a plan built from this file preserves
+    /// the existing header value.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub cycles_num: Option<u32>,
     /// Delay between loops in milliseconds.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub interval_ms: u32,
+    ///
+    /// `None` means "not specified"; a plan built from this file preserves
+    /// the existing header value.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub interval_ms: Option<u32>,
     /// Step list.
     #[cfg_attr(feature = "serde", serde(default))]
     pub steps: Vec<MacroStep>,

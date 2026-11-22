@@ -6,6 +6,7 @@
 //!
 //! Every operation in this module is read-only except
 //! [`Session::set_report_enable`], which toggles the realtime input stream.
+//! Macro flash writes live in [`crate::macro_ops`].
 //!
 //! Reads fail closed: a stale-frame drain that cannot finish within its
 //! budget refuses the read ([`Error::UnexpectedResponse`] with
@@ -14,6 +15,7 @@
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use eightbitdo_protocol::commands;
@@ -58,6 +60,26 @@ const MAX_DRAIN_DURATION: Duration = Duration::from_millis(50);
 /// Idle gap used to decide that no more stale frames are queued.
 const DRAIN_FRAME_WAIT: Duration = Duration::from_millis(1);
 
+/// How long one keepalive poll waits for its input report before the caller
+/// proceeds with the next protocol command.
+///
+/// The official app does not wait for a poll response at all; a short bound
+/// keeps a missing report from delaying a macro command, while still draining
+/// the report so it cannot be mistaken for an ACK.
+///
+/// 5 ms can be shorter than a real BLE round trip, so a poll report may
+/// arrive after the drain gives up. That is safe: every ACK wait and read
+/// loop skips non-matching frames, so a late report cannot be mistaken for a
+/// response and is simply discarded later.
+const POLL_DRAIN_WAIT: Duration = Duration::from_millis(5);
+
+/// Best-effort wait for the `0x0007` `ReportEnable` acknowledgement.
+///
+/// The official app uses a 2000 ms command timeout (two retries). The enable
+/// ACK is not required for correctness here, so a timeout is counted as a
+/// keepalive error and the macro operation continues.
+const REPORT_ENABLE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Upper bound accepted for a single wait ([`Session::try_next_input`], the
 /// per-frame and total timeouts). It mirrors the [`std::time::Instant`] range
 /// so every computed deadline stays representable; anything larger is
@@ -69,7 +91,7 @@ pub const MAX_WAIT: Duration = Duration::from_secs(3600 * 24 * 365 * 30);
 /// [`tokio::time::Instant::add`] panics on overflow, and the CLI accepts
 /// user-supplied durations (`--scan-timeout`, `--timeout`, `--hold`), so every
 /// deadline goes through this helper.
-fn deadline_after(duration: Duration) -> Result<Instant, Error> {
+pub(crate) fn deadline_after(duration: Duration) -> Result<Instant, Error> {
     if duration > MAX_WAIT {
         return Err(Error::InvalidTimeout(duration));
     }
@@ -114,11 +136,13 @@ enum DrainOutcome {
     Exhausted,
 }
 
-/// Marks a session for resync when a read returns an error or its future is
-/// dropped before completion, and records what the session has in flight.
+/// Marks a session for resync when a read or write returns an error or its
+/// future is dropped before completion, and records what the session has in
+/// flight.
 ///
-/// Dropping a **read** leaves its response in flight, so the next read must
-/// drain stale frames first. Dropping an **input poll** leaves only a realtime
+/// Dropping a **read** leaves its response in flight, and dropping a **write**
+/// leaves an ACK (or read-back data) behind, so the next operation must drain
+/// stale frames first. Dropping an **input poll** leaves only a realtime
 /// report (or nothing) behind, which the input path always skips, so a normal
 /// input poll (report, `Ok(None)`, or a drop while waiting) needs no resync.
 /// A **protocol error** on the input path is different: `try_next_input` calls
@@ -172,11 +196,11 @@ impl<'a> ResyncGuard<'a> {
 impl Drop for ResyncGuard<'_> {
     fn drop(&mut self) {
         self.clear();
-        // A read whose future is dropped mid-flight leaves a response that the
-        // next read must not mistake for its own. A successfully completed read
-        // was disarmed, which took the early return below. An input poll never
-        // needs the resync path.
-        if self.kind != InFlight::Read || self.disarmed {
+        // A read or write whose future is dropped mid-flight leaves a
+        // response that the next operation must not mistake for its own. A
+        // successfully completed operation was disarmed, which took the early
+        // return below. An input poll never needs the resync path.
+        if self.kind == InFlight::Input || self.disarmed {
             return;
         }
         self.needs_resync.store(true, Ordering::SeqCst);
@@ -193,6 +217,8 @@ enum InFlight {
     Read,
     /// A realtime input poll (`0x0003` / `0x0007`) is waiting for a report.
     Input,
+    /// A macro flash write is waiting for an ACK or read-back.
+    Write,
 }
 
 /// Decoded firmware version response.
@@ -246,6 +272,29 @@ pub struct Session<T: Transport> {
     skipped_frames: AtomicU64,
     consecutive_decode_failures: AtomicU32,
     recovered_frame_runs: AtomicU64,
+    /// Best-effort `0x0003` keepalive interval; `None` disables polling.
+    poll_interval: Option<Duration>,
+    /// Time of the previous keepalive poll, if any. `None` forces the next
+    /// [`Session::maybe_poll`] to send one.
+    last_poll: Mutex<Option<Instant>>,
+    /// Whether `0x0007` report-enable is sent for this session.
+    ///
+    /// Defaults to `false`, which is a **conservative backward-compatibility
+    /// choice, not a reproduction of the official state**: the official app
+    /// disables reports at connect time (`isReportEnable(0)` in
+    /// `setPIDVIDDone`), enables them after the initial configuration read
+    /// (`goFunction`), and leaves them enabled throughout a macro write (there
+    /// is no per-write disable). `true` sends `ReportEnable(true)` before the
+    /// operation but does **not** send the connect-time disable, so it is only
+    /// a partial reproduction.
+    send_report_enable: bool,
+    /// Whether `0x0007` report-enable was already sent for this session.
+    report_enable_sent: AtomicBool,
+    input_polls_sent: AtomicU64,
+    input_poll_errors: AtomicU64,
+    /// Failures of the `0x0007` enable send / ACK wait (subset of
+    /// [`input_poll_errors`](Self::input_poll_errors)).
+    report_enable_errors: AtomicU64,
 }
 
 impl<T: Transport> Session<T> {
@@ -260,6 +309,13 @@ impl<T: Transport> Session<T> {
             skipped_frames: AtomicU64::new(0),
             consecutive_decode_failures: AtomicU32::new(0),
             recovered_frame_runs: AtomicU64::new(0),
+            poll_interval: None,
+            last_poll: Mutex::new(None),
+            send_report_enable: false,
+            report_enable_sent: AtomicBool::new(false),
+            input_polls_sent: AtomicU64::new(0),
+            input_poll_errors: AtomicU64::new(0),
+            report_enable_errors: AtomicU64::new(0),
         }
     }
 
@@ -273,10 +329,239 @@ impl<T: Transport> Session<T> {
         self
     }
 
+    /// Enable best-effort realtime input polling between protocol commands.
+    ///
+    /// `None` (the default) leaves every command sequence unchanged. With
+    /// `Some(interval)` a macro operation polls with one `0x0003` before each
+    /// protocol command when at least `interval` elapsed since the previous
+    /// poll; the erase / write / verify settle waits poll in `interval` slices
+    /// too. Optionally one `0x0007` (`ReportEnable`) is sent first, see
+    /// [`Session::with_report_enable`].
+    ///
+    /// `Some(Duration::ZERO)` polls before every command and sends one poll at
+    /// the end of each settle wait; it does **not** remove the settle sleep
+    /// itself (tests still pay the configured flash delay, which keeps the
+    /// production timing in the loop).
+    #[must_use]
+    pub fn with_poll_interval(mut self, interval: Option<Duration>) -> Self {
+        self.poll_interval = interval;
+        self
+    }
+
+    /// Choose whether a macro operation sends `0x0007` `ReportEnable(true)`.
+    ///
+    /// The default is `false`, which keeps the pre-existing frame sequence.
+    /// The official app enables the realtime stream after its initial config
+    /// read and leaves it enabled while a macro is written, but it does not
+    /// send `0x0007` inside the write sequence itself. The default is therefore
+    /// a conservative, backward-compatible choice and does **not** reproduce
+    /// the official device state. Pass `true` to send one `0x0007` enable
+    /// before the operation (a partial reproduction: no connect-time disable
+    /// is sent); reports then stay enabled for the whole write and are never
+    /// toggled back to disable.
+    #[must_use]
+    pub fn with_report_enable(mut self, enabled: bool) -> Self {
+        self.send_report_enable = enabled;
+        self
+    }
+
+    /// Number of keepalive `0x0003` polls sent by this session.
+    #[must_use]
+    pub fn input_polls_sent(&self) -> u64 {
+        self.input_polls_sent.load(Ordering::Relaxed)
+    }
+
+    /// Number of keepalive failures.
+    ///
+    /// Counts poll send/receive/decode errors and explicit controller errors
+    /// (`0x000E`) observed while draining a poll. Polling is best effort, so
+    /// these never abort the surrounding operation.
+    #[must_use]
+    pub fn input_poll_errors(&self) -> u64 {
+        self.input_poll_errors.load(Ordering::Relaxed)
+    }
+
+    /// Configured keepalive poll interval, or `None` when polling is disabled.
+    #[must_use]
+    pub fn poll_interval(&self) -> Option<Duration> {
+        self.poll_interval
+    }
+
+    /// Whether `0x0007` `ReportEnable(true)` is sent at operation start.
+    #[must_use]
+    pub fn report_enable(&self) -> bool {
+        self.send_report_enable
+    }
+
+    /// Number of `0x0007` enable send / ACK failures.
+    ///
+    /// Enable failures are best effort and never abort the operation, but a
+    /// front end should surface them even when polling is disabled, because
+    /// `ReportEnable` was explicitly requested.
+    #[must_use]
+    pub fn report_enable_errors(&self) -> u64 {
+        self.report_enable_errors.load(Ordering::Relaxed)
+    }
+
+    /// Start the optional report enable and rewind the poll deadline.
+    ///
+    /// The two experiments are independent:
+    ///
+    /// - [`Session::with_report_enable`] `true` sends `0x0007`
+    ///   (`ReportEnable(true)`) once per session and waits up to
+    ///   [`REPORT_ENABLE_ACK_TIMEOUT`] for its acknowledgement, whether or not
+    ///   polling is enabled;
+    /// - [`Session::with_poll_interval`] additionally polls `0x0003`, and this
+    ///   call rewinds its deadline so the first command is preceded by a poll.
+    ///
+    /// Both are best effort: a failure is counted for the caller's diagnostics
+    /// and the operation continues. The enable is never toggled back to
+    /// disable, and the official connect-time `ReportEnable(0)` is not sent:
+    /// the enable path is only a partial reproduction of the official
+    /// disable-at-connect / enable-after-config sequence.
+    pub(crate) async fn start_input_keepalive(&self) {
+        *self.lock_last_poll() = None;
+        if !self.send_report_enable {
+            return;
+        }
+        if self.report_enable_sent.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if self.set_report_enable(true).await.is_err() {
+            self.input_poll_errors.fetch_add(1, Ordering::Relaxed);
+            self.report_enable_errors.fetch_add(1, Ordering::Relaxed);
+            // Retry the enable on the next macro operation.
+            self.report_enable_sent.store(false, Ordering::SeqCst);
+            return;
+        }
+        if self.wait_for_report_enable_ack().await.is_err() {
+            self.input_poll_errors.fetch_add(1, Ordering::Relaxed);
+            self.report_enable_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Wait for the `0x0007` acknowledgement, skipping unrelated frames.
+    ///
+    /// Input reports and notices are skipped, matching the official app's
+    /// frame dispatch. The wait is bounded by [`REPORT_ENABLE_ACK_TIMEOUT`];
+    /// callers treat a failure as a keepalive warning, not an abort.
+    async fn wait_for_report_enable_ack(&self) -> Result<(), Error> {
+        let deadline = deadline_after(REPORT_ENABLE_ACK_TIMEOUT)?;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(Error::Timeout {
+                    operation: "ReportEnable ACK".to_string(),
+                });
+            }
+            let wait = deadline.saturating_duration_since(now).min(self.timeout);
+            let frame = match tokio::time::timeout(wait, self.transport.recv()).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(Error::Timeout {
+                        operation: "ReportEnable ACK".to_string(),
+                    })
+                }
+            };
+            let Ok((header, _payload)) = header::decode_app_response(&frame) else {
+                continue;
+            };
+            if header.cmd == commands::cmd::REPORT_ENABLE
+                || (header.cmd == commands::cmd::RESPONSE
+                    && header.subcmd == commands::cmd::REPORT_ENABLE)
+            {
+                return Ok(());
+            }
+            if header.cmd == 0x000E {
+                return Err(Error::UnexpectedResponse(
+                    "controller returned error 0x000E for ReportEnable".to_string(),
+                ));
+            }
+        }
+    }
+
+    /// Send one keepalive poll when the configured interval has elapsed.
+    ///
+    /// Call this immediately before a protocol command: the poll report is
+    /// drained here, so it cannot be mistaken for that command's ACK. A poll
+    /// failure is counted and swallowed, because a missing keepalive must not
+    /// abort a macro write that already passed its own ACK checks.
+    pub(crate) async fn maybe_poll(&self) {
+        let Some(interval) = self.poll_interval else {
+            return;
+        };
+        let now = Instant::now();
+        {
+            let mut last_poll = self.lock_last_poll();
+            if last_poll.is_some_and(|previous| now.saturating_duration_since(previous) < interval)
+            {
+                return;
+            }
+            *last_poll = Some(now);
+        }
+        if self.request_input().await.is_err() {
+            self.input_poll_errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.input_polls_sent.fetch_add(1, Ordering::Relaxed);
+        if self.poll_input_report(POLL_DRAIN_WAIT).await.is_err() {
+            self.input_poll_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn lock_last_poll(&self) -> std::sync::MutexGuard<'_, Option<Instant>> {
+        self.last_poll
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Drain one input report for [`Session::maybe_poll`].
+    ///
+    /// The surrounding read/write operation already owns the single-flight
+    /// slot, so this path must not create its own `ResyncGuard`; an input poll
+    /// never needs the resync path.
+    async fn poll_input_report(&self, wait: Duration) -> Result<Option<InputReport>, Error> {
+        self.try_next_input_with(wait, None).await
+    }
+
+    /// Sleep for `total`, sending one poll per interval when polling is on.
+    ///
+    /// Polling is an opt-in experiment: the adjudicated official behaviour does
+    /// **not** poll `0x0003` during a macro write, so a disabled keepalive makes
+    /// this exactly `tokio::time::sleep(total)`. With an interval set, the
+    /// settle wait polls in slices to let a future re-test model a foreground
+    /// timer.
+    ///
+    /// `Some(Duration::ZERO)` is the deterministic test mode: the whole delay
+    /// is slept once and a single poll is sent at its end, instead of spinning
+    /// every millisecond.
+    pub(crate) async fn settle_with_polling(&self, total: Duration) {
+        let Some(interval) = self.poll_interval else {
+            tokio::time::sleep(total).await;
+            return;
+        };
+        let step = if interval.is_zero() { total } else { interval };
+        let started = Instant::now();
+        loop {
+            let elapsed = started.elapsed();
+            if elapsed >= total {
+                return;
+            }
+            tokio::time::sleep(step.min(total - elapsed)).await;
+            self.maybe_poll().await;
+        }
+    }
+
     /// Borrow the underlying transport.
     #[must_use]
     pub fn transport(&self) -> &T {
         &self.transport
+    }
+
+    /// Per-frame wait configured with [`Session::with_timeout`].
+    #[must_use]
+    pub(crate) fn per_frame_timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// Consume the session and return the transport.
@@ -305,12 +590,30 @@ impl<T: Transport> Session<T> {
     /// A drop (Ctrl-C, `monitor stop`) leaves `needs_resync` false, but the
     /// guard's own `Drop` bumps it back to true for reads: an abandoned read
     /// always leaves a response behind.
-    async fn run_read<F, O>(&self, read: F) -> Result<O, Error>
+    pub(crate) async fn run_read<F, O>(&self, read: F) -> Result<O, Error>
     where
         F: Future<Output = Result<O, Error>>,
     {
-        let mut guard = ResyncGuard::new(&self.needs_resync, &self.in_flight, InFlight::Read);
-        let output = read.await;
+        self.run_operation(InFlight::Read, read).await
+    }
+
+    /// Run a write body, recording what is in flight and whether it failed.
+    ///
+    /// A failed or dropped write may leave an ACK or notification queued, so
+    /// the next operation drains stale frames first.
+    pub(crate) async fn run_write<F, O>(&self, write: F) -> Result<O, Error>
+    where
+        F: Future<Output = Result<O, Error>>,
+    {
+        self.run_operation(InFlight::Write, write).await
+    }
+
+    async fn run_operation<F, O>(&self, kind: InFlight, operation: F) -> Result<O, Error>
+    where
+        F: Future<Output = Result<O, Error>>,
+    {
+        let mut guard = ResyncGuard::new(&self.needs_resync, &self.in_flight, kind);
+        let output = operation.await;
         if output.is_err() {
             guard.fail();
         } else {
@@ -324,7 +627,7 @@ impl<T: Transport> Session<T> {
     /// If stale frames may still be queued, the flag stays set so the next
     /// read retries the drain, and the current read is refused instead of
     /// risking a stale frame being mistaken for its response.
-    async fn prepare_read(&self) -> Result<(), Error> {
+    pub(crate) async fn prepare_read(&self) -> Result<(), Error> {
         if self.needs_resync.load(Ordering::SeqCst) {
             match self.drain_pending(DrainPolicy::RESYNC).await {
                 Ok(DrainOutcome::Quiesced) => {
@@ -516,20 +819,43 @@ impl<T: Transport> Session<T> {
     /// an earlier `info`), and the next read must drain it instead of accepting
     /// it as the answer to its own request.
     pub async fn try_next_input(&self, wait: Duration) -> Result<Option<InputReport>, Error> {
-        // M-4: the cap is "consecutive within one call", so a run left at the
-        // cap by a previous protocol error must not make the first frame of
-        // this call fail immediately.
-        self.clear_decode_failures();
         // An abandoned input poll leaves at most one realtime report behind,
         // which every read path skips, so it never marks the session for
         // resync (see `ResyncGuard`). A protocol error is different: it is
         // recorded below, because the frames after the garbage are unknown.
         let mut guard = ResyncGuard::new(&self.needs_resync, &self.in_flight, InFlight::Input);
+        self.try_next_input_with(wait, Some(&mut guard)).await
+    }
+
+    /// Shared body of [`Session::try_next_input`] and the keepalive drain.
+    ///
+    /// `guard` is `None` when the caller already owns the single-flight slot
+    /// (a keepalive poll inside a read/write operation). In that mode the
+    /// opportunistic stale-frame drains are skipped, but non-input frames
+    /// read while looking for the report are still discarded like in the
+    /// public path. That is safe only because polling happens **immediately
+    /// before** a command send: at that point no ACK for an in-flight command
+    /// can exist, so any queued frame is a stale response or notification,
+    /// never the reply the next wait needs. A protocol error still fails the
+    /// poll (the caller ignores it), but it does not mark the session for
+    /// resync, because an input poll never needs the resync path.
+    async fn try_next_input_with(
+        &self,
+        wait: Duration,
+        mut guard: Option<&mut ResyncGuard<'_>>,
+    ) -> Result<Option<InputReport>, Error> {
+        let polling = guard.is_none();
+        // M-4: the cap is "consecutive within one call", so a run left at the
+        // cap by a previous protocol error must not make the first frame of
+        // this call fail immediately.
+        self.clear_decode_failures();
         let deadline = deadline_after(wait)?;
         for _ in 0..MAX_INPUT_DRAIN_FRAMES {
             let now = Instant::now();
             if now >= deadline {
-                self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
+                if !polling {
+                    self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
+                }
                 // M-4 boundary: this is an idle return. The opportunistic
                 // drain may consume the next malformed frame, but that frame
                 // is discarded without being counted; the cap counts only
@@ -546,7 +872,9 @@ impl<T: Transport> Session<T> {
             {
                 Ok(result) => result?,
                 Err(_) => {
-                    self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
+                    if !polling {
+                        self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
+                    }
                     // Same M-4 boundary as the deadline branch: a per-frame
                     // timeout is an idle gap. A frame eaten by the drain is
                     // discarded, and the next call starts a new run.
@@ -559,12 +887,19 @@ impl<T: Transport> Session<T> {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     if self.record_decode_failure() {
-                        guard.fail();
+                        if let Some(guard) = guard.as_deref_mut() {
+                            guard.fail();
+                        }
                         return Err(Error::Protocol(error));
                     }
                     continue;
                 }
             };
+            if polling && header.cmd == 0x000E {
+                // Explicit controller error while draining a keepalive poll:
+                // record it for diagnostics and keep polling best effort.
+                self.input_poll_errors.fetch_add(1, Ordering::Relaxed);
+            }
             let is_input = header.cmd == commands::cmd::INPUT
                 || (header.cmd == commands::cmd::RESPONSE && header.subcmd == commands::cmd::INPUT);
             if !is_input || header.chunk_len == 0 {
@@ -576,7 +911,9 @@ impl<T: Transport> Session<T> {
             }
             let Ok(report) = InputReport::from_bytes(payload) else {
                 if self.record_decode_failure() {
-                    guard.fail();
+                    if let Some(guard) = guard.as_deref_mut() {
+                        guard.fail();
+                    }
                     return Err(Error::Protocol(eightbitdo_protocol::Error::InvalidLength {
                         expected: eightbitdo_protocol::input_report::INPUT_REPORT_SIZE,
                         actual: payload.len(),
@@ -593,7 +930,9 @@ impl<T: Transport> Session<T> {
         // Frame budget spent: discard at most one more queued frame so the
         // next call starts with a fresh frame instead of the backlog. This is
         // an idle return as well, so the malformed run does not carry over.
-        self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
+        if !polling {
+            self.drain_pending(DrainPolicy::OPPORTUNISTIC).await?;
+        }
         self.clear_decode_failures();
         Ok(None)
     }
@@ -753,12 +1092,13 @@ impl<T: Transport> Session<T> {
                 "chunked ReadConfig expects {CONFIG_SIZE} bytes, got {expected_len}"
             )));
         }
+        self.start_input_keepalive().await;
         self.prepare_read().await?;
         self.run_read(self.read_config_chunks_inner(expected_len, per_frame_timeout, total_timeout))
             .await
     }
 
-    async fn read_config_chunks_inner(
+    pub(crate) async fn read_config_chunks_inner(
         &self,
         expected_len: usize,
         per_frame_timeout: Duration,
@@ -770,6 +1110,9 @@ impl<T: Transport> Session<T> {
 
         while offset < expected_len {
             let request = commands::read_config_from(offset as u32)?;
+            // Keep the controller in configuration mode during the long
+            // 20-request config read (best effort; disabled by default).
+            self.maybe_poll().await;
             self.transport
                 .send(&request.encode_ble_payloadless(PacketKind::App)?)
                 .await?;
@@ -840,7 +1183,7 @@ impl<T: Transport> Session<T> {
     /// Returns `Ok(None)` for a payload-less acknowledgement or an unrelated
     /// command, and an error for a response envelope that names a different
     /// request or transfer size.
-    fn classify_response(
+    pub(crate) fn classify_response(
         frame: &[u8],
         request_cmd: u16,
         expected_len: usize,
@@ -925,14 +1268,14 @@ impl<T: Transport> Session<T> {
 }
 
 /// Byte buffer that tracks which positions have been filled.
-struct TransferBuffer {
+pub(crate) struct TransferBuffer {
     data: Vec<u8>,
     filled: Vec<bool>,
     received: usize,
 }
 
 impl TransferBuffer {
-    fn new(len: usize) -> Self {
+    pub(crate) fn new(len: usize) -> Self {
         Self {
             data: vec![0u8; len],
             filled: vec![false; len],
@@ -940,7 +1283,7 @@ impl TransferBuffer {
         }
     }
 
-    fn insert(&mut self, offset: usize, chunk: &[u8]) -> Result<(), Error> {
+    pub(crate) fn insert(&mut self, offset: usize, chunk: &[u8]) -> Result<(), Error> {
         let expected = self.data.len();
         let end = offset
             .checked_add(chunk.len())
@@ -965,20 +1308,20 @@ impl TransferBuffer {
         Ok(())
     }
 
-    fn received(&self) -> usize {
+    pub(crate) fn received(&self) -> usize {
         self.received
     }
 
-    fn is_complete(&self) -> bool {
+    pub(crate) fn is_complete(&self) -> bool {
         self.received == self.data.len()
     }
 
-    fn into_vec(self) -> Vec<u8> {
+    pub(crate) fn into_vec(self) -> Vec<u8> {
         self.data
     }
 }
 
-fn out_of_range(offset: usize, expected: usize) -> Error {
+pub(crate) fn out_of_range(offset: usize, expected: usize) -> Error {
     Error::UnexpectedResponse(format!(
         "chunk offset 0x{offset:X} is outside the {expected}-byte transfer"
     ))

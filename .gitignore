@@ -45,3 +45,9 @@ Thumbs.db
 .vscode/
 .env
 .env.local
+
+# Local agent scratch (RE / analysis) — keep the repo root clean
+.tmp/
+.re-scratch/
+androguard.db*
+androguard.log

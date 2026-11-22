@@ -5,13 +5,16 @@
 //! performs the App Mode handshake and transfers, and a BLE implementation
 //! backed by `btleplug`.
 //!
-//! The first slice is **read-only**: version, configuration and realtime input.
-//! Device writes (config apply, macro flash, OTA) are added separately.
+//! The first slice was read-only (version, configuration and realtime input).
+//! The current core also has macro flash read/write APIs (`macro_ops`); the
+//! write path is fail-closed and currently mock-tested only. Configuration
+//! apply and OTA are still separate phases.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod error;
+pub mod macro_ops;
 pub mod mock;
 pub mod session;
 pub mod transport;
@@ -20,6 +23,13 @@ pub mod transport;
 pub mod ble;
 
 pub use error::Error;
+pub use error::{MacroWriteStage, MacroWriteState};
+pub use macro_ops::{
+    macro_header_chunk_len, macro_write_chunk_len, macro_write_chunk_len_requested,
+    max_protocol_payload, validate_macro_chunk_size, MacroBackup, MacroEntry, MacroHeaderOutcome,
+    MacroSlotWriteOutcome, MacroTimeouts, MacroWriteOutcome, MacroWritePlan,
+    MACRO_HEADER_CHUNK_SIZE, MACRO_READ_TOTAL_TIMEOUT,
+};
 pub use mock::MockTransport;
 pub use session::{
     ConfigSnapshot, Session, VersionInfo, CONFIG_TOTAL_TIMEOUT, DEFAULT_TIMEOUT,
