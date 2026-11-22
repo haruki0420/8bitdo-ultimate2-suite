@@ -8,10 +8,16 @@ use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
+use eightbitdo_core::config_ops::{
+    ConfigCrcStatus, ConfigRegion, ConfigWriteTimeouts, PreparedConfigWrite,
+};
+use eightbitdo_core::macro_ops::{MacroBackup, MacroEntry, MacroWritePlan};
 use eightbitdo_core::{ConfigSnapshot, Error as CoreError, Session, Transport};
+use eightbitdo_protocol::config_bt2::{Bt2Config, MacroIndex, Slot};
 
-use crate::backup::{self, BackupError, BackupReport};
+use crate::backup::{self, BackupError, BackupRef, BackupReport, MacroBackupReport};
 use crate::model::{ConfigView, DeviceInfoView, InputView, VersionView};
+use crate::util::sha256_hex;
 
 /// An error from a device operation.
 #[derive(Debug)]
@@ -66,8 +72,200 @@ pub struct ConfigRead {
 pub struct BackupOutcome {
     /// Written files and SHA-256.
     pub report: BackupReport,
+    /// The block that was written.
+    pub snapshot: ConfigSnapshot,
     /// Summary of the block that was written.
     pub view: ConfigView,
+}
+
+/// Phase in which a write preparation or commit failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritePhase {
+    /// Reading the configuration or macro backup from the controller.
+    Read,
+    /// Local validation of the plan against the fresh snapshot.
+    Prepare,
+    /// Writing the mandatory pre-write backup.
+    Backup,
+    /// The controller state changed after the user reviewed the write.
+    ConfigChanged,
+    /// Sending frames to the controller (write, Save, erase, verify).
+    Device,
+}
+
+impl fmt::Display for WritePhase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read => formatter.write_str("Read"),
+            Self::Prepare => formatter.write_str("Prepare"),
+            Self::Backup => formatter.write_str("Backup"),
+            Self::ConfigChanged => formatter.write_str("ConfigChanged"),
+            Self::Device => formatter.write_str("Device"),
+        }
+    }
+}
+
+/// A failed write, carrying the pre-write backup when one exists.
+///
+/// `detail` is the untranslated core/technical text. `recovery` is the
+/// core-provided English recovery guidance (it is shown verbatim as technical
+/// detail; the UI adds its own localized recovery steps).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteFailure {
+    /// Phase that failed.
+    pub phase: WritePhase,
+    /// Technical detail (English).
+    pub detail: String,
+    /// Backup written before the failure, if any.
+    pub backup: Option<BackupRef>,
+    /// Core recovery guidance, when the core supplied one.
+    pub recovery: Option<String>,
+    /// True when the link was disconnected.
+    pub disconnected: bool,
+}
+
+impl WriteFailure {
+    fn before(phase: WritePhase, detail: impl Into<String>) -> Box<Self> {
+        Box::new(Self {
+            phase,
+            detail: detail.into(),
+            backup: None,
+            recovery: None,
+            disconnected: false,
+        })
+    }
+
+    fn from_read(error: CoreError) -> Box<Self> {
+        let disconnected = matches!(error, CoreError::Disconnected);
+        Box::new(Self {
+            phase: WritePhase::Read,
+            detail: error.to_string(),
+            backup: None,
+            recovery: None,
+            disconnected,
+        })
+    }
+
+    fn from_backup(error: BackupError) -> Box<Self> {
+        Self::before(WritePhase::Backup, error.to_string())
+    }
+
+    /// The device changed between the confirmation dialog and the write.
+    fn changed(what: &str, expected_sha256: &str, actual_sha256: &str) -> Box<Self> {
+        Self::before(
+            WritePhase::ConfigChanged,
+            format!(
+                "{what} changed since the user reviewed the write (expected SHA-256                  {expected_sha256}, controller {actual_sha256}); no frame was sent"
+            ),
+        )
+    }
+
+    fn from_device(error: CoreError, backup: BackupRef) -> Box<Self> {
+        let disconnected = matches!(error, CoreError::Disconnected);
+        let (detail, recovery) = match &error {
+            CoreError::ConfigWrite {
+                stage,
+                state,
+                reason,
+                recovery,
+            } => (
+                format!("config write failed during {stage} ({state}): {reason}"),
+                Some((*recovery).to_string()),
+            ),
+            CoreError::MacroWrite {
+                stage,
+                state,
+                reason,
+                recovery,
+            } => (
+                format!("macro write failed during {stage} ({state}): {reason}"),
+                Some((*recovery).to_string()),
+            ),
+            other => (other.to_string(), None),
+        };
+        Box::new(Self {
+            phase: WritePhase::Device,
+            detail,
+            backup: Some(backup),
+            recovery,
+            disconnected: disconnected || error.to_string().contains("transport disconnected"),
+        })
+    }
+}
+
+impl fmt::Display for WriteFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "write failed during {}: {}",
+            self.phase, self.detail
+        )
+    }
+}
+
+impl std::error::Error for WriteFailure {}
+
+/// A configuration write prepared against a fresh snapshot, with its mandatory
+/// pre-write backup already written.
+#[derive(Debug)]
+pub(crate) struct ConfigWritePreparation {
+    /// The exact snapshot the plan was prepared against and the backup holds.
+    pub snapshot: ConfigSnapshot,
+    /// Validated, CRC-recomputed buffer to send.
+    pub prepared: PreparedConfigWrite,
+    /// Written pre-write backup.
+    pub backup: BackupReport,
+}
+
+/// Result of a confirmed configuration write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigWriteReport {
+    /// Written pre-write backup.
+    pub backup: BackupReport,
+    /// Configuration read back after Save.
+    pub snapshot: ConfigSnapshot,
+    /// Display summary of the read-back.
+    pub view: ConfigView,
+    /// Byte ranges that differed from the pre-write snapshot.
+    pub changed: Vec<ConfigRegion>,
+    /// Frames sent: `0x0001` chunks + one Save.
+    pub packets_sent: usize,
+    /// CRC state of the read-back.
+    pub crc: ConfigCrcStatus,
+}
+
+/// A macro write prepared against a fresh configuration and full macro backup.
+#[derive(Debug)]
+pub(crate) struct MacroWritePreparation {
+    /// Full 12-entry macro backup (also the core write precondition).
+    pub macro_backup: MacroBackup,
+    /// The target macro as read from the device.
+    pub target: MacroEntry,
+    /// Written pre-write backup directory.
+    pub backup: MacroBackupReport,
+}
+
+/// Result of a confirmed macro write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroWriteReport {
+    /// Written pre-write backup.
+    pub backup: MacroBackupReport,
+    /// Profile.
+    pub slot: Slot,
+    /// Macro index.
+    pub index: MacroIndex,
+    /// Number of written steps.
+    pub steps: usize,
+    /// Macro read back after the final Save and verification.
+    pub readback: MacroEntry,
+    /// Slot macro-enabled flag after the update.
+    pub flag: u32,
+    /// Registered macro count after the update.
+    pub total_cnt: u8,
+    /// Frames sent for the whole sequence.
+    pub packets_sent: usize,
+    /// Whether the read-back 2768-byte config satisfies stored == computed CRC.
+    pub config_crc_valid: bool,
 }
 
 /// A connected controller with its session and link metadata.
@@ -140,7 +338,206 @@ impl<T: Transport> DeviceSession<T> {
         let report = backup::write_backup(dir, &read.snapshot, &read.view)?;
         Ok(BackupOutcome {
             report,
+            snapshot: read.snapshot,
             view: read.view,
+        })
+    }
+
+    /// Read one macro with the configuration snapshot it belongs to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GuiError::Core`] for read, protocol, or transport errors.
+    pub(crate) async fn read_macro(
+        &self,
+        snapshot: &ConfigSnapshot,
+        slot: Slot,
+        index: MacroIndex,
+    ) -> Result<MacroEntry, GuiError> {
+        Ok(self.session.read_macro(snapshot, slot, index).await?)
+    }
+
+    /// Read a fresh configuration, validate a configuration plan against it,
+    /// and write the mandatory pre-write backup.
+    ///
+    /// Nothing is sent to flash before the backup is on disk. The returned
+    /// preparation owns the exact snapshot the backup contains, so a later
+    /// read-back comparison cannot mix snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteFailure`] with the failing phase. A `Prepare` failure
+    /// (including a no-op plan) happens before any backup or frame; a `Backup`
+    /// failure happens before any frame.
+    pub(crate) async fn prepare_config_write(
+        &self,
+        plan: &eightbitdo_core::config_ops::ConfigWritePlan,
+        expected_config_sha256: &str,
+        dir: &Path,
+    ) -> Result<ConfigWritePreparation, Box<WriteFailure>> {
+        let snapshot = self
+            .session
+            .read_config_snapshot()
+            .await
+            .map_err(WriteFailure::from_read)?;
+        let actual_sha256 = sha256_hex(snapshot.config.as_bytes());
+        if actual_sha256 != expected_config_sha256 {
+            return Err(WriteFailure::changed(
+                "configuration",
+                expected_config_sha256,
+                &actual_sha256,
+            ));
+        }
+        let view = ConfigView::from_snapshot(&snapshot);
+        let prepared = plan
+            .prepare(&snapshot)
+            .map_err(|error| WriteFailure::before(WritePhase::Prepare, error.to_string()))?;
+        if prepared.is_noop() {
+            return Err(WriteFailure::before(
+                WritePhase::Prepare,
+                "configuration write plan changes nothing",
+            ));
+        }
+        let backup = backup::write_prewrite_backup(dir, &snapshot, &view)
+            .map_err(WriteFailure::from_backup)?;
+        Ok(ConfigWritePreparation {
+            snapshot,
+            prepared,
+            backup,
+        })
+    }
+
+    /// Send a prepared configuration write, Save, and verify the read-back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteFailure`] with the backup reference and the core recovery
+    /// guidance when the device write, Save, or verification fails.
+    pub(crate) async fn commit_config_write(
+        &self,
+        preparation: &ConfigWritePreparation,
+    ) -> Result<ConfigWriteReport, Box<WriteFailure>> {
+        let outcome = self
+            .session
+            .write_full_config(
+                &preparation.snapshot,
+                &preparation.prepared,
+                ConfigWriteTimeouts::default(),
+            )
+            .await
+            .map_err(|error| {
+                WriteFailure::from_device(error, BackupRef::from(&preparation.backup))
+            })?;
+        let snapshot = snapshot_from_config(outcome.read_back);
+        let view = ConfigView::from_snapshot(&snapshot);
+        Ok(ConfigWriteReport {
+            backup: preparation.backup.clone(),
+            snapshot,
+            view,
+            changed: outcome.changed,
+            packets_sent: outcome.packets_sent,
+            crc: outcome.crc,
+        })
+    }
+
+    /// Read the full configuration and all 12 macros, then write the mandatory
+    /// pre-write macro backup directory.
+    ///
+    /// The target macro must already hold steps: creating an empty macro needs
+    /// flash step-clear support that is not implemented, so it is refused
+    /// before any frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteFailure`] with the failing phase; a `Prepare` failure
+    /// (empty target) happens before any backup or frame.
+    pub(crate) async fn prepare_macro_write(
+        &self,
+        slot: Slot,
+        index: MacroIndex,
+        expected_config_sha256: &str,
+        expected_macro_raw_sha256: &str,
+        dir: &Path,
+    ) -> Result<MacroWritePreparation, Box<WriteFailure>> {
+        let snapshot = self
+            .session
+            .read_config_snapshot()
+            .await
+            .map_err(WriteFailure::from_read)?;
+        let actual_sha256 = sha256_hex(snapshot.config.as_bytes());
+        if actual_sha256 != expected_config_sha256 {
+            return Err(WriteFailure::changed(
+                "configuration",
+                expected_config_sha256,
+                &actual_sha256,
+            ));
+        }
+        let record = snapshot.config.macro_record(slot, index);
+        if eightbitdo_core::macro_ops::is_skipped_steps(record.max_steps) {
+            return Err(WriteFailure::before(
+                WritePhase::Prepare,
+                "target macro is empty; creating an empty macro is not supported",
+            ));
+        }
+        let macro_backup = self
+            .session
+            .read_macro_backup(&snapshot)
+            .await
+            .map_err(WriteFailure::from_read)?;
+        let target = macro_backup.get(slot, index).cloned().ok_or_else(|| {
+            WriteFailure::before(
+                WritePhase::Prepare,
+                "macro backup does not contain the target macro",
+            )
+        })?;
+        let actual_macro_sha256 = sha256_hex(target.raw());
+        if actual_macro_sha256 != expected_macro_raw_sha256 {
+            return Err(WriteFailure::changed(
+                "target macro steps",
+                expected_macro_raw_sha256,
+                &actual_macro_sha256,
+            ));
+        }
+        let backup = backup::write_macro_backup(dir, &snapshot, &macro_backup)
+            .map_err(WriteFailure::from_backup)?;
+        Ok(MacroWritePreparation {
+            macro_backup,
+            target,
+            backup,
+        })
+    }
+
+    /// Send a prepared macro write (Header → Save → Erase → Write → Save) and
+    /// verify the read-back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteFailure`] with the backup reference and the core recovery
+    /// guidance when a flash stage or the verification fails.
+    pub(crate) async fn commit_macro_write(
+        &self,
+        preparation: &MacroWritePreparation,
+        plan: &MacroWritePlan,
+    ) -> Result<MacroWriteReport, Box<WriteFailure>> {
+        let slot = preparation.target.slot();
+        let index = preparation.target.index();
+        let outcome = self
+            .session
+            .write_macro(&preparation.macro_backup, slot, index, plan)
+            .await
+            .map_err(|error| {
+                WriteFailure::from_device(error, BackupRef::from(&preparation.backup))
+            })?;
+        Ok(MacroWriteReport {
+            backup: preparation.backup.clone(),
+            slot,
+            index,
+            steps: plan.steps.len(),
+            readback: outcome.readback,
+            flag: outcome.flag,
+            total_cnt: outcome.total_cnt,
+            packets_sent: outcome.packets_sent,
+            config_crc_valid: outcome.config_crc_valid,
         })
     }
 
@@ -171,14 +568,32 @@ impl<T: Transport> DeviceSession<T> {
     }
 }
 
+/// Rebuild a validated snapshot from a buffer the device returned.
+fn snapshot_from_config(config: Bt2Config) -> ConfigSnapshot {
+    let stored_crc = config.crc16_stored() as u16;
+    let mut check = config.clone();
+    let computed_crc = check.recompute_crc();
+    ConfigSnapshot {
+        config,
+        stored_crc,
+        computed_crc,
+        crc_valid: stored_crc == computed_crc,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use eightbitdo_core::config_ops::{config_write_chunk_len, ConfigEdit, ConfigWritePlan};
+    use eightbitdo_core::macro_ops::{is_skipped_steps, macro_header_chunk_len, MacroWritePlan};
     use eightbitdo_core::MockTransport;
+    use eightbitdo_core::Transport;
     use eightbitdo_protocol::commands;
-    use eightbitdo_protocol::config_bt2::{Bt2Config, CONFIG_SIZE};
+    use eightbitdo_protocol::config_bt2::{Bt2Config, MacroIndex, MacroSlot, Slot, CONFIG_SIZE};
+    use eightbitdo_protocol::keymap::KeyMap;
+    use eightbitdo_protocol::macro_data::{encode_macro_steps, MacroStep};
     use eightbitdo_protocol::CustomHeader;
 
     use super::*;
@@ -324,6 +739,403 @@ mod tests {
         );
         assert!(outcome.report.json_path.exists());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn push_ack(mock: &MockTransport, cmd: u16, subcmd: u16) {
+        let header = CustomHeader::new(cmd, subcmd, 0, 0);
+        mock.push_response(&header, &[]);
+    }
+
+    fn frame_cmd(frame: &[u8]) -> u16 {
+        u16::from_le_bytes([frame[1], frame[2]])
+    }
+
+    fn count_cmd(frames: &[Vec<u8>], cmd: u16) -> usize {
+        frames
+            .iter()
+            .filter(|frame| frame_cmd(frame) == cmd)
+            .count()
+    }
+
+    fn valid_config(mut config: Bt2Config) -> Bt2Config {
+        config.recompute_crc();
+        config
+    }
+
+    fn push_macro_response(mock: &MockTransport, mode: u16, slot: Slot, raw: &[u8]) {
+        let header = CustomHeader::new(
+            commands::cmd::READ_MACRO,
+            commands::macro_subcmd(mode, slot),
+            raw.len() as u32,
+            0,
+        )
+        .with_payload(raw);
+        mock.push_response(&header, raw);
+    }
+
+    #[tokio::test]
+    async fn config_write_takes_a_prewrite_backup_and_verifies_the_read_back() {
+        let mock = MockTransport::new();
+        let mut before = Bt2Config::default();
+        before.set_profile_name(Slot::S1, "Before").unwrap();
+        before = valid_config(before);
+        push_config_chunks(&mock, before.as_bytes(), 142);
+
+        let write_chunk = config_write_chunk_len(mock.mtu()).unwrap();
+        for _ in 0..CONFIG_SIZE.div_ceil(write_chunk) {
+            push_ack(&mock, commands::cmd::RESPONSE, commands::cmd::WRITE_CONFIG);
+        }
+        push_ack(&mock, commands::cmd::SAVE, commands::subcmd::SAVE_BLE);
+
+        let mut after = before.clone();
+        after.set_profile_name(Slot::S1, "After").unwrap();
+        after = valid_config(after);
+        push_config_chunks(&mock, after.as_bytes(), 142);
+
+        let driver = driver(mock);
+        let dir = temp_dir("prewrite-config");
+        let plan = ConfigWritePlan::new().with(ConfigEdit::ProfileName {
+            slot: Slot::S1,
+            name: "After".to_string(),
+        });
+
+        let expected_sha = crate::util::sha256_hex(before.as_bytes());
+        let preparation = driver
+            .prepare_config_write(&plan, &expected_sha, &dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            preparation.backup.sha256,
+            crate::util::sha256_hex(before.as_bytes())
+        );
+        assert_eq!(
+            fs::read(&preparation.backup.raw_path).unwrap(),
+            before.as_bytes()
+        );
+        assert!(!fs::read(&preparation.backup.json_path).unwrap().is_empty());
+        let filename = preparation
+            .backup
+            .raw_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            filename.starts_with("prewrite-config-"),
+            "pre-write backups are distinguishable from manual ones: {filename}"
+        );
+
+        let report = driver.commit_config_write(&preparation).await.unwrap();
+        assert_eq!(report.view.profile_names[0], "After");
+        assert!(!report.changed.is_empty());
+        assert!(report.crc.matches_sent());
+        assert_eq!(report.packets_sent, CONFIG_SIZE.div_ceil(write_chunk) + 1);
+
+        let sent = driver.session().transport().sent_frames();
+        assert_eq!(count_cmd(&sent, commands::cmd::READ_CONFIG), 40);
+        assert_eq!(
+            count_cmd(&sent, commands::cmd::WRITE_CONFIG),
+            CONFIG_SIZE.div_ceil(write_chunk)
+        );
+        assert_eq!(count_cmd(&sent, commands::cmd::SAVE), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_noop_config_plan_is_refused_before_a_backup_is_written() {
+        let mock = MockTransport::new();
+        let config = valid_config(Bt2Config::default());
+        push_config_chunks(&mock, config.as_bytes(), 142);
+        let driver = driver(mock);
+        let dir = temp_dir("noop");
+
+        let expected_sha = crate::util::sha256_hex(config.as_bytes());
+        let failure = driver
+            .prepare_config_write(&ConfigWritePlan::new(), &expected_sha, &dir)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.phase, WritePhase::Prepare);
+        assert!(failure.backup.is_none());
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            0,
+            "no backup may be left behind for a refused plan"
+        );
+        let sent = driver.session().transport().sent_frames();
+        assert_eq!(count_cmd(&sent, commands::cmd::READ_CONFIG), 20);
+        assert_eq!(count_cmd(&sent, commands::cmd::WRITE_CONFIG), 0);
+        assert_eq!(count_cmd(&sent, commands::cmd::SAVE), 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_backup_failure_stops_before_any_write_frame() {
+        let mock = MockTransport::new();
+        let config = valid_config(Bt2Config::default());
+        push_config_chunks(&mock, config.as_bytes(), 142);
+        let driver = driver(mock);
+        let parent = temp_dir("backup-blocked");
+        let blocked = parent.join("not-a-directory");
+        fs::write(&blocked, b"not a directory").unwrap();
+
+        let plan = ConfigWritePlan::new().with(ConfigEdit::GamepadMode(
+            eightbitdo_protocol::config_bt2::GamepadMode::Mac,
+        ));
+        let expected_sha = crate::util::sha256_hex(config.as_bytes());
+        let failure = driver
+            .prepare_config_write(&plan, &expected_sha, &blocked)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.phase, WritePhase::Backup);
+        assert!(failure.backup.is_none());
+
+        let sent = driver.session().transport().sent_frames();
+        assert_eq!(count_cmd(&sent, commands::cmd::WRITE_CONFIG), 0);
+        assert_eq!(count_cmd(&sent, commands::cmd::SAVE), 0);
+
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_during_the_commit_reports_the_backup() {
+        let mock = MockTransport::new();
+        let config = valid_config(Bt2Config::default());
+        push_config_chunks(&mock, config.as_bytes(), 142);
+        let driver = driver(mock);
+        let dir = temp_dir("disconnect");
+
+        let plan = ConfigWritePlan::new().with(ConfigEdit::GamepadMode(
+            eightbitdo_protocol::config_bt2::GamepadMode::Mac,
+        ));
+        let expected_sha = crate::util::sha256_hex(config.as_bytes());
+        let preparation = driver
+            .prepare_config_write(&plan, &expected_sha, &dir)
+            .await
+            .unwrap();
+        let failure = driver.commit_config_write(&preparation).await.unwrap_err();
+        assert_eq!(failure.phase, WritePhase::Device);
+        assert!(failure.disconnected);
+        let backup = failure
+            .backup
+            .clone()
+            .expect("the pre-write backup must be reported");
+        assert_eq!(backup.config_path, preparation.backup.raw_path);
+        assert!(backup.config_path.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_empty_macro_target_is_refused_before_the_macro_backup() {
+        let mock = MockTransport::new();
+        let config = valid_config(Bt2Config::default());
+        push_config_chunks(&mock, config.as_bytes(), 142);
+        let driver = driver(mock);
+        let dir = temp_dir("empty-macro");
+
+        let expected_sha = crate::util::sha256_hex(config.as_bytes());
+        let failure = driver
+            .prepare_macro_write(Slot::S1, MacroIndex::M1, &expected_sha, "unused", &dir)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.phase, WritePhase::Prepare);
+        assert!(failure.backup.is_none());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        let sent = driver.session().transport().sent_frames();
+        assert_eq!(count_cmd(&sent, commands::cmd::READ_CONFIG), 20);
+        assert_eq!(count_cmd(&sent, commands::cmd::READ_MACRO), 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn macro_write_takes_a_full_backup_and_reads_the_steps_back() {
+        let mock = MockTransport::new();
+        let original_steps = vec![
+            MacroStep::neutral(20),
+            MacroStep {
+                ms_times: 40,
+                keys: KeyMap::A.bits() as u16,
+                ..MacroStep::neutral(40)
+            },
+        ];
+        let mut header = MacroSlot::default();
+        header.records[0].max_steps = original_steps.len() as u16;
+        let mut config = Bt2Config::default();
+        config.set_macro_slot(Slot::S1, &header);
+        config = valid_config(config);
+
+        push_config_chunks(&mock, config.as_bytes(), 142);
+        let original_raw =
+            encode_macro_steps(&original_steps).unwrap()[..original_steps.len() * 10].to_vec();
+        push_macro_response(
+            &mock,
+            config.gamepad_mode_raw() & 0xFF,
+            Slot::S1,
+            &original_raw,
+        );
+
+        let header_chunk = macro_header_chunk_len(mock.mtu()).unwrap();
+        for _ in 0..216usize.div_ceil(header_chunk) {
+            push_ack(&mock, commands::cmd::RESPONSE, commands::cmd::WRITE_CONFIG);
+        }
+        push_ack(&mock, commands::cmd::SAVE, commands::subcmd::SAVE_BLE);
+        push_ack(&mock, commands::cmd::RESPONSE, commands::cmd::ERASE_MACRO);
+        push_ack(&mock, commands::cmd::RESPONSE, commands::cmd::WRITE_MACRO);
+        push_ack(&mock, commands::cmd::SAVE, commands::subcmd::SAVE_BLE);
+
+        let new_steps = vec![
+            MacroStep::neutral(40),
+            MacroStep {
+                ms_times: 60,
+                keys: (KeyMap::B | KeyMap::R1).bits() as u16,
+                ..MacroStep::neutral(60)
+            },
+        ];
+        assert_eq!(new_steps.len(), original_steps.len());
+        push_config_chunks(&mock, config.as_bytes(), 142);
+        let new_raw = encode_macro_steps(&new_steps).unwrap()[..new_steps.len() * 10].to_vec();
+        push_macro_response(&mock, config.gamepad_mode_raw() & 0xFF, Slot::S1, &new_raw);
+
+        let driver = driver(mock);
+        let dir = temp_dir("macro-write");
+        let expected_config_sha = crate::util::sha256_hex(config.as_bytes());
+        let expected_macro_sha = crate::util::sha256_hex(&original_raw);
+        let preparation = driver
+            .prepare_macro_write(
+                Slot::S1,
+                MacroIndex::M1,
+                &expected_config_sha,
+                &expected_macro_sha,
+                &dir,
+            )
+            .await
+            .unwrap();
+        assert_eq!(preparation.backup.macro_count, 1);
+        assert_eq!(preparation.backup.skipped_count, 11);
+        assert_eq!(
+            fs::read(&preparation.backup.config_path).unwrap(),
+            config.as_bytes()
+        );
+        assert!(preparation.backup.manifest_path.exists());
+        assert!(preparation.backup.dir.join("slot0-macro0.bin").exists());
+        assert!(!is_skipped_steps(preparation.target.record().max_steps));
+
+        let plan = MacroWritePlan::new(new_steps.clone());
+        let report = driver
+            .commit_macro_write(&preparation, &plan)
+            .await
+            .unwrap();
+        assert_eq!(report.slot, Slot::S1);
+        assert_eq!(report.index, MacroIndex::M1);
+        assert_eq!(report.steps, new_steps.len());
+        assert_eq!(report.readback.steps(), new_steps.as_slice());
+        assert!(report.backup.manifest_path.exists());
+
+        let sent = driver.session().transport().sent_frames();
+        assert_eq!(count_cmd(&sent, commands::cmd::READ_CONFIG), 40);
+        assert_eq!(count_cmd(&sent, commands::cmd::READ_MACRO), 2);
+        assert_eq!(
+            count_cmd(&sent, commands::cmd::WRITE_CONFIG),
+            216usize.div_ceil(header_chunk)
+        );
+        assert_eq!(count_cmd(&sent, commands::cmd::ERASE_MACRO), 1);
+        assert_eq!(count_cmd(&sent, commands::cmd::WRITE_MACRO), 1);
+        assert_eq!(count_cmd(&sent, commands::cmd::SAVE), 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn config_write_refuses_when_the_device_changed_after_review() {
+        let mock = MockTransport::new();
+        let reviewed = valid_config(Bt2Config::default());
+        let mut changed = reviewed.clone();
+        changed.set_gamepad_mode(eightbitdo_protocol::config_bt2::GamepadMode::Mac);
+        changed = valid_config(changed);
+        push_config_chunks(&mock, changed.as_bytes(), 142);
+
+        let driver = driver(mock);
+        let dir = temp_dir("toctou-config");
+        let expected_sha = crate::util::sha256_hex(reviewed.as_bytes());
+        let plan = ConfigWritePlan::new().with(ConfigEdit::GamepadMode(
+            eightbitdo_protocol::config_bt2::GamepadMode::Mac,
+        ));
+
+        let failure = driver
+            .prepare_config_write(&plan, &expected_sha, &dir)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.phase, WritePhase::ConfigChanged);
+        assert!(failure.backup.is_none());
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            0,
+            "a changed device must not leave a pre-write backup"
+        );
+        let sent = driver.session().transport().sent_frames();
+        assert_eq!(count_cmd(&sent, commands::cmd::READ_CONFIG), 20);
+        assert_eq!(count_cmd(&sent, commands::cmd::WRITE_CONFIG), 0);
+        assert_eq!(count_cmd(&sent, commands::cmd::SAVE), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn macro_write_refuses_when_the_target_steps_changed_after_review() {
+        let mock = MockTransport::new();
+        let mut header = MacroSlot::default();
+        header.records[0].max_steps = 2;
+        let mut config = Bt2Config::default();
+        config.set_macro_slot(Slot::S1, &header);
+        config = valid_config(config);
+        push_config_chunks(&mock, config.as_bytes(), 142);
+
+        let reviewed_steps = vec![MacroStep::neutral(20), MacroStep::neutral(20)];
+        let changed_steps = vec![MacroStep::neutral(40), MacroStep::neutral(40)];
+        let changed_raw =
+            encode_macro_steps(&changed_steps).unwrap()[..changed_steps.len() * 10].to_vec();
+        push_macro_response(
+            &mock,
+            config.gamepad_mode_raw() & 0xFF,
+            Slot::S1,
+            &changed_raw,
+        );
+
+        let driver = driver(mock);
+        let dir = temp_dir("toctou-macro");
+        let expected_config_sha = crate::util::sha256_hex(config.as_bytes());
+        let reviewed_raw =
+            encode_macro_steps(&reviewed_steps).unwrap()[..reviewed_steps.len() * 10].to_vec();
+        let expected_macro_sha = crate::util::sha256_hex(&reviewed_raw);
+
+        let failure = driver
+            .prepare_macro_write(
+                Slot::S1,
+                MacroIndex::M1,
+                &expected_config_sha,
+                &expected_macro_sha,
+                &dir,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.phase, WritePhase::ConfigChanged);
+        assert!(failure.backup.is_none());
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            0,
+            "a changed macro must not leave a pre-write backup"
+        );
+        let sent = driver.session().transport().sent_frames();
+        assert_eq!(count_cmd(&sent, commands::cmd::READ_CONFIG), 20);
+        assert_eq!(count_cmd(&sent, commands::cmd::READ_MACRO), 1);
+        assert_eq!(count_cmd(&sent, commands::cmd::WRITE_CONFIG), 0);
+        assert_eq!(count_cmd(&sent, commands::cmd::ERASE_MACRO), 0);
+        assert_eq!(count_cmd(&sent, commands::cmd::WRITE_MACRO), 0);
+        assert_eq!(count_cmd(&sent, commands::cmd::SAVE), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 
