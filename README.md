@@ -78,6 +78,11 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
   - [ ] Phase 2c: BLE OTA（Linux。core 実装済み・Mock 55 テスト（`mobile-boot` 有効時。既定 52）。**単一セクション `.dat` のみ対応**で公式 `.dat` がマルチセクションの場合は未対応（公式ファーム対応の blocker）、未確認 wire ゲート既定 OFF、boot 専用 `BleBootTransport` のみ許可（App Session を切断してから `8bt` に接続。同一 BLE ロック）、type 1 application ウィンドウを暫定検証、CLI/GUI 未配線、実機書込は保留。マルチセクション対応と実機 wire 確定は次 PR の必須項目）
   - [ ] Phase 2d: 設定書き込み（BLE のみ実装済み・Mock 検証。`config write` / `set` / `remap` / `map show`、pre-write backup、確認、前後 SHA-256、read-back 検証。USB config write は未実装）
 - [ ] Phase 3: `eightbitdo-gui`（デスクトップネイティブ GUI）
+  - [x] Phase 3a: 読み取り専用 GUI（接続・ライブ入力・設定ビューア・バックアップ）。Mock / ヘッドレステストのみで**実機未検証**
+  - [x] Phase 3b: マクロエディタ（20ms 録音・ステップ編集・既存非空マクロへの書込）。pre-write backup / read-back / TOCTOU（確認後の設定変更を中止）付き。**実機未検証・Tier 3**
+  - [x] Phase 3d: 設定タブ（プロファイル・リマップ・振動・スティック/トリガー・ジャイロ・LED）。確認ダイアログ・書込前バックアップ・read-back 付き。**実機未検証・Tier 3**
+  - [ ] Phase 3c: OTA 画面（未着手）
+  - [ ] マクロ JSON/TOML 入出力、GUI からのリストア（未実装）
 - [ ] Phase 4: USB OTA（保留）
 - [ ] Phase 5: `eightbitdo-uniffi` + iOS (SwiftUI) / Android (Jetpack Compose) アプリ
 

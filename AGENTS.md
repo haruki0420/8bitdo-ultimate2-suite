@@ -7,7 +7,7 @@
 ## 1. プロジェクト概要
 
 - **目的**: **8BitDo Ultimate 2 Bluetooth Controller**（内部 PID `0x600F` / 2.4G レシーバー `0x6011`）を、Nintendo Switch と接続したまま **Linux / macOS / Windows / Android / iOS** から BLE GATT（および USB/2.4G HID）でフル設定・マクロ編集・ファームウェアアップデートできるクロスプラットフォーム OSS ツール群を構築する。
-- **現在のフェーズ**: **Phase 1 完了（`eightbitdo-protocol` 実装・テスト済み）。Phase 2 実装着手待ち**。
+- **現在のフェーズ**: Phase 1（protocol）完了。Phase 2a〜2d の core / CLI（読み取り・マクロ書込・BLE OTA core・設定書込）は実装済みだが Mock 検証中心で**実機未検証**。GUI は Phase 3a（読み取り）に加え、Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）の書き込み UI を実装済み（PR #16、**実機未検証・Tier 3**）。Phase 3c（OTA 画面）と GUI からのリストア / JSON・TOML 入出力は未着手。
 - **ライセンス／公開方針**: パブリックリポジトリ。公式バイナリ（`.apk`, `.exe`, `.dll`, `.so` 等）や公式ファームウェアファイル自体は `.gitignore` で除外しており、**絶対にコミットしないこと**。
 
 ---
@@ -86,23 +86,18 @@
 - 1 名でも blocker / 要修正なら `success` を付けない。Tier 3 で判定が割れた場合は 4 名目の独立 adjudicator を追加し、blocker の撤回または adjudication 理由を記録する。
 - `success` 投稿後に blocker が出た場合（late `CHANGES_REQUESTED`）、リードレビュアーは **同じ SHA に直ちに `review-gate=failure`** を投稿し、修正 push 後の新しい SHA で再レビューする。`success` を維持したままマージしない。`scripts/post-review-status.sh` の `reviewDecision` 確認は best-effort であり、確認後に届くレビューは防げない。
 - ruleset が強制するのは `review-gate` required check の成功（commit status または check run）まで。レビュー実施自体は手続きであり、write 権限者は迂回できる。canonical ruleset は **`.github/rulesets/main-protection.json`**（live: id `27785806`）。
+- **GUI の書き込み経路**（設定 2768B・マクロ）は、pre-write backup、デバイス write path、read-back 検証、TOCTOU（確認後の設定変更検出）を含むため **Tier 3**。`crates/eightbitdo-gui/src/write.rs` の状態機械や `backup.rs` / `driver.rs` / `worker.rs` の書込テストを変える PR も Tier 3。
 
 ---
 
 ## 6. 現在の状態と次に着手すべき作業
 
-**Phase 1 は完了済み**です（`crates/eightbitdo-protocol`）。
+**Phase 1（protocol）は完了済み**、Phase 2a〜2d の core / CLI は Mock 検証まで実装済みです（**実機未検証**）。
 
-- 実装済み: `crc.rs` / `header.rs` / `commands.rs` / `config_bt2.rs` / `keymap.rs` / `macro_data.rs` / `input_report.rs`
-- 検証コマンド:
-  - `cargo test -p eightbitdo-protocol` → 単体テスト 74 件 + doc test 4 件
-  - `cargo clippy -p eightbitdo-protocol --all-targets` → 警告なし
-  - `cargo check -p eightbitdo-protocol --no-default-features` → `no_std` + `alloc` でビルド可
-  - `cargo test -p eightbitdo-protocol --features serde` → JSON/TOML 用 `MacroFile` を含めてビルド可
-
-次は **[docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)** の **Phase 2** に進んでください。
-
-1. `crates/eightbitdo-core` に `Transport` トレイト（BLE / USB HID / Mock）とセッション管理を実装する。
-2. `crates/eightbitdo-cli` に `scan` / `info` / `config dump` / `monitor` を実装する。
-3. 実機では **読み取り専用コマンドから**検証し、最初の書き込み前に必ず 2768B 設定とマクロ 3 スロット × 4 マクロをバックアップし、ファイル名と SHA-256 を記録する。
-4. 書き込み系の前に、モックトランスポートで `Header 0x0001 (total_len=0xD8) → Save 0x0006 → Erase 0x0104 → Write 0x0103 → Save 0x0006` のパケット列と CRC を固定する。
+- **Phase 3 GUI（PR #16）**: Phase 3a の読み取り専用 UI に加えて、以下を実装。
+  - Phase 3b: マクロエディタ（20ms ライブ録音、ステップ編集、既存非空マクロへの Header → Save → Erase → Write → Save、read-back 検証）
+  - Phase 3d: 設定タブ（プロファイル・22 ボタンリマップ・振動・スティック/トリガー・特殊機能・ジャイロ・LED）
+  - 書込は確認ダイアログ必須、直前に設定 / マクロの pre-write backup、書込後に read-back、失敗時は backup path と復旧手順を表示。確認後にデバイス設定が変わっていた場合は expected SHA-256 不一致で中止（TOCTOU）。フラッシュ中は 20ms keepalive を停止して再開。
+  - **Mock / ヘッドレステストのみ。実機書込・BLE は未検証。Tier 3。**
+- **未着手**: Phase 3c（OTA 画面）、GUI からのリストア、マクロ JSON/TOML 入出力。Phase 2c の BLE OTA は core 実装済みだが CLI / GUI 未配線・実機保留。
+- 検証: `cargo test -p eightbitdo-gui` / `cargo clippy -p eightbitdo-gui --all-targets --all-features -- -D warnings` / `cargo fmt --all -- --check`。

@@ -539,7 +539,11 @@ impl App {
 
     /// Open the confirmation dialog for the loaded macro.
     fn review_macro(&mut self) {
-        match self.macro_editor.pending_write() {
+        let Some(snapshot) = self.config_snapshot.clone() else {
+            self.draft_error = Some(DraftError::NoSnapshot);
+            return;
+        };
+        match self.macro_editor.pending_write(&snapshot) {
             Ok(pending) => {
                 self.draft_error = None;
                 self.pending = Some(pending);
@@ -2014,7 +2018,12 @@ impl App {
         let (changes, valid) = self
             .settings
             .as_ref()
-            .map(|settings| (settings.changes(&config).len(), settings.validate().is_ok()))
+            .map(|settings| {
+                (
+                    settings.changes(&config).len(),
+                    settings.validate(&config).is_ok(),
+                )
+            })
             .unwrap_or((0, false));
         let mut review = false;
         let mut discard = false;
@@ -2262,6 +2271,7 @@ impl App {
             WritePhase::Read => Key::WriteReadFailed,
             WritePhase::Prepare => Key::WritePrepareFailed,
             WritePhase::Backup => Key::WriteBackupFailed,
+            WritePhase::ConfigChanged => Key::WriteChanged,
             WritePhase::Device => Key::WriteDeviceFailed,
         };
         Frame::none()
@@ -3212,21 +3222,36 @@ fn rssi_bars(rssi: Option<i16>) -> u8 {
 /// selection: the user can still click the profile/macro combo boxes behind the
 /// dialog, and the reviewed target must be the written one.
 fn pending_command(pending: PendingWrite, backup_dir: PathBuf) -> Option<(Command, Busy)> {
-    let PendingWrite { target, plan } = pending;
+    let PendingWrite {
+        target,
+        plan,
+        expected_config_sha256,
+        expected_macro_raw_sha256,
+    } = pending;
     match plan {
-        PendingPlan::Config(plan) => {
-            Some((Command::WriteConfig { plan, backup_dir }, Busy::WriteConfig))
-        }
+        PendingPlan::Config(plan) => Some((
+            Command::WriteConfig {
+                plan,
+                backup_dir,
+                expected_config_sha256,
+            },
+            Busy::WriteConfig,
+        )),
         PendingPlan::Macro(plan) => match target {
-            WriteTarget::Macro { slot, index, .. } => Some((
-                Command::WriteMacro {
-                    slot,
-                    index,
-                    plan,
-                    backup_dir,
-                },
-                Busy::WriteMacro,
-            )),
+            WriteTarget::Macro { slot, index, .. } => {
+                let expected_macro_raw_sha256 = expected_macro_raw_sha256?;
+                Some((
+                    Command::WriteMacro {
+                        slot,
+                        index,
+                        plan,
+                        backup_dir,
+                        expected_config_sha256,
+                        expected_macro_raw_sha256,
+                    },
+                    Busy::WriteMacro,
+                ))
+            }
             WriteTarget::Config { .. } => None,
         },
     }
@@ -3722,6 +3747,7 @@ fn settings_editor(
         Key::RemapHint,
     ))));
     ui.add_space(theme::SPACE_1);
+    let mut preserved_unsupported = 0usize;
     for button in ButtonIndex::ALL {
         ui.horizontal(|ui| {
             ui.add_sized(
@@ -3741,17 +3767,34 @@ fn settings_editor(
                 lang,
                 &mut settings.remap[index].keys[button.index()],
             );
-            if !write::is_valid_key_target(current) {
-                ui.add(egui::Label::new(theme::job_meta_color(
-                    &i18n::format(
-                        lang,
-                        Key::RemapUnsupported,
-                        &[format!("{:08X}", current.bits())],
-                    ),
-                    theme::AMBER,
-                )));
+            let target = settings.remap[index].keys[button.index()];
+            if !write::is_valid_key_target(target) {
+                if target == current {
+                    preserved_unsupported += 1;
+                } else {
+                    // The combo only offers valid keys, so this is a defensive
+                    // path for a hand-built draft.
+                    ui.add(egui::Label::new(theme::job_meta_color(
+                        &i18n::format(
+                            lang,
+                            Key::RemapUnsupported,
+                            &[format!("{:08X}", target.bits())],
+                        ),
+                        theme::AMBER,
+                    )));
+                }
             }
         });
+    }
+    if preserved_unsupported > 0 {
+        ui.add(egui::Label::new(theme::job_meta_color(
+            &i18n::format(
+                lang,
+                Key::RemapPreservedCount,
+                &[preserved_unsupported.to_string()],
+            ),
+            theme::AMBER,
+        )));
     }
     let _ = *slot;
 }

@@ -308,6 +308,8 @@ define_keys! {
     RemapPhysical => "物理ボタン" | "Physical button",
     RemapTarget => "割り当て先" | "Assigned to",
     RemapUnsupported => "0x{}（選択不可）" | "0x{} (not selectable)",
+    RemapPreserved => "0x{} は未変更のため保持します" | "Keeping 0x{} unchanged",
+    RemapPreservedCount => "未変更の選択不可値 {} 件を保持します" | "Keeping {} unchanged unsupported value(s)",
     RemapHint => "227・未知ビット・複合割り当ては選択肢に出ません。" | "227, unknown bits, and combined assignments are not offered.",
     SettingsNeedsConfig => "接続して設定値を読み取ると編集できます。" | "Connect and read the configuration to edit it.",
     SettingsStale => "前回読み取った設定を編集しています。書き込み直前に再読み取りして検証します。" | "Editing the last read configuration; it is re-read and re-validated immediately before writing.",
@@ -394,6 +396,7 @@ define_keys! {
     WriteFailureMacroRestore => "マクロバックアップは `eightbitdo macro restore --dir <パス>` で復元できます。" | "The macro backup can be restored with `eightbitdo macro restore --dir <path>`.",
     WriteFailureConfigRestore => "設定の raw バックアップは CLI の設定書き込みで復元できます。" | "The raw configuration backup can be restored with the CLI configuration write.",
     WriteLostLink => "書き込み中に接続が切れました。" | "The link dropped during the write.",
+    WriteChanged => "確認後にコントローラの設定が変わったため、書き込みを中止しました。読み取り直してください。" | "The controller changed after review, so the write was stopped. Read it again.",
     NameTooLong => "名前は {} 文字までです（現在 {}）。" | "Names are limited to {} units (currently {}).",
     NameHasNul => "名前に NUL 文字は使えません。" | "Names cannot contain NUL.",
     InvalidTargetError => "割り当て先には単一のキーを選んでください。" | "Choose a single documented assignment target.",
@@ -403,6 +406,7 @@ define_keys! {
     MacroStepLimitError => "マクロは 200 ステップまでです（現在 {}）。" | "A macro is limited to 200 steps (currently {}).",
     NoChangesError => "書き込む変更がありません。" | "There are no changes to write.",
     InvalidPlanError => "変更内容を検証できませんでした。" | "The changes could not be validated.",
+    NoSnapshotError => "設定値が未読み取りです。読み取ってから操作してください。" | "Read the configuration before writing.",
     KeyBtCon => "Bluetooth 接続" | "Bluetooth",
     KeySwap => "スワップ" | "Swap",
     KeyTurbo3 => "ターボ 3" | "Turbo 3",
@@ -445,6 +449,7 @@ define_keys! {
     ErrWriteBackupFailed => "バックアップを作成できなかったため、書き込みを中止しました。" | "The backup could not be written, so the write was stopped.",
     ErrDeviceWriteFailed => "書き込み中に失敗しました。" | "The write failed on the controller.",
     ErrWriteLostLink => "書き込み中に接続が切れました。" | "The link dropped during the write.",
+    ErrWriteChanged => "確認後にコントローラの設定が変わったため、書き込みを中止しました。" | "The controller changed after review; the write was stopped.",
     ErrStopLiveFailed => "ライブ入力を停止できませんでした。" | "Could not stop live input.",
     ErrStartLiveFailed => "ライブ入力を開始できませんでした。" | "Could not start live input.",
     ErrConnectionFailed => "接続できませんでした。" | "Could not connect.",
@@ -703,6 +708,7 @@ pub fn draft_error_text(lang: Lang, error: &DraftError) -> String {
         DraftError::InvalidKeyTarget { .. } => t(lang, Key::InvalidTargetError).to_string(),
         DraftError::InvalidTrigger { .. } => t(lang, Key::InvalidTriggerError).to_string(),
         DraftError::InvalidPlan(_) => t(lang, Key::InvalidPlanError).to_string(),
+        DraftError::NoSnapshot => t(lang, Key::NoSnapshotError).to_string(),
     }
 }
 

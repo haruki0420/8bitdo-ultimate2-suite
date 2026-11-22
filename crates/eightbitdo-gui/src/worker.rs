@@ -12,6 +12,11 @@
 //! [`Session::try_next_input`]. This poll is also the keepalive: the core crate
 //! has no session-owned keepalive yet (the CLI has the reference
 //! implementation), so the link stays active while live input is on.
+//!
+//! A flash write pauses this poll (`LiveState::begin_write`) and resumes it
+//! afterwards. If live input is stopped, there is no keepalive at all during
+//! the write: the write itself owns the single session, exactly like the CLI
+//! with `--interval-ms 0`.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -92,6 +97,8 @@ pub enum Command {
         plan: ConfigWritePlan,
         /// Directory for the mandatory pre-write backup.
         backup_dir: PathBuf,
+        /// SHA-256 of the snapshot the confirmation dialog was built against.
+        expected_config_sha256: String,
     },
     /// Write one existing non-empty macro after the user confirmed it.
     WriteMacro {
@@ -103,6 +110,10 @@ pub enum Command {
         plan: MacroWritePlan,
         /// Directory for the mandatory pre-write macro backup.
         backup_dir: PathBuf,
+        /// SHA-256 of the configuration the dialog was built against.
+        expected_config_sha256: String,
+        /// SHA-256 of the target macro's raw steps at review time.
+        expected_macro_raw_sha256: String,
     },
     /// Enable `0x0007` and start the `0x0003` poll loop.
     StartLive,
@@ -327,7 +338,7 @@ struct Link {
 }
 
 enum Wake {
-    Command(Option<Command>),
+    Command(Option<Box<Command>>),
     Tick,
 }
 
@@ -341,14 +352,14 @@ async fn run_loop(mut commands: UnboundedReceiver<Command>, events: Sender<Event
                     continue;
                 };
                 tokio::select! {
-                    command = commands.recv() => Wake::Command(command),
+                    command = commands.recv() => Wake::Command(command.map(Box::new)),
                     _ = link.ticker.tick() => Wake::Tick,
                 }
             };
             match wake {
                 Wake::Command(None) => break,
                 Wake::Command(Some(command)) => {
-                    if !handle_command(command, &mut link, &events).await {
+                    if !handle_command(*command, &mut link, &events).await {
                         break;
                     }
                     let _ = events.send(Event::Idle);
@@ -562,16 +573,32 @@ async fn handle_command(command: Command, link: &mut Option<Link>, events: &Send
                 }
             }
         }
-        Command::WriteConfig { plan, backup_dir } => {
-            write_config(link, plan, &backup_dir, events).await;
+        Command::WriteConfig {
+            plan,
+            backup_dir,
+            expected_config_sha256,
+        } => {
+            write_config(link, plan, &expected_config_sha256, &backup_dir, events).await;
         }
         Command::WriteMacro {
             slot,
             index,
             plan,
             backup_dir,
+            expected_config_sha256,
+            expected_macro_raw_sha256,
         } => {
-            write_macro(link, slot, index, plan, &backup_dir, events).await;
+            write_macro(
+                link,
+                slot,
+                index,
+                plan,
+                &expected_config_sha256,
+                &expected_macro_raw_sha256,
+                &backup_dir,
+                events,
+            )
+            .await;
         }
         Command::StartLive => {
             enable_live(link, events).await;
@@ -658,10 +685,13 @@ async fn ensure_snapshot(
 async fn execute_config_write<T: Transport>(
     driver: &DeviceSession<T>,
     plan: ConfigWritePlan,
+    expected_config_sha256: &str,
     backup_dir: &Path,
     events: &Sender<Event>,
 ) -> Result<ConfigWriteReport, Box<WriteFailure>> {
-    let preparation = driver.prepare_config_write(&plan, backup_dir).await?;
+    let preparation = driver
+        .prepare_config_write(&plan, expected_config_sha256, backup_dir)
+        .await?;
     let _ = events.send(Event::WriteBackup(BackupRef::from(&preparation.backup)));
     let _ = events.send(Event::Log(
         Notice::new(Key::LogPreWriteBackup)
@@ -672,15 +702,26 @@ async fn execute_config_write<T: Transport>(
 }
 
 /// Worker-side macro write: prepare, back up, commit.
+#[allow(clippy::too_many_arguments)]
 async fn execute_macro_write<T: Transport>(
     driver: &DeviceSession<T>,
     slot: Slot,
     index: MacroIndex,
     plan: MacroWritePlan,
+    expected_config_sha256: &str,
+    expected_macro_raw_sha256: &str,
     backup_dir: &Path,
     events: &Sender<Event>,
 ) -> Result<MacroWriteReport, Box<WriteFailure>> {
-    let preparation = driver.prepare_macro_write(slot, index, backup_dir).await?;
+    let preparation = driver
+        .prepare_macro_write(
+            slot,
+            index,
+            expected_config_sha256,
+            expected_macro_raw_sha256,
+            backup_dir,
+        )
+        .await?;
     let _ = events.send(Event::WriteBackup(BackupRef::from(&preparation.backup)));
     let _ = events.send(Event::Log(
         Notice::new(Key::LogPreWriteMacroBackup)
@@ -694,6 +735,7 @@ async fn execute_macro_write<T: Transport>(
 async fn write_config(
     link: &mut Option<Link>,
     plan: ConfigWritePlan,
+    expected_config_sha256: &str,
     backup_dir: &Path,
     events: &Sender<Event>,
 ) {
@@ -702,7 +744,14 @@ async fn write_config(
             return;
         };
         let _was_polling = link.live.begin_write();
-        let result = execute_config_write(&link.driver, plan, backup_dir, events).await;
+        let result = execute_config_write(
+            &link.driver,
+            plan,
+            expected_config_sha256,
+            backup_dir,
+            events,
+        )
+        .await;
         link.live.end_write();
         link.ticker.reset();
         result
@@ -723,11 +772,14 @@ async fn write_config(
 }
 
 /// Pause the 20 ms keepalive, run a macro write, and resume.
+#[allow(clippy::too_many_arguments)]
 async fn write_macro(
     link: &mut Option<Link>,
     slot: Slot,
     index: MacroIndex,
     plan: MacroWritePlan,
+    expected_config_sha256: &str,
+    expected_macro_raw_sha256: &str,
     backup_dir: &Path,
     events: &Sender<Event>,
 ) {
@@ -736,7 +788,17 @@ async fn write_macro(
             return;
         };
         let _was_polling = link.live.begin_write();
-        let result = execute_macro_write(&link.driver, slot, index, plan, backup_dir, events).await;
+        let result = execute_macro_write(
+            &link.driver,
+            slot,
+            index,
+            plan,
+            expected_config_sha256,
+            expected_macro_raw_sha256,
+            backup_dir,
+            events,
+        )
+        .await;
         link.live.end_write();
         link.ticker.reset();
         result
@@ -806,6 +868,7 @@ fn write_failure_notice(failure: &WriteFailure) -> Notice {
         WritePhase::Read => Key::ErrWriteReadFailed,
         WritePhase::Prepare => Key::ErrWritePrepareFailed,
         WritePhase::Backup => Key::ErrWriteBackupFailed,
+        WritePhase::ConfigChanged => Key::ErrWriteChanged,
         WritePhase::Device => Key::ErrDeviceWriteFailed,
     };
     Notice::new(key).with_detail(failure.detail.clone())
@@ -1122,6 +1185,7 @@ mod tests {
             (WritePhase::Read, Key::ErrWriteReadFailed),
             (WritePhase::Prepare, Key::ErrWritePrepareFailed),
             (WritePhase::Backup, Key::ErrWriteBackupFailed),
+            (WritePhase::ConfigChanged, Key::ErrWriteChanged),
             (WritePhase::Device, Key::ErrDeviceWriteFailed),
         ] {
             let failure = WriteFailure {
@@ -1166,7 +1230,8 @@ mod tests {
             eightbitdo_protocol::config_bt2::GamepadMode::Mac,
         ));
         let (events, receiver) = std::sync::mpsc::channel();
-        let report = execute_config_write(&driver, plan, &dir, &events)
+        let expected_sha = crate::util::sha256_hex(config.as_bytes());
+        let report = execute_config_write(&driver, plan, &expected_sha, &dir, &events)
             .await
             .expect("mock write succeeds");
 

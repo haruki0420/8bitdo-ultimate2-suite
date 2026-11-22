@@ -30,6 +30,7 @@ use eightbitdo_protocol::keymap::{ButtonIndex, KeyMap};
 use eightbitdo_protocol::macro_data::{MacroStep, AXIS_NEUTRAL, MAX_MACRO_STEPS};
 
 use crate::model::InputView;
+use crate::util::sha256_hex;
 
 /// Length of one live-input recording step.
 ///
@@ -181,6 +182,8 @@ pub enum DraftError {
     },
     /// The local plan failed core-side validation.
     InvalidPlan(String),
+    /// The configuration snapshot needed to identify the write is missing.
+    NoSnapshot,
 }
 
 impl std::fmt::Display for DraftError {
@@ -230,6 +233,7 @@ impl std::fmt::Display for DraftError {
                 )
             }
             Self::InvalidPlan(detail) => write!(formatter, "{detail}"),
+            Self::NoSnapshot => formatter.write_str("no configuration snapshot is loaded"),
         }
     }
 }
@@ -325,15 +329,23 @@ impl RemapDraft {
         edits
     }
 
-    /// Validate every mapping target.
+    /// Validate only the mapping targets the user changed.
+    ///
+    /// Unchanged stored values are preserved byte-for-byte even when they are
+    /// unsupported on this host (for example a factory-unused slot storing
+    /// `0xFFFFFFFF` for all 22 entries): validating them would make the whole
+    /// configuration unwritable. A changed entry must be a documented single
+    /// key, which the combo box already enforces.
     ///
     /// # Errors
     ///
-    /// Returns [`DraftError::InvalidKeyTarget`] for an unsupported stored or
-    /// edited target.
-    pub fn validate(&self, slot: Slot) -> Result<(), DraftError> {
+    /// Returns [`DraftError::InvalidKeyTarget`] for a changed target that is not
+    /// a documented single key.
+    pub fn validate(&self, config: &Bt2Config, slot: Slot) -> Result<(), DraftError> {
         for button in ButtonIndex::ALL {
-            if !is_valid_key_target(self.keys[button.index()]) {
+            let current = button_mapping(config, slot, button);
+            let target = self.keys[button.index()];
+            if target != current && !is_valid_key_target(target) {
                 return Err(DraftError::InvalidKeyTarget { slot, button });
             }
         }
@@ -597,15 +609,15 @@ impl SettingsDraft {
         changes
     }
 
-    /// Validate every name and remap target.
+    /// Validate every name and every remap entry the user changed.
     ///
     /// # Errors
     ///
     /// Returns the first [`DraftError`].
-    pub fn validate(&self) -> Result<(), DraftError> {
+    pub fn validate(&self, config: &Bt2Config) -> Result<(), DraftError> {
         for slot in Slot::ALL {
             validate_name(&self.profile_names[slot.index()], slot)?;
-            self.remap[slot.index()].validate(slot)?;
+            self.remap[slot.index()].validate(config, slot)?;
         }
         Ok(())
     }
@@ -616,7 +628,7 @@ impl SettingsDraft {
     ///
     /// Returns [`DraftError`] when a name is invalid or nothing changes.
     pub fn plan(&self, snapshot: &ConfigSnapshot) -> Result<ConfigWritePlan, DraftError> {
-        self.validate()?;
+        self.validate(&snapshot.config)?;
         let edits = self.edits(&snapshot.config);
         if edits.is_empty() {
             return Err(DraftError::NoChanges);
@@ -646,6 +658,8 @@ impl SettingsDraft {
                 focus,
             },
             plan: PendingPlan::Config(plan),
+            expected_config_sha256: sha256_hex(snapshot.config.as_bytes()),
+            expected_macro_raw_sha256: None,
         })
     }
 }
@@ -733,7 +747,10 @@ impl MacroDraft {
             return Err(DraftError::ZeroDuration { index });
         }
         validate_macro_name(&self.name)?;
-        if !is_valid_key_target(self.key_map) {
+        // The core and CLI accept any KeyMap as a macro trigger, so an
+        // existing composite / 227 trigger must remain writable unchanged.
+        // Only a newly selected value has to be a documented single key.
+        if self.key_map != entry.record().key_map && !is_valid_key_target(self.key_map) {
             return Err(DraftError::InvalidTrigger {
                 value: self.key_map,
             });
@@ -1053,10 +1070,14 @@ impl MacroEditor {
 
     /// Build a pending write for the confirmation dialog.
     ///
+    /// `snapshot` must be the configuration the editor was loaded against; its
+    /// SHA-256 and the target macro's raw step SHA-256 are stored so the worker
+    /// can refuse a write if the controller changed while the dialog was open.
+    ///
     /// # Errors
     ///
     /// Returns [`DraftError`] when nothing is loaded or the draft is invalid.
-    pub fn pending_write(&self) -> Result<PendingWrite, DraftError> {
+    pub fn pending_write(&self, snapshot: &ConfigSnapshot) -> Result<PendingWrite, DraftError> {
         let (Some(draft), Some(original)) = (self.draft.as_ref(), self.original.as_ref()) else {
             return Err(DraftError::EmptySteps);
         };
@@ -1078,6 +1099,8 @@ impl MacroEditor {
                 changes,
             },
             plan: PendingPlan::Macro(plan),
+            expected_config_sha256: sha256_hex(snapshot.config.as_bytes()),
+            expected_macro_raw_sha256: Some(sha256_hex(original.raw())),
         })
     }
 }
@@ -1131,6 +1154,16 @@ pub struct PendingWrite {
     pub target: WriteTarget,
     /// Prepared core plan.
     pub plan: PendingPlan,
+    /// SHA-256 of the configuration snapshot the dialog was built against.
+    ///
+    /// The driver compares this with a fresh read and refuses the write with
+    /// [`crate::driver::WritePhase::ConfigChanged`] when it differs.
+    pub expected_config_sha256: String,
+    /// SHA-256 of the target macro's raw steps at review time.
+    ///
+    /// Only set for a macro write; the driver compares it after reading the
+    /// full macro backup and before writing anything.
+    pub expected_macro_raw_sha256: Option<String>,
 }
 
 impl PendingWrite {
@@ -1178,6 +1211,92 @@ mod tests {
     }
 
     #[test]
+    fn untouched_factory_unused_slot_does_not_block_a_config_plan() {
+        let mut config = Bt2Config::default();
+        let mut record = config.map_key(Slot::S2);
+        record.keys = [KeyMap::from_bits(u32::MAX); BUTTON_COUNT];
+        config.set_map_key(Slot::S2, &record);
+        config.set_profile_name(Slot::S1, "Gamma").unwrap();
+        config.recompute_crc();
+        let snapshot = snapshot(config);
+
+        let mut draft = SettingsDraft::from_config(&snapshot.config);
+        assert!(
+            draft.validate(&snapshot.config).is_ok(),
+            "unchanged 0xFFFFFFFF entries must not make the config unwritable"
+        );
+        draft.profile_names[0] = "Delta".to_string();
+        let plan = draft.plan(&snapshot).expect("a plan must be built");
+        let prepared = plan.prepare(&snapshot).unwrap();
+        assert_eq!(
+            prepared.expected().map_key(Slot::S2),
+            snapshot.config.map_key(Slot::S2),
+            "the untouched slot must be preserved byte-for-byte"
+        );
+        assert!(
+            draft
+                .changes(&snapshot.config)
+                .iter()
+                .all(|change| !matches!(change, ChangeKind::RemapButton(Slot::S2, _))),
+            "unchanged unsupported entries are not reported as changes"
+        );
+        assert!(
+            draft
+                .edits(&snapshot.config)
+                .iter()
+                .all(|edit| !matches!(edit, ConfigEdit::ButtonRemap { slot: Slot::S2, .. })),
+            "unchanged unsupported entries are never sent"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_composite_macro_trigger_is_preserved() {
+        let mut header = MacroSlot::default();
+        header.records[0].max_steps = 1;
+        header.records[0].key_map = KeyMap::A | KeyMap::B;
+        let mut config = Bt2Config::default();
+        config.set_macro_slot(Slot::S1, &header);
+        let composite = entry(
+            &config,
+            Slot::S1,
+            MacroIndex::M1,
+            vec![MacroStep::neutral(20)],
+        );
+
+        let draft = MacroDraft::from_entry(&composite);
+        assert!(
+            draft.validate(&composite).is_ok(),
+            "an existing composite trigger must stay writable"
+        );
+        let plan = draft.plan(&composite).unwrap();
+        assert_eq!(plan.key_map, None, "an unchanged trigger is not rewritten");
+
+        let mut changed = MacroDraft::from_entry(&composite);
+        changed.key_map = KeyMap::MY_NULL;
+        assert!(matches!(
+            changed.validate(&composite),
+            Err(DraftError::InvalidTrigger { .. })
+        ));
+
+        let mut header = MacroSlot::default();
+        header.records[0].max_steps = 1;
+        header.records[0].key_map = KeyMap::MY_NULL;
+        let mut config = Bt2Config::default();
+        config.set_macro_slot(Slot::S1, &header);
+        let null_trigger = entry(
+            &config,
+            Slot::S1,
+            MacroIndex::M1,
+            vec![MacroStep::neutral(20)],
+        );
+        let draft = MacroDraft::from_entry(&null_trigger);
+        assert!(
+            draft.validate(&null_trigger).is_ok(),
+            "an existing 227 trigger must stay writable unchanged"
+        );
+    }
+
+    #[test]
     fn remap_targets_reject_null_unknown_and_composites() {
         assert!(is_valid_key_target(KeyMap::A));
         assert!(is_valid_key_target(KeyMap::M1));
@@ -1216,7 +1335,7 @@ mod tests {
 
         draft.keys[ButtonIndex::B.index()] = KeyMap::MY_NULL;
         assert_eq!(
-            draft.validate(Slot::S1),
+            draft.validate(&config, Slot::S1),
             Err(DraftError::InvalidKeyTarget {
                 slot: Slot::S1,
                 button: ButtonIndex::B
@@ -1494,12 +1613,21 @@ mod tests {
             vec![MacroStep::neutral(20)],
         );
 
+        let snapshot = snapshot(config);
+        let expected_config_sha = sha256_hex(snapshot.config.as_bytes());
+        let expected_macro_sha = sha256_hex(entry.raw());
+
         let mut editor = MacroEditor::default();
         editor.load(entry);
-        assert_eq!(editor.pending_write(), Err(DraftError::NoChanges));
+        assert_eq!(editor.pending_write(&snapshot), Err(DraftError::NoChanges));
 
         editor.draft.as_mut().unwrap().steps[0].ms_times = 40;
-        let pending = editor.pending_write().unwrap();
+        let pending = editor.pending_write(&snapshot).unwrap();
+        assert_eq!(pending.expected_config_sha256, expected_config_sha);
+        assert_eq!(
+            pending.expected_macro_raw_sha256.as_deref(),
+            Some(expected_macro_sha.as_str())
+        );
         match pending.target {
             WriteTarget::Macro {
                 steps,

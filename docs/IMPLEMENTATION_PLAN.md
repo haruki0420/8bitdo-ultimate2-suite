@@ -142,17 +142,17 @@ graph TD
 ```text
 Track A: コア / CLI（Linux・デスクトップ）
   Phase 1  protocol                 完了
-  Phase 2a read-only + session      ← いまここ
-  Phase 2b macro write              本命
-  Phase 2c BLE OTA (Linux)
-  Phase 2d config apply
+  Phase 2a read-only + session      完了
+  Phase 2b macro write              完了（Mock、実機未検証）
+  Phase 2c BLE OTA (Linux)          core 実装済み（CLI / GUI 未配線、実機保留）
+  Phase 2d config apply             完了（Mock、実機未検証）
   Phase 2e USB / 2.4G transport     保留
 
 Track B: GUI（egui / Pure Rust）
-  Phase 3a read-only GUI            2a 後（前倒し可）
-  Phase 3b macro editor             2b 後
-  Phase 3c OTA screen               2c 後
-  Phase 3d settings tabs            2d 後
+  Phase 3a read-only GUI            完了（Mock / headless、実機未検証）
+  Phase 3b macro editor             実装済み（PR #16、実機未検証・Tier 3）
+  Phase 3c OTA screen               未着手
+  Phase 3d settings tabs            実装済み（PR #16、実機未検証・Tier 3）
 
 Track C: モバイル
   Phase 5  UniFFI + iOS / Android   最後
@@ -263,9 +263,14 @@ Track C: モバイル
 ### Phase 3: `eightbitdo-gui`（デスクトップ ネイティブ GUI：Linux / macOS / Windows）
 - **技術**: `egui` (`eframe`)、Pure Rust。Node.js / WebView / Electron / Tauri は使わない。
 - **Phase 3a（read-only GUI、Phase 2a 後）**: 接続パネル、デバイス情報、ライブ入力、設定ビューア、バックアップ。既定は **Tier 2**、ただし `crates/eightbitdo-core/**`（`session` / transport / mock を含む）の変更を伴う場合は **Tier 3**。GUI 側だけで完結する場合も、`session` の読み取り契約（ドレインの fail-closed、応答 `total_len` / `crc16` 照合、`Instant` 上限）を検証するテストを変えるなら Tier 3。
+  - **状態**: 実装済み（PR #16 以前）。Mock / ヘッドレステストのみで**実機未検証**。
 - **Phase 3b（マクロエディタ、Phase 2b 後）**: タイムライン / テーブル、リアルタイム録音、1ms、8bit スティック、トリガー、JSON/TOML。Tier 3。
+  - **状態**: 実装済み（PR #16、**実機未検証**）。20ms ライブ録音、ステップ編集（削除・待ち時間挿入・値変更）、既存非空マクロへの Header → Save → Erase → Write → Save、read-back 検証。空マクロ作成は拒否。JSON/TOML 入出力は未実装。
 - **Phase 3c（OTA 画面、Phase 2c 後）**: バージョン確認、進捗、復旧モード。Tier 3。
+  - **状態**: 未着手（core の BLE OTA も CLI / GUI 未配線・実機保留）。
 - **Phase 3d（設定タブ、Phase 2d 後）**: プロファイル、リマップ、デッドゾーン、振動、6 軸、RGB。Tier 3。
+  - **状態**: 実装済み（PR #16、**実機未検証**）。22 ボタンリマップ（未変更の unsupported 値は保持、新規選択は単一文書化キーのみ）、プロファイル名、`gamepad_mode`、有効プロファイル、振動、スティック/トリガー、特殊機能、ジャイロ、LED。確認ダイアログ、pre-write backup、read-back 検証、TOCTOU（expected SHA-256 不一致で中止）付き。
+- **書込経路の安全性**: GUI の書込は pre-write backup → デバイス書込 → read-back の順を固定し、フラッシュ中は 20ms keepalive を停止して再開する。ライブ入力停止中は keepalive なしで書く（CLI の polling 無効時と同じ）。失敗時は backup path・SHA-256・復旧手順を表示する。確認後に設定 / マクロが変わっていた場合は 1 フレームも送らず中止する。
 - **完了条件**: Linux / macOS / Windows でビルド・起動し、実機と同期すること。
 
 ### Phase 4: USB OTA（保留）
