@@ -738,8 +738,9 @@ Bootloader Mode (`"8bt"`, Service `0000FF20-...`, Char `0000FF21-...`) では先
 #### 実装済み API
 
 - `OtaUpdate` の段階: `Idle` → `EnteringBoot`（`0x000C`）→ `AwaitingBootReconnect`（`"8bt"` への再接続はフロントエンドの責務）→ `PreparingBoot`（`readPID 0x0008` → `gamepad_type` 判定 → 任意で `readVersionInBoot 0x0005`）→ `Ready` → `Erasing` / `Writing` / `Finalizing` → `Complete`（失敗時は `Failed`）。
-- `prepare_boot` は **`BootReady<'a, T>` ガード**を返し、`write_firmware` はそのガードのみを受け付ける。ガードは PID 読みに使った boot transport を借用し、生成元 `OtaUpdate` の ID も保持するため、「PID 確認後のリンク」と「書込リンク」を別にできない（型 + 実行時 ID 照合）。`OtaTransport` マーカーは Mock と BLE にのみ実装し、USB transport は型で受け付けない。
-- 期待 app base の必須化: `OtaConfig::new(expected_load_base)` が **非 0・4KB アライン**を検証し、`write_firmware` は `.dat +0x04` の `load_base_addr` が `expected_load_base` と厳密一致しない限り最初の Erase 前に `OtaInvalidFirmware` で停止する。`load_base = 0` 等で bootloader 領域を消去することはできない（`expected_load_base` が唯一の allowlist。bootloader / flash 領域の列挙はしない）。
+- `prepare_boot` は **`BootReady<'a, T>` ガード**を返し、`write_firmware` はそのガードのみを受け付ける。ガードは PID 読みに使った boot transport を借用し、生成元 `OtaUpdate` の ID も保持するため、「PID 確認後のリンク」と「書込リンク」を別にできない（型 + 実行時 ID 照合）。`OtaTransport` マーカーは **sealed**（外部 crate 実装不可）で、crate 内の Mock と **boot 専用 `BleBootTransport`**（`"8bt"` / service `FF20` / characteristic `FF21`・`FF23`）にのみ実装する。App Mode `BleTransport`（`"80ND"` / `FF10`）は接続先が異なり `"8bt"` に到達できないため、`OtaTransport` ではない。USB transport は型で拒否される。
+- 期待 app base の組み込み検証: `OtaConfig::new(expected_load_base)` と `OtaUpdate::with_config` は、base が **type 1 の暫定 application ウィンドウ `0x0101_0000..0x0102_0000`**（`UT2_TYPE1_APP_BASE_MIN..UT2_TYPE1_APP_FLASH_END`）内で 4KB アラインであることを要求する。さらに `write_firmware` は `.dat +0x04` の `load_base_addr` が `expected_load_base` と厳密一致し、`expected_load_base + image_len <= UT2_TYPE1_APP_FLASH_END` であることを **最初の Erase 前**に検査し、外れたら `OtaInvalidFirmware` で停止する。`load_base = 0` / bootloader 領域 / type 0 の `0x0801_xxxx` は拒否される。
+  - このウィンドウは、文書化された type 1 のアドレス（`readVersionInBoot`/`WriteFirmwareVersion` = `0x01017040`、`JumpApp` = `0x01018000`）を含み、0 番地・bootloader・type 0 領域を除外する **暫定の 64 KiB アライン範囲**である。公式 `.dat` の `load_base_addr` と実フラッシュサイズは未測定のため、実機と公式 `.dat` で確定するまで暫定値として扱い、CLI 配線は保留する。
 - MTU 事前検証: 最初の Erase 前に `mtu - 3 >= 81`（`OTA_MIN_MTU = 84`）を検証し、不足なら `MtuTooSmall` で停止する。最大フレームは 64B WriteFirmware の **81B**（1B prefix + 16B header + 64B payload）。Erase 17B / WriteVersion 41B / WriteFirmwareVersion 21B / JumpApp 17B はこれに収まる。App Mode の観測 MTU は 92 だが、**Bootloader の実 MTU は未確認**。
 - 未確認 wire の実行時ゲート: `OtaConfig::allow_unverified_wire` は既定 **false**。false の間は `write_firmware` がフラッシュフレームを 1 つも送らず `InvalidRequest` で拒否する。Mock テストと、復旧可能な実機でのベンチ実験のみ `with_unverified_wire_allowed(true)` を明示する。**この時点で実機書込に使わないこと。**
 - 書込順序: セクタごとに `EraseFlash 0x0004` ACK（10s）→ `WriteFirmware 0x0003` 64B + CRC-16/MODBUS ACK（1s/チャンク）を繰り返し、最後に `WriteVersion 0x00C4`（24B ヘッダ、3s）→ `WriteFirmwareVersion 0x0002`（4B、send-only）→ `JumpApp 0x0006`。全フレームは最初の Erase 前に構築・検証する。
@@ -750,14 +751,15 @@ Bootloader Mode (`"8bt"`, Service `0000FF20-...`, Char `0000FF21-...`) では先
 - `read_version_in_boot` は既定 **ON**。読み取り失敗はフラッシュ書込前に中止する（`OtaWriteState::Untouched` 相当）。
 - 部分セクタ: `image_len` が 4KB 倍数でない場合、セクタ数は `ceil(image_len / 4096)` で、最終セクタは部分書き込みになる（例: `0x1040` は 2 セクタ・65 チャンク）。
 - キャンセル契約: `write_firmware` の Future を drop した場合、その時点までのフラッシュ操作はロールバックされず、構造化された recovery エラーも返らない。フロントエンドは erase / write / finalize 区間を非キャンセルにし、強制キャンセル後は `"8bt"` へ再接続して `prepare_boot` → 全消去・再書込を行うこと。
-- `OtaUnsupportedPid` / `OtaInvalidFirmware` / `MtuTooSmall` / unverified-wire 拒否はすべて **最初のフラッシュフレーム前**（`OtaWriteState::Untouched` 相当）。
+- `OtaUnsupportedPid` は `OtaWriteState::Untouched` を保持する。`OtaInvalidFirmware` / `MtuTooSmall` / unverified-wire 拒否もすべて **最初のフラッシュフレーム前**（`Untouched` 相当）。
 
 #### ready ACK と完了 ACK の区別（未検証・オプトインガード）
 
 payload-less の ready ACK が完了 ACK より先に届く場合、Erase 完了前に Write を送る / チャンク完了前に次を送る危険がある。ACK 形状は実機未確認のため:
 
 - 既定（`require_completion_ack = false`）は仕様どおり最初の matching ACK を完了として扱う。**この既定のまま実機書込に使わない。**
-- `OtaConfig::with_completion_ack_required(true)` で、EraseFlash / WriteFirmware の最初の payload-less `cmd=0x0004` envelope を ready ACK としてスキップし、次の matching ACK を待つ。1 個しか ACK が来ない場合はタイムアウトで fail-closed。
+- `OtaConfig::with_completion_ack_required(true)` で、**EraseFlash / WriteFirmware / WriteVersion** の最初の payload-less `cmd=0x0004` matching frame を ready ACK としてスキップし、次の matching ACK を待つ。1 個しか ACK が来ない場合はタイムアウトで fail-closed。
+- **payload-less direct echo の扱い**: EraseFlash の要求 `cmd` は `0x0004`（応答 envelope と同値）なので、`cmd=0x0004, subcmd=0` の直接 echo は envelope と区別できず、completion モードでは ready ACK としてもスキップされる。その他のコマンドでは直接 echo の `cmd` が `0x0004` ではないため、即座に完了 ACK として扱う。この非対称性は実 wire 形状が未確認であることによる。
 - 実機 btsnoop で ACK 形状が確定するまで、CLI / GUI / UniFFI の OTA 配線は保留する。
 
 #### N/A（実装しない）
@@ -770,7 +772,7 @@ payload-less の ready ACK が完了 ACK より先に届く場合、Erase 完了
 
 1. **Bootloader RX フレーミング**: 応答は App Mode 同様「16B ヘッダ + payload、先頭 prefix なし」を仮定。`0x05` が TX のみかは未確認。
 2. **`readPID` / `readVersionInBoot` の応答形状**: `cmd=0x0004` envelope（要求 `cmd` を `subcmd` にエコー）または `cmd` 直エコーを受理。payload 長は 2B / 4B を要求。
-3. **ready ACK と完了 ACK の区別**: 上記オプトインガードの前提となる実 wire 形状が未確認。
+3. **ready ACK と完了 ACK の区別**: 上記オプトインガードの前提となる実 wire 形状が未確認（WriteVersion を含む。payload-less direct echo の扱いも上記のとおり）。
 4. **PID → `gamepad_type` の対応**: 本実装は `0x600F` → type 1 のホワイトリスト（プロジェクト規約）。証跡 §6 はキャラクタリスティック index 由来と報告。
 5. **Erase / Write のアドレス規約**: 仕様 §8.3 の `load_base_addr + sector_off (+ chunk_off)` を実装。証跡 §3 / §7 は Android 実装がイメージ相対 `sector_off` を wire に載せると報告しており矛盾する。
 6. **`WriteVersion 0x00C4` の payload**: 仕様どおり 24B ヘッダを送る。証跡 §2 は Android 実装が payload 0B（16B フレーム）と報告。
@@ -779,10 +781,20 @@ payload-less の ready ACK が完了 ACK より先に届く場合、Erase 完了
 9. **`enterBoot 0x000C`**: ACK と App リンク切断の両方を受理。Android APK では dead code（証跡 §4）。`"8bt"` の `readPID` 成功までフラッシュには触れない。
 10. **タイムアウト差**: `readPID` / `readVersionInBoot` は仕様の 5s を実装。証跡 §5 は Android 実装が 2s と報告。
 11. **Bootloader の MTU**: 81B フレームが通るかは未確認。`MTU >= 84` は `mtu - 3` の host 側推論であり、デバイス要件として確認されていない。
-12. **マルチセクション `.dat`**: 単一セクションのみ対応。証跡 §8 のとおり公式 `.dat` がマルチセクションである可能性があり、その場合この実装は更新を拒否する。**次 PR の必須項目**。
+12. **マルチセクション `.dat`（blocker）**: 単一セクションのみ対応。証跡 §8 のとおり公式 `.dat` がマルチセクションである可能性が高く、その場合この実装は更新を拒否する。**公式ファームウェア対応の blocker であり、次 PR の必須項目**。
 13. **`load_base_addr` の来歴**: 本実装は `expected_load_base` との厳密一致だけを検証し、`.dat` の署名・ハッシュ・配信元は検証しない。呼び出し元が信頼できる `.dat` と期待 base を渡す trust boundary である。
 14. **バッテリー / ダウングレード / ファームウェア取得・検証**: 本 PR の範囲外。
 
+#### CLI / GUI / UniFFI 配線時の必須検証（配線は保留）
+
+1. 実機 btsnoop で Bootloader RX フレーミング、ready/完了 ACK（WriteVersion 含む）、Erase/Write のアドレス規約、`WriteVersion` payload 長、`WriteFirmware` 実フレーム長、Erase の `chunk_len`、Bootloader MTU を確定する。
+2. 公式 `.dat` の `load_base_addr` / `image_len` / セクション数を実測し、`UT2_TYPE1_APP_BASE_MIN` / `UT2_TYPE1_APP_FLASH_END` の暫定ウィンドウを確定値に置き換える（外れた画像は Erase 前に拒否する）。
+3. マルチセクション `.dat` をサポートするか、公式 `.dat` 非対応を明示する（blocker 解消）。
+4. `require_completion_ack` の既定値を実 wire に合わせて確定し、`allow_unverified_wire` を削除または明示的なベンチ専用に限定する。
+5. バッテリー残量、バージョン / ダウングレード判定、ダウンロード整合性（SHA-256 / 署名）を追加する。
+6. `OtaTransport` は boot 専用 `BleBootTransport` のみを使い、App Mode `BleTransport` や USB transport を渡さない（型で強制）。
+7. 成功判定は ACK だけでなく、`"80ND"` への再接続と App Mode のバージョン読み出しで確認する。
+
 #### テスト
 
-MockTransport による **42 テスト**: 正常系の全パケット列・CRC・チャンク境界・セクタ境界・複数セクタ進捗・部分セクタ、Erase/Write/WriteVersion/WriteFirmwareVersion/Jump の失敗、送信失敗、ACK タイムアウト（リトライなし）、PID 不一致、ready/completion ACK ガード（スキップ成功・単独 ACK タイムアウト）、MTU 不足、expected base 不一致・0・非アライン、transport 不一致（ガード）、未確認 wire ゲート、`0x000E` 応答、キャンセル、マルチセクション拒否メッセージ、`load_base + image_len` の 2^32 境界。
+MockTransport による **46 テスト**: 正常系の全パケット列・CRC・チャンク境界・セクタ境界・複数セクタ進捗・部分セクタ、Erase/Write/WriteVersion/WriteFirmwareVersion/Jump の失敗、送信失敗、ACK タイムアウト（リトライなし）、PID 不一致、ready/completion ACK ガード（スキップ成功・単独 ACK タイムアウト）、MTU 不足、type 1 ウィンドウ外・`base + image_len` 上限超過・境界ちょうど、transport 不一致（ガード）、未確認 wire ゲート、`0x000E` 応答、キャンセル、マルチセクション拒否メッセージ、`load_base + image_len` の 2^32 境界、WriteVersion の ready ACK 単独タイムアウト。

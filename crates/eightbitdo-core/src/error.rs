@@ -334,15 +334,17 @@ pub enum Error {
     /// Only `gamepad_type == 1` (PID `0x600F`) is documented. The version and
     /// jump addresses of any other type are unknown, so the update stops after
     /// `readPID` without sending a read at a guessed offset or any flash write.
-    /// This is a pre-write failure: it is equivalent to
-    /// [`OtaWriteState::Untouched`] (the error variant itself carries no state).
+    /// This is a pre-write failure and always carries
+    /// [`OtaWriteState::Untouched`].
     #[error(
-        "unsupported bootloader PID 0x{pid:04X}: only gamepad_type 1 (PID 0x600F) has documented \
-         BLE OTA readVersionInBoot/JumpApp offsets; stopping before any flash write"
+        "unsupported bootloader PID 0x{pid:04X} ({state}): only gamepad_type 1 (PID 0x600F) has \
+         documented BLE OTA readVersionInBoot/JumpApp offsets; stopping before any flash write"
     )]
     OtaUnsupportedPid {
         /// PID the bootloader reported.
         pid: u16,
+        /// Always [`OtaWriteState::Untouched`]; no flash frame was sent.
+        state: OtaWriteState,
     },
 
     /// A `.dat` firmware image failed local validation before any flash write.

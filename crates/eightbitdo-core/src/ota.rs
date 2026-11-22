@@ -50,11 +50,14 @@
 //!
 //! `FirmwareImage::parse` validates structure, not provenance. The caller must
 //! supply `.dat` bytes from a trusted source and must also pass the expected
-//! application base. This module does not enumerate flash/bootloader regions:
-//! `OtaConfig::expected_load_base` is the only address allowlist, and it is
-//! mandatory. Only single-section `.dat` files are accepted; official firmware
-//! images may be multi-section, in which case the update refuses instead of
-//! writing a partial image (next-PR blocker, see §8.5).
+//! application base. The address allowlist is built in: the base must lie in
+//! the provisional type-1 window
+//! [`UT2_TYPE1_APP_BASE_MIN`]..[`UT2_TYPE1_APP_FLASH_END`] and
+//! `base + image_len` must not exceed the window end. Both checks happen before
+//! the first EraseFlash. Only single-section `.dat` files are accepted;
+//! official firmware images may be multi-section, in which case the update
+//! refuses instead of writing a partial image (**blocker** for official
+//! firmware support, see §8.5).
 //!
 //! # Cancellation contract
 //!
@@ -78,11 +81,14 @@
 //! `WriteAPPID` / `JumpApp`) is undocumented (`docs/PROTOCOL_SPEC.md` §8.4,
 //! `AGENTS.md` §4.4). `[0x00, 0x05]` is an RX-only prefix and must not be
 //! reused as TX framing, so this module implements **BLE only**. Only types
-//! implementing the [`OtaTransport`] marker can be passed to the boot phase;
-//! the marker is implemented for [`MockTransport`](crate::mock::MockTransport)
-//! and [`BleTransport`](crate::ble::BleTransport), not for a USB transport.
-//! USB OTA is `N/A` until the spec carries framing evidence, and USB recovery
-//! is re-enumeration / reconnection, never the BLE `"8bt"` reconnect.
+//! implementing the sealed [`OtaTransport`] marker can be passed to the boot
+//! phase; the marker is implemented only for
+//! [`MockTransport`](crate::mock::MockTransport) and the boot-specific
+//! [`BleBootTransport`](crate::ble::BleBootTransport). The App Mode
+//! [`BleTransport`](crate::ble::BleTransport) (`"80ND"` / `FF10`) cannot reach
+//! `"8bt"` and is deliberately excluded. USB OTA is `N/A` until the spec
+//! carries framing evidence, and USB recovery is re-enumeration /
+//! reconnection, never the BLE `"8bt"` reconnect.
 //!
 //! # `gamepad_type` policy
 //!
@@ -113,9 +119,13 @@
 //!   16-byte frame with no payload; again unverified.
 //! * Ready-vs-completion ACK shapes are unverified. With
 //!   [`OtaConfig::require_completion_ack`] enabled, the first payload-less
-//!   `cmd 0x0004` envelope is treated as a ready ACK and skipped for
-//!   EraseFlash / WriteFirmware; the option is off by default until btsnoop
-//!   evidence exists.
+//!   `cmd 0x0004` matching frame is treated as a ready ACK and skipped for
+//!   EraseFlash / WriteFirmware / WriteVersion; the option is off by default
+//!   until btsnoop evidence exists. Because EraseFlash's request `cmd` is also
+//!   `0x0004`, a payload-less direct echo (`cmd=0x0004, subcmd=0`) is
+//!   indistinguishable from the envelope and is also skipped as a ready ACK in
+//!   that mode. For other commands a direct `cmd` echo is not `0x0004` and
+//!   completes immediately.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -179,21 +189,52 @@ pub const OTA_MAX_FRAME_LEN: usize = 1 + HEADER_SIZE + OTA_CHUNK_SIZE;
 /// so an avoidable erase cannot happen on a link that cannot carry the writes.
 pub const OTA_MIN_MTU: u16 = (OTA_MAX_FRAME_LEN + 3) as u16;
 
+/// Provisional type-1 application window start.
+///
+/// Derived from the only documented type-1 addresses: `readVersionInBoot` /
+/// `WriteFirmwareVersion` at `0x01017040` and the `JumpApp` entry at
+/// `0x01018000` (`docs/PROTOCOL_SPEC.md` §8.3). The official `.dat`
+/// `load_base_addr` has **not been measured**, so this 64 KiB-aligned window
+/// (`0x01010000..0x01020000`) is a conservative allowlist that contains both
+/// documented addresses and excludes address 0 / the bootloader area / the
+/// type-0 `0x0801_xxxx` region. It is provisional and must be confirmed from an
+/// official `.dat` and a real device before CLI wiring.
+pub const UT2_TYPE1_APP_BASE_MIN: u32 = 0x0101_0000;
+
+/// Provisional exclusive end of the type-1 application flash window.
+///
+/// See [`UT2_TYPE1_APP_BASE_MIN`]. `expected_load_base + image_len` must not
+/// exceed this address, so the last EraseFlash/WriteFirmware sector cannot
+/// leave the application window.
+pub const UT2_TYPE1_APP_FLASH_END: u32 = 0x0102_0000;
+
 /// Marker for transports that may carry the BLE `"8bt"` bootloader protocol.
 ///
 /// The boot phase is BLE-only: USB Boot TX framing is undocumented, so a USB
 /// transport must not be passed to [`OtaUpdate::prepare_boot`] /
-/// [`OtaUpdate::write_firmware`]. The marker is implemented for
-/// [`MockTransport`](crate::mock::MockTransport) and
-/// [`BleTransport`](crate::ble::BleTransport). A front end adding another BLE
-/// implementation must implement this marker explicitly, which documents that
-/// it speaks the BLE frame shape (TX `0x05` prefix, RX without a prefix).
-pub trait OtaTransport: Transport {}
+/// [`OtaUpdate::write_firmware`]. The marker is sealed (downstream crates
+/// cannot implement it) and is implemented only inside this crate for
+/// [`MockTransport`](crate::mock::MockTransport) and the boot-specific
+/// [`BleBootTransport`](crate::ble::BleBootTransport) (`"8bt"`, service `FF20`,
+/// characteristic `FF21`/`FF23`).
+///
+/// The App Mode [`BleTransport`](crate::ble::BleTransport) is fixed to
+/// `"80ND"` / service `FF10` and cannot reach the bootloader, so it is
+/// deliberately **not** an `OtaTransport`.
+pub trait OtaTransport: Transport + sealed::Sealed {}
 
+mod sealed {
+    /// Prevents downstream crates from implementing [`OtaTransport`].
+    pub trait Sealed {}
+}
+
+impl sealed::Sealed for crate::mock::MockTransport {}
 impl OtaTransport for crate::mock::MockTransport {}
 
 #[cfg(feature = "ble")]
-impl OtaTransport for crate::ble::BleTransport {}
+impl sealed::Sealed for crate::ble::BleBootTransport {}
+#[cfg(feature = "ble")]
+impl OtaTransport for crate::ble::BleBootTransport {}
 
 /// The controller generation whose BLE OTA offsets are documented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,33 +345,71 @@ pub struct OtaConfig {
     ///
     /// Mandatory trust boundary: an image whose header names any other base is
     /// refused before the first EraseFlash, so a malformed `load_base = 0`
-    /// cannot erase the bootloader area. Must be non-zero and 4 KB aligned.
-    pub expected_load_base: u32,
+    /// cannot erase the bootloader area. Must be inside the provisional type-1
+    /// window [`UT2_TYPE1_APP_BASE_MIN`]..[`UT2_TYPE1_APP_FLASH_END`] and 4 KB
+    /// aligned; `expected_load_base + image_len` must also stay inside the
+    /// window.
+    expected_load_base: u32,
     /// ACK timeouts.
-    pub timeouts: OtaTimeouts,
+    timeouts: OtaTimeouts,
     /// Read `readVersionInBoot` (`0x0005`) after the PID check.
     ///
     /// Defaults to `true` (the documented sequence). It is read-only and its
     /// result is reported in [`OtaOutcome::boot_version`]; a failure aborts
     /// before any flash write.
-    pub read_version_in_boot: bool,
-    /// Treat the first payload-less `cmd 0x0004` matching envelope for
-    /// EraseFlash / WriteFirmware as a ready ACK and wait for a completion ACK.
+    read_version_in_boot: bool,
+    /// Treat the first payload-less `cmd 0x0004` matching frame for
+    /// EraseFlash / WriteFirmware / WriteVersion as a ready ACK and wait for a
+    /// completion ACK.
     ///
     /// Off by default because the bootloader ACK shapes are unverified. When
-    /// enabled, a device that emits only one envelope ACK will time out
-    /// (fail-closed); when disabled, the first matching ACK completes the
-    /// command (current documented behavior).
-    pub require_completion_ack: bool,
+    /// enabled, a device that emits only one ACK will time out (fail-closed);
+    /// when disabled, the first matching ACK completes the command (current
+    /// documented behavior). For EraseFlash the direct echo (`cmd=0x0004,
+    /// subcmd=0`) shares the `cmd` value with the envelope, so it is also
+    /// treated as a ready ACK in this mode; for the other commands a direct
+    /// echo completes immediately.
+    require_completion_ack: bool,
     /// Allow flash writes while the bootloader wire shape is unverified.
     ///
     /// `false` (default) makes [`OtaUpdate::write_firmware`] refuse before any
     /// flash frame. Only MockTransport tests and bench experiments on a
     /// recoverable controller should opt in; see the module docs.
-    pub allow_unverified_wire: bool,
+    allow_unverified_wire: bool,
 }
 
 impl OtaConfig {
+    /// Expected application base from the trusted `.dat`.
+    #[must_use]
+    pub const fn expected_load_base(&self) -> u32 {
+        self.expected_load_base
+    }
+
+    /// ACK timeouts.
+    #[must_use]
+    pub const fn timeouts(&self) -> OtaTimeouts {
+        self.timeouts
+    }
+
+    /// Whether `readVersionInBoot` is sent (default `true`).
+    #[must_use]
+    pub const fn read_version_in_boot(&self) -> bool {
+        self.read_version_in_boot
+    }
+
+    /// Whether the first payload-less ready ACK is skipped for the flash
+    /// commands (Erase / Write / WriteVersion).
+    #[must_use]
+    pub const fn require_completion_ack(&self) -> bool {
+        self.require_completion_ack
+    }
+
+    /// Whether flash writes are allowed while the wire shape is unverified.
+    #[must_use]
+    pub const fn allow_unverified_wire(&self) -> bool {
+        self.allow_unverified_wire
+    }
+
     /// Create a configuration with a mandatory expected application base.
     ///
     /// # Errors
@@ -685,13 +764,19 @@ impl OtaUpdate {
     /// Returns [`Error::OtaInvalidFirmware`] when `expected_load_base` is `0`
     /// or not 4 KB aligned.
     pub fn new(expected_load_base: u32) -> Result<Self, Error> {
-        Ok(Self::with_config(OtaConfig::new(expected_load_base)?))
+        Self::with_config(OtaConfig::new(expected_load_base)?)
     }
 
     /// Create an update with an explicit configuration.
-    #[must_use]
-    pub fn with_config(config: OtaConfig) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OtaInvalidFirmware`] when the configuration's expected
+    /// application base is outside the provisional type-1 window or not 4 KB
+    /// aligned. The same invariant is re-checked before the first EraseFlash.
+    pub fn with_config(config: OtaConfig) -> Result<Self, Error> {
+        validate_expected_load_base(config.expected_load_base)?;
+        Ok(Self {
             id: NEXT_UPDATE_ID.fetch_add(1, Ordering::Relaxed),
             config,
             phase: OtaPhase::Idle,
@@ -705,7 +790,7 @@ impl OtaUpdate {
             bytes_written: 0,
             packets_sent: 0,
             image_len: 0,
-        }
+        })
     }
 
     /// Configured timeouts and options.
@@ -860,7 +945,10 @@ impl OtaUpdate {
         self.pid = Some(pid);
         let Some(gamepad_type) = gamepad_type_from_pid(pid) else {
             self.phase = OtaPhase::Failed;
-            return Err(Error::OtaUnsupportedPid { pid });
+            return Err(Error::OtaUnsupportedPid {
+                pid,
+                state: OtaWriteState::Untouched,
+            });
         };
         self.gamepad_type = Some(gamepad_type);
 
@@ -941,9 +1029,11 @@ impl OtaUpdate {
                     .to_string(),
             ));
         }
-        // Re-validate the config value itself: `OtaConfig` fields are public,
-        // so a struct literal must not be able to turn the allowlist into 0.
-        if let Err(error) = validate_expected_load_base(self.config.expected_load_base) {
+        // Re-validate the config value and the image range before any frame:
+        // `expected_load_base + image_len` must stay inside the provisional
+        // type-1 application window, so the last erase/write cannot leave it.
+        if let Err(error) = validate_image_range(self.config.expected_load_base, image.image_len())
+        {
             self.phase = OtaPhase::Failed;
             return Err(error);
         }
@@ -1080,7 +1170,7 @@ impl OtaUpdate {
             &version_header,
             self.config.timeouts.write_version,
             "WriteVersion",
-            false,
+            require_completion_ack,
         )
         .await
         {
@@ -1191,16 +1281,32 @@ impl OtaUpdate {
 }
 
 fn validate_expected_load_base(expected_load_base: u32) -> Result<(), Error> {
-    if expected_load_base == 0 {
-        return Err(invalid_firmware(
-            "expected_load_base must not be 0; a zero base would erase the bootloader region"
-                .to_string(),
-        ));
+    if !(UT2_TYPE1_APP_BASE_MIN..UT2_TYPE1_APP_FLASH_END).contains(&expected_load_base) {
+        return Err(invalid_firmware(format!(
+            "expected_load_base 0x{expected_load_base:08X} is outside the provisional type-1 \
+             application window 0x{UT2_TYPE1_APP_BASE_MIN:08X}..0x{UT2_TYPE1_APP_FLASH_END:08X}; \
+             refusing to erase an unvalidated flash region (address 0 / the bootloader area / the \
+             type-0 0x0801_xxxx region are not valid type-1 application bases)"
+        )));
     }
     if expected_load_base % OTA_SECTOR_SIZE != 0 {
         return Err(invalid_firmware(format!(
             "expected_load_base 0x{expected_load_base:08X} is not {OTA_SECTOR_SIZE}-byte aligned; \
              EraseFlash addresses are expected_load_base + sector_off"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the whole image range against the provisional type-1 window.
+fn validate_image_range(expected_load_base: u32, image_len: u32) -> Result<(), Error> {
+    validate_expected_load_base(expected_load_base)?;
+    let end = u64::from(expected_load_base) + u64::from(image_len);
+    if end > u64::from(UT2_TYPE1_APP_FLASH_END) {
+        return Err(invalid_firmware(format!(
+            "expected_load_base 0x{expected_load_base:08X} + image_len {image_len} = \
+             0x{end:08X} exceeds the type-1 application flash end \
+             0x{UT2_TYPE1_APP_FLASH_END:08X}; refusing to erase past the application window"
         )));
     }
     Ok(())
@@ -1269,9 +1375,13 @@ async fn boot_request_read<T: Transport>(
 /// Send a bootloader command and wait for its ACK.
 ///
 /// `require_completion_ack` makes the first payload-less `cmd 0x0004` matching
-/// envelope count as a ready ACK only; the next matching frame completes the
+/// frame count as a ready ACK only; the next matching frame completes the
 /// command. This is an opt-in guard for the unverified ready/completion ACK
-/// distinction. No command is ever retried.
+/// distinction. Because `EraseFlash`'s request `cmd` is `0x0004`, its
+/// payload-less direct echo (`cmd=0x0004, subcmd=0`) is indistinguishable from
+/// the envelope and is also skipped in this mode; for every other command a
+/// direct echo has a different `cmd` and completes immediately. No command is
+/// ever retried.
 async fn boot_send_and_await_ack<T: Transport>(
     transport: &T,
     request: &commands::Request,
@@ -1428,11 +1538,11 @@ mod tests {
     }
 
     fn new_update() -> OtaUpdate {
-        OtaUpdate::with_config(base_config())
+        OtaUpdate::with_config(base_config()).unwrap()
     }
 
     fn update_with_timeouts(timeouts: OtaTimeouts) -> OtaUpdate {
-        OtaUpdate::with_config(base_config().with_timeouts(timeouts))
+        OtaUpdate::with_config(base_config().with_timeouts(timeouts)).unwrap()
     }
 
     /// MockTransport with the App Mode-observed MTU (92), enough for the
@@ -1638,7 +1748,7 @@ mod tests {
         let mock = high_mtu_mock();
         mock.push_incoming(&pid_response(UT2_BOOT_PID));
         let config = base_config().with_read_version_in_boot(false);
-        let mut update = OtaUpdate::with_config(config);
+        let mut update = OtaUpdate::with_config(config).unwrap();
 
         let _ready = update.prepare_boot(&mock).await.unwrap();
 
@@ -1655,7 +1765,14 @@ mod tests {
 
         let error = update.prepare_boot(&mock).await.unwrap_err();
 
-        assert!(matches!(error, Error::OtaUnsupportedPid { pid: 0x6011 }));
+        assert!(matches!(
+            error,
+            Error::OtaUnsupportedPid {
+                pid: 0x6011,
+                state: OtaWriteState::Untouched,
+                ..
+            }
+        ));
         assert_eq!(update.phase(), OtaPhase::Failed);
         assert_eq!(update.pid(), Some(0x6011));
         assert_eq!(update.gamepad_type(), None);
@@ -2144,7 +2261,7 @@ mod tests {
             &UT2_BOOT_PID.to_le_bytes(),
         ));
         let config = base_config().with_read_version_in_boot(false);
-        let mut update = OtaUpdate::with_config(config);
+        let mut update = OtaUpdate::with_config(config).unwrap();
 
         let _ready = update.prepare_boot(&mock).await.unwrap();
 
@@ -2342,7 +2459,7 @@ mod tests {
         let image = FirmwareImage::parse(&image_bytes).unwrap();
         let mock = high_mtu_mock();
         queue_prepare(&mock, UT2_BOOT_PID, 0x0000_0102);
-        let mut update = OtaUpdate::with_config(OtaConfig::new(TEST_BASE).unwrap());
+        let mut update = OtaUpdate::with_config(OtaConfig::new(TEST_BASE).unwrap()).unwrap();
         let _ready = update.prepare_boot(&mock).await.unwrap();
 
         let error = update
@@ -2399,12 +2516,13 @@ mod tests {
             queue_ack(&mock, request);
             queue_ack(&mock, request);
         }
-        queue_ack(
-            &mock,
-            &boot::write_version_header(image.image_len(), image.version_header()).unwrap(),
-        );
+        let version_header =
+            boot::write_version_header(image.image_len(), image.version_header()).unwrap();
+        queue_ack(&mock, &version_header);
+        queue_ack(&mock, &version_header);
         queue_ack(&mock, &boot::jump_app());
-        let mut update = OtaUpdate::with_config(base_config().with_completion_ack_required(true));
+        let mut update =
+            OtaUpdate::with_config(base_config().with_completion_ack_required(true)).unwrap();
         let _ready = update.prepare_boot(&mock).await.unwrap();
 
         let outcome = update
@@ -2435,7 +2553,8 @@ mod tests {
                     erase: Duration::from_millis(1),
                     ..OtaTimeouts::default()
                 }),
-        );
+        )
+        .unwrap();
         let _ready = update.prepare_boot(&transport).await.unwrap();
 
         let error = update
@@ -2748,19 +2867,50 @@ mod tests {
         assert_eq!(recovery.phase(), OtaPhase::Ready);
     }
 
-    #[tokio::test]
-    async fn zero_expected_base_is_rejected_even_when_the_image_matches() {
-        let image_bytes = dat(0x80, 0);
-        let image = FirmwareImage::parse(&image_bytes).unwrap();
-        let mock = high_mtu_mock();
-        queue_prepare(&mock, UT2_BOOT_PID, 0x0000_0102);
-        // Bypass OtaConfig::new with a struct literal: the write preflight must
-        // still refuse a zero base instead of erasing the bootloader region.
+    #[test]
+    fn zero_expected_base_is_rejected_by_with_config() {
+        // `OtaConfig` fields are private, so `OtaConfig::new` is the only public
+        // construction path. Even the in-crate struct-literal bypass is caught
+        // by `OtaUpdate::with_config`, and `write_firmware` re-validates again.
         let config = OtaConfig {
             expected_load_base: 0,
             ..base_config()
         };
-        let mut update = OtaUpdate::with_config(config);
+        assert!(matches!(
+            OtaUpdate::with_config(config),
+            Err(Error::OtaInvalidFirmware(_))
+        ));
+    }
+
+    #[test]
+    fn expected_base_outside_the_type1_window_is_rejected() {
+        assert!(OtaConfig::new(UT2_TYPE1_APP_BASE_MIN).is_ok());
+        for base in [
+            0x0000_0000,
+            0x0100_F000,
+            0x0102_0000,
+            0x0801_0000,
+            0xFFFF_F000,
+        ] {
+            assert!(
+                matches!(OtaConfig::new(base), Err(Error::OtaInvalidFirmware(_))),
+                "base 0x{base:08X} must be outside the type-1 window"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn image_end_beyond_the_type1_flash_window_is_rejected_before_erase() {
+        // Base is valid, but base + image_len crosses the provisional end.
+        let base = UT2_TYPE1_APP_FLASH_END - OTA_SECTOR_SIZE;
+        let image_bytes = dat(0x2000, base);
+        let image = FirmwareImage::parse(&image_bytes).unwrap();
+        let mock = high_mtu_mock();
+        queue_prepare(&mock, UT2_BOOT_PID, 0x0000_0102);
+        let config = OtaConfig::new(base)
+            .unwrap()
+            .with_unverified_wire_allowed(true);
+        let mut update = OtaUpdate::with_config(config).unwrap();
         let _ready = update.prepare_boot(&mock).await.unwrap();
 
         let error = update
@@ -2775,6 +2925,88 @@ mod tests {
         assert!(sent
             .iter()
             .all(|(header, _)| header.cmd != boot::CMD_ERASE_FLASH));
+    }
+
+    #[tokio::test]
+    async fn image_end_at_the_type1_flash_boundary_is_accepted() {
+        let base = UT2_TYPE1_APP_FLASH_END - OTA_SECTOR_SIZE;
+        let image_bytes = dat(OTA_SECTOR_SIZE, base);
+        let image = FirmwareImage::parse(&image_bytes).unwrap();
+        let mock = high_mtu_mock();
+        queue_prepare(&mock, UT2_BOOT_PID, 0x0000_0102);
+        queue_ack(&mock, &boot::erase_flash(base).unwrap());
+        let writes = boot::write_firmware_packets(base, image.image_len(), image.image()).unwrap();
+        for request in &writes {
+            queue_ack(&mock, request);
+        }
+        queue_ack(
+            &mock,
+            &boot::write_version_header(image.image_len(), image.version_header()).unwrap(),
+        );
+        queue_ack(&mock, &boot::jump_app());
+        let config = OtaConfig::new(base)
+            .unwrap()
+            .with_unverified_wire_allowed(true);
+        let mut update = OtaUpdate::with_config(config).unwrap();
+        let _ready = update.prepare_boot(&mock).await.unwrap();
+
+        let outcome = update
+            .write_firmware(_ready, &image, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.chunks_written, 64);
+        assert_eq!(outcome.bytes_written, OTA_SECTOR_SIZE);
+    }
+
+    #[tokio::test]
+    async fn write_version_ready_ack_guard_times_out_on_a_single_ack() {
+        let image_bytes = one_sector_image();
+        let image = FirmwareImage::parse(&image_bytes).unwrap();
+        let mut frames = vec![pid_response(UT2_BOOT_PID), version_response(0x0000_0102)];
+        let erase = boot::erase_flash(TEST_BASE).unwrap();
+        frames.push(ack(&erase));
+        frames.push(ack(&erase));
+        let writes =
+            boot::write_firmware_packets(TEST_BASE, image.image_len(), image.image()).unwrap();
+        for request in &writes {
+            frames.push(ack(request));
+            frames.push(ack(request));
+        }
+        // Only one WriteVersion ACK: the guard treats it as a ready ACK and
+        // must wait for a completion ACK until the timeout fires.
+        frames.push(ack(&boot::write_version_header(
+            image.image_len(),
+            image.version_header(),
+        )
+        .unwrap()));
+        let transport = PendingAfter::new(frames);
+        let config = base_config()
+            .with_completion_ack_required(true)
+            .with_timeouts(OtaTimeouts {
+                write_version: Duration::from_millis(1),
+                ..OtaTimeouts::default()
+            });
+        let mut update = OtaUpdate::with_config(config).unwrap();
+        let _ready = update.prepare_boot(&transport).await.unwrap();
+
+        let error = update
+            .write_firmware(_ready, &image, &mut |_| {})
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                Error::Ota {
+                    stage: OtaFailureStage::WriteVersion,
+                    state: OtaWriteState::Written,
+                    ..
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(update.chunks_written(), 64);
     }
 
     #[test]
@@ -2803,6 +3035,8 @@ mod tests {
             self.incoming.lock().unwrap_or_else(PoisonError::into_inner)
         }
     }
+
+    impl super::sealed::Sealed for PendingAfter {}
 
     impl OtaTransport for PendingAfter {}
 
@@ -2852,6 +3086,8 @@ mod tests {
             }
         }
     }
+
+    impl super::sealed::Sealed for FailingSend {}
 
     impl OtaTransport for FailingSend {}
 
