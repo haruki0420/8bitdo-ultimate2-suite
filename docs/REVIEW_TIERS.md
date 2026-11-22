@@ -51,8 +51,8 @@ PR のリスクに応じてレビューの深さを変えます。目的は「do
 - mock transport、golden vector、CRC テストベクタ
 - `btleplug` / `hidapi` など BLE/USB 依存の更新（write timing・MTU/chunking・retry・error handling が変わるもの）
 - build script / native dependency / feature flag（ビルドされる書き込みコードを変えるもの）
-- `apps/ios/**` / `apps/android/**` の native write path
-- 将来の `crates/eightbitdo-gui` など、デバイス書き込みを引き起こしうる新規 crate
+- `mobile/ios/**` / `mobile/android/**` の native write path
+- `crates/eightbitdo-gui` の書き込み UI、または将来の新規 crate（デバイス書き込みを引き起こすもの）
 
 読み取り専用のビルダー（`read_config` など）は Tier 2 のままでよいです。ただし、認証/認可、暗号/署名検証、secret の扱い、trust-boundary の入力検証、権限変更などのセキュリティの振る舞いを含む場合は Tier 3 です。
 
@@ -141,7 +141,7 @@ Tier 3 のパスに対する変更は、原則として Tier 3 のままです�
 - `crates/eightbitdo-core/**` の書き込み・セッション・OTA・backup/restore
 - `crates/eightbitdo-cli/**` の書き込みコマンド
 - `crates/eightbitdo-uniffi/**` の書き込み / OTA 公開 API
-- `apps/ios/**` / `apps/android/**` の native write path
+- `mobile/ios/**` / `mobile/android/**` の native write path
 - `packaging/**` / リリース設定 / 署名
 - `unsafe` / FFI / ファームウェアのダウンロード・検証 / secrets / build script
 - 認証 / 認可 / 暗号 / 署名検証 / secret の扱い / trust-boundary の入力検証 / 権限変更 / これらに影響する依存
