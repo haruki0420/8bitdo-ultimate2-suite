@@ -199,6 +199,14 @@ enum ConfigCommand {
         #[arg(long)]
         accept_reserved_drift: bool,
 
+        /// Downgrade undocumented / out-of-range field checks to warnings.
+        ///
+        /// Use only to restore a backup that contains values the device
+        /// actually holds but this tool does not recognize (for example an
+        /// undocumented key_map). The reserved-region guard still applies.
+        #[arg(long)]
+        force_raw: bool,
+
         /// Override the 0x0001 write payload size in bytes.
         ///
         /// Defaults to min(MTU payload, 74): 74 reproduces the official
@@ -448,6 +456,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                 file,
                 backup_dir,
                 accept_reserved_drift,
+                force_raw,
                 write_chunk,
                 yes,
             } => {
@@ -456,6 +465,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                     &file,
                     backup_dir.as_deref(),
                     accept_reserved_drift,
+                    force_raw,
                     write_chunk,
                     yes,
                 )
@@ -1942,7 +1952,7 @@ fn validate_write_chunk_preconnect(chunk: Option<u16>) -> Result<(), Error> {
 /// `cur_slot` has firmware-observed values outside the documented enum
 /// (`6`), so unknown values are preserved with a warning instead of being
 /// rejected. Everything the official writers interpret is validated in
-/// [`validate_raw_config`].
+/// `validate_raw_config_for_write`.
 fn raw_config_warnings(config: &Bt2Config) -> Vec<String> {
     let mut warnings = Vec::new();
     let cur_slot = config.cur_slot_raw();
@@ -1958,11 +1968,12 @@ fn raw_config_warnings(config: &Bt2Config) -> Vec<String> {
 ///
 /// Every field the official writers interpret must pass the same checks the
 /// typed `config set` / `config remap` paths use, so a hand-edited file cannot
-/// bypass them: 22 `MapKeyRecord` entries, `gyro.key_map`, record flags, macro
-/// header counts / step counts / trigger key maps. Ranges that only apply to
-/// an enabled record are checked only when that record's flag is `1`
-/// (disabled records are preserved as-is).
-fn validate_raw_config(config: &Bt2Config) -> Result<(), Error> {
+/// bypass them: 22 `MapKeyRecord` entries, `gyro.key_map`, every record
+/// `flag` (0/1), macro header counts / step counts / trigger key maps. Numeric
+/// ranges that only apply to an enabled record are checked only when that
+/// record's flag is `1` (disabled records are preserved as-is); key maps and
+/// flags are always checked.
+fn raw_config_problems(config: &Bt2Config) -> Vec<String> {
     let mut problems: Vec<String> = Vec::new();
     if config.gamepad_mode().is_none() {
         problems.push(format!(
@@ -1972,6 +1983,13 @@ fn validate_raw_config(config: &Bt2Config) -> Result<(), Error> {
     }
     for slot in Slot::ALL {
         let joy = config.joy(slot);
+        if joy.flag > 1 {
+            problems.push(format!(
+                "joy[{}].flag {} is outside 0..=1",
+                slot.index(),
+                joy.flag
+            ));
+        }
         if joy.flag == 1 {
             for (name, value, max) in [
                 ("left_start_value", joy.left_start_value, 127u8),
@@ -1988,7 +2006,23 @@ fn validate_raw_config(config: &Bt2Config) -> Result<(), Error> {
             }
         }
 
+        let trigger = config.trigger(slot);
+        if trigger.flag > 1 {
+            problems.push(format!(
+                "trigger[{}].flag {} is outside 0..=1",
+                slot.index(),
+                trigger.flag
+            ));
+        }
+
         let gyro = config.six_axis(slot);
+        if gyro.flag > 1 {
+            problems.push(format!(
+                "gyro[{}].flag {} is outside 0..=1",
+                slot.index(),
+                gyro.flag
+            ));
+        }
         if gyro.flag == 1 {
             if !(1..=15).contains(&gyro.sensitivity) {
                 problems.push(format!(
@@ -2072,6 +2106,13 @@ fn validate_raw_config(config: &Bt2Config) -> Result<(), Error> {
         }
 
         let rumble = config.rumble(slot);
+        if rumble.flag > 1 {
+            problems.push(format!(
+                "rumble[{}].flag {} is outside 0..=1",
+                slot.index(),
+                rumble.flag
+            ));
+        }
         if rumble.flag == 1 {
             for (name, value) in [("left", rumble.left), ("right", rumble.right)] {
                 if !value.is_finite() || !(0.0..=1.0).contains(&value) {
@@ -2081,6 +2122,15 @@ fn validate_raw_config(config: &Bt2Config) -> Result<(), Error> {
                     ));
                 }
             }
+        }
+
+        let special = config.special(slot);
+        if special.flag > 1 {
+            problems.push(format!(
+                "special[{}].flag {} is outside 0..=1",
+                slot.index(),
+                special.flag
+            ));
         }
 
         let macro_slot = config.macro_slot(slot);
@@ -2106,21 +2156,57 @@ fn validate_raw_config(config: &Bt2Config) -> Result<(), Error> {
                     record.max_steps
                 ));
             }
-            if !record.key_map.is_single_documented() {
-                problems.push(format!(
-                    "macro[{}].record[{index}].key_map 0x{:08X} is not a documented single \
-                     KeyMap value",
-                    slot.index(),
-                    record.key_map.bits()
-                ));
-            }
+            // M2: a macro trigger may be a combined KeyMap (the
+            // `macro write --trigger` parser accepts any KeyMap value), so the
+            // raw path must not require a single documented value here.
         }
     }
+    problems
+}
+
+/// Validate a raw configuration file, refusing on any problem.
+///
+/// Test helper; the write path uses [`validate_raw_config_for_write`] so
+/// `--force-raw` can downgrade the same problems to warnings.
+#[cfg(test)]
+fn validate_raw_config(config: &Bt2Config) -> Result<(), Error> {
+    let problems = raw_config_problems(config);
     if problems.is_empty() {
         Ok(())
     } else {
         Err(invalid_data(format!(
             "configuration file has invalid known fields; refusing to write:\n  - {}",
+            problems.join("\n  - ")
+        )))
+    }
+}
+
+/// Validate a raw configuration file for an actual write.
+///
+/// With `force_raw`, undocumented / out-of-range values are warnings instead
+/// of errors so a backup the device produced can be restored. The reserved
+/// region guard is separate and is never bypassed by this flag.
+fn validate_raw_config_for_write(config: &Bt2Config, force_raw: bool) -> Result<(), Error> {
+    let problems = raw_config_problems(config);
+    if problems.is_empty() {
+        return Ok(());
+    }
+    if force_raw {
+        eprintln!(
+            "warning: --force-raw is writing {} undocumented / out-of-range field(s):",
+            problems.len()
+        );
+        for problem in &problems {
+            eprintln!("  - {problem}");
+        }
+        eprintln!(
+            "warning: --force-raw keeps the reserved-region guard; review the values before saving"
+        );
+        Ok(())
+    } else {
+        Err(invalid_data(format!(
+            "configuration file has invalid known fields; refusing to write (use --force-raw only \
+             to restore an undocumented device backup):\n  - {}",
             problems.join("\n  - ")
         )))
     }
@@ -2222,7 +2308,7 @@ async fn apply_config_prepared<T: Transport>(
     );
     eprintln!(
         "recover with: {recover} (add --accept-reserved-drift if the device normalized reserved \
-         bytes)"
+         bytes; add --force-raw only when the backup contains undocumented fields)"
     );
 
     if !confirmation.confirm()? {
@@ -2268,7 +2354,8 @@ async fn apply_config_prepared<T: Transport>(
             );
             eprintln!(
                 "recover with: {recover} (add --accept-reserved-drift if the device normalized \
-                 reserved bytes)"
+                 reserved bytes; add --force-raw only when the backup contains undocumented \
+                 fields)"
             );
             return Err(error);
         }
@@ -2347,6 +2434,7 @@ async fn config_write(
     file: &Path,
     backup_dir: Option<&Path>,
     accept_reserved_drift: bool,
+    force_raw: bool,
     write_chunk: Option<u16>,
     assume_yes: bool,
 ) -> Result<(), Error> {
@@ -2355,7 +2443,7 @@ async fn config_write(
     // configuration mode at all.
     validate_write_chunk_preconnect(write_chunk)?;
     let edited = read_config_file(file)?;
-    validate_raw_config(&edited)?;
+    validate_raw_config_for_write(&edited, force_raw)?;
     for warning in raw_config_warnings(&edited) {
         eprintln!("warning: {warning}");
     }
@@ -9020,21 +9108,175 @@ mod tests {
             .to_string()
             .contains("total_cnt 5"));
 
+        // M2: a macro trigger may be any KeyMap (matching `macro write
+        // --trigger`), so an undocumented / combined value is accepted.
         let mut edited = config.clone();
         let mut header = edited.macro_slot(Slot::S1);
         header.records[0].max_steps = 10;
         header.records[0].key_map = KeyMap::MY_NULL;
         edited.set_macro_slot(Slot::S1, &header);
-        assert!(validate_raw_config(&edited)
-            .unwrap_err()
-            .to_string()
-            .contains("macro[0].record[0].key_map"));
+        assert!(validate_raw_config(&edited).is_ok());
 
         // A valid dump (0/0xFFFF max_steps, documented key maps) still passes.
         let mut valid = config.clone();
         valid.set_map_key_entry(Slot::S1, ButtonIndex::L2, KeyMap::P2);
         valid.set_map_key_entry(Slot::S1, ButtonIndex::P1, KeyMap::NONE);
         assert!(validate_raw_config(&valid).is_ok());
+    }
+
+    #[test]
+    fn raw_config_validation_rejects_record_flags_above_one() {
+        let config = config_write_fixture();
+        assert!(validate_raw_config(&config).is_ok());
+
+        // joy.flag
+        let mut edited = config.clone();
+        let mut joy = edited.joy(Slot::S1);
+        joy.flag = 2;
+        edited.set_joy(Slot::S1, &joy);
+        assert!(validate_raw_config(&edited)
+            .unwrap_err()
+            .to_string()
+            .contains("joy[0].flag 2"));
+
+        // trigger.flag (previously not checked at all)
+        let mut edited = config.clone();
+        let mut trigger = edited.trigger(Slot::S2);
+        trigger.flag = 2;
+        edited.set_trigger(Slot::S2, &trigger);
+        assert!(validate_raw_config(&edited)
+            .unwrap_err()
+            .to_string()
+            .contains("trigger[1].flag 2"));
+
+        // rumble.flag
+        let mut edited = config.clone();
+        let mut rumble = edited.rumble(Slot::S3);
+        rumble.flag = 2;
+        edited.set_rumble(Slot::S3, &rumble);
+        assert!(validate_raw_config(&edited)
+            .unwrap_err()
+            .to_string()
+            .contains("rumble[2].flag 2"));
+
+        // gyro.flag
+        let mut edited = config.clone();
+        let mut gyro = edited.six_axis(Slot::S1);
+        gyro.flag = 2;
+        edited.set_six_axis(Slot::S1, &gyro);
+        assert!(validate_raw_config(&edited)
+            .unwrap_err()
+            .to_string()
+            .contains("gyro[0].flag 2"));
+
+        // special.flag
+        let mut edited = config.clone();
+        let mut special = edited.special(Slot::S2);
+        special.flag = 2;
+        edited.set_special(Slot::S2, &special);
+        assert!(validate_raw_config(&edited)
+            .unwrap_err()
+            .to_string()
+            .contains("special[1].flag 2"));
+
+        // 0 and 1 are accepted for every record flag.
+        let mut edited = config.clone();
+        for slot in Slot::ALL {
+            let mut joy = edited.joy(slot);
+            joy.flag = 1;
+            edited.set_joy(slot, &joy);
+            let mut trigger = edited.trigger(slot);
+            trigger.flag = 1;
+            edited.set_trigger(slot, &trigger);
+            let mut rumble = edited.rumble(slot);
+            rumble.flag = 1;
+            edited.set_rumble(slot, &rumble);
+            let mut gyro = edited.six_axis(slot);
+            gyro.flag = 1;
+            gyro.sensitivity = 5;
+            gyro.trigger_mode = 0;
+            gyro.mapping_type = 0;
+            edited.set_six_axis(slot, &gyro);
+            let mut special = edited.special(slot);
+            special.flag = 1;
+            edited.set_special(slot, &special);
+        }
+        assert!(
+            validate_raw_config(&edited).is_ok(),
+            "{:?}",
+            validate_raw_config(&edited)
+        );
+    }
+
+    #[test]
+    fn force_raw_downgrades_unknown_fields_but_keeps_the_reserved_guard() {
+        let config = config_write_fixture();
+        let mut undocumented = config.clone();
+        // A KeyMap value this tool refuses on the typed path.
+        undocumented.set_map_key_entry(Slot::S1, ButtonIndex::A, KeyMap::MY_NULL);
+        assert!(validate_raw_config_for_write(&undocumented, false).is_err());
+        assert!(validate_raw_config_for_write(&undocumented, true).is_ok());
+
+        // A range/enum problem is downgraded as well.
+        let mut out_of_range = config.clone();
+        out_of_range.set_gamepad_mode_raw(9);
+        assert!(validate_raw_config_for_write(&out_of_range, false).is_err());
+        assert!(validate_raw_config_for_write(&out_of_range, true).is_ok());
+
+        // --force-raw does not bypass the reserved-region guard: that guard
+        // lives in PreparedConfigWrite::from_buffer.
+        let snapshot = config_snapshot(config.clone());
+        let mut drifted = config.clone();
+        drifted.as_mut_bytes()[eightbitdo_protocol::config_bt2::OFF_LEGACY_A] ^= 0xFF;
+        drifted.set_map_key_entry(Slot::S1, ButtonIndex::A, KeyMap::MY_NULL);
+        assert!(PreparedConfigWrite::from_buffer(&snapshot, drifted).is_err());
+    }
+
+    #[test]
+    fn raw_config_validation_accepts_combined_macro_key_maps() {
+        let config = config_write_fixture();
+        let mut edited = config.clone();
+        let mut header = edited.macro_slot(Slot::S2);
+        header.records[0].max_steps = 10;
+        header.records[0].key_map = KeyMap::A | KeyMap::B;
+        edited.set_macro_slot(Slot::S2, &header);
+        assert!(
+            validate_raw_config(&edited).is_ok(),
+            "{:?}",
+            validate_raw_config(&edited)
+        );
+        // The same dump also passes the write-path wrapper without --force-raw.
+        assert!(validate_raw_config_for_write(&edited, false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn config_write_end_to_end_restores_a_combined_macro_trigger() {
+        let dir = scratch_dir("config-combined-trigger");
+        let initial = config_write_fixture();
+        let mut dump = initial.clone();
+        let mut header = dump.macro_slot(Slot::S1);
+        header.records[0].max_steps = 10;
+        header.records[0].key_map = KeyMap::A | KeyMap::B;
+        dump.set_macro_slot(Slot::S1, &header);
+
+        let transport = ConfigDeviceTransport::new(initial.clone());
+        let session = Session::new(&transport);
+        config_write_session(
+            &session,
+            &dump,
+            Some(&dir.join("backup")),
+            false,
+            ConfigConfirmation::AssumeYes,
+            None,
+        )
+        .await
+        .unwrap();
+        let restored = transport.config();
+        assert_eq!(
+            restored.macro_record(Slot::S1, MacroIndex::M1).key_map,
+            KeyMap::A | KeyMap::B
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

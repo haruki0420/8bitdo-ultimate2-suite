@@ -71,7 +71,7 @@
 > Android 版 `libadvancelib.so` の `getBT2_WriteSixAxis` は `.rodata 0x1d6a0` (`{0x0, 0xC, 0xC, 0xC}`) を読み込む実装ミスによりヘッダに `offset = 0, total_len = 0x0C, len = 0x0C` を入れている（ペイロードポインタ自体は `base + slot * 0x0C + 0x92C` を指す）。一方 Windows 版 `8BitDoAdvance.dll` の `_writeUltimateBT2sixaxis@2772` では正しく **`offset = 0x92C + slot * 0x0C`, `total_len = 0x0AD0`, `len = 0x0C`** を送信している。独自実装では Windows DLL 準拠（`offset = 0x92C + slot * 0x0C, total_len = 0x0AD0`）を用いること。
 
 > **書込時の BLE 分割長（RE 再確認・2026-11-22）**:
-> 公式 Android の `Generate_CustomDataCmd` は書込系で `min(残り, MAX_ATT_MTU - 0x12)` を使い、`MAX_ATT_MTU` は初期値 **`0x5C` (92)** のまま `0x600F` 用に変更されない。したがって **公式書込のペイロード上限は 74B**（静的解析。実機書込キャプチャは未確認）。既存の「MTU 200 → 142B」は**読み出し応答側の実機観測値**であり、書込側の分割長ではない。本リポジトリの full config write は既定で **`min(MTU ペイロード, 74)`**（MTU 200 でも 74B）を使い、`--write-chunk <BYTES>` で交渉 MTU までの任意サイズ（例: 180）を明示指定できる（公式 74B との A/B 用。実機未確認）。
+> 公式 Android の `Generate_CustomDataCmd` は書込系で `min(残り, MAX_ATT_MTU - 0x12)` を使い、`MAX_ATT_MTU` は初期値 **`0x5C` (92)** のまま `0x600F` 用に変更されない。したがって **公式書込のペイロード上限は 74B**（静的解析。実機書込キャプチャは未確認）。既存の「MTU 200 → 142B」は**読み出し応答側の実機観測値**であり、書込側の分割長ではない。本リポジトリの full config write は既定で **`min(MTU ペイロード, 74)`**（MTU 200 でも 74B）を使い、`--write-chunk <BYTES>` は接続前上限 **180**（観測 MTU 200 のペイロード上限）まで明示指定できる（公式 74B との A/B 用。実機未確認）。
 >
 > **部分書込と Save（RE 確定・2026-11-22）**: `getBT2_Write*` の部分書込も、完了時に共通 onfinished から **`0x0006/0x0067` Save が必ず 1 回**送られる（部分書込専用の Save 関数は無い）。
 
@@ -162,7 +162,7 @@ struct Bt2Header {
 | `3` | `CONFIG_SLOT_SWIFT_MAX` | スロット数上限マーカー |
 | `4` | `CONFIG_SLOT_SWIFT_NONE` | スロット未選択 / 削除状態（オフ状態） |
 
-> **実機観測・未確定（2026-11-21）**: Ultimate 2 Bluetooth で `cur_slot = 6` を観測した。enum の `0..=2` / `4` の範囲外であり、意味は未確定である。CLI は `0..=2` を `profile N`、`4` を `none`、それ以外を `unknown (6)` のように表示する。`deleteCurslot` が `cur_slot = 4` を書くことは解析済みだが、実機で 6 が観測される理由（別状態・未初期化・ファームウェア固有値など）は断定できない。
+> **実機観測・未確定（2026-11-21）**: Ultimate 2 Bluetooth で `cur_slot = 6` を観測した。enum の `0..=2` / `4` の範囲外であり、意味は未確定である。CLI は `0..=2` を `profile N`、`4` を `none`、それ以外を `unknown (6)` のように表示する。`deleteCurslot` が `cur_slot = 4` を書くことは解析済みだが、実機で 6 が観測される理由（別状態・未初期化・ファームウェア固有値など）は断定できない。**raw `config write` は不明な `cur_slot`（6 等）を拒否せず、警告して保持する。**
 
 ---
 
