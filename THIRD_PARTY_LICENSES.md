@@ -6,12 +6,14 @@
 >
 > また、依存バージョンと各プロジェクトのライセンスは将来変更され得ます。**依存を追加・更新するたびに再生成・再確認**してください。
 
+> 本ファイルは**要約と参照**です。131 クレート全件の著作権表示・ライセンス本文を網羅するものではありません。現時点で全文を収録しているのは、追加義務のある BSD-3-Clause（btleplug）、Unicode-3.0（unicode-ident）、SIL OFL 1.1（同梱予定フォント）です。バイナリとして配布する場合は、`cargo-about` 等で依存グラフ全体の著作権表示とライセンス本文を生成し、配布物へ同梱してください（§4）。
+
 ## 1. サマリ
 
 - 基準: base commit `80f8d66`（2026-11-23）の `cargo metadata --offline --format-version 1 --all-features`。
 - パッケージ総数 134（workspace メンバー 3 を除く**第三者クレート 131**）。`license` フィールドが空のクレートは **0**。
-- **GPL / AGPL / SSPL / EUPL / CDDL / EPL は 0 件。** すべて MIT / Apache-2.0 を選択可能。
-- 直接依存はすべて `MIT OR Apache-2.0`（または同等の選択式）で、本プロジェクトの `license = "MIT OR Apache-2.0"` と整合します。
+- **GPL / AGPL / SSPL / EUPL / CDDL / EPL は 0 件。** すべてのクレートが MIT または Apache-2.0 を選択可能です（BSD-3-Clause / Zlib / Unlicense などとの選択を含む）。ただし `unicode-ident` は `(MIT OR Apache-2.0) AND Unicode-3.0` のため、MIT / Apache に加えて **Unicode-3.0 の帰属義務**があります。
+- 直接依存もすべて MIT または Apache-2.0 を選択可能（`btleplug` は BSD-3-Clause を含む三択、`uuid` は Apache-2.0/MIT）で、本プロジェクトの `license = "MIT OR Apache-2.0"` と整合します。
 
 | SPDX 式 | 件数 |
 | --- | ---: |
@@ -47,13 +49,13 @@
 | `async-trait` | 0.1.92 | `MIT OR Apache-2.0` | `eightbitdo-core`, `eightbitdo-cli`（dev） | — |
 | `futures-util` | 0.3.34 | `MIT OR Apache-2.0` | `eightbitdo-core`（任意 feature `ble`） | — |
 | `hex` | 0.4.3 | `MIT OR Apache-2.0` | `eightbitdo-cli` | — |
-| `unicode-ident` | 1.0.27 | `(MIT OR Apache-2.0) AND Unicode-3.0` | 推移的（proc-macro 経由） | **Unicode-3.0 の帰属義務が加算される**（§3.2） |
+| `unicode-ident` | 1.0.27 | `(MIT OR Apache-2.0) AND Unicode-3.0` | 推移的（`proc-macro2` 経由） | 本プロジェクトのコードから直接使用していない。**Unicode-3.0 の帰属義務が加算される**（§3.2） |
 
 > Linux で実際にビルドされる集合は `--all-features` より小さくなります。macOS / Windows / Android 向けのクレート（`objc2*` / `windows*` / `jni*`）も同梱物に応じて帰属表示が必要です。
 
 ## 3. 帰属・ライセンス全文の扱い
 
-本プロジェクトのコードは `MIT OR Apache-2.0` で提供され、全文は [LICENSE-MIT](LICENSE-MIT) / [LICENSE-APACHE](LICENSE-APACHE) にあります。依存側の選択式ライセンス（`OR`）は、本プロジェクトでは **MIT または Apache-2.0** を選択します。以下は追加で注意が必要なものです。
+本プロジェクトのコードは `MIT OR Apache-2.0` で提供され、全文は [LICENSE-MIT](LICENSE-MIT) / [LICENSE-APACHE](LICENSE-APACHE) にあります。`LICENSE-APACHE` は Apache-2.0 の公式原文で、APPENDIX の `[yyyy] [name of copyright owner]` を `2026 haruki0420` に置換した以外は改変していません。依存側の選択式ライセンス（`OR`）は、本プロジェクトでは **MIT または Apache-2.0** を選択します。以下は追加で注意が必要なものです。
 
 ### 3.1 BSD-3-Clause（btleplug）
 
@@ -98,7 +100,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ### 3.2 Unicode-3.0（unicode-ident）
 
-`unicode-ident` は `(MIT OR Apache-2.0) AND Unicode-3.0` のため、MIT / Apache-2.0 に**加えて** Unicode ライセンスの著作権表示と許可通知を同梱する必要があります。
+`unicode-ident` は `proc-macro2` 経由で入る推移的依存で、`(MIT OR Apache-2.0) AND Unicode-3.0` のため、MIT / Apache-2.0 に**加えて** Unicode ライセンスの著作権表示と許可通知を同梱する必要があります。
 
 ```text
 UNICODE LICENSE V3
@@ -172,7 +174,7 @@ authorization of the copyright holder.
 
 ## 4. 生成・更新方法
 
-本ファイルは `cargo metadata` の集計結果を初期版としています。依存の追加・更新時に次を実行して差分を確認してください。
+本ファイルは `cargo metadata` の集計結果を初期版としています。依存の追加・更新時に次を実行して差分を確認してください。**未マージのブランチが追加する依存は本一覧に未反映です。** 例えば GUI / モバイル / OTA 系ブランチで追加される `eframe` / `egui`、`fs2`、`rustix` などが main にマージされた時点で、本ファイルを再生成し、直接依存の表と帰属義務（NOTICE / ライセンス全文の要否）を更新してください。
 
 ```sh
 cargo metadata --format-version 1 --all-features > /tmp/meta.json
@@ -407,3 +409,5 @@ echo "OK: no proprietary assets"
 ```
 
 > `*.bin` はバックアップやテスト fixture でも使われ得るため、資産スキャンの禁止拡張子には入れず、`.gitignore` とパス限定で扱っています。
+
+fixture の配置規約: `.dat` / `.bin` を含むテスト fixture は `tests/fixtures/` または `crates/<crate>/tests/fixtures/` に置きます（`.gitignore` はこの 2 つのパスだけを例外にしています）。それ以外の場所の `.dat` / `.bin` は公式資産として除外されます。

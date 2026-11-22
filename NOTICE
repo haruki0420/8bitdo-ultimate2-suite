@@ -2,15 +2,20 @@ eightbitdo-ultimate2-suite
 Copyright 2026 haruki0420
 
 This product includes software developed by third parties.
-See THIRD_PARTY_LICENSES.md for the list of dependencies, their
-copyright notices, and license texts.
+THIRD_PARTY_LICENSES.md summarizes the dependencies, their licenses, and
+the required attribution. It is a summary and reference, not a complete
+bundle of copyright notices and license texts. Binary distributions must
+ship the full third-party notices generated from the dependency graph
+(e.g. with cargo-about); see THIRD_PARTY_LICENSES.md for the procedure.
 
-"8BitDo" and "Ultimate 2" are trademarks of Shenzhen Bestodo Tech Co.,
-Ltd. This project is an unofficial, independent open-source project and
-is not affiliated with, endorsed by, or sponsored by 8BitDo or Shenzhen
-Bestodo Tech Co., Ltd. It does not include or redistribute any official
-8BitDo binaries, firmware images, logos, or other proprietary assets.
-See TRADEMARKS.md for details.
+"8BitDo" is a registered trademark of Shenzhen Bestodo Tech Co., Ltd.
+"Ultimate 2" is a product name of the same company; its standalone
+trademark registration has not been verified by this project. This project
+is an unofficial, independent open-source project and is not affiliated
+with, endorsed by, or sponsored by 8BitDo or Shenzhen Bestodo Tech Co.,
+Ltd. It does not include or redistribute any official 8BitDo binaries,
+firmware images, logos, or other proprietary assets. See TRADEMARKS.md
+for details.
 
 This software is provided "AS IS", without warranty of any kind. Use at
 your own risk. Writing settings or firmware to a controller can render it

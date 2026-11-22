@@ -90,13 +90,13 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 ## ライセンス
 
 - **コード**（`crates/` 以下）: [MIT](LICENSE-MIT) または [Apache-2.0](LICENSE-APACHE) のいずれかを選択できます（`MIT OR Apache-2.0`）。
-- **ドキュメント**（`docs/` 以下と `README.md` など）: 特記がない限り、コードと同じ `MIT OR Apache-2.0` です。将来 CC BY 4.0 などの別ライセンスへ変更する場合は、変更時に本文へ明記します。
-- **同梱フォント**（GUI 実装時）: SIL Open Font License 1.1。`crates/eightbitdo-gui/assets/fonts/OFL.txt` を同梱し、アプリ内のライセンス表示から全文を参照できるようにします。
-- 依存ソフトウェアのライセンス・帰属表示は [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) を参照してください。
+- **ドキュメント**（`docs/` 以下と `README.md` など）: 特記がない限り、コードと同じ `MIT OR Apache-2.0` です。将来 CC BY 4.0 などの別ライセンスへ変更する場合は、変更時に本文へ明記します。ただし、第三者に由来する部分（同梱フォントの OFL、第三者コードの BSD / Unicode 表示、引用・出典）は、それぞれの権利者のライセンス条件に従います。
+- **同梱フォント**（GUI を取り込む時点で同梱）: SIL Open Font License 1.1。`crates/eightbitdo-gui/assets/fonts/OFL.txt` を同梱し、GUI の About > Open Source Licenses などのライセンス画面から全文を参照できるようにします。
+- 依存ソフトウェアのライセンスは [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) を参照してください。同ファイルは要約と参照であり、全クレートの著作権表示・ライセンス本文を網羅しません。バイナリ配布時は `cargo-about` 等で完全な第三者通知を生成して同梱してください。
 - 商標・非公式に関する方針は [TRADEMARKS.md](TRADEMARKS.md) を参照してください。
 
 ## 免責
 
-本プロジェクトは**非公式**の独立したオープンソースプロジェクトであり、8BitDo（Shenzhen Bestodo Tech Co., Ltd.）とは提携・承認・後援関係にありません。"8BitDo" および "Ultimate 2" は同社の商標です。本リポジトリは公式のバイナリ・ファームウェア・ロゴ等を含みません。
+本プロジェクトは**非公式**の独立したオープンソースプロジェクトであり、8BitDo（Shenzhen Bestodo Tech Co., Ltd.）とは提携・承認・後援関係にありません。"8BitDo" は同社の登録商標です。"Ultimate 2" は同社の製品名です（単独の商標登録の有無は未確認）。本リポジトリは公式のバイナリ・ファームウェア・ロゴ等を含みません。
 
 本ソフトウェアは無保証（"AS IS"）で提供されます。コントローラへの設定・ファームウェア書き込み・マクロ書き込みは、文鎮化・保証喪失・データ損失のリスクを伴います。自己責任で使用してください。

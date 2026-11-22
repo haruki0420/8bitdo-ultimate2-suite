@@ -12,7 +12,17 @@
 
 English summary:
 
-> "8BitDo" and "Ultimate 2" are trademarks of Shenzhen Bestodo Tech Co., Ltd. This project is an unofficial, independent open-source project and is not affiliated with, endorsed by, or sponsored by 8BitDo or Shenzhen Bestodo Tech Co., Ltd. We do not use 8BitDo logos, icons, official screenshots, or other brand assets. Compatibility statements are descriptive only and do not imply endorsement.
+> "8BitDo" is a registered trademark of Shenzhen Bestodo Tech Co., Ltd. "Ultimate 2" is a product name of the same company; its standalone trademark registration has not been verified by this project. This project is an unofficial, independent open-source project and is not affiliated with, endorsed by, or sponsored by 8BitDo or Shenzhen Bestodo Tech Co., Ltd. We do not use 8BitDo logos, icons, official screenshots, or other brand assets. Compatibility statements are descriptive only and do not imply endorsement.
+
+## その他の第三者の商標
+
+- **"Nintendo Switch"** は任天堂株式会社の商標です。本プロジェクトは任天堂株式会社と提携・承認・後援関係にありません。
+- **Bluetooth®** のワードマークおよびロゴは **Bluetooth SIG, Inc.** が所有する登録商標です。本プロジェクトは Bluetooth SIG, Inc. と提携・承認関係にありません。Bluetooth 技術への対応は互換性の記述であり、Bluetooth SIG による認証・承認を意味しません。
+- その他の製品名・会社名は、それぞれの権利者の商標または登録商標です。
+
+English notice:
+
+> The Bluetooth® word mark and logos are registered trademarks owned by Bluetooth SIG, Inc. "Nintendo Switch" is a trademark of Nintendo. This project is not affiliated with, endorsed by, or sponsored by Bluetooth SIG, Inc. or Nintendo. Other product and company names are trademarks or registered trademarks of their respective owners.
 
 ## 本プロジェクト名の扱い
 
@@ -32,6 +42,7 @@ English summary:
 ## 参考リンク
 
 - 8BitDo Intellectual Property Rights: <https://shop.8bitdo.com/pages/intellectual-property-rights>
+- Bluetooth SIG 商標ガイドライン: <https://www.bluetooth.com/develop-with-bluetooth/marketing-branding/>
 - USPTO 商標情報（8BITDO, 出願 88010697 / 登録 5,830,011）: <https://uspto.report/TM/88010697>
 - Apple App Store Review Guidelines 5.2.1: <https://developer.apple.com/app-store/review/guidelines/>
 - Google Play 模倣（Impersonation）ポリシー: <https://support.google.com/googleplay/android-developer/answer/9888374>
