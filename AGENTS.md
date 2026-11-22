@@ -130,7 +130,7 @@
 2. **OTA の配線と安全機構**: 確定後、CLI / GUI / UniFFI に OTA を追加し、バッテリー警告、バージョン / ダウングレード判定、ファームウェア取得・SHA-256 検証、成功時の `"80ND"` 再接続 + バージョン確認を実装する。Tier 3。
 3. **GUI 書き込み UI**（PR #16）: config write / remap / マクロエディタは実装済み。残るのは実機確認（Tier 3、pre-write backup + read-back 前提）と、backup 復元 UI / JSON・TOML 入出力。
 4. **モバイルの仕上げ**: Android NDK + cargo-ndk で `libeightbitdo_uniffi.so` を同梱した APK、iOS / Android 実機での BLE 読み取り確認、App Store / TestFlight 配布（macOS + Xcode が必要）。書き込み・OTA の公開は Tier 3 レビューとバックアップ UI が揃うまで行わない（[mobile/README.md](mobile/README.md)）。
-5. **クロスプラットフォーム実機確認**: macOS / Windows の BLE（btleplug）と Linux BlueZ の回帰、Android / iOS。現状の実機証跡は Linux のみ。
+5. **クロスプラットフォーム実機確認**: macOS / Windows の BLE（btleplug）と Linux BlueZ の回帰、Android / iOS。現状の実機証跡は Linux のみ。**ビルド/コンパイルの確認状況は [docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)**: Windows は `cargo check`（リンク・実行は未確認、MinGW 必要）のみ確認済みで、**Windows ビルドは Rust 1.88 以上が必要**（`btleplug` の Windows バックエンドの let チェーン由来。宣言 MSRV 1.85 では `E0658`）、macOS は target / SDK 不在のため Linux からは確認不能。
 6. **USB HID / 2.4G（Phase 2e / 4）**: USB App Mode の実機証跡と USB Boot の TX フレーミングが未文書化のため保留。`docs/PROTOCOL_SPEC.md` に証跡が追加されるまで実装しない。
 
 ### 6.3 レビュー Tier（変更時）
