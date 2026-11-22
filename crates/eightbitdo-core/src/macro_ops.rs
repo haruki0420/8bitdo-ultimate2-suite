@@ -107,6 +107,12 @@ pub const MACRO_HEADER_CHUNK_SIZE: usize = 142;
 /// uncertainty in `docs/PROTOCOL_SPEC.md`.
 pub const MACRO_SAVE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Wait after Save before reading the configuration back.
+///
+/// The device may still be committing the header when the ACK arrives. 100 ms
+/// is a conservative first value and is **not** confirmed on hardware.
+pub const MACRO_VERIFY_DELAY: Duration = Duration::from_millis(100);
+
 /// Per-stage ACK timeouts for a macro write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MacroTimeouts {
@@ -462,15 +468,17 @@ impl<T: Transport> Session<T> {
     /// Read one macro using the `max_steps` in `snapshot`.
     ///
     /// A header with `max_steps == 0` returns an empty entry without sending
-    /// a flash read. Otherwise the request is payload-less
+    /// a flash read. Otherwise each chunk is requested with payload-less
     /// `cmd 0x0102`, `subcmd = (gamepad_mode << 8) | slot`,
-    /// `offset = macro_idx << 12`, and `total_len = chunk_len = steps * 10`.
+    /// `offset = (macro_idx << 12) + chunk_offset`, and
+    /// `total_len = chunk_len = steps * 10`.
     ///
     /// Responses may be a direct `cmd 0x0102` frame or the
-    /// `cmd 0x0004, subcmd 0x0102` envelope. Split notifications are
-    /// assembled by their reported offset. The response offset may be either
-    /// sector-based (`macro_idx << 12`) or relative to the sector start; both
-    /// in-range forms are accepted and overlap is rejected.
+    /// `cmd 0x0004, subcmd 0x0102` envelope. The response offset mode is
+    /// fixed for the whole macro: absolute echo, sector-relative, or a first
+    /// `0` that resolves on the next chunk. Mixing absolute and relative
+    /// echoes is rejected so a stale response cannot be spliced into another
+    /// macro.
     ///
     /// # Errors
     ///
@@ -549,6 +557,7 @@ impl<T: Transport> Session<T> {
         let mut buffer = TransferBuffer::new(expected_len);
         let mut chunk_offset = 0usize;
         let mut response_offsets = Vec::new();
+        let mut offset_mode: Option<OffsetMode> = None;
         let deadline = deadline_after(MACRO_READ_TOTAL_TIMEOUT)?;
 
         while chunk_offset < expected_len {
@@ -588,18 +597,53 @@ impl<T: Transport> Session<T> {
                 };
 
                 let reported = header.offset;
-                // Accepted forms for every chunk:
-                // - 0: the device's sequential-chunk convention;
-                // - the requested absolute offset (`sector + chunk_offset`);
-                // - a sector-relative offset equal to `chunk_offset`
-                //   (未確定: macro_idx > 0 の実機応答で確認する).
-                let relative_match = u64::from(reported) == chunk_offset as u64;
-                if reported != 0 && reported != requested && !relative_match {
-                    return Err(Error::UnexpectedResponse(format!(
-                        "macro chunk response offset 0x{reported:X} does not match requested \
-                         0x{requested:X} (accepted: 0 for the sequential convention, or the \
-                         requested offset; sector-relative 0x{chunk_offset:X} is also accepted)"
-                    )));
+                // Fix one offset interpretation for the whole macro read.
+                // A first `0` is ambiguous (sequential or relative); the next
+                // non-zero chunk decides. Mixing absolute and relative echoes
+                // within one macro is rejected so a stale response cannot be
+                // spliced into a different macro.
+                let mode = match offset_mode {
+                    None if reported == 0 => OffsetMode::AmbiguousZero,
+                    None if reported == requested => OffsetMode::Absolute,
+                    None if u64::from(reported) == chunk_offset as u64 => OffsetMode::Relative,
+                    None => {
+                        return Err(offset_mode_error(reported, requested, chunk_offset, None));
+                    }
+                    Some(mode) => mode,
+                };
+                match mode {
+                    OffsetMode::Absolute if reported != requested => {
+                        return Err(offset_mode_error(
+                            reported,
+                            requested,
+                            chunk_offset,
+                            Some(mode),
+                        ));
+                    }
+                    OffsetMode::Relative if u64::from(reported) != chunk_offset as u64 => {
+                        return Err(offset_mode_error(
+                            reported,
+                            requested,
+                            chunk_offset,
+                            Some(mode),
+                        ));
+                    }
+                    OffsetMode::AmbiguousZero if reported != 0 => {
+                        if u64::from(reported) == chunk_offset as u64 {
+                            offset_mode = Some(OffsetMode::Relative);
+                        } else {
+                            return Err(offset_mode_error(
+                                reported,
+                                requested,
+                                chunk_offset,
+                                Some(mode),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                if offset_mode.is_none() {
+                    offset_mode = Some(mode);
                 }
                 response_offsets.push(reported);
                 break payload.to_vec();
@@ -624,7 +668,8 @@ impl<T: Transport> Session<T> {
     /// `backup` must contain all 12 entries (see [`MacroBackup::new`]); this is
     /// the "backup first" precondition. Writing into an empty macro
     /// (`max_steps == 0` / `0xFFFF`) is rejected with
-    /// [`Error::EmptyMacroWrite`] because clear support is not implemented.
+    /// [`Error::EmptyMacroWrite`] because step-data clear support is not
+    /// implemented.
     /// `SaveTransport::Usb` is rejected with [`Error::Unsupported`].
     /// If Erase, any Write chunk or the 216-byte header update fails,
     /// **Save is not sent** and [`Error::MacroWrite`] is returned with
@@ -779,6 +824,7 @@ impl<T: Transport> Session<T> {
         .map_err(|error| macro_write_failure(MacroWriteStage::Save, error, true))?;
         packets_sent += 1;
 
+        tokio::time::sleep(MACRO_VERIFY_DELAY).await;
         self.verify_config_header(header_offset, &header_bytes)
             .await
             .map_err(|error| macro_write_failure(MacroWriteStage::Verify, error, true))?;
@@ -827,6 +873,23 @@ impl<T: Transport> Session<T> {
         backup: &MacroBackup,
         slot: Slot,
     ) -> Result<MacroHeaderOutcome, Error> {
+        let header = backup.snapshot().config.macro_slot(slot);
+        if header
+            .records
+            .iter()
+            .any(|record| !is_skipped_steps(record.max_steps))
+        {
+            return Err(Error::Unsupported(
+                "write_macro_header is only for an all-empty backup slot; use write_macro"
+                    .to_string(),
+            ));
+        }
+        if usize::from(header.total_cnt) > MACROS_PER_SLOT {
+            return Err(Error::Protocol(eightbitdo_protocol::Error::InvalidFrame(
+                "macro total_cnt must be 0..=4",
+            )));
+        }
+
         let mtu = self.transport().mtu();
         let header_chunk_size = macro_header_chunk_len(mtu)?;
         self.prepare_read().await?;
@@ -878,6 +941,7 @@ impl<T: Transport> Session<T> {
         .map_err(|error| macro_write_failure(MacroWriteStage::Save, error, true))?;
         packets_sent += 1;
 
+        tokio::time::sleep(MACRO_VERIFY_DELAY).await;
         self.verify_config_header(header_offset, &header_bytes)
             .await
             .map_err(|error| macro_write_failure(MacroWriteStage::Verify, error, true))?;
@@ -905,10 +969,12 @@ impl<T: Transport> Session<T> {
                 .zip(expected)
                 .position(|(actual, expected)| actual != expected)
                 .unwrap_or(0);
+            let field = header_field_name(first_diff);
             return Err(Error::UnexpectedResponse(format!(
-                "macro header read-back mismatch at config offset 0x{:X} (first differing byte \
-                 +0x{first_diff:X}: device 0x{:02X}, sent 0x{:02X})",
-                header_offset,
+                "macro header read-back mismatch at config offset 0x{header_offset:X} (first \
+                 differing byte +0x{first_diff:X} in {field}: device 0x{:02X}, sent 0x{:02X}). \
+                 The device may normalize flag/total_cnt/reserved bytes; Save was sent \
+                 (saved=true), so do not rewrite blindly.",
                 actual.get(first_diff).copied().unwrap_or(0),
                 expected.get(first_diff).copied().unwrap_or(0)
             )));
@@ -1016,6 +1082,11 @@ fn apply_macro_write_plan(
     if let Some(total_cnt) = plan.total_cnt {
         header.total_cnt = total_cnt;
     }
+    if usize::from(header.total_cnt) > MACROS_PER_SLOT {
+        return Err(Error::Protocol(eightbitdo_protocol::Error::InvalidFrame(
+            "macro total_cnt must be 0..=4",
+        )));
+    }
     set_macro_slot_preserving_reserved(&mut updated, slot, &header);
     updated.recompute_crc();
     Ok((updated, record, header))
@@ -1061,6 +1132,50 @@ fn ack_timeout(description: &str, ack_cmd: u16, timeout: Duration) -> Error {
     Error::Timeout {
         operation: format!("{description} ACK (cmd=0x{ack_cmd:04X}) within {timeout:?}"),
     }
+}
+
+fn header_field_name(offset: usize) -> &'static str {
+    if offset < 4 {
+        "slot flag"
+    } else if offset == 4 {
+        "total_cnt"
+    } else if (5..8).contains(&offset) {
+        "slot reserved"
+    } else {
+        for index in 0..MACROS_PER_SLOT {
+            let record = 8 + index * MACRO_RECORD_SIZE;
+            if offset == record + 0x26 || offset == record + 0x27 {
+                return "record reserved";
+            }
+            if (record..record + MACRO_RECORD_SIZE).contains(&offset) {
+                return "record field";
+            }
+        }
+        "unknown"
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffsetMode {
+    /// Response `offset` echoes the requested absolute offset.
+    Absolute,
+    /// Response `offset` is relative to the macro's sector base.
+    Relative,
+    /// Every response so far reported `0`; the next non-zero chunk decides.
+    AmbiguousZero,
+}
+
+fn offset_mode_error(
+    reported: u32,
+    requested: u32,
+    chunk_offset: usize,
+    mode: Option<OffsetMode>,
+) -> Error {
+    Error::UnexpectedResponse(format!(
+        "macro chunk response offset 0x{reported:X} does not match requested 0x{requested:X} \
+         (chunk offset 0x{chunk_offset:X}, mode {mode:?}); absolute and relative echoes must not \
+         be mixed within one macro"
+    ))
 }
 
 fn macro_read_timeout(chunk_offset: usize, expected: usize, response_offsets: &[u32]) -> Error {
@@ -1379,6 +1494,37 @@ mod tests {
         }
         assert_eq!(entry.raw(), raw);
         assert_eq!(entry.read_offsets(), &expected_offsets);
+    }
+
+    #[tokio::test]
+    async fn read_macro_rejects_mixed_absolute_and_relative_offsets() {
+        let mut config = config_with_macros();
+        let mut record = config.macro_record(Slot::S1, MacroIndex::M3);
+        record.max_steps = 30;
+        config.set_macro_record(Slot::S1, MacroIndex::M3, &record);
+        config.recompute_crc();
+        let snapshot = snapshot(config);
+
+        let steps = sample_steps(30);
+        let raw = sample_entry_payload(&steps);
+        let mock = MockTransport::new();
+        // First chunk is an absolute echo (0x2000), then a stale relative
+        // response (142) that would belong to macro 0.
+        let mut first = envelope(cmd::READ_MACRO, 300, 0x2000, &raw[..142]);
+        first.crc16 = packet_crc16(&raw[..142]);
+        mock.push_response(&first, &raw[..142]);
+        let mut second = envelope(cmd::READ_MACRO, 300, 142, &raw[142..284]);
+        second.crc16 = packet_crc16(&raw[142..284]);
+        mock.push_response(&second, &raw[142..284]);
+
+        let session = Session::new(&mock);
+        let result = session
+            .read_macro(&snapshot, Slot::S1, MacroIndex::M3)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::UnexpectedResponse(message)) if message.contains("must not be mixed")
+        ));
     }
 
     #[tokio::test]
@@ -2291,15 +2437,19 @@ mod write_tests {
             Err(Error::MacroWrite {
                 stage: MacroWriteStage::Verify,
                 saved: true,
+                reason,
                 ..
-            })
+            }) if reason.contains("normalize")
         ));
         assert!(sent.iter().any(|frame| frame_cmd(frame) == cmd::SAVE));
     }
 
     #[tokio::test]
     async fn write_macro_header_writes_only_the_header_and_saves() {
-        let backup = backup_from(config_with_existing_macro());
+        let mut config = Bt2Config::zeroed();
+        config.set_gamepad_mode(GamepadMode::Switch);
+        config.recompute_crc();
+        let backup = backup_from(config);
         let mock = MockTransport::with_mtu(200);
         push_ack(&mock, cmd::WRITE_CONFIG, true);
         push_ack(&mock, cmd::WRITE_CONFIG, true);
@@ -2323,6 +2473,68 @@ mod write_tests {
             commands,
             vec![cmd::WRITE_CONFIG, cmd::WRITE_CONFIG, cmd::SAVE]
         );
+    }
+
+    #[tokio::test]
+    async fn write_macro_header_rejects_non_empty_slot() {
+        let backup = backup_from(config_with_existing_macro());
+        let transport = ScriptedTransport::new(Vec::new(), true, 200);
+        let session = Session::new(&transport);
+        let result = session.write_macro_header(&backup, Slot::S1).await;
+        assert!(matches!(
+            result,
+            Err(Error::Unsupported(message)) if message.contains("all-empty")
+        ));
+        assert!(transport.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_macro_header_readback_mismatch_fails_after_save() {
+        let mut config = Bt2Config::zeroed();
+        config.set_gamepad_mode(GamepadMode::Switch);
+        config.recompute_crc();
+        let backup = backup_from(config.clone());
+
+        let mut changed = config.clone();
+        let mut header = changed.macro_slot(Slot::S1);
+        header.flag = 1;
+        changed.set_macro_slot(Slot::S1, &header);
+        changed.recompute_crc();
+
+        let mock = MockTransport::with_mtu(200);
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        push_ack(&mock, cmd::SAVE, true);
+        push_config(&mock, &changed);
+
+        let session = Session::new(&mock);
+        let result = session.write_macro_header(&backup, Slot::S1).await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Verify,
+                saved: true,
+                reason,
+                ..
+            }) if reason.contains("normalize")
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_macro_header_rejects_total_cnt_above_four() {
+        let mut config = Bt2Config::zeroed();
+        config.set_gamepad_mode(GamepadMode::Switch);
+        let mut header = config.macro_slot(Slot::S1);
+        header.total_cnt = 5;
+        config.set_macro_slot(Slot::S1, &header);
+        config.recompute_crc();
+        let backup = backup_from(config);
+
+        let transport = ScriptedTransport::new(Vec::new(), true, 200);
+        let session = Session::new(&transport);
+        let result = session.write_macro_header(&backup, Slot::S1).await;
+        assert!(matches!(result, Err(Error::Protocol(_))));
+        assert!(transport.sent().is_empty());
     }
 
     #[tokio::test]
@@ -2418,5 +2630,107 @@ mod write_tests {
         assert_eq!(header_payload[4], 2);
         assert_eq!(&header_payload[5..8], &[0xA1, 0xA2, 0xA3]);
         assert_eq!(&record[0x26..0x28], &[0xB1, 0xB2]);
+    }
+    #[test]
+    fn macro_backup_rejects_missing_duplicate_and_mismatched_entries() {
+        let config = config_with_existing_macro();
+        let mut entries = Vec::new();
+        for slot in Slot::ALL {
+            for index in MacroIndex::ALL {
+                let record = config.macro_record(slot, index);
+                let raw = if is_skipped_steps(record.max_steps) {
+                    Vec::new()
+                } else {
+                    raw_steps(&sample_steps(usize::from(record.max_steps)))
+                };
+                entries.push(MacroEntry::new(slot, index, record, raw).unwrap());
+            }
+        }
+        let snapshot = snapshot(config.clone());
+
+        let mut missing = entries.clone();
+        missing.pop();
+        assert!(matches!(
+            MacroBackup::new(snapshot.clone(), missing),
+            Err(Error::UnexpectedResponse(message))
+                if message.contains("needs") || message.contains("missing")
+        ));
+
+        let mut duplicate = entries.clone();
+        duplicate[1] = duplicate[0].clone();
+        assert!(matches!(
+            MacroBackup::new(snapshot.clone(), duplicate),
+            Err(Error::UnexpectedResponse(message)) if message.contains("repeats")
+        ));
+
+        let record = config.macro_record(Slot::S1, MacroIndex::M1);
+        let mut mismatched = entries;
+        let mut changed = record;
+        changed.max_steps += 1;
+        mismatched[0] = MacroEntry::new(
+            Slot::S1,
+            MacroIndex::M1,
+            changed,
+            raw_steps(&sample_steps(usize::from(changed.max_steps))),
+        )
+        .unwrap();
+        assert!(matches!(
+            MacroBackup::new(snapshot, mismatched),
+            Err(Error::UnexpectedResponse(message)) if message.contains("does not match")
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_macro_preserves_non_canonical_raw_name_bytes() {
+        let mut config = config_with_existing_macro();
+        let mut record = config.macro_record(Slot::S1, MacroIndex::M1);
+        record.name = [0u8; 32];
+        record.name[0] = 0x00;
+        record.name[1] = 0xD8; // unpaired high surrogate
+        config.set_macro_record(Slot::S1, MacroIndex::M1, &record);
+        config.recompute_crc();
+        let backup = backup_from(config);
+
+        let steps = sample_steps(10);
+        let plan = MacroWritePlan::new(steps.clone());
+        let mock = MockTransport::with_mtu(200);
+        push_ack(&mock, cmd::ERASE_MACRO, true);
+        for _ in 0..2 {
+            push_ack(&mock, cmd::WRITE_MACRO, true);
+        }
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        push_ack(&mock, cmd::SAVE, true);
+        let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
+        push_config(&mock, &expected);
+        push_readback(&mock, &steps);
+
+        let session = Session::new(&mock);
+        session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await
+            .unwrap();
+
+        let header: Vec<u8> = mock
+            .sent_frames()
+            .iter()
+            .filter(|frame| frame_cmd(frame) == cmd::WRITE_CONFIG)
+            .flat_map(|frame| frame[17..].iter().copied())
+            .collect();
+        assert_eq!(&header[8..12], &[0x00, 0xD8, 0x00, 0x00]);
+    }
+
+    #[tokio::test]
+    async fn write_macro_rejects_total_cnt_above_four() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(10);
+        let plan = MacroWritePlan::new(steps).with_header_state(1, 5);
+        let transport = ScriptedTransport::new(Vec::new(), true, 200);
+        let session = Session::new(&transport);
+        let result = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await;
+        assert!(matches!(result, Err(Error::Protocol(_))));
+        assert!(transport.sent().is_empty());
     }
 }

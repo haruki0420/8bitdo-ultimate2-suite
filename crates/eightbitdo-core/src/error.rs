@@ -86,10 +86,10 @@ pub enum Error {
         reason: String,
     },
 
-    /// Writing into an empty macro requires clear support that is not
-    /// implemented yet.
+    /// Writing into an empty macro requires step-data clear support that is
+    /// not implemented yet.
     #[error(
-        "empty macro write requires clear support; not implemented. Choose an existing macro."
+        "empty macro write requires step data clear support; not implemented. Choose an existing macro."
     )]
     EmptyMacroWrite,
 
@@ -116,11 +116,11 @@ pub enum Error {
 
     /// A macro flash write failed.
     ///
-    /// `saved` is true once the `0x0006` Save command was sent, even if its
-    /// acknowledgement or the read-back did not complete. When `saved` is
-    /// false the Save command was not sent, but Erase or a partial Write may
-    /// already have changed the sector. Restore from the full 3-slot ×
-    /// 4-macro backup before retrying.
+    /// `saved` is true once the `0x0006` Save command was sent **or its send
+    /// was attempted**, even if its acknowledgement or the read-back did not
+    /// complete. When `saved` is false the Save command was not sent, but
+    /// Erase or a partial Write may already have changed the sector. Restore
+    /// from the full 3-slot × 4-macro backup before retrying.
     #[error("macro write failed during {stage}: {reason}; {recovery}")]
     MacroWrite {
         /// Stage that failed.
