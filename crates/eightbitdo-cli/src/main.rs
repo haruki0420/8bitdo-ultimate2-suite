@@ -130,8 +130,10 @@ enum Command {
 
     /// Keep one connection open and run commands interactively.
     ///
-    /// The REPL is read-only by default. `macro write` and `macro restore`
-    /// additionally require `--allow-macro-write`.
+    /// The REPL is read-only by default. `macro write` / `macro restore`
+    /// require `--allow-macro-write`; `config set` / `config remap` /
+    /// `config write` require `--allow-config-write` and an explicit `--yes`
+    /// or the interactive `yes` prompt.
     Session {
         /// Input poll interval in milliseconds.
         #[arg(long, default_value_t = 20, value_name = "MILLISECONDS")]
@@ -144,6 +146,12 @@ enum Command {
         /// write mode: only the two macro flash commands are enabled.
         #[arg(long)]
         allow_macro_write: bool,
+
+        /// Enable `config set` / `config remap` / `config write` inside the
+        /// REPL. Each write still needs `--yes` or the interactive `yes`
+        /// confirmation, and a pre-write backup is always taken.
+        #[arg(long)]
+        allow_config_write: bool,
 
         /// Do not send the `0x0007` ReportEnable(true) when the session
         /// starts.
@@ -589,12 +597,14 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
         Command::Session {
             interval_ms,
             allow_macro_write,
+            allow_config_write,
             no_report_enable,
         } => {
             return session(
                 &options,
                 Duration::from_millis(interval_ms),
                 allow_macro_write,
+                allow_config_write,
                 session_report_enable(no_report_enable),
             )
             .await;
@@ -1810,12 +1820,11 @@ async fn config_remap(
     validate_write_chunk_preconnect(write_chunk)?;
     let transport = BleTransport::connect(options).await?;
     let session = Session::new(transport);
-    let stdin = std::io::stdin();
-    let mut stdin_lock = stdin.lock();
+    let mut prompt = || confirm_config_write(&mut std::io::stdin().lock());
     let confirmation = if assume_yes {
         ConfigConfirmation::AssumeYes
     } else {
-        ConfigConfirmation::Reader(&mut stdin_lock)
+        ConfigConfirmation::Reader(&mut prompt)
     };
     let result = config_remap_session(
         &session,
@@ -1887,26 +1896,47 @@ fn config_readback_crc_label(crc: ConfigCrcStatus) -> &'static str {
 enum ConfigConfirmation<'a> {
     /// `--yes` was passed: write without prompting.
     AssumeYes,
-    /// Prompt on stderr and read one line from this reader (stdin in
-    /// production, a cursor in tests).
-    Reader(&'a mut dyn std::io::BufRead),
+    /// Prompt on stderr and read one line through this synchronous callback
+    /// (top-level stdin, or a cursor in tests). A `FnMut` keeps the whole
+    /// confirmation enum `Send` even when the REPL loop is spawned.
+    Reader(&'a mut (dyn FnMut() -> Result<bool, Error> + Send)),
+    /// Prompt and read one line from the session REPL's async reader so the
+    /// operator answers on the same input stream.
+    AsyncReader(&'a mut (dyn tokio::io::AsyncBufRead + Unpin + Send)),
 }
 
 impl ConfigConfirmation<'_> {
-    fn confirm(&mut self) -> Result<bool, Error> {
+    async fn confirm(&mut self) -> Result<bool, Error> {
         match self {
             Self::AssumeYes => Ok(true),
-            Self::Reader(reader) => confirm_config_write(reader),
+            Self::Reader(prompt) => prompt(),
+            Self::AsyncReader(reader) => confirm_config_write_async(*reader).await,
         }
     }
 }
 
+/// The confirmation prompt shared by the sync and async readers.
+const CONFIG_CONFIRM_PROMPT: &str = "Type 'yes' to write the 2768-byte configuration: ";
+
 /// Ask for confirmation unless `--yes` was passed.
 fn confirm_config_write(reader: &mut impl std::io::BufRead) -> Result<bool, Error> {
-    eprint!("Type 'yes' to write the 2768-byte configuration: ");
+    eprint!("{CONFIG_CONFIRM_PROMPT}");
     std::io::stderr().flush()?;
     let mut answer = String::new();
     reader.read_line(&mut answer)?;
+    Ok(answer.trim().eq_ignore_ascii_case("yes"))
+}
+
+/// Async form used by the session REPL (its stdin reader is async).
+async fn confirm_config_write_async(
+    reader: &mut (dyn tokio::io::AsyncBufRead + Unpin + Send),
+) -> Result<bool, Error> {
+    use tokio::io::AsyncBufReadExt as _;
+
+    eprint!("{CONFIG_CONFIRM_PROMPT}");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    reader.read_line(&mut answer).await?;
     Ok(answer.trim().eq_ignore_ascii_case("yes"))
 }
 
@@ -2311,7 +2341,7 @@ async fn apply_config_prepared<T: Transport>(
          bytes; add --force-raw only when the backup contains undocumented fields)"
     );
 
-    if !confirmation.confirm()? {
+    if !confirmation.confirm().await? {
         println!("aborted; no configuration was written");
         return Ok(());
     }
@@ -2429,6 +2459,91 @@ async fn config_set_session<T: Transport>(
     .await
 }
 
+/// Read and validate a raw configuration file for a write.
+///
+/// Shared by the top-level `config write` and the session REPL so both apply
+/// the same `--force-raw` downgrade and warnings.
+fn read_and_validate_config_file(path: &Path, force_raw: bool) -> Result<Bt2Config, Error> {
+    let edited = read_config_file(path)?;
+    validate_raw_config_for_write(&edited, force_raw)?;
+    for warning in raw_config_warnings(&edited) {
+        eprintln!("warning: {warning}");
+    }
+    Ok(edited)
+}
+
+/// Confirmation source for a REPL config write.
+///
+/// `--yes` skips the prompt; otherwise the REPL's async reader is used. A
+/// non-REPL caller without a reader must pass `--yes` (the top-level command
+/// has its own synchronous stdin reader).
+fn config_confirmation_for_session<'a>(
+    yes: bool,
+    reader: &'a mut Option<&mut (dyn tokio::io::AsyncBufRead + Unpin + Send)>,
+) -> Result<ConfigConfirmation<'a>, Error> {
+    match (yes, reader.as_deref_mut()) {
+        (true, _) => Ok(ConfigConfirmation::AssumeYes),
+        (false, Some(reader)) => Ok(ConfigConfirmation::AsyncReader(reader)),
+        (false, None) => Err(Error::InvalidRequest(
+            "interactive confirmation is only available in the session REPL; pass --yes"
+                .to_string(),
+        )),
+    }
+}
+
+async fn run_session_config_write<T: Transport>(
+    session: &Arc<AsyncMutex<Session<T>>>,
+    edited: &Bt2Config,
+    backup_dir: Option<&Path>,
+    accept_reserved_drift: bool,
+    confirmation: ConfigConfirmation<'_>,
+    write_chunk: Option<u16>,
+) -> Result<(), Error> {
+    let guard = session.lock().await;
+    config_write_session(
+        &guard,
+        edited,
+        backup_dir,
+        accept_reserved_drift,
+        confirmation,
+        write_chunk,
+    )
+    .await
+}
+
+async fn run_session_config_set<T: Transport>(
+    session: &Arc<AsyncMutex<Session<T>>>,
+    set: &ConfigSet,
+    backup_dir: Option<&Path>,
+    confirmation: ConfigConfirmation<'_>,
+    write_chunk: Option<u16>,
+) -> Result<(), Error> {
+    let guard = session.lock().await;
+    config_set_session(&guard, set, backup_dir, confirmation, write_chunk).await
+}
+
+async fn run_session_config_remap<T: Transport>(
+    session: &Arc<AsyncMutex<Session<T>>>,
+    slot: Slot,
+    button: ButtonIndex,
+    target: KeyMap,
+    backup_dir: Option<&Path>,
+    confirmation: ConfigConfirmation<'_>,
+    write_chunk: Option<u16>,
+) -> Result<(), Error> {
+    let guard = session.lock().await;
+    config_remap_session(
+        &guard,
+        slot,
+        button,
+        target,
+        backup_dir,
+        confirmation,
+        write_chunk,
+    )
+    .await
+}
+
 async fn config_write(
     options: &BleOptions,
     file: &Path,
@@ -2442,19 +2557,14 @@ async fn config_write(
     // BLE connection: an invalid path, length, field or chunk must not enter
     // configuration mode at all.
     validate_write_chunk_preconnect(write_chunk)?;
-    let edited = read_config_file(file)?;
-    validate_raw_config_for_write(&edited, force_raw)?;
-    for warning in raw_config_warnings(&edited) {
-        eprintln!("warning: {warning}");
-    }
+    let edited = read_and_validate_config_file(file, force_raw)?;
     let transport = BleTransport::connect(options).await?;
     let session = Session::new(transport);
-    let stdin = std::io::stdin();
-    let mut stdin_lock = stdin.lock();
+    let mut prompt = || confirm_config_write(&mut std::io::stdin().lock());
     let confirmation = if assume_yes {
         ConfigConfirmation::AssumeYes
     } else {
-        ConfigConfirmation::Reader(&mut stdin_lock)
+        ConfigConfirmation::Reader(&mut prompt)
     };
     let result = config_write_session(
         &session,
@@ -2479,12 +2589,11 @@ async fn config_set(
     validate_write_chunk_preconnect(write_chunk)?;
     let transport = BleTransport::connect(options).await?;
     let session = Session::new(transport);
-    let stdin = std::io::stdin();
-    let mut stdin_lock = stdin.lock();
+    let mut prompt = || confirm_config_write(&mut std::io::stdin().lock());
     let confirmation = if assume_yes {
         ConfigConfirmation::AssumeYes
     } else {
-        ConfigConfirmation::Reader(&mut stdin_lock)
+        ConfigConfirmation::Reader(&mut prompt)
     };
     let result = config_set_session(&session, set, backup_dir, confirmation, write_chunk).await;
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
@@ -4427,6 +4536,33 @@ enum SessionCommand {
         raw: Option<PathBuf>,
         json: Option<PathBuf>,
     },
+    ConfigSet {
+        field: String,
+        value: String,
+        slot: u8,
+        backup_dir: Option<PathBuf>,
+        yes: bool,
+        write_chunk: Option<u16>,
+    },
+    ConfigRemap {
+        from: String,
+        to: String,
+        slot: u8,
+        backup_dir: Option<PathBuf>,
+        yes: bool,
+        write_chunk: Option<u16>,
+    },
+    ConfigMapShow {
+        slot: u8,
+    },
+    ConfigWrite {
+        file: PathBuf,
+        backup_dir: Option<PathBuf>,
+        accept_reserved_drift: bool,
+        force_raw: bool,
+        yes: bool,
+        write_chunk: Option<u16>,
+    },
     Backup {
         raw: Option<PathBuf>,
         json: Option<PathBuf>,
@@ -4509,15 +4645,8 @@ fn parse_session_command(line: &str) -> SessionCommand {
     };
     match head {
         "info" if parts.next().is_none() => SessionCommand::Info,
-        "config" => {
-            if parts.next() != Some("dump") {
-                return SessionCommand::Unknown(line.to_string());
-            }
-            match parse_file_options(parts) {
-                Some((raw, json)) => SessionCommand::ConfigDump { raw, json },
-                None => SessionCommand::Unknown(line.to_string()),
-            }
-        }
+        "config" => parse_config_session_command(parts)
+            .unwrap_or_else(|| SessionCommand::Unknown(line.to_string())),
         "backup" => match parse_file_options(parts) {
             Some((raw, json)) => SessionCommand::Backup { raw, json },
             None => SessionCommand::Unknown(line.to_string()),
@@ -4547,6 +4676,129 @@ fn parse_session_command(line: &str) -> SessionCommand {
 fn session_plain_value<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<&'a str> {
     let value = parts.next()?;
     (!value.starts_with("--")).then_some(value)
+}
+
+/// Parse the `config ...` REPL subcommands.
+///
+/// `config dump` keeps its read-only file options. The write subcommands mirror
+/// the top-level flags: `--slot`, `--write-chunk`, `--accept-reserved-drift`,
+/// `--force-raw`, `--backup-dir` and `--yes`. Values are whitespace tokens, so
+/// a value containing spaces (a profile name) needs the top-level command.
+fn parse_config_session_command<'a>(
+    mut parts: impl Iterator<Item = &'a str>,
+) -> Option<SessionCommand> {
+    match parts.next()? {
+        "dump" => {
+            parse_file_options(parts).map(|(raw, json)| SessionCommand::ConfigDump { raw, json })
+        }
+        "map" => {
+            if parts.next() != Some("show") {
+                return None;
+            }
+            let mut slot = 0u8;
+            let mut seen_slot = false;
+            while let Some(part) = parts.next() {
+                match part {
+                    "--slot" if !seen_slot => {
+                        slot = session_plain_value(&mut parts)?.parse().ok()?;
+                        seen_slot = true;
+                    }
+                    _ => return None,
+                }
+            }
+            Some(SessionCommand::ConfigMapShow { slot })
+        }
+        "set" => {
+            let field = session_plain_value(&mut parts)?.to_string();
+            let value = session_plain_value(&mut parts)?.to_string();
+            let (slot, backup_dir, yes, write_chunk) = parse_config_write_options(parts)?;
+            Some(SessionCommand::ConfigSet {
+                field,
+                value,
+                slot,
+                backup_dir,
+                yes,
+                write_chunk,
+            })
+        }
+        "remap" => {
+            let from = session_plain_value(&mut parts)?.to_string();
+            let to = session_plain_value(&mut parts)?.to_string();
+            let (slot, backup_dir, yes, write_chunk) = parse_config_write_options(parts)?;
+            Some(SessionCommand::ConfigRemap {
+                from,
+                to,
+                slot,
+                backup_dir,
+                yes,
+                write_chunk,
+            })
+        }
+        "write" => {
+            let mut file = None;
+            let mut backup_dir = None;
+            let mut accept_reserved_drift = false;
+            let mut force_raw = false;
+            let mut yes = false;
+            let mut write_chunk = None;
+            while let Some(part) = parts.next() {
+                match part {
+                    "--file" if file.is_none() => {
+                        file = Some(PathBuf::from(session_plain_value(&mut parts)?));
+                    }
+                    "--backup-dir" if backup_dir.is_none() => {
+                        backup_dir = Some(PathBuf::from(session_plain_value(&mut parts)?));
+                    }
+                    "--write-chunk" if write_chunk.is_none() => {
+                        write_chunk = Some(session_plain_value(&mut parts)?.parse().ok()?);
+                    }
+                    "--accept-reserved-drift" if !accept_reserved_drift => {
+                        accept_reserved_drift = true;
+                    }
+                    "--force-raw" if !force_raw => force_raw = true,
+                    "--yes" if !yes => yes = true,
+                    _ => return None,
+                }
+            }
+            Some(SessionCommand::ConfigWrite {
+                file: file?,
+                backup_dir,
+                accept_reserved_drift,
+                force_raw,
+                yes,
+                write_chunk,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Parse the shared `config set` / `config remap` options.
+fn parse_config_write_options<'a>(
+    mut parts: impl Iterator<Item = &'a str>,
+) -> Option<(u8, Option<PathBuf>, bool, Option<u16>)> {
+    let mut slot = 0u8;
+    let mut seen_slot = false;
+    let mut backup_dir = None;
+    let mut yes = false;
+    let mut write_chunk = None;
+    while let Some(part) = parts.next() {
+        match part {
+            "--slot" if !seen_slot => {
+                slot = session_plain_value(&mut parts)?.parse().ok()?;
+                seen_slot = true;
+            }
+            "--backup-dir" if backup_dir.is_none() => {
+                backup_dir = Some(PathBuf::from(session_plain_value(&mut parts)?));
+            }
+            "--write-chunk" if write_chunk.is_none() => {
+                write_chunk = Some(session_plain_value(&mut parts)?.parse().ok()?);
+            }
+            "--yes" if !yes => yes = true,
+            _ => return None,
+        }
+    }
+    Some((slot, backup_dir, yes, write_chunk))
 }
 
 /// Parse the `macro ...` REPL subcommands.
@@ -4615,6 +4867,16 @@ fn parse_macro_session_command<'a>(
     }
 }
 
+/// True for the REPL commands that perform a configuration flash write.
+fn is_config_write_command(command: &SessionCommand) -> bool {
+    matches!(
+        command,
+        SessionCommand::ConfigSet { .. }
+            | SessionCommand::ConfigRemap { .. }
+            | SessionCommand::ConfigWrite { .. }
+    )
+}
+
 /// True for the two REPL commands that write macro flash.
 ///
 /// These are the commands that must not be cancelled by Ctrl-C, and the ones
@@ -4640,10 +4902,23 @@ fn macro_write_disabled_message(command: &SessionCommand) -> Option<&'static str
     }
 }
 
-fn print_session_help(allow_macro_write: bool) {
+fn print_session_help(allow_macro_write: bool, allow_config_write: bool) {
     println!("commands:");
     println!("  info");
     println!("  config dump [--raw FILE] [--json FILE]");
+    println!("  config map show [--slot N]");
+    if allow_config_write {
+        println!("  config set <FIELD> <VALUE> [--slot N] [--write-chunk BYTES] [--yes]");
+        println!("  config remap <PHYSICAL> <TARGET> [--slot N] [--write-chunk BYTES] [--yes]");
+        println!(
+            "  config write --file <PATH> [--backup-dir DIR] [--write-chunk BYTES] \
+             [--accept-reserved-drift] [--force-raw] [--yes]"
+        );
+    } else {
+        println!("  config set ... (disabled; restart with --allow-config-write)");
+        println!("  config remap ... (disabled; restart with --allow-config-write)");
+        println!("  config write ... (disabled; restart with --allow-config-write)");
+    }
     println!("  backup [--raw FILE] [--json FILE]");
     println!("  macro backup <DIR>");
     if allow_macro_write {
@@ -5306,6 +5581,7 @@ async fn run_session_macro_restore<T: Transport>(
     run_macro_restore(&guard, dir, force, None, MacroWriteLayout::default_ble()).await
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn execute_session_command<T: Transport + 'static>(
     session: &Arc<AsyncMutex<Session<T>>>,
@@ -5317,6 +5593,36 @@ async fn execute_session_command<T: Transport + 'static>(
     monitor: &mut Option<SessionMonitor>,
     command: SessionCommand,
 ) -> Result<SessionOutcome, Error> {
+    // Tests and non-REPL callers have no async prompt; config writes without
+    // `--yes` are refused by `config_confirmation_for_session`.
+    execute_session_command_with_io(
+        session,
+        keepalive,
+        started,
+        mtu,
+        interval,
+        allow_macro_write,
+        false,
+        monitor,
+        command,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_session_command_with_io<T: Transport + 'static>(
+    session: &Arc<AsyncMutex<Session<T>>>,
+    keepalive: &Arc<SessionKeepaliveState>,
+    started: Instant,
+    mtu: u16,
+    interval: Duration,
+    allow_macro_write: bool,
+    allow_config_write: bool,
+    monitor: &mut Option<SessionMonitor>,
+    command: SessionCommand,
+    mut repl_reader: Option<&mut (dyn tokio::io::AsyncBufRead + Unpin + Send)>,
+) -> Result<SessionOutcome, Error> {
     // The read-only default is enforced before touching the session: a
     // disabled write/restore must not send even one frame.
     if !allow_macro_write {
@@ -5324,6 +5630,10 @@ async fn execute_session_command<T: Transport + 'static>(
             eprintln!("{message}");
             return Ok(SessionOutcome::Continue);
         }
+    }
+    if !allow_config_write && is_config_write_command(&command) {
+        eprintln!("config write is disabled; restart with --allow-config-write");
+        return Ok(SessionOutcome::Continue);
     }
     let reaped = reap_finished_monitor(monitor).await;
     if let Some(status) = &reaped {
@@ -5350,6 +5660,102 @@ async fn execute_session_command<T: Transport + 'static>(
             let snapshot = guard.read_config_snapshot().await?;
             let sha256 = write_config_outputs(&snapshot, raw.as_deref(), json.as_deref())?;
             print_config_summary(&snapshot, &sha256);
+            Ok(SessionOutcome::Continue)
+        }
+        SessionCommand::ConfigSet {
+            field,
+            value,
+            slot,
+            backup_dir,
+            yes,
+            write_chunk,
+        } => {
+            if monitor.is_some() {
+                eprintln!("monitor is running; use 'monitor stop' first");
+                return Ok(SessionOutcome::Continue);
+            }
+            // Parse and validate before the lock: a bad field/value must not
+            // stall or touch the controller.
+            let slot = parse_slot(slot)?;
+            let set = parse_config_set(&field, &value, slot)?;
+            validate_write_chunk_preconnect(write_chunk)?;
+            let confirmation = config_confirmation_for_session(yes, &mut repl_reader)?;
+            run_session_config_set(
+                session,
+                &set,
+                backup_dir.as_deref(),
+                confirmation,
+                write_chunk,
+            )
+            .await?;
+            Ok(SessionOutcome::Continue)
+        }
+        SessionCommand::ConfigRemap {
+            from,
+            to,
+            slot,
+            backup_dir,
+            yes,
+            write_chunk,
+        } => {
+            if monitor.is_some() {
+                eprintln!("monitor is running; use 'monitor stop' first");
+                return Ok(SessionOutcome::Continue);
+            }
+            let slot = parse_slot(slot)?;
+            let button = parse_physical_button(&from)?;
+            let target = parse_remap_target(&to)?;
+            validate_write_chunk_preconnect(write_chunk)?;
+            let confirmation = config_confirmation_for_session(yes, &mut repl_reader)?;
+            run_session_config_remap(
+                session,
+                slot,
+                button,
+                target,
+                backup_dir.as_deref(),
+                confirmation,
+                write_chunk,
+            )
+            .await?;
+            Ok(SessionOutcome::Continue)
+        }
+        SessionCommand::ConfigMapShow { slot } => {
+            if monitor.is_some() {
+                eprintln!("monitor is running; use 'monitor stop' first");
+                return Ok(SessionOutcome::Continue);
+            }
+            let slot = parse_slot(slot)?;
+            let guard = session.lock().await;
+            let snapshot = guard.read_config_snapshot().await?;
+            for line in mapping_lines(&snapshot.config, slot) {
+                println!("{line}");
+            }
+            Ok(SessionOutcome::Continue)
+        }
+        SessionCommand::ConfigWrite {
+            file,
+            backup_dir,
+            accept_reserved_drift,
+            force_raw,
+            yes,
+            write_chunk,
+        } => {
+            if monitor.is_some() {
+                eprintln!("monitor is running; use 'monitor stop' first");
+                return Ok(SessionOutcome::Continue);
+            }
+            validate_write_chunk_preconnect(write_chunk)?;
+            let edited = read_and_validate_config_file(&file, force_raw)?;
+            let confirmation = config_confirmation_for_session(yes, &mut repl_reader)?;
+            run_session_config_write(
+                session,
+                &edited,
+                backup_dir.as_deref(),
+                accept_reserved_drift,
+                confirmation,
+                write_chunk,
+            )
+            .await?;
             Ok(SessionOutcome::Continue)
         }
         SessionCommand::Backup { raw, json } => {
@@ -5476,7 +5882,7 @@ async fn execute_session_command<T: Transport + 'static>(
             Ok(SessionOutcome::Continue)
         }
         SessionCommand::Help => {
-            print_session_help(allow_macro_write);
+            print_session_help(allow_macro_write, allow_config_write);
             Ok(SessionOutcome::Continue)
         }
         SessionCommand::Quit => Ok(SessionOutcome::Quit),
@@ -5644,6 +6050,7 @@ async fn session_repl_loop<T: Transport + 'static>(
     mtu: u16,
     interval: Duration,
     allow_macro_write: bool,
+    allow_config_write: bool,
 ) -> Result<(), Error> {
     let stdin = tokio::io::stdin();
     let mut reader = tokio::io::BufReader::new(stdin);
@@ -5658,6 +6065,7 @@ async fn session_repl_loop<T: Transport + 'static>(
         mtu,
         interval,
         allow_macro_write,
+        allow_config_write,
         &mut reader,
         ctrl_c,
         interactive,
@@ -5673,13 +6081,14 @@ async fn session_repl_loop_with_io<T, R, F>(
     mtu: u16,
     interval: Duration,
     allow_macro_write: bool,
+    allow_config_write: bool,
     reader: &mut R,
     ctrl_c: F,
     interactive: bool,
 ) -> Result<(), Error>
 where
     T: Transport + 'static,
-    R: tokio::io::AsyncBufRead + Unpin,
+    R: tokio::io::AsyncBufRead + Unpin + Send,
     F: Future<Output = ()>,
 {
     enum LoopEvent {
@@ -5773,15 +6182,17 @@ where
                 // observed once (with a notice) and then serviced after the
                 // command returns by the loop's own Ctrl-C branch.
                 let outcome = if allow_macro_write && is_macro_flash_command(&command) {
-                    let mut command_future = std::pin::pin!(execute_session_command(
+                    let mut command_future = std::pin::pin!(execute_session_command_with_io(
                         session,
                         keepalive,
                         started,
                         mtu,
                         interval,
                         allow_macro_write,
+                        allow_config_write,
                         &mut monitor,
                         command,
+                        Some(&mut *reader),
                     ));
                     tokio::select! {
                         biased;
@@ -5808,15 +6219,17 @@ where
                             // clear; `Session::InFlight` makes that decision.
                             break;
                         }
-                        outcome = execute_session_command(
+                        outcome = execute_session_command_with_io(
                             session,
                             keepalive,
                             started,
                             mtu,
                             interval,
                             allow_macro_write,
+                            allow_config_write,
                             &mut monitor,
                             command,
+                            Some(&mut *reader),
                         ) => outcome,
                     }
                 };
@@ -5858,6 +6271,7 @@ async fn session(
     options: &BleOptions,
     interval: Duration,
     allow_macro_write: bool,
+    allow_config_write: bool,
     report_enable: bool,
 ) -> Result<ExitCode, Error> {
     if interval.is_zero() {
@@ -5905,8 +6319,16 @@ async fn session(
     );
     let state = Arc::clone(&keepalive.state);
     let started = Instant::now();
-    let result =
-        session_repl_loop(&session, &state, started, mtu, interval, allow_macro_write).await;
+    let result = session_repl_loop(
+        &session,
+        &state,
+        started,
+        mtu,
+        interval,
+        allow_macro_write,
+        allow_config_write,
+    )
+    .await;
     shutdown_session(&session, keepalive).await;
     let result = finalize_session_result(result, &state);
 
@@ -6841,6 +7263,7 @@ mod tests {
             200,
             Duration::from_millis(20),
             false,
+            false,
             &mut reader,
             std::future::pending::<()>(),
             false,
@@ -6932,6 +7355,7 @@ mod tests {
             200,
             Duration::from_millis(20),
             true,
+            false,
             &mut reader,
             ctrl_c,
             false,
@@ -8084,6 +8508,7 @@ mod tests {
                 64,
                 Duration::from_millis(1),
                 false,
+                false,
                 &mut buf_reader,
                 std::future::pending::<()>(),
                 false,
@@ -8174,6 +8599,7 @@ mod tests {
             64,
             Duration::from_millis(10),
             false,
+            false,
             &mut eof_reader,
             std::future::pending::<()>(),
             false,
@@ -8197,6 +8623,7 @@ mod tests {
             Instant::now(),
             64,
             Duration::from_millis(10),
+            false,
             false,
             &mut quit_reader,
             std::future::pending::<()>(),
@@ -8325,11 +8752,13 @@ mod tests {
     /// read-back requests from the bytes written so far, so the whole
     /// `config write` / `config set` path (including read-back verification)
     /// can be tested without a device.
+    #[derive(Clone)]
     struct ConfigDeviceTransport {
-        config: Mutex<Bt2Config>,
-        incoming: Mutex<VecDeque<Vec<u8>>>,
-        sent: Mutex<Vec<Vec<u8>>>,
+        config: Arc<Mutex<Bt2Config>>,
+        incoming: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
         mtu: u16,
+        stall_when_empty: bool,
     }
 
     impl ConfigDeviceTransport {
@@ -8339,11 +8768,19 @@ mod tests {
 
         fn with_mtu(config: Bt2Config, mtu: u16) -> Self {
             Self {
-                config: Mutex::new(config),
-                incoming: Mutex::new(VecDeque::new()),
-                sent: Mutex::new(Vec::new()),
+                config: Arc::new(Mutex::new(config)),
+                incoming: Arc::new(Mutex::new(VecDeque::new())),
+                sent: Arc::new(Mutex::new(Vec::new())),
                 mtu,
+                stall_when_empty: false,
             }
+        }
+
+        /// Make `recv` stay pending when no frame is queued, so a keepalive
+        /// poll times out instead of seeing a disconnect.
+        fn stalling(mut self) -> Self {
+            self.stall_when_empty = true;
+            self
         }
 
         fn set_config(&self, config: Bt2Config) {
@@ -8419,11 +8856,13 @@ mod tests {
         }
 
         async fn recv(&self) -> Result<Vec<u8>, Error> {
-            self.incoming
-                .lock()
-                .unwrap()
-                .pop_front()
-                .ok_or(Error::Disconnected)
+            if let Some(frame) = self.incoming.lock().unwrap().pop_front() {
+                return Ok(frame);
+            }
+            if self.stall_when_empty {
+                std::future::pending::<()>().await;
+            }
+            Err(Error::Disconnected)
         }
 
         fn mtu(&self) -> u16 {
@@ -9350,12 +9789,13 @@ mod tests {
         let session = Session::new(&transport);
         let backup = dir.join("backup");
         let mut reader = std::io::Cursor::new(b"no\n".to_vec());
+        let mut prompt = || confirm_config_write(&mut reader);
         config_write_session(
             &session,
             &edited,
             Some(&backup),
             false,
-            ConfigConfirmation::Reader(&mut reader),
+            ConfigConfirmation::Reader(&mut prompt),
             None,
         )
         .await
@@ -9579,6 +10019,298 @@ mod tests {
             cmd == commands::cmd::WRITE_CONFIG || cmd == commands::cmd::SAVE
         });
         assert!(!wrote);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_session_config_commands_accept_the_top_level_options() {
+        assert_eq!(
+            parse_session_command("config set joy.left_start 42 --slot 2 --yes"),
+            SessionCommand::ConfigSet {
+                field: "joy.left_start".to_string(),
+                value: "42".to_string(),
+                slot: 2,
+                backup_dir: None,
+                yes: true,
+                write_chunk: None,
+            }
+        );
+        assert_eq!(
+            parse_session_command(
+                "config remap A B --slot 1 --backup-dir /tmp/b --write-chunk 74 --yes"
+            ),
+            SessionCommand::ConfigRemap {
+                from: "A".to_string(),
+                to: "B".to_string(),
+                slot: 1,
+                backup_dir: Some(PathBuf::from("/tmp/b")),
+                yes: true,
+                write_chunk: Some(74),
+            }
+        );
+        assert_eq!(
+            parse_session_command("config map show"),
+            SessionCommand::ConfigMapShow { slot: 0 }
+        );
+        assert_eq!(
+            parse_session_command("config map show --slot 2"),
+            SessionCommand::ConfigMapShow { slot: 2 }
+        );
+        assert_eq!(
+            parse_session_command(
+                "config write --file /tmp/c.bin --backup-dir /tmp/b --accept-reserved-drift \
+                 --force-raw --write-chunk 180 --yes"
+            ),
+            SessionCommand::ConfigWrite {
+                file: PathBuf::from("/tmp/c.bin"),
+                backup_dir: Some(PathBuf::from("/tmp/b")),
+                accept_reserved_drift: true,
+                force_raw: true,
+                yes: true,
+                write_chunk: Some(180),
+            }
+        );
+        // Unknown subcommands, missing values and duplicate options are
+        // rejected as a whole.
+        for line in [
+            "config set",
+            "config set field",
+            "config remap A",
+            "config write --file",
+            "config write",
+            "config map",
+            "config set a b --slot 1 --slot 2",
+            "config write --file /tmp/c.bin --yes --yes",
+            "config unknown",
+        ] {
+            assert!(
+                matches!(parse_session_command(line), SessionCommand::Unknown(_)),
+                "{line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_repl_config_set_writes_backup_and_reads_back() {
+        let dir = scratch_dir("session-config-set");
+        let initial = config_write_fixture();
+        let before = config_snapshot(initial.clone());
+        let transport = ConfigDeviceTransport::new(initial.clone());
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let state = Arc::new(SessionKeepaliveState::new());
+        let backup = dir.join("backup");
+        let input = format!(
+            "config set joy.left_start 42 --slot 1 --backup-dir {} --yes\n\
+             config map show --slot 1\n\
+             quit\n",
+            backup.display()
+        );
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes()));
+        let result = session_repl_loop_with_io(
+            &session,
+            &state,
+            Instant::now(),
+            200,
+            Duration::from_millis(20),
+            false,
+            true,
+            &mut reader,
+            std::future::pending::<()>(),
+            false,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let device = transport.config();
+        assert_eq!(device.joy(Slot::S2).left_start_value, 42);
+        assert_eq!(
+            device.joy(Slot::S2).left_end_value,
+            before.config.joy(Slot::S2).left_end_value
+        );
+        assert!(backup.join("config.bin").is_file());
+        assert!(backup.join("config.json").is_file());
+        let frames = transport.sent();
+        assert!(frames.iter().any(|frame| {
+            CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::WRITE_CONFIG
+        }));
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::SAVE)
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn session_repl_config_set_abort_confirmation_keeps_backup_and_sends_no_write() {
+        let dir = scratch_dir("session-config-abort");
+        let initial = config_write_fixture();
+        let transport = ConfigDeviceTransport::new(initial.clone());
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let state = Arc::new(SessionKeepaliveState::new());
+        let backup = dir.join("backup");
+        let input = format!(
+            "config set joy.left_start 42 --slot 1 --backup-dir {}\nno\nquit\n",
+            backup.display()
+        );
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes()));
+        let result = session_repl_loop_with_io(
+            &session,
+            &state,
+            Instant::now(),
+            200,
+            Duration::from_millis(20),
+            false,
+            true,
+            &mut reader,
+            std::future::pending::<()>(),
+            false,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+
+        assert_eq!(transport.config().as_bytes(), initial.as_bytes());
+        assert!(backup.join("config.bin").is_file(), "backup must remain");
+        let wrote = transport.sent().iter().any(|frame| {
+            let cmd = CustomHeader::parse(&frame[1..]).unwrap().cmd;
+            cmd == commands::cmd::WRITE_CONFIG || cmd == commands::cmd::SAVE
+        });
+        assert!(!wrote, "aborted confirmation must not write");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn session_repl_config_write_force_raw_keeps_the_reserved_guard() {
+        let dir = scratch_dir("session-config-force");
+        let initial = config_write_fixture();
+        let mut edited = initial.clone();
+        edited.as_mut_bytes()[eightbitdo_protocol::config_bt2::OFF_LEGACY_A] ^= 0xFF;
+        edited.set_map_key_entry(Slot::S1, ButtonIndex::A, KeyMap::MY_NULL);
+        let file = dir.join("edited.bin");
+        std::fs::write(&file, edited.as_bytes()).unwrap();
+
+        let transport = ConfigDeviceTransport::new(initial.clone());
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let state = Arc::new(SessionKeepaliveState::new());
+        let input = format!(
+            "config write --file {} --backup-dir {} --force-raw --yes\nquit\n",
+            file.display(),
+            dir.join("backup").display()
+        );
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes()));
+        let result = session_repl_loop_with_io(
+            &session,
+            &state,
+            Instant::now(),
+            200,
+            Duration::from_millis(20),
+            false,
+            true,
+            &mut reader,
+            std::future::pending::<()>(),
+            false,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+
+        // --force-raw downgrades the key_map check, but the reserved-region
+        // guard still refuses the file before any write/Save frame.
+        let wrote = transport.sent().iter().any(|frame| {
+            let cmd = CustomHeader::parse(&frame[1..]).unwrap().cmd;
+            cmd == commands::cmd::WRITE_CONFIG || cmd == commands::cmd::SAVE
+        });
+        assert!(
+            !wrote,
+            "reserved drift must be refused even with --force-raw"
+        );
+        assert_eq!(transport.config().as_bytes(), initial.as_bytes());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn session_repl_config_writes_are_gated_without_the_opt_in_flag() {
+        let dir = scratch_dir("session-config-gate");
+        let initial = config_write_fixture();
+        let transport = ConfigDeviceTransport::new(initial.clone());
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let state = Arc::new(SessionKeepaliveState::new());
+        let input = format!(
+            "config set joy.left_start 42 --slot 1 --backup-dir {} --yes\nquit\n",
+            dir.join("backup").display()
+        );
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes()));
+        let result = session_repl_loop_with_io(
+            &session,
+            &state,
+            Instant::now(),
+            200,
+            Duration::from_millis(20),
+            false,
+            false,
+            &mut reader,
+            std::future::pending::<()>(),
+            false,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            transport.sent().is_empty(),
+            "gated config write sent frames"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn session_repl_config_write_holds_the_operation_lock_against_keepalive() {
+        let dir = scratch_dir("session-config-lock");
+        let initial = config_write_fixture();
+        let transport = ConfigDeviceTransport::new(initial.clone()).stalling();
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let keepalive = start_session_keepalive(Arc::clone(&session), Duration::from_millis(5))
+            .await
+            .unwrap();
+        wait_for_keepalive_send(&keepalive.state).await;
+
+        let state = Arc::clone(&keepalive.state);
+        let backup = dir.join("backup");
+        let input = format!(
+            "config set joy.left_start 42 --slot 1 --backup-dir {} --yes\nquit\n",
+            backup.display()
+        );
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes()));
+        let result = session_repl_loop_with_io(
+            &session,
+            &state,
+            Instant::now(),
+            200,
+            Duration::from_millis(20),
+            false,
+            true,
+            &mut reader,
+            std::future::pending::<()>(),
+            false,
+        )
+        .await;
+        shutdown_session(&session, keepalive).await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let frames = transport.sent();
+        let first_write = frames.iter().position(|frame| {
+            CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::WRITE_CONFIG
+        });
+        let save = frames
+            .iter()
+            .position(|frame| CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::SAVE);
+        let (first_write, save) = (first_write.unwrap(), save.unwrap());
+        assert!(first_write < save);
+        assert!(
+            frames[first_write..=save].iter().all(|frame| {
+                CustomHeader::parse(&frame[1..]).unwrap().cmd != commands::cmd::INPUT
+            }),
+            "keepalive 0x0003 interleaved with the config write"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
