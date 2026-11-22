@@ -25,7 +25,19 @@ import Foundation
 /// is the only public lower bound, so the transport reports
 /// `maximumWriteValueLength(for: .withoutResponse) + 3` (the 3-byte ATT
 /// notification header the Rust sizing code subtracts).
+///
+/// # Write mode
+///
+/// The protocol normally uses write-without-response, but some FF11/FF13
+/// implementations only advertise write-with-response. Both carry the same
+/// frames; the mode is selected from the characteristic properties, and a
+/// characteristic with neither is refused by `AppModel` and by `send`.
 final class CoreBluetoothTransport: NSObject, NativeTransport, @unchecked Sendable {
+    /// How command frames are written to the App Mode characteristic.
+    enum WriteMode {
+        case withoutResponse
+        case withResponse
+    }
     /// Same bound as the Rust bridge queue: enough for one full config read.
     static let frameCapacity = 64
 
@@ -33,12 +45,14 @@ final class CoreBluetoothTransport: NSObject, NativeTransport, @unchecked Sendab
     private let characteristic: CBCharacteristic
     private let callbackQueue: DispatchQueue
     private let mtuValue: UInt16
-    private let supportsWriteWithoutResponse: Bool
+    private let writeMode: WriteMode?
 
     private let condition = NSCondition()
     private var frames: [Data] = []
     private var droppedFrames: UInt64 = 0
     private var closed = false
+    private var pendingWrite = false
+    private var pendingWriteError: Error?
 
     init(
         peripheral: CBPeripheral,
@@ -50,10 +64,17 @@ final class CoreBluetoothTransport: NSObject, NativeTransport, @unchecked Sendab
         self.characteristic = characteristic
         self.mtuValue = mtu
         self.callbackQueue = callbackQueue
-        // Checked again in `send`, because a silent fallback to a write with
-        // response (or a dropped write) would corrupt the frame stream.
-        self.supportsWriteWithoutResponse =
-            characteristic.properties.contains(.writeWithoutResponse)
+        // Prefer without-response (the protocol's normal mode); fall back to
+        // with-response when the characteristic only advertises that. Checked
+        // again in `send`, because silently dropping a write would corrupt the
+        // frame stream.
+        if characteristic.properties.contains(.writeWithoutResponse) {
+            self.writeMode = .withoutResponse
+        } else if characteristic.properties.contains(.write) {
+            self.writeMode = .withResponse
+        } else {
+            self.writeMode = nil
+        }
         super.init()
         peripheral.delegate = self
     }
@@ -65,24 +86,56 @@ final class CoreBluetoothTransport: NSObject, NativeTransport, @unchecked Sendab
         let isClosed = closed
         condition.unlock()
         guard !isClosed else {
-            throw NativeTransportError.Failure(message: "BLE link is closed")
+            throw NativeTransportError.Failure(detail: "BLE link is closed")
         }
-        guard supportsWriteWithoutResponse else {
+        guard let mode = writeMode else {
             throw NativeTransportError.Failure(
-                message: "App Mode characteristic has no write-without-response property"
-            )
-        }
-        // With .withoutResponse the stack drops a write when its buffer is
-        // full. Failing closed (instead of writing anyway) keeps the frame
-        // stream ordered; the Rust layer reports the read as failed.
-        guard waitForWriteCapacity() else {
-            throw NativeTransportError.Failure(
-                message: "BLE write capacity did not free up within the timeout"
+                detail: "App Mode characteristic has no write property"
             )
         }
 
-        callbackQueue.async { [peripheral, characteristic] in
-            peripheral.writeValue(data, for: characteristic, type: .withoutResponse)
+        switch mode {
+        case .withoutResponse:
+            // With .withoutResponse the stack drops a write when its buffer is
+            // full. Failing closed (instead of writing anyway) keeps the frame
+            // stream ordered; the Rust layer reports the read as failed.
+            guard waitForWriteCapacity() else {
+                throw NativeTransportError.Failure(
+                    detail: "BLE write capacity did not free up within the timeout"
+                )
+            }
+            callbackQueue.async { [peripheral, characteristic] in
+                peripheral.writeValue(data, for: characteristic, type: .withoutResponse)
+            }
+
+        case .withResponse:
+            // Wait for `didWriteValueFor` so a failed or slow ATT write is
+            // reported instead of silently losing a frame.
+            condition.lock()
+            pendingWrite = true
+            pendingWriteError = nil
+            condition.unlock()
+            callbackQueue.async { [peripheral, characteristic] in
+                peripheral.writeValue(data, for: characteristic, type: .withResponse)
+            }
+            condition.lock()
+            let deadline = Date(timeIntervalSinceNow: 2.0)
+            while pendingWrite && !closed {
+                if !condition.wait(until: deadline) {
+                    break
+                }
+            }
+            let failed = closed || pendingWriteError != nil
+            let writeError = pendingWriteError
+            pendingWrite = false
+            pendingWriteError = nil
+            condition.unlock()
+            if failed {
+                let reason = writeError?.localizedDescription ?? "link closed"
+                throw NativeTransportError.Failure(
+                    detail: "BLE write with response failed: \(reason)"
+                )
+            }
         }
     }
 
@@ -93,7 +146,7 @@ final class CoreBluetoothTransport: NSObject, NativeTransport, @unchecked Sendab
 
         while frames.isEmpty {
             if closed {
-                throw NativeTransportError.Failure(message: "BLE link is closed")
+                throw NativeTransportError.Failure(detail: "BLE link is closed")
             }
             if !condition.wait(until: deadline) {
                 return nil
@@ -110,6 +163,7 @@ final class CoreBluetoothTransport: NSObject, NativeTransport, @unchecked Sendab
         condition.lock()
         closed = true
         frames.removeAll()
+        pendingWrite = false
         condition.broadcast()
         condition.unlock()
     }
@@ -157,6 +211,19 @@ extension CoreBluetoothTransport: CBPeripheralDelegate {
 
     func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
         condition.lock()
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func peripheral(
+        _ peripheral: CBPeripheral,
+        didWriteValueFor characteristic: CBCharacteristic,
+        error: Error?
+    ) {
+        guard characteristic.uuid == self.characteristic.uuid else { return }
+        condition.lock()
+        pendingWrite = false
+        pendingWriteError = error
         condition.broadcast()
         condition.unlock()
     }

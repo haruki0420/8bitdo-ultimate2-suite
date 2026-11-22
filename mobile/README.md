@@ -24,15 +24,39 @@ crates/eightbitdo-protocol … フレーム・CRC・構造体
 
 | 項目 | 状態 |
 | --- | --- |
-| `eightbitdo-uniffi` クレート | 実装済み。`cargo test -p eightbitdo-uniffi` で 12 テスト成功 |
+| `eightbitdo-uniffi` クレート | 実装済み。`cargo test -p eightbitdo-uniffi` で 14 テスト成功 |
 | 受信キュー（Rust / Android / iOS） | bounded（64 フレーム、溢れたら最古を drop）。Rust・Android に単体テストあり |
-| UniFFI の Swift / Kotlin バインディング生成 | 実測で成功（`uniffi` 0.32.2） |
+| UniFFI の Swift / Kotlin バインディング生成 | 実測で成功（`uniffi` 0.31.2） |
 | iOS: SwiftUI 雛形 + CoreBluetooth transport | 実装済み |
 | iOS: `xtool dev build --ipa`（署名なし IPA） | **成功**（Linux / xtool 1.24.0） |
-| Android: Gradle + Compose + GATT transport 雛形 | 実装済み。SDK/NDK が無いため**ビルド未実施** |
-| Android: APK ビルド / unit test | 未実施（下記の導入手順が必要） |
+| Android: Gradle + Compose + GATT transport 雛形 | 実装済み |
+| Android: `assembleDebug` / JVM unit test | **成功**（Kotlin/Compose 検証。Rust JNI は NDK 不在のため未同梱） |
 | 実機での動作確認 | 未実施（実機なし） |
 | 設定書き込み・OTA | 未公開（意図的。後述） |
+
+## Rust / UniFFI のバージョン制約（MSRV 1.85）
+
+ワークスペースの MSRV は **Rust 1.85**（`Cargo.toml` の `rust-version`）です。
+CI と同じコマンドで確認できます。
+
+```bash
+cargo +1.85.0 check --workspace --all-targets --all-features --locked
+```
+
+**`uniffi` は 0.32 系ではなく 0.31.2 に固定しています。** 0.32.2 は
+`cargo_metadata 0.23.1`（MSRV 1.86）、`askama 0.16.1` / `textwrap 0.16.4`
+（MSRV 1.88）、`cargo-platform 0.3.3`（MSRV 1.91）を引き込み、
+`--all-features` の MSRV チェックが失敗するためです。0.31.2 は
+`cargo_metadata 0.19.2`（1.78）と `askama 0.14.0`（1.83）で 1.85 に収まります
+（`textwrap` は 0.16.2 に固定）。
+
+* `crates/eightbitdo-uniffi/Cargo.toml` の `uniffi` と生成バインディング
+  （`scripts/mobile/gen-bindings.sh`）は必ず同じバージョンにそろえる。
+  bindgen と crate の不一致は実行時クラッシュにつながります。
+* 0.32 系へ上げるときは、MSRV 1.85 を維持するなら上記推移依存の
+  ダウングレード（`cargo update --precise`）か、bindgen を workspace 外へ
+  分離する必要があります。CI の `msrv` ジョブは
+  `cargo check --workspace --all-targets --all-features --locked` を実行します。
 
 ## UniFFI 公開 API
 
@@ -87,7 +111,10 @@ Kotlin は `Dispatchers.IO`、Swift は専用キューから呼んでくださ�
 
 * Rust `FrameQueue`（`BridgeTransport` 内）: 容量 **64 フレーム**、満杯時は
   **最古を drop** してカウント。落ちたフレームは読み出しの失敗（timeout /
-  resync）として表面化し、成功扱いにはなりません。
+  resync）として表面化し、成功扱いにはなりません。**応答フレーム自体が
+  落ちる可能性はありますが、その read は必ず失敗します**（部分転送を成功に
+  しない）。将来の書き込み経路を配線するときは、任意フレームではなく
+  リアルタイム入力レポートだけを drop 対象にすることを検討します。
 * Android `FrameQueue`: 同じ容量・同じ drop-oldest 方針。
 * iOS `CoreBluetoothTransport`: 同じ容量・同じ drop-oldest 方針。
 * 64 は 2768B 設定読み出し（約 20 通知）に余裕を持たせた値です。
@@ -156,15 +183,27 @@ cd mobile/ios && xtool dev build -c release --ipa
 
 ### 実測結果（2026-11-23、この環境・レビュー反映後）
 
-* `xtool dev build --ipa`: `Build complete! (6.66 secs)` → IPA 生成
-* IPA サイズ: 1,526,794 bytes
+* `xtool dev build --ipa`: `Build complete! (6.64 secs)` → IPA 生成
+* IPA サイズ: 1,548,642 bytes
 * `Payload/EightBitDo.app/EightBitDo`: `Mach-O 64-bit arm64 executable`
 * `llvm-nm` で `_uniffi_eightbitdo_uniffi_fn_constructor_mobilesession_new` など
   UniFFI シンボル 61 個を確認（Rust staticlib が実際にリンクされている）
 * `Info.plist`: `CFBundleIdentifier=dev.eightbitdo.mobile`,
   `NSBluetoothAlwaysUsageDescription`（"read its settings and enable live
   input"）, `UIBackgroundModes=[bluetooth-central]`, `MinimumOSVersion=17.0`
-* Rust staticlib サイズ: 20,903,152 bytes（release、LTO なし）
+* Rust staticlib サイズ: 20,899,048 bytes（release、LTO なし）
+
+### 書き込みモード（without-response / with-response）
+
+プロトコルは通常 write-without-response で駆動しますが、FF11/FF13 の中には
+with-response しか広告しない実装があります。フレーム自体は同じなので、
+両プラットフォームとも特性の `properties` から書き込みモードを選びます。
+
+* without-response が利用可能ならそれを使用（通常経路）。
+* 無ければ with-response を使用し、ATT 応答（iOS `didWriteValueFor` /
+  Android `onCharacteristicWrite`）を待ってから次のフレームへ進む。
+* どちらの書き込みプロパティも無い場合のみ、接続時に明示エラー。
+  iOS は MTU 不足時と同じく `cancelPeripheralConnection` でリンクを閉じます。
 
 ### 接続ライフサイクルと transport の責務
 
@@ -218,12 +257,33 @@ cd mobile/ios && xtool dev build -c release --ipa
 
 ## Android（`mobile/android/`）
 
-### この環境ではビルドしていません
+### この環境でのビルド結果（実測）
 
-このホストには Android SDK / NDK / Gradle がありません
-（`sdkmanager` / `gradle` / `kotlinc` 不在。`adb` のみ）。
-**重い SDK を勝手に導入しない**方針のため、APK ビルドは未実施です。
-コードと Gradle 構成は置いてあり、下記の導入後に `assembleDebug` できます。
+このホストには Android SDK が `/opt/android-sdk` にあり、Gradle 9.8.2 の
+ディストリビューションも `~/.gradle` にキャッシュされていたため、
+**Kotlin コンパイル・JVM unit test・debug APK 生成まで実測できました**。
+
+| 項目 | 結果 |
+| --- | --- |
+| ツールチェーン | AGP **9.5.0** / Gradle **9.8.2**（wrapper 同梱）/ Kotlin **2.4.21**（AGP 9 の built-in Kotlin）/ JDK 21 |
+| Android SDK | `/opt/android-sdk`（platforms;android-36, build-tools;36.0.0） |
+| `./gradlew testDebugUnitTest` | **BUILD SUCCESSFUL**（`FrameQueueTest` 3 + `AppWriteModeTest` 3 = 6 テスト、失敗 0） |
+| `./gradlew assembleDebug` | **BUILD SUCCESSFUL**（`app/build/outputs/apk/debug/app-debug.apk` = 12,076,864 bytes） |
+| Rust JNI ライブラリ | **未同梱**（NDK / cargo-ndk が無いため `cargo ndk` を実行していない） |
+
+注意: 生成できた APK は Kotlin / Compose / リソース / manifest のコンパイル検証であり、
+`libeightbitdo_uniffi.so` を含みません。実機で Rust コアを動かすには NDK と
+cargo-ndk を導入し、下記の通常ビルドを実行してください。
+
+AGP 9 では `org.jetbrains.kotlin.android` プラグインを適用できません（built-in
+Kotlin が標準）。本プロジェクトは `com.android.application` +
+`org.jetbrains.kotlin.plugin.compose` のみを適用しています。
+
+また UniFFI 0.31.2 が生成する Kotlin のエラークラスは、フィールド名が
+`message` だと Kotlin 2.4 で `override val message` と衝突するため、Rust 側の
+エラーフィールドは **`detail`** にしています（生成コードは `detail` を保持し
+`message` を override します）。バインディングを再生成するときはこの前提を
+変えないでください。
 
 ### 導入コマンド（Linux）
 
@@ -238,26 +298,26 @@ yes | ./latest/bin/sdkmanager --licenses
   "build-tools;36.0.0" "ndk;27.2.12479018"
 export ANDROID_HOME="$HOME/android-sdk"
 
-# 2. Rust Android ターゲット + cargo-ndk
+# 2. Rust Android ターゲット + cargo-ndk（Rust JNI を含める場合）
 rustup target add aarch64-linux-android x86_64-linux-android
 cargo install cargo-ndk --locked
-
-# 3. Gradle（wrapper jar はコミットしていないので一度だけ生成する）
-cd mobile/android
-gradle wrapper --gradle-version 8.14.3
 ```
+
+Gradle wrapper は同梱済みです（`mobile/android/gradlew`、Gradle 9.8.2）。
+グローバルな Gradle は不要です。
 
 ### ビルド
 
 ```bash
 export ANDROID_HOME="$HOME/android-sdk"
-./scripts/mobile/build-android.sh
+./scripts/mobile/build-android.sh            # Rust .so 込みの完全ビルド
+./scripts/mobile/build-android.sh --kotlin-only  # Kotlin/Compose + unit test のみ（NDK 不要）
 ```
 
-内部で `gen-bindings.sh` → `cargo ndk`（`app/src/main/jniLibs`）→
-`./gradlew assembleDebug` を実行します。debug 署名なので配布不可・実機検証用です。
-`FrameQueue` など JVM だけで動くロジックは `./gradlew testDebugUnitTest` で
-検証できます（この環境では SDK が無いため未実行）。
+完全ビルドは `gen-bindings.sh` → `cargo ndk`（`app/src/main/jniLibs`）→
+`./gradlew testDebugUnitTest assembleDebug` を実行します。debug 署名なので
+配布不可・実機検証用です。`--kotlin-only` は NDK が無い環境での
+コンパイル検証用で、APK に Rust JNI ライブラリは入りません。
 
 ### 構成
 
@@ -271,7 +331,10 @@ export ANDROID_HOME="$HOME/android-sdk"
   * 通知は `FrameQueue` 経由（drop-oldest、容量 64）
   * CCCD `0x2902` 有効化・MTU 交渉は**厳格**（失敗・無応答はエラー、
     23 へのフォールバックなし）。MTU は `minimumReadMtu()`（161）以上を検証
-  * `PROPERTY_NOTIFY` と `PROPERTY_WRITE_NO_RESPONSE` の両方を要求
+  * `PROPERTY_NOTIFY` を要求。書き込みは `PROPERTY_WRITE_NO_RESPONSE`
+    があれば without-response、無ければ `PROPERTY_WRITE` で with-response を
+    選ぶ両対応（`AppWriteMode`）。どちらも無い場合だけエラー。
+    with-response は `onCharacteristicWrite` を待って完了
   * `open()` 失敗・切断通知・`disconnect()` のすべてで GATT client を
     `close()` し executor を `shutdownNow()`
 * 接続ライフサイクルは `DeviceViewModel` が所有。再接続前に旧セッションを
@@ -305,19 +368,27 @@ mobile/android/app/src/main/jniLibs/        # cargo-ndk の .so
 公式バイナリ・IPA・APK は従来どおりコミットしません。
 バインディングは `scripts/mobile/gen-bindings.sh` でいつでも再生成できます。
 
+例外として **Gradle wrapper**（`mobile/android/gradlew`,
+`gradle/wrapper/gradle-wrapper.jar`, `gradle-wrapper.properties`）は
+ビルド再現性のためコミットしています（Gradle 9.8.2、Android 公式の慣例）。
+
 ## 既知の制限・残課題
 
 1. **実機未検証**。iOS / Android とも、`80ND` への接続・2768B 読み出し・
    マクロ読み出しは実機で確認していない。iOS は `xtool devices` が空。
-2. **Android APK 未ビルド / unit test 未実行**。SDK/NDK 導入が必要（上記）。
+2. **Android の Rust JNI は未検証**。SDK は `/opt/android-sdk` にあったため
+   Kotlin コンパイル・unit test・debug APK 生成までは実測済みですが、NDK と
+   cargo-ndk が無いため `libeightbitdo_uniffi.so` は APK に含まれていません。
+   実機で Rust コアを動かすには NDK 導入後の完全ビルドが必要です。
 3. **設定書き込み・OTA は未公開**。`prepareConfigWrite` まで。
 4. **バックグラウンド書き込み不可**（設計上、前景専用）。
 5. **MTU 161 以上が必須**。交渉に失敗した場合は明確なエラーで停止します
    （23 へのフォールバックはしません）。
 6. **iOS の MTU** は `maximumWriteValueLength(for: .withoutResponse) + 3` で
    推定する（Apple は ATT MTU を直接公開しない）。
-7. **UniFFI のバージョン**は `0.32.2` に固定。bindgen と crate の不一致は
-   実行時クラッシュにつながるため、`Cargo.toml` と生成スクリプトを同時に更新する。
+7. **UniFFI のバージョン**は **0.31.2** に固定（MSRV 1.85 のため。前述）。
+   bindgen と crate の不一致は実行時クラッシュにつながるため、
+   `Cargo.toml` と生成スクリプトを同時に更新する。
 8. **App Store 審査**は BLE 利用目的の説明とプライバシーマニフェストが必要。
    カスタムハードウェア連携アプリとして審査可能だが、通過を保証しない。
 9. 商標・ライセンス表記はリポジトリ方針（非公式であることの明示）に従う。

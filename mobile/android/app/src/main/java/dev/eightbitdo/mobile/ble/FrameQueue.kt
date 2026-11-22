@@ -1,5 +1,9 @@
 package dev.eightbitdo.mobile.ble
 
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
 /**
  * A bounded notification-frame queue with drop-oldest overflow handling.
  *
@@ -9,10 +13,15 @@ package dev.eightbitdo.mobile.ble
  * so an unbounded queue would grow without limit. When the queue is full the
  * **oldest** frame is dropped and counted; the affected Rust read then fails
  * closed (timeout / resync) instead of consuming a corrupt transfer.
+ *
+ * A dropped frame can be a read response. That is deliberate and safe today
+ * because every affected read fails; when a flash-write path is wired in,
+ * revisit this to drop only realtime input reports.
  */
 class FrameQueue(private val capacity: Int = DEFAULT_CAPACITY) {
 
-    private val lock = Any()
+    private val lock = ReentrantLock()
+    private val changed = lock.newCondition()
     private val frames = ArrayDeque<ByteArray>()
     private var closed = false
     private var dropped: Long = 0
@@ -23,14 +32,14 @@ class FrameQueue(private val capacity: Int = DEFAULT_CAPACITY) {
 
     /** Push one frame, dropping the oldest when the queue is full. */
     fun push(frame: ByteArray) {
-        synchronized(lock) {
+        lock.withLock {
             if (closed) return
             if (frames.size >= capacity) {
                 frames.removeFirst()
                 dropped++
             }
             frames.addLast(frame)
-            lock.notifyAll()
+            changed.signalAll()
         }
     }
 
@@ -41,14 +50,12 @@ class FrameQueue(private val capacity: Int = DEFAULT_CAPACITY) {
      * surface the latter as a link error.
      */
     fun poll(timeoutMs: Long): ByteArray? {
-        synchronized(lock) {
-            val deadline = System.nanoTime() + timeoutMs * 1_000_000
+        lock.withLock {
+            var remaining = TimeUnit.MILLISECONDS.toNanos(timeoutMs)
             while (frames.isEmpty()) {
                 if (closed) return null
-                val remaining = deadline - System.nanoTime()
                 if (remaining <= 0) return null
-                val millis = remaining / 1_000_000
-                lock.wait(if (millis > 0) millis else 1)
+                remaining = changed.awaitNanos(remaining)
             }
             return frames.removeFirst()
         }
@@ -56,18 +63,18 @@ class FrameQueue(private val capacity: Int = DEFAULT_CAPACITY) {
 
     /** Close the queue: clear buffered frames and wake every waiter. */
     fun close() {
-        synchronized(lock) {
+        lock.withLock {
             closed = true
             frames.clear()
-            lock.notifyAll()
+            changed.signalAll()
         }
     }
 
     /** Number of frames dropped because of overflow. */
-    fun droppedFrames(): Long = synchronized(lock) { dropped }
+    fun droppedFrames(): Long = lock.withLock { dropped }
 
     /** `true` once [close] was called. */
-    fun isClosed(): Boolean = synchronized(lock) { closed }
+    fun isClosed(): Boolean = lock.withLock { closed }
 
     companion object {
         /** Same bound as the Rust bridge queue: enough for one full config read. */

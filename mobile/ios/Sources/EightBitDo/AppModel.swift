@@ -270,7 +270,10 @@ final class AppModel: NSObject, ObservableObject {
         // notifications and hang the read.
         let minimumMtu = minimumReadMtu()
         guard mtu >= minimumMtu else {
+            // Tear the link down as well: a half-configured link with too small
+            // an MTU must not linger while the UI shows the error.
             transport.disconnect()
+            central?.cancelPeripheralConnection(peripheral)
             publish {
                 self.stage = .failed(
                     "negotiated MTU \(mtu) is below the \(minimumMtu) needed to read the configuration"
@@ -411,15 +414,15 @@ extension AppModel: CBPeripheralDelegate {
             publish { self.stage = .failed("App Mode characteristic cannot notify") }
             return
         }
-        // Every frame is written without response; a characteristic that only
-        // supports write-with-response cannot carry the protocol safely (the
-        // command stream would serialize per ACK), so fail before enabling
-        // notifications instead of discovering it at the first send.
-        guard characteristic.properties.contains(.writeWithoutResponse) else {
+        // Write-without-response is the protocol's normal mode, but some
+        // FF11/FF13 units only advertise write-with-response. Both carry the
+        // same frames; `CoreBluetoothTransport` picks the mode, so require only
+        // that one of the two exists.
+        guard characteristic.properties.contains(.writeWithoutResponse)
+            || characteristic.properties.contains(.write)
+        else {
             publish {
-                self.stage = .failed(
-                    "App Mode characteristic does not support write-without-response"
-                )
+                self.stage = .failed("App Mode characteristic is not writable")
             }
             return
         }

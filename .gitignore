@@ -56,6 +56,7 @@ mobile/ios/.bsp/
 mobile/android/app/src/main/jniLibs/
 mobile/android/app/src/main/java/dev/eightbitdo/mobile/core/
 mobile/android/.gradle/
+mobile/android/.kotlin/
 mobile/android/build/
 mobile/android/app/build/
 mobile/android/local.properties

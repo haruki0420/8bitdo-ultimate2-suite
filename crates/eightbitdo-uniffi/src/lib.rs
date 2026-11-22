@@ -70,6 +70,12 @@ const RECV_POLL_MS: u32 = 200;
 ///
 /// Enough for a full configuration read (the device answers a 2768-byte read
 /// with ~20 notifications) with room for interleaved input reports.
+///
+/// Drop-oldest is safe but not free: if a slow read lets more than this many
+/// frames arrive, a response frame can be dropped and the read fails closed
+/// (timeout / resync). It never returns a partial frame as success. When a
+/// write path is wired in, revisit this to drop only realtime input reports
+/// (`cmd 0x0003` / `0x0004,0x0003`) instead of arbitrary frames.
 const RX_QUEUE_CAPACITY: usize = 64;
 
 /// Minimum negotiated ATT MTU needed to receive a configuration chunk.
@@ -88,10 +94,10 @@ pub const MIN_READ_MTU: u16 = 161;
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum NativeTransportError {
     /// The platform could not complete the operation.
-    #[error("{message}")]
+    #[error("{detail}")]
     Failure {
         /// Human-readable description (should not contain secrets).
-        message: String,
+        detail: String,
     },
 }
 
@@ -133,53 +139,53 @@ pub trait NativeTransport: Send + Sync {
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MobileError {
     /// The platform link failed.
-    #[error("transport error: {message}")]
+    #[error("transport error: {detail}")]
     Transport {
         /// Underlying description.
-        message: String,
+        detail: String,
     },
     /// The controller answered with something the protocol layer rejected.
-    #[error("protocol error: {message}")]
+    #[error("protocol error: {detail}")]
     Protocol {
         /// Underlying description.
-        message: String,
+        detail: String,
     },
     /// An operation did not finish within the core's deadline.
-    #[error("timed out: {message}")]
+    #[error("timed out: {detail}")]
     Timeout {
         /// Underlying description.
-        message: String,
+        detail: String,
     },
     /// The notification channel was closed by the platform.
-    #[error("disconnected: {message}")]
+    #[error("disconnected: {detail}")]
     Disconnected {
         /// Underlying description.
-        message: String,
+        detail: String,
     },
     /// The operation is not implemented or not supported on this link.
-    #[error("unsupported: {message}")]
+    #[error("unsupported: {detail}")]
     Unsupported {
         /// Underlying description.
-        message: String,
+        detail: String,
     },
     /// The caller passed inconsistent input (wrong buffer size, ...).
-    #[error("invalid request: {message}")]
+    #[error("invalid request: {detail}")]
     InvalidRequest {
         /// Underlying description.
-        message: String,
+        detail: String,
     },
     /// A local resource (thread, runtime, JSON) failed.
-    #[error("internal error: {message}")]
+    #[error("internal error: {detail}")]
     Internal {
         /// Underlying description.
-        message: String,
+        detail: String,
     },
 }
 
 impl MobileError {
     fn internal(context: &str, error: impl std::fmt::Display) -> Self {
         Self::Internal {
-            message: format!("{context}: {error}"),
+            detail: format!("{context}: {error}"),
         }
     }
 }
@@ -188,29 +194,27 @@ impl MobileError {
 fn core_error(error: eightbitdo_core::Error) -> MobileError {
     use eightbitdo_core::Error as CoreError;
 
-    let message = error.to_string();
+    let detail = error.to_string();
     match error {
         CoreError::Protocol(_)
         | CoreError::UnexpectedResponse(_)
         | CoreError::IncompleteTransfer { .. }
         | CoreError::MacroWrite { .. }
-        | CoreError::ConfigWrite { .. } => MobileError::Protocol { message },
+        | CoreError::ConfigWrite { .. } => MobileError::Protocol { detail },
         CoreError::Transport(_)
         | CoreError::DeviceNotFound { .. }
-        | CoreError::CharacteristicNotFound => MobileError::Transport { message },
-        CoreError::Timeout { .. } | CoreError::InvalidTimeout(_) => {
-            MobileError::Timeout { message }
-        }
-        CoreError::Disconnected => MobileError::Disconnected { message },
+        | CoreError::CharacteristicNotFound => MobileError::Transport { detail },
+        CoreError::Timeout { .. } | CoreError::InvalidTimeout(_) => MobileError::Timeout { detail },
+        CoreError::Disconnected => MobileError::Disconnected { detail },
         CoreError::Unsupported(_) | CoreError::EmptyMacroWrite => {
-            MobileError::Unsupported { message }
+            MobileError::Unsupported { detail }
         }
         CoreError::MtuTooSmall { .. } | CoreError::InvalidRequest(_) => {
-            MobileError::InvalidRequest { message }
+            MobileError::InvalidRequest { detail }
         }
         // `Error::Ble` only exists with the core's `ble` feature; the mobile
         // crate deliberately builds the core without it (the platform owns BLE).
-        _ => MobileError::Transport { message },
+        _ => MobileError::Transport { detail },
     }
 }
 
@@ -227,9 +231,10 @@ fn core_error(error: eightbitdo_core::Error) -> MobileError {
 /// delivers frames faster than the session consumes them (typically the 20 ms
 /// realtime input stream during a slow read), the **oldest** frame is dropped
 /// and counted. A dropped frame makes the affected read fail closed
-/// (timeout / resync) instead of growing memory without bound. The queue is
-/// never a silent success path: a transfer that loses a frame cannot produce a
-/// valid result.
+/// (timeout / resync) instead of growing memory without bound. The dropped
+/// frame can be a read response: the read then never completes with a partial
+/// or shifted transfer, it fails. When a flash-write path is wired in, revisit
+/// this to drop only realtime input reports instead of arbitrary frames.
 struct BridgeTransport {
     inner: Arc<dyn NativeTransport>,
     rx: Arc<FrameQueue>,
@@ -294,11 +299,14 @@ impl FrameQueue {
     }
 
     /// Pop the oldest frame, or `None` once the queue is closed.
+    ///
+    /// The waiter is registered (`Notified::enable`) *before* the state check,
+    /// so a `close` / `push` between the check and the await cannot be lost:
+    /// `notify_waiters` only wakes waiters that are already registered.
     async fn recv(&self) -> Option<Vec<u8>> {
         loop {
-            // Register before checking the state so a push between the check
-            // and the await cannot be lost.
-            let notified = self.notify.notified();
+            let mut notified = std::pin::pin!(self.notify.notified());
+            notified.as_mut().enable();
             {
                 let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
                 if let Some(frame) = state.frames.pop_front() {
@@ -520,7 +528,7 @@ pub struct ConfigWriteDraft {
 /// Build a [`ConfigSummary`] from a raw 2768-byte block.
 fn summarize(raw: &[u8]) -> Result<ConfigSummary, MobileError> {
     let config = Bt2Config::from_bytes(raw).map_err(|error| MobileError::InvalidRequest {
-        message: format!("configuration must be {CONFIG_SIZE} bytes: {error}"),
+        detail: format!("configuration must be {CONFIG_SIZE} bytes: {error}"),
     })?;
     Ok(ConfigSummary {
         gamepad_mode_raw: config.gamepad_mode_raw(),
@@ -624,7 +632,7 @@ impl MobileSession {
         let mtu = transport.mtu();
         if mtu < MIN_READ_MTU {
             return Err(MobileError::InvalidRequest {
-                message: format!(
+                detail: format!(
                     "negotiated MTU {mtu} is below the {MIN_READ_MTU} required to receive a \
                      configuration chunk; request a larger MTU and reconnect"
                 ),
@@ -863,11 +871,11 @@ pub fn prepare_config_write(
 ) -> Result<ConfigWriteDraft, MobileError> {
     let snapshot_config =
         Bt2Config::from_bytes(&snapshot).map_err(|error| MobileError::InvalidRequest {
-            message: format!("configuration snapshot must be {CONFIG_SIZE} bytes: {error}"),
+            detail: format!("configuration snapshot must be {CONFIG_SIZE} bytes: {error}"),
         })?;
     let edited_config =
         Bt2Config::from_bytes(&edited).map_err(|error| MobileError::InvalidRequest {
-            message: format!("edited configuration must be {CONFIG_SIZE} bytes: {error}"),
+            detail: format!("edited configuration must be {CONFIG_SIZE} bytes: {error}"),
         })?;
 
     let stored_crc = snapshot_config.crc16_stored() as u16;
@@ -942,6 +950,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push_back(frame);
+        }
+
+        fn remaining(&self) -> usize {
+            self.frames
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len()
         }
 
         fn sent_frames(&self) -> Vec<Vec<u8>> {
@@ -1151,9 +1166,9 @@ mod tests {
             Err(error) => error,
         };
         match error {
-            MobileError::InvalidRequest { message } => {
-                assert!(message.contains("MTU 23"), "unexpected message: {message}");
-                assert!(message.contains("161"), "unexpected message: {message}");
+            MobileError::InvalidRequest { detail } => {
+                assert!(detail.contains("MTU 23"), "unexpected message: {detail}");
+                assert!(detail.contains("161"), "unexpected message: {detail}");
             }
             other => panic!("expected InvalidRequest, got {other:?}"),
         }
@@ -1196,6 +1211,75 @@ mod tests {
         assert!(receiver.join().expect("receiver thread").is_none());
     }
 
+    /// `close` must not be lost when it lands between the waiter's state check
+    /// and its await. Before the `Notified::enable` fix, `notify_waiters` could
+    /// miss an unregistered waiter and park it forever.
+    #[test]
+    fn frame_queue_close_is_not_lost_between_check_and_wait() {
+        for _ in 0..200 {
+            let queue = Arc::new(FrameQueue::new());
+            let consumer = Arc::clone(&queue);
+            let receiver = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .expect("runtime");
+                runtime.block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), consumer.recv())
+                        .await
+                        .expect("close must wake a pending recv")
+                })
+            });
+            // Close immediately, so some iterations hit the window between
+            // the state check and the await registration.
+            queue.close();
+            let result = receiver.join().expect("receiver thread");
+            assert!(result.is_none(), "a closed queue must yield None");
+        }
+    }
+
+    #[test]
+    fn dropped_frame_during_a_read_fails_instead_of_succeeding() {
+        use eightbitdo_core::Session;
+        use eightbitdo_protocol::commands::cmd;
+
+        // Queue a version response first, then enough noise to push it out of
+        // the 64-frame bridge queue before the read starts.
+        let native = ScriptedNative::new(200);
+        native.push(response_frame(cmd::READ_VERSION, &[0xC8, 0, 0, 0]));
+        let noise: Vec<u8> = eightbitdo_protocol::CustomHeader::new(0x00FF, 0, 0, 0)
+            .to_bytes()
+            .to_vec();
+        for _ in 0..(RX_QUEUE_CAPACITY + 40) {
+            native.push(noise.clone());
+        }
+
+        let bridge = BridgeTransport::new(native.clone()).expect("bridge");
+        // Wait until the receive worker has drained the scripted source, so
+        // the bridge queue is settled on the newest 64 frames.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while native.remaining() > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            bridge.rx.dropped() > 0,
+            "the response frame must be dropped"
+        );
+
+        // The read can only time out: the dropped response is never replaced.
+        let session = Session::new(bridge).with_timeout(Duration::from_millis(200));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(session.read_version());
+        assert!(
+            matches!(result, Err(eightbitdo_core::Error::Timeout { .. })),
+            "a dropped response must fail the read, got {result:?}"
+        );
+    }
+
     /// A platform transport whose link is already gone.
     struct FailingNative;
 
@@ -1206,7 +1290,7 @@ mod tests {
 
         fn recv(&self, _timeout_ms: u32) -> Result<Option<Vec<u8>>, NativeTransportError> {
             Err(NativeTransportError::Failure {
-                message: "link dropped".to_string(),
+                detail: "link dropped".to_string(),
             })
         }
 

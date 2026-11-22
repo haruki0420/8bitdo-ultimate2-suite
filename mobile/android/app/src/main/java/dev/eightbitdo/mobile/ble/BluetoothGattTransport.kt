@@ -14,6 +14,7 @@ import dev.eightbitdo.mobile.core.NativeTransportException
 import dev.eightbitdo.mobile.core.minimumReadMtu
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
@@ -56,6 +57,12 @@ class BluetoothGattTransport(
 
     @Volatile
     private var appCharacteristic: BluetoothGattCharacteristic? = null
+
+    @Volatile
+    private var writeMode: AppWriteMode? = null
+
+    @Volatile
+    private var pendingWrite: PendingWrite? = null
 
     @Volatile
     private var mtuValue: UShort = 23u
@@ -120,19 +127,17 @@ class BluetoothGattTransport(
             ?: service.getCharacteristic(APP_CHARACTERISTIC_ALT_UUID)
             ?: throw NativeTransportException.Failure("App Mode characteristic FF11/FF13 not found")
 
-        // The protocol writes commands without an ATT response and receives
-        // notifications; refuse a characteristic that cannot do both instead of
-        // discovering it at the first frame.
+        // The protocol needs notifications and a writable characteristic.
+        // Write-without-response is the normal mode, but some FF11/FF13
+        // implementations only advertise write-with-response; both produce the
+        // same frames, so accept either and fail only when neither exists.
         if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY == 0) {
             throw NativeTransportException.Failure("App Mode characteristic cannot notify")
         }
-        if (characteristic.properties and
-            BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE == 0
-        ) {
-            throw NativeTransportException.Failure(
-                "App Mode characteristic does not support write-without-response",
+        writeMode = AppWriteMode.select(characteristic.properties)
+            ?: throw NativeTransportException.Failure(
+                "App Mode characteristic is not writable (no write property)",
             )
-        }
         appCharacteristic = characteristic
 
         if (!connectedGatt.setCharacteristicNotification(characteristic, true)) {
@@ -166,19 +171,14 @@ class BluetoothGattTransport(
         if (closed) throw NativeTransportException.Failure("GATT link is closed")
         val characteristic = appCharacteristic
             ?: throw NativeTransportException.Failure("App Mode characteristic is not ready")
-        if (characteristic.properties and
-            BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE == 0
-        ) {
-            throw NativeTransportException.Failure(
-                "App Mode characteristic does not support write-without-response",
-            )
-        }
+        val mode = writeMode
+            ?: throw NativeTransportException.Failure("App Mode write mode is unknown")
 
         val result = CompletableFuture<Unit>()
         try {
             gattExecutor.execute {
                 try {
-                    writeFrame(data, characteristic)
+                    writeFrame(data, characteristic, mode)
                     result.complete(Unit)
                 } catch (error: Throwable) {
                     result.completeExceptionally(error)
@@ -229,9 +229,25 @@ class BluetoothGattTransport(
         gattExecutor.shutdownNow()
     }
 
-    private fun writeFrame(data: ByteArray, characteristic: BluetoothGattCharacteristic) {
+    private fun writeFrame(
+        data: ByteArray,
+        characteristic: BluetoothGattCharacteristic,
+        mode: AppWriteMode,
+    ) {
         val currentGatt = gatt ?: throw NativeTransportException.Failure("GATT link is closed")
+        if (mode == AppWriteMode.WITH_RESPONSE) {
+            writeWithResponse(currentGatt, characteristic, data)
+        } else {
+            writeWithoutResponse(currentGatt, characteristic, data)
+        }
+    }
 
+    /** Write without an ATT response; retry while the stack is busy. */
+    private fun writeWithoutResponse(
+        currentGatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        data: ByteArray,
+    ) {
         // Android refuses a write while the previous one is in flight; retry a
         // few times instead of dropping a chunk.
         repeat(WRITE_ATTEMPTS) { attempt ->
@@ -244,6 +260,7 @@ class BluetoothGattTransport(
             } else {
                 @Suppress("DEPRECATION")
                 run {
+                    characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
                     characteristic.value = data
                     currentGatt.writeCharacteristic(characteristic)
                 }
@@ -254,6 +271,50 @@ class BluetoothGattTransport(
             }
         }
         throw NativeTransportException.Failure("GATT write was refused after $WRITE_ATTEMPTS attempts")
+    }
+
+    /** Write with an ATT response and wait for `onCharacteristicWrite`. */
+    private fun writeWithResponse(
+        currentGatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        data: ByteArray,
+    ) {
+        val pending = PendingWrite()
+        pendingWrite = pending
+        val issued = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            currentGatt.writeCharacteristic(
+                characteristic,
+                data,
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+            ) == BluetoothStatusCodes.SUCCESS
+        } else {
+            @Suppress("DEPRECATION")
+            run {
+                characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                characteristic.value = data
+                currentGatt.writeCharacteristic(characteristic)
+            }
+        }
+        if (!issued) {
+            pendingWrite = null
+            throw NativeTransportException.Failure("GATT write (with response) was refused")
+        }
+        val completed = pending.done.await(WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        pendingWrite = null
+        if (!completed) {
+            throw NativeTransportException.Failure("timed out waiting for the ATT write response")
+        }
+        if (pending.status != BluetoothGatt.GATT_SUCCESS) {
+            throw NativeTransportException.Failure("GATT write failed (status ${pending.status})")
+        }
+    }
+
+    /** Per-write completion signal for write-with-response. */
+    private class PendingWrite {
+        val done = CountDownLatch(1)
+
+        @Volatile
+        var status: Int = Int.MIN_VALUE
     }
 
     private fun writeDescriptor(currentGatt: BluetoothGatt, descriptor: BluetoothGattDescriptor) {
@@ -338,6 +399,21 @@ class BluetoothGattTransport(
             mtuSignal?.complete(mtu)
         }
 
+        override fun onCharacteristicWrite(
+            currentGatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int,
+        ) {
+            if (characteristic.uuid != APP_CHARACTERISTIC_UUID &&
+                characteristic.uuid != APP_CHARACTERISTIC_ALT_UUID
+            ) {
+                return
+            }
+            val pending = pendingWrite ?: return
+            pending.status = status
+            pending.done.countDown()
+        }
+
         override fun onCharacteristicChanged(
             currentGatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
@@ -350,6 +426,7 @@ class BluetoothGattTransport(
             }
         }
 
+        @Deprecated("Deprecated in API 33; the value overload above is used there")
         @Suppress("DEPRECATION")
         override fun onCharacteristicChanged(
             currentGatt: BluetoothGatt,
