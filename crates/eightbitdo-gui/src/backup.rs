@@ -106,6 +106,18 @@ pub fn write_backup(
     snapshot: &ConfigSnapshot,
     view: &ConfigView,
 ) -> Result<BackupReport, BackupError> {
+    // Reject a symlinked final component before `create_dir_all` follows it.
+    // The CLI's Phase 2a backup path validation rejects symlinks for the same
+    // reason: a local link must not redirect personal configuration data or
+    // cause the process to chmod an unrelated directory.
+    if let Ok(metadata) = fs::symlink_metadata(dir) {
+        if metadata.file_type().is_symlink() {
+            return Err(BackupError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("backup directory must not be a symlink: {}", dir.display()),
+            )));
+        }
+    }
     fs::create_dir_all(dir)?;
     let mut warnings = Vec::new();
     ensure_private_directory(dir, &mut warnings);
@@ -377,6 +389,23 @@ mod tests {
     #[test]
     fn default_directory_is_named_8bitdo_backups() {
         assert!(default_backup_dir().ends_with("8bitdo-backups"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_backup_directory_is_rejected_without_writing() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new("symlink");
+        let target = dir.0.join("target");
+        fs::create_dir(&target).unwrap();
+        let link = dir.0.join("link");
+        symlink(&target, &link).unwrap();
+        let (snapshot, view) = sample();
+
+        let error = write_backup(&link, &snapshot, &view).unwrap_err();
+        assert!(matches!(error, BackupError::Io(_)));
+        assert!(fs::read_dir(&target).unwrap().next().is_none());
     }
 
     #[test]

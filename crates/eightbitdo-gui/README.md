@@ -12,8 +12,8 @@ Save、バックアップからのリストア、ファームウェア更新は�
 - **接続パネル**: BLE スキャン（`scan_devices`）、`80ND` への接続、切断、状態表示
 - **デバイス情報**: 名前、アドレス、MTU、使用中の GATT characteristic（`FF11` / `FF13`）
 - **ファームウェア**: 接続直後に `ReadVersion` を実行し、raw 4 バイト・text・LE `u32` を表示
-- **ライブ入力**: 接続直後に `0x0007` を有効化し、16ms 周期の `0x0003` ポーリングで
-  スティック、トリガー、ボタン、バッテリー raw 値を約 60fps で表示（Stop も可能）
+- **ライブ入力**: 接続直後に `0x0007` を有効化し、公式 20ms 周期の `0x0003` ポーリングで
+  スティック、トリガー、ボタン、バッテリー raw 値を表示（Stop も可能）
 - **設定ビューア**: 2768B 設定の profile flag、`gamepad_mode`、`cur_slot`、
   プロファイル名、3 プロファイル × 4 マクロのヘッダ（name / max_steps / offset /
   key_map / cycles / interval など）を読み取り専用で表示
@@ -68,7 +68,7 @@ crates/eightbitdo-gui/src/
 - UI スレッドは `Command` を送り、`Event` を毎フレーム drain するだけです。
 - BLE ワーカーは専用スレッドの tokio ランタイム上で動き、`Session` の
   single-flight 契約を守るため、読み取りと入力ポーリングを同時に実行しません。
-- ライブ入力中の 16ms `0x0003` ポーリングが keepalive を兼ねます。接続直後の
+- ライブ入力中の 20ms `0x0003` ポーリングが keepalive を兼ねます。接続直後の
   version / config 読み取りが終わると自動で開始します。現時点の
   `eightbitdo-core` に session 所有の keepalive はないため、CLI の
   `run_keepalive` と同じ方式を GUI ワーカー側に置いています。Stop すると
@@ -103,7 +103,8 @@ git diff --check
 - マクロ 3 スロット × 4 本の Flash バックアップは、core にマクロ読み出し API が
   入ってから追加する（PR #6 / Phase 2b の後）。
 - マクロ編集 UI、録音、JSON/TOML 入出力は Phase 3b。書き込み系を追加する際は
-  Erase → Write → Header → Save の順序と、書き込み前バックアップを必須にする。
+  Header (`total_len=0xD8`) → Save → Erase → Write → Save の公式順序と、
+  書き込み前バックアップを必須にする。
 - 設定書き込み（Phase 3d）と OTA 画面（Phase 3c）は、それぞれ core の write path
   と OTA API が安定してから着手する。
 - 既定フォントは Latin のみのため、GUI は日本語を表示しない。デバイス由来の
@@ -111,3 +112,6 @@ git diff --check
   Noto Sans JP などの同梱フォントを追加する。
 - workspace は `resolver = "3"` に変更し、`rust-version = 1.85` を守る範囲で
   eframe の依存を解決している。GUI を追加しても CI の `msrv` は 1.85 のまま。
+  この変更で `Cargo.lock` の既存解決も一部変わる（`hashbrown` 0.14.5 → 0.17.2、
+  `redox_syscall` 0.5.18 → 0.9.5）。全 workspace の test / clippy / MSRV 1.85 で
+  確認済み。

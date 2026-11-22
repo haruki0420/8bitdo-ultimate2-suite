@@ -8,7 +8,7 @@
 //! One worker owns at most one [`Session`], preserving the core single-flight
 //! contract. Live input starts automatically after the post-connect version
 //! and configuration reads. While live input is running, one `0x0003` poll runs
-//! per 16 ms tick and incoming reports are drained through
+//! per 20 ms tick and incoming reports are drained through
 //! [`Session::try_next_input`]. This poll is also the keepalive: the core crate
 //! has no session-owned keepalive yet (the CLI has the reference
 //! implementation), so the link stays active while live input is on.
@@ -38,11 +38,13 @@ const CONNECT_SCAN_TIMEOUT: Duration = Duration::from_secs(8);
 /// Connection and service-discovery timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Realtime input poll period (about 60 Hz).
-const INPUT_TICK: Duration = Duration::from_millis(16);
+/// Realtime input poll period (the official 20 ms keepalive cadence).
+const INPUT_TICK: Duration = Duration::from_millis(20);
 
-/// Per-tick wait for the answer to one `0x0003` poll.
-const INPUT_WAIT: Duration = Duration::from_millis(4);
+/// Per-tick wait for the answer to one `0x0003` poll. This matches the CLI's
+/// top-level keepalive drain window; late reports remain queued for the next
+/// tick.
+const INPUT_WAIT: Duration = Duration::from_millis(20);
 
 /// Bound for best-effort report disable and link teardown.
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
