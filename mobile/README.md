@@ -24,12 +24,13 @@ crates/eightbitdo-protocol … フレーム・CRC・構造体
 
 | 項目 | 状態 |
 | --- | --- |
-| `eightbitdo-uniffi` クレート | 実装済み。`cargo test -p eightbitdo-uniffi` で 7 テスト成功 |
+| `eightbitdo-uniffi` クレート | 実装済み。`cargo test -p eightbitdo-uniffi` で 12 テスト成功 |
+| 受信キュー（Rust / Android / iOS） | bounded（64 フレーム、溢れたら最古を drop）。Rust・Android に単体テストあり |
 | UniFFI の Swift / Kotlin バインディング生成 | 実測で成功（`uniffi` 0.32.2） |
 | iOS: SwiftUI 雛形 + CoreBluetooth transport | 実装済み |
 | iOS: `xtool dev build --ipa`（署名なし IPA） | **成功**（Linux / xtool 1.24.0） |
 | Android: Gradle + Compose + GATT transport 雛形 | 実装済み。SDK/NDK が無いため**ビルド未実施** |
-| Android: APK ビルド | 未実施（下記の導入手順が必要） |
+| Android: APK ビルド / unit test | 未実施（下記の導入手順が必要） |
 | 実機での動作確認 | 未実施（実機なし） |
 | 設定書き込み・OTA | 未公開（意図的。後述） |
 
@@ -51,13 +52,15 @@ pub trait NativeTransport: Send + Sync {
 * `recv` は **プレフィックスなし**の通知フレーム（16 バイトヘッダ + payload）を返す。
 * `mtu` は**交渉後の実値**。要求値を返さない（Android 14+ は 517 に固定される
   ことがあるため）。
-* `disconnect` は冪等で、進行中の `recv` を終わらせること。
+* `disconnect` は冪等で、進行中の `recv` を終わらせること。ネイティブ側の
+  切断通知（iOS `didDisconnectPeripheral` / Android `onConnectionStateChange`）
+  でも必ず呼ぶ。
 
 ### オブジェクト / 関数
 
 | API | 戻り値 | 説明 |
 | --- | --- | --- |
-| `MobileSession(transport)` | — | 接続済み transport を渡す。失敗時は `MobileError` |
+| `MobileSession(transport)` | — | 接続済み transport を渡す。MTU・transport 異常で `MobileError` |
 | `readDeviceInfo()` | `DeviceInfo` | ファームウェア版（`0x000B`） |
 | `readConfig()` | `DeviceConfig` | 2768B 設定 + CRC 状態 + 要約 |
 | `readConfigJson()` | `String` | 上記の JSON（`raw_hex` 含む） |
@@ -67,12 +70,38 @@ pub trait NativeTransport: Send + Sync {
 | `readInputOnce(timeoutMs)` | `InputSnapshot?` | 入力 1 フレーム（`0x0003`） |
 | `disconnect()` | — | 受信スレッド停止を含む切断 |
 | `describeConfig(raw)` | `ConfigSummary` | 保存済みダンプの表示（I/O なし） |
-| `prepareConfigWrite(snapshot, edited)` | `ConfigWriteDraft` | **書き込み準備のみ**（差分・CRC 再計算、送信なし） |
+| `minimumReadMtu()` | `u16` | セッションに必要な最低 ATT MTU（**161**） |
+| `prepareConfigWrite(snapshot, edited)` | `ConfigWriteDraft` | **書き込み準備のみ**（差分・CRC 再計算、送信なし・セッション不要） |
 | `configWriteChunkLen(mtu)` | `u16` | MTU に対する 1 パケットの payload 長 |
 
 Rust の `Session` は単一飛行（同時操作禁止）なので、`MobileSession` の
 全メソッドは内部 Mutex で直列化しています。呼び出しはブロッキングなので
 Kotlin は `Dispatchers.IO`、Swift は専用キューから呼んでください。
+`disconnect()` は受信スレッドの join を含むため、メインスレッド（ANR 対象）
+では呼ばないでください。
+
+### 受信キューと MTU の前提
+
+**受信キューは bounded です。** コントローラは読み出し中にも 20ms 周期の
+入力レポートを送るため、無制限キューはメモリを際限なく消費します。
+
+* Rust `FrameQueue`（`BridgeTransport` 内）: 容量 **64 フレーム**、満杯時は
+  **最古を drop** してカウント。落ちたフレームは読み出しの失敗（timeout /
+  resync）として表面化し、成功扱いにはなりません。
+* Android `FrameQueue`: 同じ容量・同じ drop-oldest 方針。
+* iOS `CoreBluetoothTransport`: 同じ容量・同じ drop-oldest 方針。
+* 64 は 2768B 設定読み出し（約 20 通知）に余裕を持たせた値です。
+
+**MTU は読み出しの前提条件です。** 設定読み出しの通知は 1 件あたり
+`16（ヘッダ）+ 142（payload）= 158` バイトで、ATT の通知ヘッダ 3 バイトを
+含めると **ATT MTU 161 以上**が必要です。
+
+* `MobileSession` のコンストラクタは `mtu < 161` を `InvalidRequest` で拒否。
+* Android は `requestMtu(200)` の**交渉を必須**にし、失敗・無応答・
+  `onMtuChanged` 異常はすべてエラーにします。**23 へのフォールバックはしません**
+  （23 のままだと 158 バイト通知を受信できず読み出しが破綻するため）。
+* iOS は `maximumWriteValueLength(for:.withoutResponse) + 3` を MTU とし、
+  161 未満ならセッションを作らずエラー表示します。
 
 ### 設定書き込みを公開していない理由
 
@@ -84,8 +113,11 @@ Kotlin は `Dispatchers.IO`、Swift は専用キューから呼んでくださ�
 2. 差分確認 UI と失敗時の復旧手順（`ConfigWriteStage` / `ConfigWriteState` の表示）
 3. AGENTS.md §5 の Tier 3 レビュー
 
-`prepareConfigWrite` はその第一歩で、I/O なし・送信なしで
-「どのバイトが変わるか」「再計算後 CRC」だけを返します。
+`prepareConfigWrite` はその第一歩です。**デバイス I/O もフレーム送信もせず、
+セッションも不要**な純関数で、入力は「スナップショットの 2768 バイト」と
+「編集後の 2768 バイト」だけです。返すのは再計算後 CRC、変更バイト範囲、
+送信予定バッファで、フラッシュへの書き込み経路には接続していません。
+`write_full_config` を FFI に公開するのは上記 1〜3 が揃った後です。
 
 ## iOS（`mobile/ios/`）
 
@@ -122,17 +154,39 @@ cd mobile/ios && xtool dev build -c release --ipa
 
 出力: `mobile/ios/xtool/EightBitDo.ipa`（**署名なし**、実機には入りません）。
 
-### 実測結果（2026-11-23、この環境）
+### 実測結果（2026-11-23、この環境・レビュー反映後）
 
-* `xtool dev build --ipa`: `Build complete! (7.10 secs)` → IPA 生成
-* IPA サイズ: 1,548,492 bytes
+* `xtool dev build --ipa`: `Build complete! (6.66 secs)` → IPA 生成
+* IPA サイズ: 1,526,794 bytes
 * `Payload/EightBitDo.app/EightBitDo`: `Mach-O 64-bit arm64 executable`
 * `llvm-nm` で `_uniffi_eightbitdo_uniffi_fn_constructor_mobilesession_new` など
-  UniFFI シンボル 59 個を確認（Rust staticlib が実際にリンクされている）
+  UniFFI シンボル 61 個を確認（Rust staticlib が実際にリンクされている）
 * `Info.plist`: `CFBundleIdentifier=dev.eightbitdo.mobile`,
-  `NSBluetoothAlwaysUsageDescription`, `UIBackgroundModes=[bluetooth-central]`,
-  `MinimumOSVersion=17.0`
-* Rust staticlib サイズ: 20,941,368 bytes（release、LTO なし）
+  `NSBluetoothAlwaysUsageDescription`（"read its settings and enable live
+  input"）, `UIBackgroundModes=[bluetooth-central]`, `MinimumOSVersion=17.0`
+* Rust staticlib サイズ: 20,903,152 bytes（release、LTO なし）
+
+### 接続ライフサイクルと transport の責務
+
+`AppModel` が `CBCentralManager` の接続ライフサイクルを所有し、
+`CoreBluetoothTransport` は「接続済み 1 リンクの状態」だけを持ちます。
+
+* 接続・切断・再接続の判断は `AppModel`。`CoreBluetoothTransport` は自分から
+  接続を開始/停止しません。
+* `centralManager(_:didDisconnectPeripheral:error:)` では、まず
+  `transport.disconnect()`（`AppModel.closeCurrentSession()` 経由）を呼び、
+  保留中の Rust `recv` を即座にエラーで返します。その後セッションを解放します
+  （Rust の join は最大で transport の `recv` タイムアウト分ブロックするため
+  メインスレッドでは実行しません）。
+* `MobileSession(transport:)` が失敗した場合や MTU が 161 未満の場合は、
+  同じ経路で transport を閉じます（リンク状態のリーク防止）。
+* 再接続時は旧セッションを必ず閉じてから新しいリンクに接続します。
+
+> iOS 側の自動テストは、Linux の Swift ツールチェーンに CoreBluetooth が無い
+> ため実行できません。リンク断の契約（`recv` がエラーを返し、セッションが
+> `Disconnected` / `Transport` エラーになること）は Rust 側の
+> `platform_receive_failure_surfaces_as_a_mobile_error` テストで固定し、
+> Swift 側は `xtool dev build --ipa` のリンク検証で代替しています。
 
 ### リンク構成
 
@@ -202,15 +256,27 @@ export ANDROID_HOME="$HOME/android-sdk"
 
 内部で `gen-bindings.sh` → `cargo ndk`（`app/src/main/jniLibs`）→
 `./gradlew assembleDebug` を実行します。debug 署名なので配布不可・実機検証用です。
+`FrameQueue` など JVM だけで動くロジックは `./gradlew testDebugUnitTest` で
+検証できます（この環境では SDK が無いため未実行）。
 
 ### 構成
 
 * `minSdk 26` / `targetSdk 36` / `compileSdk 36`
 * Compose Material 3、`ViewModel` + `StateFlow`
 * `ble/BleScanner.kt`: `80ND` 名 or service `FF10` でフィルタしてスキャン
-* `ble/BluetoothGattTransport.kt`: `NativeTransport` 実装（GATT 操作を
-  単一スレッド executor で直列化、通知は `LinkedBlockingQueue`、
-  CCCD `0x2902` 有効化、`requestMtu(200)` は**実測値**だけ採用）
+* `ble/FrameQueue.kt`: bounded 通知キュー（64、溢れたら最古を drop）。
+  `src/test` に単体テストあり
+* `ble/BluetoothGattTransport.kt`: `NativeTransport` 実装
+  * GATT 操作を単一スレッド executor で直列化
+  * 通知は `FrameQueue` 経由（drop-oldest、容量 64）
+  * CCCD `0x2902` 有効化・MTU 交渉は**厳格**（失敗・無応答はエラー、
+    23 へのフォールバックなし）。MTU は `minimumReadMtu()`（161）以上を検証
+  * `PROPERTY_NOTIFY` と `PROPERTY_WRITE_NO_RESPONSE` の両方を要求
+  * `open()` 失敗・切断通知・`disconnect()` のすべてで GATT client を
+    `close()` し executor を `shutdownNow()`
+* 接続ライフサイクルは `DeviceViewModel` が所有。再接続前に旧セッションを
+  `Dispatchers.IO` で閉じ、`onCleared()` では専用スレッドで閉じます
+  （同期 FFI をメインスレッドで呼ばない）
 * 権限: `BLUETOOTH_SCAN`（`neverForLocation`）/ `BLUETOOTH_CONNECT`
   （Android 12+）、Android 11 以下は `BLUETOOTH` / `BLUETOOTH_ADMIN` /
   `ACCESS_FINE_LOCATION`
@@ -243,16 +309,18 @@ mobile/android/app/src/main/jniLibs/        # cargo-ndk の .so
 
 1. **実機未検証**。iOS / Android とも、`80ND` への接続・2768B 読み出し・
    マクロ読み出しは実機で確認していない。iOS は `xtool devices` が空。
-2. **Android APK 未ビルド**。SDK/NDK 導入が必要（上記）。
+2. **Android APK 未ビルド / unit test 未実行**。SDK/NDK 導入が必要（上記）。
 3. **設定書き込み・OTA は未公開**。`prepareConfigWrite` まで。
 4. **バックグラウンド書き込み不可**（設計上、前景専用）。
-5. **iOS の MTU** は `maximumWriteValueLength(for: .withoutResponse) + 3` で
+5. **MTU 161 以上が必須**。交渉に失敗した場合は明確なエラーで停止します
+   （23 へのフォールバックはしません）。
+6. **iOS の MTU** は `maximumWriteValueLength(for: .withoutResponse) + 3` で
    推定する（Apple は ATT MTU を直接公開しない）。
-6. **UniFFI のバージョン**は `0.32.2` に固定。bindgen と crate の不一致は
+7. **UniFFI のバージョン**は `0.32.2` に固定。bindgen と crate の不一致は
    実行時クラッシュにつながるため、`Cargo.toml` と生成スクリプトを同時に更新する。
-7. **App Store 審査**は BLE 利用目的の説明とプライバシーマニフェストが必要。
+8. **App Store 審査**は BLE 利用目的の説明とプライバシーマニフェストが必要。
    カスタムハードウェア連携アプリとして審査可能だが、通過を保証しない。
-8. 商標・ライセンス表記はリポジトリ方針（非公式であることの明示）に従う。
+9. 商標・ライセンス表記はリポジトリ方針（非公式であることの明示）に従う。
 
 ## ライセンス
 

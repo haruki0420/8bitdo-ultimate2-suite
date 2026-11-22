@@ -77,9 +77,15 @@ class DeviceViewModel(application: Application) : AndroidViewModel(application) 
         scanJob?.cancel()
         scanJob = null
         viewModelScope.launch {
+            // A reconnect must never leave the previous session attached.
+            closeCurrentSession()
             _state.value = _state.value.copy(
                 status = "接続中: ${device.name}",
                 busy = true,
+                connected = false,
+                deviceInfo = null,
+                config = null,
+                macros = null,
                 error = null,
             )
             try {
@@ -139,18 +145,40 @@ class DeviceViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun disconnect() {
-        val current = session
+        viewModelScope.launch {
+            closeCurrentSession()
+            _state.value = UiState()
+        }
+    }
+
+    /**
+     * Detach the active session on the IO dispatcher.
+     *
+     * Rust `disconnect()` joins its receive worker (bounded by the platform
+     * `recv` timeout), so it must never run on the main thread. The transport
+     * is stopped first so a pending read fails immediately.
+     */
+    private suspend fun closeCurrentSession() {
+        val currentSession = session
+        val currentTransport = transport
         session = null
         transport = null
-        viewModelScope.launch {
-            withContext(Dispatchers.IO) { current?.disconnect() }
-            _state.value = UiState()
+        if (currentSession == null && currentTransport == null) return
+        withContext(Dispatchers.IO) {
+            currentTransport?.disconnect()
+            currentSession?.disconnect()
         }
     }
 
     override fun onCleared() {
         super.onCleared()
-        session?.disconnect()
+        // `onCleared` is not a coroutine scope; shut down on a worker thread so
+        // the receive-worker join cannot block the main thread (ANR).
+        val current = session
         session = null
+        transport = null
+        if (current != null) {
+            Thread { current.disconnect() }.start()
+        }
     }
 }

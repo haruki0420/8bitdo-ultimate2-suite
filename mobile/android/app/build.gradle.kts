@@ -68,4 +68,6 @@ dependencies {
     // UniFFI's Kotlin bindings are JNA-based. The @aar artifact contains the
     // Android JNI native libraries; the plain jar does not.
     implementation("net.java.dev.jna:jna:5.17.0@aar")
+
+    testImplementation(libs.junit)
 }

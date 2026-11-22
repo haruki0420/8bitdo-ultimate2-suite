@@ -8,11 +8,18 @@
 //! # Design
 //!
 //! * The platform (CoreBluetooth / BluetoothGatt) owns scanning, connecting and
-//!   the GATT callbacks. It hands Rust an already-connected link.
+//!   the GATT callbacks. It hands Rust an already-connected link, and it must
+//!   call [`NativeTransport::disconnect`] when the platform reports a
+//!   disconnection so a pending `recv` fails immediately.
 //! * `BridgeTransport` adapts that link to the core [`Transport`] trait. A
-//!   dedicated thread performs the blocking `recv` poll and forwards frames
-//!   over a Tokio channel, so the core's `tokio::time::timeout` wrappers keep
-//!   working without blocking a Tokio worker in JNA or CoreBluetooth.
+//!   dedicated thread performs the blocking `recv` poll and pushes frames into
+//!   a **bounded** queue (64 frames, oldest dropped on overflow), so the core's
+//!   `tokio::time::timeout` wrappers keep working without blocking a Tokio
+//!   worker in JNA or CoreBluetooth and without unbounded memory growth when
+//!   the input stream runs during a read.
+//! * [`MobileSession::new`] requires a negotiated MTU of at least
+//!   [`MIN_READ_MTU`] (161): the controller's configuration notifications are
+//!   158 bytes, which a default-MTU link cannot deliver.
 //! * Every exported call is synchronous and runs on a private current-thread
 //!   Tokio runtime. Kotlin/Swift callers are expected to invoke it from a
 //!   background dispatcher (`Dispatchers.IO`, a utility queue, ...).
@@ -23,22 +30,25 @@
 //!
 //! The current surface is **read-only** plus *configuration write preparation*:
 //! [`prepare_config_write`] validates an edited 2768-byte buffer, recomputes the
-//! CRC and reports the changed regions, but nothing here sends a write. The
-//! flash write itself (`Session::write_full_config`) stays unexported until the
-//! Tier 3 safety review and the mandatory pre-write backup flow are in place.
+//! CRC and reports the changed regions, but nothing here sends a write. It is a
+//! pure local function (no session, no device I/O). The flash write itself
+//! (`Session::write_full_config`) stays unexported until the Tier 3 safety
+//! review and the mandatory pre-write backup flow are in place.
 //!
 //! # Threading contract
 //!
 //! [`MobileSession`] may be shared across threads. Calls block; do not call
-//! them on the UI thread. The platform transport's `recv` must not block for
-//! longer than the requested timeout and must return an error after
-//! `disconnect` so the receive worker can stop.
+//! them on the UI thread. [`MobileSession::disconnect`] joins the receive
+//! worker, so it can block for up to the platform `recv` timeout. The platform
+//! transport's `recv` must not block for longer than the requested timeout and
+//! must return an error after `disconnect` so the receive worker can stop.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 uniffi::setup_scaffolding!();
 
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -48,13 +58,28 @@ use async_trait::async_trait;
 use eightbitdo_core::{ConfigSnapshot, Session, Transport};
 use eightbitdo_protocol::config_bt2::{Bt2Config, Slot, CONFIG_SIZE};
 use eightbitdo_protocol::macro_data::MacroStep;
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 /// How long one blocking platform `recv` call waits before returning `None`.
 ///
 /// Keeping this short bounds how long [`BridgeTransport`] can take to stop
 /// after `disconnect` without requiring a platform-specific wakeup token.
 const RECV_POLL_MS: u32 = 200;
+
+/// Maximum number of notification frames buffered before the oldest is dropped.
+///
+/// Enough for a full configuration read (the device answers a 2768-byte read
+/// with ~20 notifications) with room for interleaved input reports.
+const RX_QUEUE_CAPACITY: usize = 64;
+
+/// Minimum negotiated ATT MTU needed to receive a configuration chunk.
+///
+/// The controller sends 142 payload bytes per notification, and a notification
+/// costs 16 header bytes plus a 3-byte ATT notification header:
+/// `142 + 16 + 3 = 161`. A smaller MTU makes the platform truncate or drop
+/// notifications, so [`MobileSession::new`] refuses to start below this value
+/// instead of hanging or reading corrupt data.
+pub const MIN_READ_MTU: u16 = 161;
 
 /// An error returned by a platform transport callback.
 ///
@@ -192,43 +217,137 @@ fn core_error(error: eightbitdo_core::Error) -> MobileError {
 /// Adapts a foreign [`NativeTransport`] to the core's async [`Transport`].
 ///
 /// A dedicated thread performs the blocking `recv` polling and forwards frames
-/// over a Tokio channel, so the core's `tokio::time::timeout` wrapper keeps
-/// working while no Tokio worker is parked inside JNA / CoreBluetooth.
+/// into a **bounded** [`FrameQueue`], so the core's `tokio::time::timeout`
+/// wrapper keeps working while no Tokio worker is parked inside JNA /
+/// CoreBluetooth.
+///
+/// # Bounded queue
+///
+/// The queue holds at most [`RX_QUEUE_CAPACITY`] frames. When the platform
+/// delivers frames faster than the session consumes them (typically the 20 ms
+/// realtime input stream during a slow read), the **oldest** frame is dropped
+/// and counted. A dropped frame makes the affected read fail closed
+/// (timeout / resync) instead of growing memory without bound. The queue is
+/// never a silent success path: a transfer that loses a frame cannot produce a
+/// valid result.
 struct BridgeTransport {
     inner: Arc<dyn NativeTransport>,
-    rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
+    rx: Arc<FrameQueue>,
     mtu: u16,
     stop: Arc<AtomicBool>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+/// A bounded frame queue with drop-oldest overflow handling.
+///
+/// The producer is the blocking receive thread; the consumer is the async
+/// session. An `mpsc` channel was not enough here: `tokio` channels are either
+/// unbounded (growth without limit) or bounded with back-pressure (the receive
+/// thread would stall and, with a platform `recv` that must keep draining, the
+/// link would pile frames on the platform side). Dropping the oldest frame
+/// keeps the receive loop alive and bounds memory.
+struct FrameQueue {
+    state: Mutex<FrameQueueState>,
+    notify: Notify,
+}
+
+struct FrameQueueState {
+    frames: VecDeque<Vec<u8>>,
+    dropped: u64,
+    closed: bool,
+}
+
+impl FrameQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(FrameQueueState {
+                frames: VecDeque::new(),
+                dropped: 0,
+                closed: false,
+            }),
+            notify: Notify::new(),
+        }
+    }
+
+    /// Push one frame, dropping the oldest when the queue is full.
+    fn push(&self, frame: Vec<u8>) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.closed {
+            return;
+        }
+        if state.frames.len() >= RX_QUEUE_CAPACITY {
+            state.frames.pop_front();
+            state.dropped += 1;
+        }
+        state.frames.push_back(frame);
+        drop(state);
+        self.notify.notify_one();
+    }
+
+    /// Close the queue: clear queued frames and wake every waiter.
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.closed = true;
+        state.frames.clear();
+        drop(state);
+        self.notify.notify_waiters();
+    }
+
+    /// Pop the oldest frame, or `None` once the queue is closed.
+    async fn recv(&self) -> Option<Vec<u8>> {
+        loop {
+            // Register before checking the state so a push between the check
+            // and the await cannot be lost.
+            let notified = self.notify.notified();
+            {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(frame) = state.frames.pop_front() {
+                    return Some(frame);
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn dropped(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .dropped
+    }
+}
+
 impl BridgeTransport {
     fn new(inner: Arc<dyn NativeTransport>) -> Result<Self, MobileError> {
         let mtu = inner.mtu();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let queue = Arc::new(FrameQueue::new());
         let stop = Arc::new(AtomicBool::new(false));
         let worker_inner = Arc::clone(&inner);
         let worker_stop = Arc::clone(&stop);
+        let worker_queue = Arc::clone(&queue);
         let worker = std::thread::Builder::new()
             .name("eightbitdo-rx".to_string())
             .spawn(move || {
                 while !worker_stop.load(Ordering::Relaxed) {
                     match worker_inner.recv(RECV_POLL_MS) {
-                        Ok(Some(frame)) => {
-                            if tx.send(frame).is_err() {
-                                break;
-                            }
-                        }
+                        Ok(Some(frame)) => worker_queue.push(frame),
                         Ok(None) => {}
                         Err(_) => break,
                     }
                 }
+                // Wake a pending `recv` instead of leaving it parked until the
+                // core timeout once the link is gone.
+                worker_queue.close();
             })
             .map_err(|error| MobileError::internal("failed to spawn the receive thread", error))?;
 
         Ok(Self {
             inner,
-            rx: tokio::sync::Mutex::new(rx),
+            rx: queue,
             mtu,
             stop,
             worker: Mutex::new(Some(worker)),
@@ -236,17 +355,24 @@ impl BridgeTransport {
     }
 
     /// Stop the receive worker and close the platform link. Idempotent.
-    fn shutdown(&self) {
+    ///
+    /// `join` is `true` for an explicit disconnect and `false` from `Drop`:
+    /// the join is bounded by the platform's `recv` timeout (the worker checks
+    /// the stop flag after each call), but `Drop` must not block a caller that
+    /// is only releasing memory.
+    fn shutdown(&self, join: bool) {
         self.stop.store(true, Ordering::Relaxed);
         self.inner.disconnect();
+        self.rx.close();
+        if !join {
+            return;
+        }
         let worker = self
             .worker
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some(worker) = worker {
-            // Bounded by `RECV_POLL_MS`: the worker checks the stop flag after
-            // every platform `recv` call.
             let _ = worker.join();
         }
     }
@@ -254,7 +380,7 @@ impl BridgeTransport {
 
 impl Drop for BridgeTransport {
     fn drop(&mut self) {
-        self.shutdown();
+        self.shutdown(false);
     }
 }
 
@@ -268,8 +394,6 @@ impl Transport for BridgeTransport {
 
     async fn recv(&self) -> Result<Vec<u8>, eightbitdo_core::Error> {
         self.rx
-            .lock()
-            .await
             .recv()
             .await
             .ok_or(eightbitdo_core::Error::Disconnected)
@@ -280,7 +404,7 @@ impl Transport for BridgeTransport {
     }
 
     async fn disconnect(&self) -> Result<(), eightbitdo_core::Error> {
-        self.shutdown();
+        self.shutdown(true);
         Ok(())
     }
 }
@@ -451,7 +575,14 @@ struct MacroBackupJson {
 /// A connected App Mode session.
 ///
 /// Construct it only after the platform link is connected and notifications
-/// are enabled, and pass the negotiated MTU from the platform transport.
+/// are enabled, and pass the negotiated MTU from the platform transport. The
+/// constructor rejects an MTU below [`MIN_READ_MTU`]: with a smaller MTU the
+/// platform cannot deliver the controller's 158-byte configuration
+/// notifications, so reads would truncate or hang instead of failing.
+///
+/// All methods block; call them off the UI thread (Kotlin `Dispatchers.IO`,
+/// a Swift background queue). [`MobileSession::disconnect`] joins the receive
+/// worker, so it can take up to the platform `recv` timeout.
 #[derive(uniffi::Object)]
 pub struct MobileSession {
     // Declared before `runtime` so the transport (and its receive worker) is
@@ -467,6 +598,15 @@ impl MobileSession {
     }
 }
 
+/// Minimum negotiated ATT MTU ([`MIN_READ_MTU`]) for a usable session.
+///
+/// Native code should compare its negotiated MTU against this value before
+/// constructing [`MobileSession`] and surface a "negotiate a larger MTU" error.
+#[uniffi::export]
+pub fn minimum_read_mtu() -> u16 {
+    MIN_READ_MTU
+}
+
 #[uniffi::export]
 impl MobileSession {
     /// Wrap an already-connected platform transport.
@@ -476,10 +616,20 @@ impl MobileSession {
     ///
     /// # Errors
     ///
-    /// Returns [`MobileError::Internal`] when the Tokio runtime or the receive
-    /// thread cannot be created.
+    /// Returns [`MobileError::InvalidRequest`] when the negotiated MTU is below
+    /// [`MIN_READ_MTU`], and [`MobileError::Internal`] when the Tokio runtime
+    /// or the receive thread cannot be created.
     #[uniffi::constructor]
     pub fn new(transport: Arc<dyn NativeTransport>) -> Result<Arc<Self>, MobileError> {
+        let mtu = transport.mtu();
+        if mtu < MIN_READ_MTU {
+            return Err(MobileError::InvalidRequest {
+                message: format!(
+                    "negotiated MTU {mtu} is below the {MIN_READ_MTU} required to receive a \
+                     configuration chunk; request a larger MTU and reconnect"
+                ),
+            });
+        }
         let transport_for_bridge = Arc::clone(&transport);
         let bridge = BridgeTransport::new(transport_for_bridge)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -653,7 +803,7 @@ impl MobileSession {
         // so an in-flight read cannot interleave with the shutdown.
         self.transport.disconnect();
         let session = self.lock();
-        session.transport().shutdown();
+        session.transport().shutdown(true);
     }
 }
 
@@ -990,5 +1140,93 @@ mod tests {
         assert!(native.disconnected.load(Ordering::Relaxed));
         // Dropping the session must not block or panic after disconnect.
         drop(session);
+    }
+
+    #[test]
+    fn minimum_read_mtu_is_enforced_at_the_session_boundary() {
+        assert_eq!(minimum_read_mtu(), MIN_READ_MTU);
+        let native = ScriptedNative::new(23);
+        let error = match MobileSession::new(native) {
+            Ok(_) => panic!("MTU 23 must be rejected"),
+            Err(error) => error,
+        };
+        match error {
+            MobileError::InvalidRequest { message } => {
+                assert!(message.contains("MTU 23"), "unexpected message: {message}");
+                assert!(message.contains("161"), "unexpected message: {message}");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_queue_is_bounded_and_drops_the_oldest_frames() {
+        let queue = FrameQueue::new();
+        for index in 0..(RX_QUEUE_CAPACITY + 5) {
+            queue.push(vec![index as u8]);
+        }
+        assert_eq!(queue.dropped(), 5);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        for expected in 5..(RX_QUEUE_CAPACITY + 5) {
+            let frame = runtime.block_on(queue.recv()).expect("queued frame");
+            assert_eq!(frame, vec![expected as u8]);
+        }
+        // Closing an empty queue ends a pending receive instead of parking it.
+        runtime.block_on(async {
+            queue.close();
+            assert!(queue.recv().await.is_none());
+        });
+    }
+
+    #[test]
+    fn frame_queue_close_wakes_a_pending_receiver() {
+        let queue = Arc::new(FrameQueue::new());
+        let consumer = Arc::clone(&queue);
+        let receiver = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime");
+            runtime.block_on(consumer.recv())
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        queue.close();
+        assert!(receiver.join().expect("receiver thread").is_none());
+    }
+
+    /// A platform transport whose link is already gone.
+    struct FailingNative;
+
+    impl NativeTransport for FailingNative {
+        fn send(&self, _data: Vec<u8>) -> Result<(), NativeTransportError> {
+            Ok(())
+        }
+
+        fn recv(&self, _timeout_ms: u32) -> Result<Option<Vec<u8>>, NativeTransportError> {
+            Err(NativeTransportError::Failure {
+                message: "link dropped".to_string(),
+            })
+        }
+
+        fn mtu(&self) -> u16 {
+            200
+        }
+
+        fn disconnect(&self) {}
+    }
+
+    #[test]
+    fn platform_receive_failure_surfaces_as_a_mobile_error() {
+        let session = MobileSession::new(Arc::new(FailingNative)).unwrap();
+        let error = session.read_device_info().expect_err("the link is gone");
+        assert!(
+            matches!(
+                error,
+                MobileError::Disconnected { .. } | MobileError::Transport { .. }
+            ),
+            "unexpected error: {error:?}"
+        );
     }
 }

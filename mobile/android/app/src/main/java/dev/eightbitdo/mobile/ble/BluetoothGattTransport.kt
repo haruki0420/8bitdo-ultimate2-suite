@@ -11,10 +11,11 @@ import android.content.Context
 import android.os.Build
 import dev.eightbitdo.mobile.core.NativeTransport
 import dev.eightbitdo.mobile.core.NativeTransportException
+import dev.eightbitdo.mobile.core.minimumReadMtu
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeout
@@ -23,19 +24,31 @@ import kotlinx.coroutines.withTimeout
  * `BluetoothGatt` implementation of the Rust `NativeTransport` callback.
  *
  * The Rust bridge calls [recv] from its own receive thread and [send] from the
- * session thread, so frames cross the boundary through a blocking queue and all
- * GATT operations are serialised on a single-thread executor (Android rejects
- * concurrent GATT operations).
+ * session thread, so frames cross the boundary through a bounded [FrameQueue]
+ * and all GATT operations are serialised on a single-thread executor (Android
+ * rejects concurrent GATT operations).
  *
- * The MTU is the value reported by `onMtuChanged`, never the requested one
- * (Android 14+ may pin it to 517).
+ * # Failure handling
+ *
+ * Every asynchronous step (connect, service discovery, CCCD write, MTU) is
+ * awaited strictly and an error closes the link instead of falling back to a
+ * default. In particular the MTU must be >= [minimumReadMtu]: at the default 23
+ * the stack cannot deliver the controller's 158-byte configuration
+ * notifications, so a session created at that MTU would hang mid-read.
+ *
+ * # Lifecycle
+ *
+ * [open] either leaves a fully usable link or throws with all resources
+ * released. [disconnect] is idempotent; a disconnection reported by the stack
+ * also releases the GATT client and the executor, so a reconnect cannot leak
+ * the previous client.
  */
 class BluetoothGattTransport(
     private val context: Context,
     private val device: BluetoothDevice,
 ) : NativeTransport {
 
-    private val frames = LinkedBlockingQueue<ByteArray>()
+    private val frames = FrameQueue(FRAME_QUEUE_CAPACITY)
     private val gattExecutor = Executors.newSingleThreadExecutor()
 
     @Volatile
@@ -51,6 +64,9 @@ class BluetoothGattTransport(
     private var closed = false
 
     @Volatile
+    private var released = false
+
+    @Volatile
     private var connectionSignal: CompletableDeferred<BluetoothGatt>? = null
 
     @Volatile
@@ -63,11 +79,23 @@ class BluetoothGattTransport(
     private var mtuSignal: CompletableDeferred<Int>? = null
 
     /**
-     * Connect, discover the App Mode service and enable notifications.
+     * Connect, discover the App Mode service, enable notifications and
+     * negotiate the MTU.
      *
      * Suspend: called from a coroutine on [kotlinx.coroutines.Dispatchers.IO].
+     * On any failure the link, GATT client and executor are released before the
+     * exception is rethrown.
      */
     suspend fun open() {
+        try {
+            openInternal()
+        } catch (error: Throwable) {
+            releaseResources()
+            throw error
+        }
+    }
+
+    private suspend fun openInternal() {
         val connection = CompletableDeferred<BluetoothGatt>()
         connectionSignal = connection
         val connectedGatt = device.connectGatt(
@@ -91,6 +119,20 @@ class BluetoothGattTransport(
         val characteristic = service.getCharacteristic(APP_CHARACTERISTIC_UUID)
             ?: service.getCharacteristic(APP_CHARACTERISTIC_ALT_UUID)
             ?: throw NativeTransportException.Failure("App Mode characteristic FF11/FF13 not found")
+
+        // The protocol writes commands without an ATT response and receives
+        // notifications; refuse a characteristic that cannot do both instead of
+        // discovering it at the first frame.
+        if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY == 0) {
+            throw NativeTransportException.Failure("App Mode characteristic cannot notify")
+        }
+        if (characteristic.properties and
+            BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE == 0
+        ) {
+            throw NativeTransportException.Failure(
+                "App Mode characteristic does not support write-without-response",
+            )
+        }
         appCharacteristic = characteristic
 
         if (!connectedGatt.setCharacteristicNotification(characteristic, true)) {
@@ -101,29 +143,49 @@ class BluetoothGattTransport(
         val descriptor = CompletableDeferred<Unit>()
         descriptorSignal = descriptor
         writeDescriptor(connectedGatt, cccd)
-        runCatching { withTimeout(CCCD_TIMEOUT_MS) { descriptor.await() } }
+        withTimeout(CCCD_TIMEOUT_MS) { descriptor.await() }
 
         val mtu = CompletableDeferred<Int>()
         mtuSignal = mtu
-        connectedGatt.requestMtu(REQUESTED_MTU)
-        // The negotiation is advisory: keep the default if the stack never reports.
-        mtuValue = runCatching { withTimeout(MTU_TIMEOUT_MS) { mtu.await() } }
-            .getOrDefault(23)
-            .toUShort()
+        if (!connectedGatt.requestMtu(REQUESTED_MTU)) {
+            throw NativeTransportException.Failure("requestMtu($REQUESTED_MTU) was refused")
+        }
+        val negotiated = withTimeout(MTU_TIMEOUT_MS) { mtu.await() }
+        val minimum = minimumReadMtu().toInt()
+        if (negotiated < minimum) {
+            throw NativeTransportException.Failure(
+                "negotiated MTU $negotiated is below the $minimum needed to read the configuration",
+            )
+        }
+        mtuValue = negotiated.toUShort()
     }
 
     // ---- NativeTransport -------------------------------------------------
 
     override fun send(data: ByteArray) {
         if (closed) throw NativeTransportException.Failure("GATT link is closed")
+        val characteristic = appCharacteristic
+            ?: throw NativeTransportException.Failure("App Mode characteristic is not ready")
+        if (characteristic.properties and
+            BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE == 0
+        ) {
+            throw NativeTransportException.Failure(
+                "App Mode characteristic does not support write-without-response",
+            )
+        }
+
         val result = CompletableFuture<Unit>()
-        gattExecutor.execute {
-            try {
-                writeFrame(data)
-                result.complete(Unit)
-            } catch (error: Throwable) {
-                result.completeExceptionally(error)
+        try {
+            gattExecutor.execute {
+                try {
+                    writeFrame(data, characteristic)
+                    result.complete(Unit)
+                } catch (error: Throwable) {
+                    result.completeExceptionally(error)
+                }
             }
+        } catch (error: RejectedExecutionException) {
+            throw NativeTransportException.Failure("GATT link is closed")
         }
         try {
             result.get(WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
@@ -133,8 +195,8 @@ class BluetoothGattTransport(
     }
 
     override fun recv(timeoutMs: UInt): ByteArray? {
-        val frame = frames.poll(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-        if (frame == null && closed) {
+        val frame = frames.poll(timeoutMs.toLong())
+        if (frame == null && (closed || frames.isClosed())) {
             throw NativeTransportException.Failure("GATT link is closed")
         }
         return frame
@@ -143,8 +205,21 @@ class BluetoothGattTransport(
     override fun mtu(): UShort = mtuValue
 
     override fun disconnect() {
-        if (closed) return
+        // No early return on `closed`: a second call must still be able to
+        // free resources left behind by a partial `open()`.
+        releaseResources()
+    }
+
+    // ---- internals -------------------------------------------------------
+
+    private fun releaseResources() {
+        synchronized(this) {
+            if (released) return
+            released = true
+        }
         closed = true
+        frames.close()
+        failAllSignals("GATT link closed")
         val current = gatt
         gatt = null
         current?.let {
@@ -154,12 +229,8 @@ class BluetoothGattTransport(
         gattExecutor.shutdownNow()
     }
 
-    // ---- internals -------------------------------------------------------
-
-    private fun writeFrame(data: ByteArray) {
+    private fun writeFrame(data: ByteArray, characteristic: BluetoothGattCharacteristic) {
         val currentGatt = gatt ?: throw NativeTransportException.Failure("GATT link is closed")
-        val characteristic = appCharacteristic
-            ?: throw NativeTransportException.Failure("App Mode characteristic is not ready")
 
         // Android refuses a write while the previous one is in flight; retry a
         // few times instead of dropping a chunk.
@@ -219,8 +290,10 @@ class BluetoothGattTransport(
                     connectionSignal?.complete(currentGatt)
 
                 BluetoothProfile.STATE_DISCONNECTED -> {
-                    closed = true
-                    failAllSignals("connection lost (status $status)")
+                    // The stack already dropped the link; release the client
+                    // and executor so a reconnect starts clean. This also
+                    // completes every pending signal with an error.
+                    releaseResources()
                 }
 
                 else -> Unit
@@ -253,14 +326,16 @@ class BluetoothGattTransport(
         }
 
         override fun onMtuChanged(currentGatt: BluetoothGatt, mtu: Int, status: Int) {
-            mtuValue = mtu.toUShort()
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                mtuSignal?.complete(mtu)
-            } else {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                // No fallback: the session requires a negotiated MTU that can
+                // carry the device's 158-byte notifications.
                 mtuSignal?.completeExceptionally(
                     NativeTransportException.Failure("MTU request failed (status $status)"),
                 )
+                return
             }
+            mtuValue = mtu.toUShort()
+            mtuSignal?.complete(mtu)
         }
 
         override fun onCharacteristicChanged(
@@ -271,7 +346,7 @@ class BluetoothGattTransport(
             if (characteristic.uuid == APP_CHARACTERISTIC_UUID ||
                 characteristic.uuid == APP_CHARACTERISTIC_ALT_UUID
             ) {
-                frames.put(value)
+                frames.push(value)
             }
         }
 
@@ -283,7 +358,7 @@ class BluetoothGattTransport(
             if (characteristic.uuid == APP_CHARACTERISTIC_UUID ||
                 characteristic.uuid == APP_CHARACTERISTIC_ALT_UUID
             ) {
-                characteristic.value?.let { frames.put(it) }
+                characteristic.value?.let { frames.push(it) }
             }
         }
     }
@@ -302,6 +377,7 @@ class BluetoothGattTransport(
         private val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805F9B34FB")
 
         private const val REQUESTED_MTU = 200
+        private const val FRAME_QUEUE_CAPACITY = FrameQueue.DEFAULT_CAPACITY
         private const val CONNECT_TIMEOUT_MS = 10_000L
         private const val DISCOVERY_TIMEOUT_MS = 10_000L
         private const val CCCD_TIMEOUT_MS = 3_000L

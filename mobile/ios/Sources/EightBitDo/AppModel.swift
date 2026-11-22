@@ -105,6 +105,10 @@ final class AppModel: NSObject, ObservableObject {
     func connect(_ device: DiscoveredDevice) {
         bleQueue.async { [weak self] in
             guard let self, let peripheral = self.discoveredPeripherals[device.id] else { return }
+            // A reconnect must never leave the previous session (or its
+            // receive thread) attached to the old link.
+            self.closeCurrentSession()
+            self.didSubscribe = false
             self.wantsScan = false
             self.central?.stopScan()
             self.activePeripheral = peripheral
@@ -117,12 +121,9 @@ final class AppModel: NSObject, ObservableObject {
     func disconnect() {
         wantsScan = false
         didSubscribe = false
-        let session = self.session
-        self.session = nil
-        let transport = self.transport
-        self.transport = nil
         let peripheral = activePeripheral
         activePeripheral = nil
+        closeCurrentSession()
 
         publish {
             self.stage = .idle
@@ -130,16 +131,32 @@ final class AppModel: NSObject, ObservableObject {
             self.configuration = nil
             self.macroBackup = nil
         }
-        // Shut the Rust side down off the main thread: it joins the receive
-        // worker (bounded by the transport poll interval).
-        DispatchQueue.global(qos: .userInitiated).async {
-            session?.disconnect()
-            transport?.disconnect()
-        }
         if let peripheral {
             bleQueue.async { [weak self] in
                 self?.central?.cancelPeripheralConnection(peripheral)
             }
+        }
+    }
+
+    // MARK: - Session lifecycle
+
+    /// Detach and shut down the active Rust session off the main thread.
+    ///
+    /// `AppModel` owns the `CBCentralManager` lifecycle; `CoreBluetoothTransport`
+    /// only mirrors the link state. Both paths below deliberately call
+    /// `transport.disconnect()`: it is what makes a pending Rust `recv` fail
+    /// with a transport error instead of waiting out its timeout. The Rust
+    /// `disconnect()` then joins the receive worker (bounded by the transport
+    /// poll interval), so it must not run on the main thread.
+    private func closeCurrentSession() {
+        let session = self.session
+        let transport = self.transport
+        self.session = nil
+        self.transport = nil
+        guard session != nil || transport != nil else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            session?.disconnect()
+            transport?.disconnect()
         }
     }
 
@@ -240,13 +257,27 @@ final class AppModel: NSObject, ObservableObject {
 
     private func attachSession(peripheral: CBPeripheral, characteristic: CBCharacteristic) {
         let writeLength = peripheral.maximumWriteValueLength(for: .withoutResponse)
-        let mtu = UInt16(max(23, writeLength + 3))
+        let mtu = UInt16(writeLength + 3)
         let transport = CoreBluetoothTransport(
             peripheral: peripheral,
             characteristic: characteristic,
             mtu: mtu,
             callbackQueue: bleQueue
         )
+        // The mobile session refuses an MTU below this anyway; checking here
+        // gives the user a specific message instead of a generic constructor
+        // failure. A fallback MTU would truncate the 158-byte config
+        // notifications and hang the read.
+        let minimumMtu = minimumReadMtu()
+        guard mtu >= minimumMtu else {
+            transport.disconnect()
+            publish {
+                self.stage = .failed(
+                    "negotiated MTU \(mtu) is below the \(minimumMtu) needed to read the configuration"
+                )
+            }
+            return
+        }
         do {
             let session = try MobileSession(transport: transport)
             self.transport = transport
@@ -255,6 +286,9 @@ final class AppModel: NSObject, ObservableObject {
             publish { self.stage = .connected(name) }
             refreshAll()
         } catch {
+            // The Rust side never took ownership; close the link so the
+            // peripheral does not keep a stale delegate/notification state.
+            transport.disconnect()
             publish { self.stage = .failed("could not start the Rust session") }
             report(error)
         }
@@ -316,8 +350,10 @@ extension AppModel: CBCentralManagerDelegate {
         didDisconnectPeripheral peripheral: CBPeripheral,
         error: Error?
     ) {
-        session = nil
-        transport = nil
+        // `AppModel` owns the connection lifecycle: tell the transport the link
+        // is gone first, so the Rust `recv` fails now instead of waiting out its
+        // timeout, then release the session off the main thread.
+        closeCurrentSession()
         didSubscribe = false
         activePeripheral = nil
         let reason = error?.localizedDescription
@@ -373,6 +409,18 @@ extension AppModel: CBPeripheralDelegate {
         }
         guard characteristic.properties.contains(.notify) else {
             publish { self.stage = .failed("App Mode characteristic cannot notify") }
+            return
+        }
+        // Every frame is written without response; a characteristic that only
+        // supports write-with-response cannot carry the protocol safely (the
+        // command stream would serialize per ACK), so fail before enabling
+        // notifications instead of discovering it at the first send.
+        guard characteristic.properties.contains(.writeWithoutResponse) else {
+            publish {
+                self.stage = .failed(
+                    "App Mode characteristic does not support write-without-response"
+                )
+            }
             return
         }
         peripheral.setNotifyValue(true, for: characteristic)
