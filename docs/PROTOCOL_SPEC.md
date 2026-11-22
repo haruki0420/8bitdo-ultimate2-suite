@@ -472,6 +472,12 @@ sequenceDiagram
 | ホットホイール照明 (`getBT2_WriteHotWheel`) | `0x0974 + slot * 0x10` | `0x10` (16B) | カラーホイール等 |
 | シングル照明 (`getBT2_WriteSingle`) | `0x09A4 + slot * 0x64` | `0x64` (100B) | 単色・24 LED カラー配列 |
 
+> **キーマッピング（mapKey）書込の確定仕様（RE・2026-11-22）**:
+> `MapKeyRecord` = `0x0E0 + slot * 0x5C`（`flag` u32 + `key[22]` の 22 × u32）。22 index 順は `A, B, X, Y, L1, R1, L2, R2, L3, R3, Select, Start, Share, Logo, Up, Down, Left, Right, P1/PL, P2/PR, P3/L4, P4/R4`。
+> 単一エントリ書込は `offset = 0x0E4 + slot * 0x5C + idx * 4`, `len = 4`, `total_len = 0x0AD0` で `0x0001` を送り、完了時に共通 onfinished から **`0x0006/0x0067` Save**（Android。Windows USB は `0x0123`）。公式は書込後の read-back を行わない。
+> 変更するのは対象 4B のみで、`flag`（`0` = 無効）は変更しない。`flag` を 1 にするのは `setMapKey` の全 22 + flag 一括コピー経由。全体 2768B 書込でも同じ領域を更新できる（本実装は全体書込 + Save + read-back 検証を使用）。
+> 無効値は `KeyMap_N = 0`。`KeyMap_My_NUll = 227` は書込・表示経路から参照されず用途未確認のため書かない。1 ボタン = 1 つの 32-bit `KeyMap` 値で、ビット合成は確認されていない。
+
 - **マクロ詳細ステップ (`MacroDatas`, 1 ステップ = 10 バイト)**:
   - `S_UltimateBT2Advance.setMacroStruct` より、1 ステップは以下の `5 x u16` (Little-Endian, 計 10 バイト) で構成される:
     - `+0x00` (`u16`): `msTimes`（保持/待機時間 ms）

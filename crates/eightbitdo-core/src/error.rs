@@ -65,6 +65,55 @@ impl fmt::Display for MacroWriteState {
     }
 }
 
+/// Stage of a full 2768-byte configuration write that failed.
+///
+/// The order is Write (`0x0001` chunks) → Save (`0x0006`) → Verify
+/// (`0x0002` read-back). Prepare failures are local validation errors and do
+/// not use this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigWriteStage {
+    /// One `0x0001` configuration chunk was refused or timed out.
+    Write,
+    /// The `0x0006` Save was refused or timed out.
+    Save,
+    /// The post-Save `0x0002` read-back failed, did not match, or the CRC
+    /// could not be reconciled.
+    Verify,
+}
+
+impl fmt::Display for ConfigWriteStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Write => formatter.write_str("Write"),
+            Self::Save => formatter.write_str("Save"),
+            Self::Verify => formatter.write_str("Verify"),
+        }
+    }
+}
+
+/// How far a failed full configuration write got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigWriteState {
+    /// No Save was acknowledged. For a `Write` stage failure no Save was sent
+    /// at all; for a `Save` stage failure the Save was sent but its ACK never
+    /// arrived, so the flash commit is unconfirmed. The controller must be
+    /// re-read (and may keep partially updated bytes in RAM).
+    NotSaved,
+    /// The Save was acknowledged, so the new configuration is committed (or
+    /// the device normalized it). Only the read-back / CRC verification is
+    /// unconfirmed.
+    Saved,
+}
+
+impl fmt::Display for ConfigWriteState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotSaved => formatter.write_str("NotSaved"),
+            Self::Saved => formatter.write_str("Saved"),
+        }
+    }
+}
+
 /// Errors returned by `eightbitdo-core`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -160,6 +209,19 @@ pub enum Error {
         stage: MacroWriteStage,
         /// How far the write got.
         state: MacroWriteState,
+        /// Underlying error text.
+        reason: String,
+        /// Operator-facing recovery guidance.
+        recovery: &'static str,
+    },
+
+    /// A full 2768-byte configuration write failed.
+    #[error("config write failed during {stage} ({state}): {reason}; {recovery}")]
+    ConfigWrite {
+        /// Stage that failed.
+        stage: ConfigWriteStage,
+        /// How far the write got (before / after a confirmed Save).
+        state: ConfigWriteState,
         /// Underlying error text.
         reason: String,
         /// Operator-facing recovery guidance.
