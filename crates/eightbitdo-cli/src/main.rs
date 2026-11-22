@@ -18,8 +18,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand};
 use eightbitdo_core::{
     macro_header_chunk_len, macro_ops::is_skipped_steps, macro_write_chunk_len,
-    macro_write_chunk_len_requested, scan_devices, BleOptions, BleTransport, ConfigSnapshot, Error,
-    MacroBackup, MacroEntry, MacroWritePlan, Session, Transport, VersionInfo,
+    macro_write_chunk_len_requested, scan_devices, validate_macro_chunk_size, BleOptions,
+    BleTransport, ConfigSnapshot, Error, MacroBackup, MacroEntry, MacroWritePlan, Session,
+    Transport, VersionInfo,
 };
 use eightbitdo_protocol::commands::SaveTransport;
 use eightbitdo_protocol::config_bt2::{
@@ -1203,11 +1204,10 @@ async fn macro_write_session_inner<T: Transport>(
     // Fail before creating a pre-write backup directory if this MTU cannot
     // support the macro write at all.
     macro_header_chunk_len(mtu)?;
-    if let Some(requested) = chunk_size {
-        macro_write_chunk_len_requested(mtu, requested)?;
-    } else {
-        macro_write_chunk_len(mtu)?;
-    }
+    let effective_chunk_size = match chunk_size {
+        Some(requested) => macro_write_chunk_len_requested(mtu, requested)?,
+        None => macro_write_chunk_len(mtu)?,
+    };
     prepare_output_directory(backup_dir)?;
     println!("reading configuration...");
     let snapshot = session.read_config_snapshot().await?;
@@ -1259,13 +1259,12 @@ async fn macro_write_session_inner<T: Transport>(
     plan.save_transport = SaveTransport::Ble;
 
     println!(
-        "writing slot {} (profile {}) macro {} ({}): {} steps (chunk size from MTU {})",
+        "writing slot {} (profile {}) macro {} ({}): {} steps (chunk size {effective_chunk_size}B, MTU {mtu})",
         slot.index(),
         slot.number(),
         index.index(),
         macro_id(index),
         plan.steps.len(),
-        mtu
     );
     eprintln!(
         "warning: do not press Ctrl-C during the macro write; a failure can leave a sector \
@@ -1275,6 +1274,7 @@ async fn macro_write_session_inner<T: Transport>(
         backup_dir.display()
     );
     let outcome = session.write_macro(&backup, slot, index, &plan).await?;
+    warn_if_config_crc_invalid(outcome.config_crc_valid);
 
     println!("wrote macro: slot {} macro {}", slot.index(), index.index());
     println!("  name: {:?}", outcome.record.name());
@@ -1625,6 +1625,12 @@ fn report_restore_recovery(pre_restore_complete: bool, pre_dir: &Path) {
     }
 }
 
+fn warn_if_config_crc_invalid(config_crc_valid: bool) {
+    if !config_crc_valid {
+        eprintln!("warning: config CRC is invalid; a full 2768B config write may be required");
+    }
+}
+
 fn restore_recovery_warning(
     pre_restore_complete: bool,
     pre_dir: &Path,
@@ -1652,11 +1658,10 @@ async fn macro_restore_session_core<T: Transport>(
     chunk_size: Option<u16>,
 ) -> Result<(), Error> {
     let mtu = session.transport().mtu();
-    macro_header_chunk_len(mtu)?;
     if let Some(requested) = chunk_size {
-        macro_write_chunk_len_requested(mtu, requested)?;
-    } else {
-        macro_write_chunk_len(mtu)?;
+        // Reject unsupported values before any backup directory is created.
+        // MTU fit is checked later, only when a non-empty macro is restored.
+        validate_macro_chunk_size(requested)?;
     }
     let backup = read_restore_backup(dir)?;
     println!("loaded backup: {}", dir.display());
@@ -1737,6 +1742,17 @@ async fn macro_restore_session_core<T: Transport>(
         }
     }
 
+    let effective_chunk_size = if slots_with_non_empty.iter().any(|written| *written) {
+        let size = match chunk_size {
+            Some(requested) => macro_write_chunk_len_requested(mtu, requested)?,
+            None => macro_write_chunk_len(mtu)?,
+        };
+        println!("macro write chunk size: {size} bytes");
+        Some(size as u16)
+    } else {
+        None
+    };
+
     if has_writes {
         eprintln!(
             "warning: do not press Ctrl-C during the macro write; a failure can leave a sector \
@@ -1746,31 +1762,39 @@ async fn macro_restore_session_core<T: Transport>(
     }
 
     for slot in Slot::ALL {
-        for index in MacroIndex::ALL {
-            let entry = backup.get(slot, index).expect("full backup has 12 entries");
-            let record = entry.record();
-            if is_skipped_steps(record.max_steps) {
-                continue;
-            }
-            let header = backup.snapshot().config.macro_slot(slot);
-            let plan = restore_macro_plan(entry, &header, chunk_size);
-            println!(
-                "restoring slot {} macro {} ({} steps)...",
-                slot.index(),
-                index.index(),
-                plan.steps.len()
-            );
-            if let Err(error) = session.write_macro(&backup, slot, index, &plan).await {
-                eprintln!(
-                    "restore stopped at slot {} macro {}: {error}",
-                    slot.index(),
-                    index.index()
-                );
+        if !slots_with_non_empty[slot.index()] {
+            continue;
+        }
+        let header = backup.snapshot().config.macro_slot(slot);
+        let plans: Vec<(MacroIndex, MacroWritePlan)> = MacroIndex::ALL
+            .iter()
+            .filter_map(|index| {
+                let entry = backup
+                    .get(slot, *index)
+                    .expect("full backup has 12 entries");
+                if is_skipped_steps(entry.record().max_steps) {
+                    return None;
+                }
+                Some((
+                    *index,
+                    restore_macro_plan(entry, &header, effective_chunk_size),
+                ))
+            })
+            .collect();
+        println!(
+            "restoring slot {} ({} macros: Header -> Save -> Erase/Write -> Save)...",
+            slot.index(),
+            plans.len()
+        );
+        match session.write_macro_slot(&backup, slot, &plans).await {
+            Ok(outcome) => warn_if_config_crc_invalid(outcome.config_crc_valid),
+            Err(error) => {
+                eprintln!("restore stopped at slot {}: {error}", slot.index());
                 report_restore_recovery(pre_restore_complete, pre_dir);
                 return Err(error);
             }
-            restored += 1;
         }
+        restored += plans.len();
     }
 
     for slot in Slot::ALL {
@@ -1786,10 +1810,13 @@ async fn macro_restore_session_core<T: Transport>(
             "restoring slot {} 216B header only (no step data written)...",
             slot.index()
         );
-        if let Err(error) = session.write_macro_header(&backup, slot).await {
-            eprintln!("restore header stopped at slot {}: {error}", slot.index());
-            report_restore_recovery(pre_restore_complete, pre_dir);
-            return Err(error);
+        match session.write_macro_header(&backup, slot).await {
+            Ok(outcome) => warn_if_config_crc_invalid(outcome.config_crc_valid),
+            Err(error) => {
+                eprintln!("restore header stopped at slot {}: {error}", slot.index());
+                report_restore_recovery(pre_restore_complete, pre_dir);
+                return Err(error);
+            }
         }
         headers_restored += 1;
     }
@@ -6453,6 +6480,66 @@ mod tests {
         assert_eq!(parsed.interval_ms, None);
     }
 
+    fn push_ack(mock: &MockTransport, command: u16) {
+        mock.push_response(&CustomHeader::new(command, 0, 0, 0), &[]);
+    }
+
+    fn backup_fixture_with_macros(
+        dir: &Path,
+        macros: &[(MacroIndex, &str, Vec<MacroStep>)],
+    ) -> (ConfigSnapshot, MacroBackup) {
+        use eightbitdo_protocol::config_bt2::{GamepadMode, MacroRecord};
+        use eightbitdo_protocol::macro_data;
+
+        let mut config = Bt2Config::zeroed();
+        config.set_gamepad_mode(GamepadMode::Switch);
+        for (index, name, steps) in macros {
+            let mut record = MacroRecord {
+                max_steps: steps.len() as u16,
+                ..MacroRecord::default()
+            };
+            record.set_name(name).unwrap();
+            config.set_macro_record(Slot::S1, *index, &record);
+        }
+        config.recompute_crc();
+
+        let stored_crc = config.crc16_stored() as u16;
+        let mut check = config.clone();
+        let computed_crc = check.recompute_crc();
+        let snapshot = ConfigSnapshot {
+            config: config.clone(),
+            stored_crc,
+            computed_crc,
+            crc_valid: stored_crc == computed_crc,
+        };
+
+        let mut entries = Vec::new();
+        for slot in Slot::ALL {
+            for index in MacroIndex::ALL {
+                let record = config.macro_record(slot, index);
+                let raw = macros
+                    .iter()
+                    .find(|(macro_index, _, _)| slot == Slot::S1 && *macro_index == index)
+                    .map(|(_, _, steps)| {
+                        macro_data::encode_macro_steps(steps).unwrap()
+                            [..steps.len() * macro_data::MACRO_STEP_SIZE]
+                            .to_vec()
+                    })
+                    .unwrap_or_default();
+                entries.push(MacroEntry::new(slot, index, record, raw).unwrap());
+            }
+        }
+        let backup = MacroBackup::new(snapshot.clone(), entries).unwrap();
+        write_macro_backup(
+            dir,
+            &snapshot,
+            &backup,
+            &sha256_hex(snapshot.config.as_bytes()),
+        )
+        .unwrap();
+        (snapshot, backup)
+    }
+
     fn backup_fixture(dir: &Path) -> (ConfigSnapshot, MacroBackup) {
         use eightbitdo_protocol::config_bt2::{GamepadMode, MacroRecord};
         use eightbitdo_protocol::macro_data;
@@ -6715,6 +6802,214 @@ mod tests {
             .sent_frames()
             .iter()
             .any(|frame| is_write_command(frame)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn restore_two_macros_uses_one_per_slot_header_save_and_final_save() {
+        let root = scratch_dir("macro-restore-batch");
+        let fixture_dir = root.join("fixture");
+        let (snapshot, backup) = backup_fixture_with_macros(
+            &fixture_dir,
+            &[
+                (MacroIndex::M1, "One", vec![MacroStep::neutral(10); 2]),
+                (MacroIndex::M2, "Two", vec![MacroStep::neutral(20); 2]),
+            ],
+        );
+
+        let mock = MockTransport::with_mtu(200);
+        // Initial config and the pre-restore backup reads.
+        push_config_responses(&mock, &snapshot.config);
+        push_macro_read(&mock, &snapshot.config, Slot::S1, MacroIndex::M1);
+        push_macro_read(&mock, &snapshot.config, Slot::S1, MacroIndex::M2);
+        // One header Save for the slot, then Erase/Write for both macros,
+        // then one final Save.
+        push_ack(&mock, commands::cmd::WRITE_CONFIG);
+        push_ack(&mock, commands::cmd::WRITE_CONFIG);
+        push_ack(&mock, commands::cmd::SAVE);
+        push_ack(&mock, commands::cmd::ERASE_MACRO);
+        push_ack(&mock, commands::cmd::WRITE_MACRO);
+        push_ack(&mock, commands::cmd::ERASE_MACRO);
+        push_ack(&mock, commands::cmd::WRITE_MACRO);
+        push_ack(&mock, commands::cmd::SAVE);
+        // Batch verification, then the final whole-backup verification.
+        push_config_responses(&mock, &snapshot.config);
+        push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M1);
+        push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M2);
+        push_config_responses(&mock, &snapshot.config);
+        push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M1);
+        push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M2);
+
+        let session = Session::new(&mock);
+        macro_restore_session(&session, &fixture_dir, false, None)
+            .await
+            .unwrap();
+
+        let sent = mock.sent_frames();
+        let commands: Vec<u16> = sent
+            .iter()
+            .map(|frame| CustomHeader::parse(&frame[1..]).unwrap().cmd)
+            .filter(|command| {
+                matches!(
+                    *command,
+                    commands::cmd::WRITE_CONFIG
+                        | commands::cmd::SAVE
+                        | commands::cmd::ERASE_MACRO
+                        | commands::cmd::WRITE_MACRO
+                )
+            })
+            .collect();
+        assert_eq!(
+            commands,
+            vec![
+                commands::cmd::WRITE_CONFIG,
+                commands::cmd::WRITE_CONFIG,
+                commands::cmd::SAVE,
+                commands::cmd::ERASE_MACRO,
+                commands::cmd::WRITE_MACRO,
+                commands::cmd::ERASE_MACRO,
+                commands::cmd::WRITE_MACRO,
+                commands::cmd::SAVE,
+            ]
+        );
+        assert_eq!(
+            sent.iter()
+                .filter(|frame| {
+                    CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::SAVE
+                })
+                .count(),
+            2
+        );
+
+        // M1's write payload is unchanged by the later M2 write.
+        let m1 = backup.get(Slot::S1, MacroIndex::M1).unwrap();
+        let first_write = sent
+            .iter()
+            .find(|frame| {
+                CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::WRITE_MACRO
+            })
+            .unwrap();
+        assert_eq!(&first_write[17..17 + m1.raw().len()], m1.raw());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn restore_mtu_23_header_only_succeeds() {
+        let root = scratch_dir("macro-restore-mtu23");
+        let empty_dir = root.join("empty");
+        let current_dir = root.join("current");
+        let (empty_snapshot, _) = empty_backup_fixture(&empty_dir);
+        let (current_snapshot, _) = backup_fixture(&current_dir);
+
+        let mock = MockTransport::with_mtu(23);
+        push_config_responses(&mock, &current_snapshot.config);
+        push_macro_read(&mock, &current_snapshot.config, Slot::S1, MacroIndex::M1);
+        // MTU 23 leaves 3 payload bytes per header packet: 216 / 3 = 72.
+        for _ in 0..72 {
+            push_ack(&mock, commands::cmd::WRITE_CONFIG);
+        }
+        push_ack(&mock, commands::cmd::SAVE);
+        push_config_responses(&mock, &empty_snapshot.config);
+        push_config_responses(&mock, &empty_snapshot.config);
+
+        let session = Session::new(&mock);
+        macro_restore_session(&session, &empty_dir, true, None)
+            .await
+            .unwrap();
+
+        let sent = mock.sent_frames();
+        assert_eq!(
+            sent.iter()
+                .filter(|frame| {
+                    CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::WRITE_CONFIG
+                })
+                .count(),
+            72
+        );
+        assert!(!sent.iter().any(|frame| matches!(
+            CustomHeader::parse(&frame[1..]).unwrap().cmd,
+            commands::cmd::ERASE_MACRO | commands::cmd::WRITE_MACRO
+        )));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_chunk_size_48_before_creating_a_backup() {
+        let root = scratch_dir("macro-restore-chunk48");
+        let fixture_dir = root.join("fixture");
+        empty_backup_fixture(&fixture_dir);
+        let before: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+
+        let mock = MockTransport::with_mtu(200);
+        let session = Session::new(&mock);
+        let result = macro_restore_session(&session, &fixture_dir, false, Some(48)).await;
+        assert!(matches!(
+            result,
+            Err(Error::Protocol(
+                eightbitdo_protocol::Error::UnsupportedChunkSize { actual: 48 }
+            ))
+        ));
+        assert!(mock.sent_frames().is_empty());
+        let after: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after, "no pre-restore directory may be created");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn restore_chunk_size_32_writes_32_byte_macro_chunks() {
+        let root = scratch_dir("macro-restore-chunk32");
+        let fixture_dir = root.join("fixture");
+        let steps = vec![MacroStep::neutral(10); 46];
+        let (snapshot, backup) =
+            backup_fixture_with_macros(&fixture_dir, &[(MacroIndex::M2, "Long", steps)]);
+
+        let mock = MockTransport::with_mtu(200);
+        push_config_responses(&mock, &snapshot.config);
+        push_macro_read(&mock, &snapshot.config, Slot::S1, MacroIndex::M2);
+        push_ack(&mock, commands::cmd::WRITE_CONFIG);
+        push_ack(&mock, commands::cmd::WRITE_CONFIG);
+        push_ack(&mock, commands::cmd::SAVE);
+        push_ack(&mock, commands::cmd::ERASE_MACRO);
+        for _ in 0..15 {
+            push_ack(&mock, commands::cmd::WRITE_MACRO);
+        }
+        push_ack(&mock, commands::cmd::SAVE);
+        push_config_responses(&mock, &snapshot.config);
+        push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M2);
+        push_config_responses(&mock, &snapshot.config);
+        push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M2);
+
+        let session = Session::new(&mock);
+        macro_restore_session(&session, &fixture_dir, false, Some(32))
+            .await
+            .unwrap();
+
+        let writes: Vec<_> = mock
+            .sent_frames()
+            .iter()
+            .filter(|frame| {
+                CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::WRITE_MACRO
+            })
+            .cloned()
+            .collect();
+        assert_eq!(writes.len(), 15);
+        for (index, frame) in writes.iter().enumerate() {
+            let header = CustomHeader::parse(&frame[1..]).unwrap();
+            assert_eq!(header.total_len, 480);
+            assert_eq!(header.chunk_len, 32);
+            assert_eq!(header.offset, 0x1000 + (index * 32) as u32);
+            assert_eq!(frame[17..].len(), 32);
+            assert_eq!(
+                header.crc16,
+                eightbitdo_protocol::crc::packet_crc16(&frame[17..])
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
