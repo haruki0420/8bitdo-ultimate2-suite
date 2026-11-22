@@ -226,7 +226,8 @@ pub enum Error {
     #[cfg(feature = "ble")]
     #[error(
         "another process is using the BLE adapter (lock file {}); close the other \
-         scan/session/connect and retry",
+         scan/session/connect and retry (if an App Mode session is open, disconnect/drop it \
+         first: the \"8bt\" boot link takes the same single-owner lock)",
         path.display()
     )]
     BleBusy {

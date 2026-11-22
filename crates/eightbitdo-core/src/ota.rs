@@ -117,6 +117,11 @@
 //! * `WriteVersion` sends the documented 24-byte image header.
 //!   `docs/OTA_BLE_EVIDENCE.md` §2 reports the Android implementation sends a
 //!   16-byte frame with no payload; again unverified.
+//! * The boot link takes the same single-owner BLE lock as the App Mode link.
+//!   Drop (or disconnect) the App Mode [`Session`] **before**
+//!   `BleBootTransport::connect`; otherwise the boot connect returns
+//!   [`Error::BleBusy`]. [`OtaUpdate::enter_boot_and_release`] performs the
+//!   EnterBoot step and then closes the App link for this reason.
 //! * Ready-vs-completion ACK shapes are unverified. With
 //!   [`OtaConfig::require_completion_ack`] enabled, the first payload-less
 //!   `cmd 0x0004` matching frame is treated as a ready ACK and skipped for
@@ -126,6 +131,12 @@
 //!   indistinguishable from the envelope and is also skipped as a ready ACK in
 //!   that mode. For other commands a direct `cmd` echo is not `0x0004` and
 //!   completes immediately.
+//! * Bootloader ACKs carry no sequence number. A duplicated or delayed ACK for
+//!   a previous WriteFirmware chunk can therefore be matched as the ACK of the
+//!   next chunk, which would advance the write before the previous chunk is
+//!   known to be committed. `require_completion_ack` consumes two matching
+//!   frames per command and reduces, but does not eliminate, this risk. Do not
+//!   run the flash path on hardware until btsnoop confirms the ACK ordering.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -221,7 +232,14 @@ pub const UT2_TYPE1_APP_FLASH_END: u32 = 0x0102_0000;
 ///
 /// The App Mode [`BleTransport`](crate::ble::BleTransport) is fixed to
 /// `"80ND"` / service `FF10` and cannot reach the bootloader, so it is
-/// deliberately **not** an `OtaTransport`.
+/// deliberately **not** an `OtaTransport`. Desktop front ends must use
+/// [`BleBootTransport`](crate::ble::BleBootTransport).
+///
+/// For native mobile transports the sealed marker cannot be implemented by
+/// `eightbitdo-uniffi`; use the hidden [`MobileBootLink::from_native`] adapter
+/// instead. That adapter accepts any [`Transport`], so the boot framing /
+/// ownership / lock contract becomes the caller's responsibility; **USB and
+/// App Mode links are not excluded by the type system** on that path.
 pub trait OtaTransport: Transport + sealed::Sealed {}
 
 mod sealed {
@@ -237,44 +255,42 @@ impl sealed::Sealed for crate::ble::BleBootTransport {}
 #[cfg(feature = "ble")]
 impl OtaTransport for crate::ble::BleBootTransport {}
 
-/// Adapter for a boot transport supplied by another crate (UniFFI / mobile).
+/// Mobile-only adapter for a boot transport supplied by another crate
+/// (UniFFI / native CoreBluetooth / Android BluetoothGatt).
 ///
-/// [`OtaTransport`] is sealed so downstream crates cannot implement it, but
-/// UniFFI must inject a native transport (CoreBluetooth / Android
-/// BluetoothGatt) for mobile BLE OTA. Wrap that transport in `OtaLink` and pass
-/// it to [`OtaUpdate::prepare_boot`] / [`OtaUpdate::write_firmware`].
+/// [`OtaTransport`] is sealed, so downstream crates cannot implement it.
+/// `MobileBootLink` is the **documented escape hatch for native mobile
+/// transports**: the crate implements the marker for this wrapper, and the
+/// caller injects its own [`Transport`]. It is `#[doc(hidden)]` because desktop
+/// front ends must use [`BleBootTransport`](crate::ble::BleBootTransport),
+/// which resolves `"8bt"` / `FF20` / `FF21` and takes the single-owner BLE lock.
 ///
-/// # Framing contract
+/// # Trust contract (caller-owned)
 ///
-/// The wrapped transport must behave like the `"8bt"` bootloader link, not like
-/// the App Mode link:
+/// `MobileBootLink` cannot verify what it wraps: a [`Transport`] is just
+/// bytes. Wrapping the App Mode `BleTransport`, a USB link, or any other
+/// transport is **not prevented by the type system** and is a caller error.
+/// The wrapped transport must:
 ///
-/// * it is connected to the advertised name `"8bt"`, service `FF20`, and
+/// * be connected to the advertised name `"8bt"`, service `FF20`, and
 ///   characteristic `FF21` or `FF23`;
-/// * [`Transport::send`] writes the bytes it is given unchanged (the core
-///   already prepends the `0x05` bootloader prefix; the native layer must not
-///   add or strip framing);
-/// * [`Transport::recv`] returns one complete notification frame starting with
-///   the 16-byte header (no prefix byte);
-/// * [`Transport::mtu`] reports the negotiated ATT MTU (`mtu - 3` usable);
-/// * the link is owned exclusively by this update (the native layer must not
-///   share it or perform its own scan/connect while the update runs).
-///
-/// `OtaLink` cannot verify any of this at runtime (a transport is just bytes),
-/// so wrapping an App Mode or USB link is a caller error. The adapter only
-/// delegates the [`Transport`] methods; it adds no framing and no locking.
-pub struct OtaLink<T: Transport>(T);
+/// * write the bytes it is given unchanged (the core already prepends the
+///   `0x05` bootloader prefix; the native layer must not add or strip framing);
+/// * return one complete notification frame per [`Transport::recv`], starting
+///   with the 16-byte header (no prefix byte);
+/// * report the negotiated ATT MTU from [`Transport::mtu`] (`mtu - 3` usable);
+/// * be owned exclusively by this update, and hold its own single-owner lock
+///   (or equivalent) so no App Mode session / other process races it. The
+///   adapter does **not** acquire the BLE lock and does not close the App link.
+#[doc(hidden)]
+pub struct MobileBootLink<T: Transport>(T);
 
-impl<T: Transport> OtaLink<T> {
-    /// Wrap a native boot transport.
+impl<T: Transport> MobileBootLink<T> {
+    /// Wrap a native boot transport for UniFFI / mobile integration.
     ///
-    /// The caller is responsible for the framing / ownership contract in the
-    /// [`OtaLink`] documentation. Prefer
-    /// [`BleBootTransport`](crate::ble::BleBootTransport) on desktop, which
-    /// enforces the `"8bt"` scan/service resolution and takes the single-owner
-    /// BLE lock.
+    /// The caller owns the trust contract in the [`MobileBootLink`] docs.
     #[must_use]
-    pub const fn new(transport: T) -> Self {
+    pub const fn from_native(transport: T) -> Self {
         Self(transport)
     }
 
@@ -285,12 +301,12 @@ impl<T: Transport> OtaLink<T> {
     }
 }
 
-impl<T: Transport> sealed::Sealed for OtaLink<T> {}
+impl<T: Transport> sealed::Sealed for MobileBootLink<T> {}
 
-impl<T: Transport> OtaTransport for OtaLink<T> {}
+impl<T: Transport> OtaTransport for MobileBootLink<T> {}
 
 #[async_trait]
-impl<T: Transport> Transport for OtaLink<T> {
+impl<T: Transport> Transport for MobileBootLink<T> {
     async fn send(&self, data: &[u8]) -> Result<(), Error> {
         self.0.send(data).await
     }
@@ -762,6 +778,13 @@ const RECOVERY_ENTER_BOOT: &str =
      controller is idle, and retry EnterBoot; if the controller already advertises \"8bt\", create \
      a new OtaUpdate (phase Idle) and start from prepare_boot.";
 
+/// Recovery text for a failed App-link teardown after EnterBoot.
+const RECOVERY_ENTER_BOOT_RELEASE: &str =
+    "EnterBoot was accepted but the App Mode link could not be closed. The boot link takes the \
+     same single-owner BLE lock as App Mode, so disconnect/drop the App Mode session (and any GUI \
+     or session process holding the lock) before connecting to \"8bt\"; then create a new \
+     OtaUpdate (phase Idle) and call prepare_boot.";
+
 /// Recovery text for an EraseFlash failure.
 const RECOVERY_ERASE: &str =
     "flash erase was sent but not acknowledged, so the application area may be erased. Start \
@@ -794,8 +817,10 @@ const RECOVERY_JUMP: &str =
 /// Construct one per update attempt:
 ///
 /// 1. [`OtaUpdate::enter_boot`] on the App Mode [`Session`] (`0x000C`),
-/// 2. reconnect to `"8bt"` (service FF20 / characteristic FF21) and keep the
-///    boot [`OtaTransport`],
+/// 2. close/drop the App Mode [`Session`] and reconnect to `"8bt"` (service
+///    FF20 / characteristic FF21); the boot link shares the single-owner BLE
+///    lock with App Mode, so a live App session yields [`Error::BleBusy`].
+///    [`OtaUpdate::enter_boot_and_release`] combines steps 1 and the teardown,
 /// 3. [`OtaUpdate::prepare_boot`] (`readPID`, `gamepad_type` check, optional
 ///    `readVersionInBoot`) returns a [`BootReady`] guard,
 /// 4. [`OtaUpdate::write_firmware`] with that guard (erase / write / finalize /
@@ -926,6 +951,12 @@ impl OtaUpdate {
     /// the expected end state. Either way no flash frame is sent here; the next
     /// gate is [`OtaUpdate::prepare_boot`] on the `"8bt"` link.
     ///
+    /// The App Mode session **must be dropped/disconnected before**
+    /// [`BleBootTransport::connect`](crate::ble::BleBootTransport::connect):
+    /// both links take the same single-owner BLE lock, so a live App session
+    /// makes the boot connect fail with [`Error::BleBusy`]. Use
+    /// [`OtaUpdate::enter_boot_and_release`] to do both steps in one call.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidRequest`] unless the phase is [`OtaPhase::Idle`],
@@ -968,6 +999,38 @@ impl OtaUpdate {
                 RECOVERY_ENTER_BOOT,
             )),
         }
+    }
+
+    /// Send EnterBoot, then consume the App Mode [`Session`] and close its link.
+    ///
+    /// This is the recommended pairing for a real update: EnterBoot makes the
+    /// controller reboot, and the App Mode link must be closed before
+    /// [`BleBootTransport::connect`](crate::ble::BleBootTransport::connect) can
+    /// take the single-owner BLE lock for `"8bt"` (otherwise it returns
+    /// [`Error::BleBusy`]). The helper calls [`OtaUpdate::enter_boot`], then
+    /// [`Session::into_inner`] and [`Transport::disconnect`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`OtaUpdate::enter_boot`], or [`Error::Ota`] with stage
+    /// [`OtaFailureStage::EnterBoot`] when the App link teardown fails. In that
+    /// case the boot link cannot take the lock; close the App session and
+    /// restart from a new `OtaUpdate`.
+    pub async fn enter_boot_and_release<T: Transport>(
+        &mut self,
+        app: Session<T>,
+    ) -> Result<(), Error> {
+        self.enter_boot(&app).await?;
+        let transport = app.into_inner();
+        if let Err(error) = transport.disconnect().await {
+            return Err(self.fail(
+                OtaFailureStage::EnterBoot,
+                OtaWriteState::Untouched,
+                error,
+                RECOVERY_ENTER_BOOT_RELEASE,
+            ));
+        }
+        Ok(())
     }
 
     /// Read the bootloader PID, verify `gamepad_type`, and optionally read the
@@ -3082,7 +3145,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ota_link_adapter_allows_an_external_boot_transport() {
+    async fn mobile_boot_link_allows_an_external_boot_transport() {
         let image_bytes = one_sector_image();
         let image = FirmwareImage::parse(&image_bytes).unwrap();
         let mock = high_mtu_mock();
@@ -3101,7 +3164,7 @@ mod tests {
 
         // UniFFI injects a native transport through this adapter; the sealed
         // OtaTransport marker is implemented by the crate, not downstream.
-        let link = OtaLink::new(&mock);
+        let link = MobileBootLink::from_native(&mock);
         assert_eq!(link.mtu(), 92);
         let mut update = new_update();
         let ready = update.prepare_boot(&link).await.unwrap();
@@ -3116,11 +3179,49 @@ mod tests {
     }
 
     #[test]
-    fn ota_link_adapter_returns_the_wrapped_transport() {
+    fn mobile_boot_link_returns_the_wrapped_transport() {
         let mock = high_mtu_mock();
-        let link = OtaLink::new(mock);
+        let link = MobileBootLink::from_native(mock);
         let mock = link.into_inner();
         assert_eq!(mock.mtu(), 92);
+    }
+
+    #[tokio::test]
+    async fn mobile_boot_link_delegates_receive_errors() {
+        let transport = PendingAfter::new(vec![pid_response(UT2_BOOT_PID)]);
+        let link = MobileBootLink::from_native(&transport);
+        let mut update = update_with_timeouts(OtaTimeouts {
+            version: Duration::from_millis(1),
+            ..OtaTimeouts::default()
+        });
+
+        let error = update.prepare_boot(&link).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                Error::Ota {
+                    stage: OtaFailureStage::ReadVersion,
+                    state: OtaWriteState::Untouched,
+                    ..
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(update.packets_sent(), 2);
+    }
+
+    #[tokio::test]
+    async fn enter_boot_and_release_closes_the_app_link() {
+        let mock = high_mtu_mock();
+        mock.push_incoming(&frame(cmd::RESPONSE, cmd::ENTER_BOOT, &[]));
+        let session = Session::new(&mock);
+        let mut update = new_update();
+
+        update.enter_boot_and_release(session).await.unwrap();
+
+        assert_eq!(update.phase(), OtaPhase::AwaitingBootReconnect);
+        assert!(mock.is_disconnected());
     }
 
     #[test]

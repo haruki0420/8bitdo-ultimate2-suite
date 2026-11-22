@@ -123,7 +123,10 @@ pub struct BleBootOptions {
     ///
     /// `None` (the default) uses the production lock path. The boot link takes
     /// the same lock as the App Mode link, so an OTA cannot race a resident
-    /// `session` / GUI for the adapter.
+    /// `session` / GUI for the adapter. **The App Mode session must already be
+    /// disconnected/dropped before connecting to `"8bt"`**; otherwise connect
+    /// returns [`Error::BleBusy`]. Only tests/tools should override this path
+    /// to a temporary file.
     pub lock_path: Option<PathBuf>,
 }
 
@@ -387,6 +390,10 @@ impl BleBootTransport {
     /// The advertised name is fixed to [`BOOT_BLE_NAME`]; `options.address`,
     /// timeouts and verbose logging are honored. Service `FF20` is resolved
     /// with characteristic `FF21` first, then `FF23`.
+    ///
+    /// The App Mode session must be disconnected/dropped first: this call takes
+    /// the same single-owner BLE lock and returns [`Error::BleBusy`] otherwise.
+    /// `OtaUpdate::enter_boot_and_release` closes the App link after EnterBoot.
     ///
     /// # Errors
     ///
