@@ -15,8 +15,8 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 ### 実装済み
 
 - **BLE 設定モード（`80ND`）への接続と読み取り**: Switch に接続したまま Profile ボタン約 3 秒で設定モードに入り、version / 2768B 設定 / マクロ 3 slot × 4 / リアルタイム入力 / keepalive を取得。20ms `0x0003` keepalive、per-user BLE 単一所有ロック、degraded 時の終了コード 3。
-- **設定の書き込みとボタンリマップ（BLE）**: `config write` / `config set` / `config remap` / `config map show`。予約バイト保持、CRC 再計算、必須 pre-write backup、前後 SHA-256、TOCTOU 再読込、read-back 検証。**実機確認済み**。
-- **マクロのバックアップ・書き込み・復元（BLE）**: `macro backup` / `macro write` / `macro restore`。公式順序（Header `0xD8` → Save → Erase → Write → Save）と Write `total_len` の**絶対終端**。**実機確認済み**（slot S1 の M1/M2）。
+- **設定の書き込みとボタンリマップ（BLE）**: `config write` / `config set` / `config remap` / `config map show`。予約バイト保持、CRC 再計算、必須 pre-write backup、前後 SHA-256、TOCTOU 再読込、read-back 検証。**実機確認済み**（full write / remap のみ。`config set` 各フィールドは未確認）。
+- **マクロのバックアップ・書き込み・復元（BLE）**: `macro backup` / `macro write` / `macro restore`。公式順序（Header `0xD8` → Save → Erase → Write → Save）と Write `total_len` の**絶対終端**。**実機確認済み**（slot S1 の M1/M2。**Switch 側の発動は未確認**）。
 - **読み取り専用 GUI**: egui / Pure Rust。日本語 UI、燻しスレートのテーマ、Noto Sans JP 同梱。デバイス / ライブ入力 / 設定値 / ログの 4 タブ。設定・マクロ・ファームウェアの書き込みは行わない。
 - **セッション REPL**: 1 接続で `info` / `config dump` / `backup` / `monitor` / `macro backup` / `config map show` などを実行。書込系は `--allow-macro-write` / `--allow-config-write` と確認が必須。
 - **マクロ・設定の JSON / TOML I/O**: `MacroFile` のインポート / エクスポート。1ms 解像度・8-bit スティック / トリガー値を保持。
@@ -40,16 +40,16 @@ main は `6b39e23`（2026-11-23）時点。フェーズの詳細・残課題は 
 | 1 | `eightbitdo-protocol`（CRC・ヘッダ・2768B・KeyMap・マクロ・入力） | 完了（単体 100 + doc test 4） |
 | 2a | 読み取り専用 core / CLI / `session` REPL | 完了・実機確認済み |
 | 2b | BLE マクロ backup / write / restore | 完了・実機確認済み（S1 の M1/M2。Switch 側の発動は未確認） |
-| 2c | BLE OTA 状態機械 | **core のみ**。Mock 55 テスト。実機未検証・CLI/GUI/UniFFI 未配線 |
-| 2d | 設定 write / set / remap（BLE） | 完了・実機確認済み |
+| 2c | BLE OTA 状態機械 | **core のみ**。Mock 55（`mobile-boot` 有効時）/ 52（既定）テスト。実機未検証・CLI/GUI/UniFFI 未配線 |
+| 2d | 設定 write / set / remap（BLE） | 完了・実機確認済み（full write / remap のみ。`config set` 各フィールドは未確認） |
 | 3a | 読み取り専用 GUI | 完了（PR #9） |
 | 3b〜3d | GUI 書き込み UI / マクロエディタ / OTA 画面 | `feat/gui-write` で進行中（未マージ） |
 | 4 | USB OTA | 保留（USB Boot TX 未文書化） |
 | 5 | UniFFI + iOS / Android | 雛形完了。実機・JNI 同梱 APK・配布は未着手 |
 
-**実機で確認済み（Linux・BLE・MTU 200、2026-11-21〜23）**: version / 2768B dump / マクロ backup、マクロ書込（絶対終端 `total_len`）と復元、設定 full write（39 packets・74B chunk・read-back SHA 一致）、remap A→B→A。
+**実機で確認済み（Linux・BLE・MTU 200、2026-11-21〜23）**: version / 2768B dump / マクロ backup、マクロ書込（絶対終端 `total_len`）と復元、設定 full write（38 write + 1 Save = 合計 39 packets・74B chunk・read-back SHA 一致）、remap A→B→A。**設定の実機確認範囲は full write / remap のみ**（`config set` 各フィールド・`--force-raw`・MTU 200 以外は未確認）。
 
-**未確認**: slot S2/S3・`macro_idx=2/3 (M3/M4)`、MTU 200 以外、USB HID の config / macro write、GUI / REPL からの書込、OTA の wire / ACK / アドレス / MTU、macOS / Windows / Android / iOS 実機。
+**未確認**: slot S2/S3・`macro_idx=2/3 (M3/M4)`、MTU 200 以外、USB HID の config / macro write、`config set` の各フィールド実機確認、`--force-raw` / `--accept-reserved-drift`、GUI / REPL からの書込、OTA の wire / ACK / アドレス / MTU、macOS / Windows / Android / iOS 実機。
 
 ---
 
@@ -100,7 +100,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 - `config set <field> <value>` — プロファイル名、cur_slot、gamepad_mode、rumble / joy / trigger / gyro / LED、`map_key.flag`。範囲外は I/O 前に拒否。joy / trigger はレコード flag=1、LED color はテーマ flag=1 の副作用あり（help に明記）。
 - `config remap <physical> <target>` — 1 ボタンのみ（4B）変更。`config map show` で 22 index を表示。
 - 安全策: **pre-write backup 必須**（`config.bin` + `config.json`）、`--yes` なしの確認、前後 SHA-256、確認後の TOCTOU 再読込、read-back 検証、マクロヘッダ変更警告。書込 chunk は既定 `min(MTU, 74)`（RE: 公式 74B）で、`--write-chunk` は接続前上限 **180**（観測 MTU 200 のペイロード上限）まで指定可能。
-- raw `config write` の検証: 22 個の `button_mappings`、`gyro.key_map`、全レコードの flag 0/1、マクロ `max_steps`（0/0xFFFF/1..=200）・`total_cnt`、マクロ `key_map`（`macro write --trigger` と同じ任意 KeyMap）を確認。不明な `cur_slot`（実機観測 6 など）は警告して保持。`--force-raw` は未文書値の復旧用（予約領域ガードは維持）。
+- raw `config write` の検証: 22 個の `button_mappings`、`gyro.key_map`、全レコードの flag 0/1、マクロ `max_steps`（0/0xFFFF/1..=200）・`total_cnt`、マクロ `key_map`（`macro write --trigger` と同じ任意 KeyMap）を確認。不明な `cur_slot`（実機観測 6 など）は警告して保持。`--force-raw` は未文書値の復旧用（予約領域ガードは維持）。**既知の不整合**: 実機の `map_key.flag` は slot 0/1 = `0x20200911`、slot 2 = `0xFFFFFFFF` で意味は未確定（opaque）。現行の 0/1 検証は実機値と合わないため、実機 dump の書き戻しには `--force-raw` が必要（別 PR で修正予定）。
 - `session --allow-config-write` の REPL からも `config set` / `config remap` / `config write --file` を実行できる（`config map show` と `config dump` はフラグ不要の read-only）。書込は `--yes` で対話確認なし、無い場合は `yes` 入力の確認、pre-write backup、前後 SHA-256、read-back 検証付き。確認待ちの間は operation lock を解放して 20ms keepalive を継続し、確認プロンプトは Ctrl-C で中止できる（pre-write backup は残る）。実書込（最初の `0x0001` 以降）だけが operation lock 下の Ctrl-C 非キャンセル区間で、書込後は keepalive が再開する。
 - 既知の差: 公式 BLE Save は 2000ms / 最大 2 再送（静的解析）だが、本実装は 3 秒 / リトライなし。USB config write は未実装。
 - BLE 競合・degraded 対策: `scan` / `connect` / `session` と `BleTransport::connect` を使う全 CLI コマンド（info / config / macro / backup / monitor / keepalive）は、BLE を触る前に **per-user** 単一所有者 flock を取得する。パスは環境非依存で、`EIGHTBITDO_BLE_LOCK`（テスト/ラッパー用の信頼された例外）→ NSS（`getpwuid_r`）の euid ホーム由来の `~/.cache/8bitdo/8bitdo-ble.lock` → ホーム不明時のみ temp の per-user dir。**XDG_RUNTIME_DIR / XDG_CACHE_HOME / `$HOME` は参照しない**ので、デスクトップ/SSH/cron/systemd で同じユーザーなら同じロックになる。`O_NOFOLLOW` と fd メタデータ検証で symlink / 非通常ファイル / 他ユーザー所有を拒否し、既定パスでは既存 parent が euid 所有かつ group/other write なし・**symlink でない**ことを検証し、Unix は dirfd（`openat`）で TOCTOU も閉じる。取得できなければ「別プロセスが BLE を使用中」として失敗する（`session` は接続保持中ロックを保持し、teardown 成功時のみ解放）。別ユーザー同士は排他しない。`session` の keepalive が **I/O エラー連続 3 回**（無応答は failure に数えない）/ `Disconnected` で degraded になると終了コード **3** で終了し、自動再接続しない（コマンドが観測した `Disconnected` は exit 1）。切断と同時に App Mode を抜けて `80ND` が広告されなくなるため、再開には Profile 約 3 秒押しが必要である旨を表示する。SIGINT は範囲に応じて警告する（REPL 終了 0 / connect 前・info/config/macro 130 / backup・monitor・keepalive は全体を 130 / flash は prepare（ファイル読込・backup・確認プロンプト）が**キャンセル可**で、最初の flash フレーム以降だけ**遅延**して完了後に復旧案内 + 130）。`scan --check` は 1 行出力し、exit 0 = App Mode あり / 3 = なし / その他 = エラーで、人間向け出力の grep は不要。常駐運用は `scripts/session-loop.sh`（exit 0 では最低 2 秒待ってから `scan --check` し、見えれば指数 backoff で再起動、見えなければ押下案内して停止。bash 4 + GNU date 必須、macOS 非対応）。押下を依頼する前に `scan` で `80ND` を確認する手順は [docs/SESSION_OPERATIONS.md](docs/SESSION_OPERATIONS.md) を参照。
@@ -128,7 +128,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 
 ## ファームウェア更新（OTA）の現状
 
-- **BLE OTA**: `crates/eightbitdo-core/src/ota.rs` に状態機械を実装済み（Mock 55 テスト。`mobile-boot` 有効時、既定 52）。ただし **実機 btsnoop 未取得・実機書込未検証・CLI / GUI / UniFFI 未配線**です。未確認 wire の実行時ゲートは既定 OFF。
+- **BLE OTA**: `crates/eightbitdo-core/src/ota.rs` に状態機械を実装済み（Mock 55（`mobile-boot` 有効時）/ 52（既定）テスト）。ただし **実機 btsnoop 未取得・実機書込未検証・CLI / GUI / UniFFI 未配線**です。未確認 wire の実行時ゲートは既定 OFF。
 - **公式 `.dat` の制約**: 現実装は **単一セクション `.dat` のみ**対応。公式ファームがマルチセクションの場合は更新を拒否するため、これは公式ファーム対応の **blocker** です。
 - **ACK 照合**: 現状は cmd/subcmd のみで、Bootloader ACK の `offset` / `total_len` を照合していません。遅延・重複 ACK の誤帰属を防ぐため、**CLI 配線前に照合を追加するのが必須**です。
 - **USB OTA**: USB Boot の TX フレーミングが未文書化のため `N/A + 理由（USB Boot TX 未文書化）`。BLE の `"8bt"` / prefix `0x05` を流用しません。
@@ -164,7 +164,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 - [x] 公式アプリ（Android v2.01 / Windows v1.38）の通信プロトコル・バイナリ構造・OTA シーケンスの解析完了
 - [x] 完全仕様書・実装計画書・AI 引き継ぎドキュメント作成
 - [x] Phase 1: `eightbitdo-protocol`（Rust プロトコル・構造体・CRC・マクロ、単体テスト 100 件 + doc test 4 件）
-- [x] Phase 2: `eightbitdo-core` + `eightbitdo-cli`（BLE 実機通信＆検証）
+- [ ] Phase 2: `eightbitdo-core` + `eightbitdo-cli`（BLE 実機通信＆検証。**2a / 2b / 2d は完了、2c BLE OTA は core 実装のみで未完了**）
   - [x] Phase 2a: 読み取り専用 core / CLI / `session`（`eightbitdo session [--interval-ms 20] [--allow-macro-write] [--allow-config-write] [--no-report-enable]` の REPL は `info` / `config dump` / `backup` / `monitor` / `monitor stop` / `status` / `help` / `quit`。REPL には `macro backup <DIR>`（読み取りのみ、常に利用可）/ `macro write <SLOT> <INDEX> <FILE> [--trigger <KEY>] [--chunk-size <32|64>]` / `macro restore <DIR> [--force]` もあり、書込系は `--allow-macro-write`（既定 OFF）が必要。`session` は既定で起動時に `0x0007 enable(1)` を送る（公式相当）ため REPL の `macro write` は enable 状態で動き（トップレベル `macro write` の既定とは条件が異なる）、`--no-report-enable` 指定時は起動時の enable(1) を送らず `0x0003` keepalive のみを継続する（終了時の disable(0) は best-effort。トップレベル既定と同じ書込条件で A/B するため）。`--allow-macro-write` 時の `macro write` / `macro restore` は、ファイル読込・pre-write/pre-restore backup を含むコマンド全体で Ctrl-C を遅延する（非通常ファイルは読取前に拒否し、デバイス I/O は timeout で有界。SIGKILL・電源断は防げない）。REPL の `macro write` は `--backup-dir`（既定名 `macro-backup-<unix-nanos>-<pid>-<sequence>`）、`macro restore` は `--chunk-size` を指定できず、REPL 経由の実機書込は未検証。設定バックアップは `--raw` / `--json` を同一ディレクトリの一時ファイル経由でアトミックに書き、同一ファイルを指す 2 つの出力パスは拒否する。ただし hard link の同一性検出は Unix のみで、Windows は file identity 未実装のため hard link alias を事前拒否せず、raw 書き込み後の再検証と `rename` semantics で保護する。この再検証は偶発的な alias 用であり、出力ディレクトリに write 権限を持つ攻撃者による TOCTOU / 並行 rename は非保証である）
   - [x] Phase 2b: マクロ読み書き（実機確認済み。BLE・slot S1 の M1/M2。M3/M4・S2/S3 は外挿）
   - [ ] Phase 2c: BLE OTA（Linux。core 実装済み・Mock 55 テスト（`mobile-boot` 有効時。既定 52）。**単一セクション `.dat` のみ対応**で公式 `.dat` がマルチセクションの場合は未対応（公式ファーム対応の blocker）、未確認 wire ゲート既定 OFF、boot 専用 `BleBootTransport` のみ許可（App Session を切断してから `8bt` に接続。同一 BLE ロック）、type 1 application ウィンドウを暫定検証、CLI/GUI 未配線、実機書込は保留。マルチセクション対応と実機 wire 確定は次 PR の必須項目）

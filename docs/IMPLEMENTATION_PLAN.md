@@ -159,7 +159,7 @@ Track A: コア / CLI（Linux・デスクトップ）
   Phase 1  protocol                 完了（単体 100 + doc 4）
   Phase 2a read-only + session      完了・実機確認済み
   Phase 2b macro write              完了・実機確認済み（S1 の M1/M2。M3/M4・S2/S3 は外挿）
-  Phase 2c BLE OTA                  core のみ完了（Mock 55）。実機 wire 未確定・未配線
+  Phase 2c BLE OTA                  core のみ完了（Mock 55 / 既定 52）。実機 wire 未確定・未配線
   Phase 2d config apply             完了・実機確認済み（BLE・MTU 200・74B chunk）
   Phase 2e USB / 2.4G transport     保留
 
@@ -181,7 +181,7 @@ Track C: モバイル
 | Phase 2a | 完了。実機で ReadVersion **200 (0xC8)**、2768B dump（SHA-256 `1dca47fa...59c600`）、20ms keepalive **128.9 秒**、`session` の info / config dump / backup / monitor を確認 |
 | Phase 2b | 完了（PR #6）。実機（BLE・slot S1）でマクロ書込・読み戻し・restore を確認。Write `0x0103` の `total_len` は絶対終端が必須。**Switch 側でのマクロ発動は未確認**。M3/M4・S2/S3・USB HID は未確認 |
 | Phase 2c | core 実装済み（PR #11）。Mock 55 テスト（既定 52）。**実機 btsnoop 未取得、CLI / GUI / UniFFI 未配線、実機書込未検証**。マルチセクション `.dat` 非対応が公式ファーム対応の blocker |
-| Phase 2d | 完了（PR #7）。実機（BLE・MTU 200・74B chunk）で full 2768B write → Save → read-back 一致、`config remap` A→B→A を同一接続で確認。USB config write は未実装 |
+| Phase 2d | 完了（PR #7）。実機（BLE・MTU 200・74B chunk）で full 2768B write → Save → read-back 一致、`config remap` A→B→A を同一接続で確認。**実機確認は full write / remap のみ**で、`config set` 各フィールド・`--force-raw`・MTU 200 以外は未確認。USB config write は未実装 |
 | Phase 3a | 完了（PR #9）。読み取り専用 GUI、日本語、燻しスレート。デバイス / ライブ入力 / 設定値 / ログの 4 タブ。書き込みは行わない |
 | Phase 3b〜3d | 未マージ。`feat/gui-write` で GUI 書き込み UI を進行中 |
 | Phase 4 | 保留（USB Boot TX 未文書化） |
@@ -233,6 +233,7 @@ Track C: モバイル
   - restore は「backup で空、現在は非空」を `--force` なしで拒否。`--force` は読めない現在マクロの skipped のみ許可し、pre-restore backup の書込み失敗は `--force` でも中止。全空 slot は 216B ヘッダのみ書込
   - `MacroFile.cycles_num` / `interval_ms` は省略可能（未指定は既存値保持）。`gamepad_mode` は無視
 - **完了条件**: 実機で 1 マクロ書き込み → 読み戻し一致 → 元のマクロへ復元（**書込・読み戻し・復元は実機確認済み。Switch 側でのマクロ発動確認は未実施**）。
+- **完了条件の変更（レビュー指摘）**: 当初の「Switch 側で発動」は未確認のため、実機で確認できた「書込 → 読み戻し一致 → 復元」を完了条件とし、**Switch 側の発動確認は未確認のまま完了扱い**として §5.4 の残課題に分離した。
 - **Tier**: **3**（write-path / Flash / CRC / マクロ）。
 - **状態**: **完了（実機で書込・読み戻し・復元まで確認。Switch 側でのマクロ発動は未確認）**。読み取り・バックアップ（142B チャンク、offset エコー）に加え、**2026-11-22 実機（BLE・slot S1・`macro_idx=0/1 (M1/M2)`）: Write `0x0103` の `total_len` を絶対終端 `(macro_idx << 12) + align32(steps * 10)` にすることで `macro_idx=1` の永続化を確認**（相対値 `align32(steps * 10)` では ACK のみで未永続。`macro_idx=0` は base 0 のため両者一致）。**restore も実行し、復元後の config SHA-256 が書込前の `1dca47fa...59c600` に一致した。** `macro_idx=2/3 (M3/M4)` と slot S2/S3 は式からの外挿で未確認。これが既定。CLI `--write-total-relative` は旧 framing に戻す A/B 用。USB HID の Write は未実装・未検証（BLE のみ実装）。残る未確定点は `PROTOCOL_SPEC.md` §6.5（ACK 形状 / total_len 照合、Save タイムアウト、config CRC 再計算、MTU 200 以外での実機挙動）。
 
@@ -267,18 +268,19 @@ Track C: モバイル
 - **ゴール**: 2768B 全体の書込み + Save を CLI から安全に実行する。
 - **実装状況（2026-11-23、BLE のみ。実機 write / remap 確認済み）**:
   - core `config_ops`: デバイス snapshot に型付き編集を適用し、予約バイト（`0x1F4..0x68C` / `0x914..0x92C`）を保持、`ANSI_CRC_16_sh` を再計算して **2768B 全体を `0x0001` 分割送信 → `0x0006/0x0067` Save → `0x0002` read-back 検証**。CRC 不一致・ACK 失敗は `ConfigWriteStage`（Write/Save/Verify）+ `ConfigWriteState`（NotSaved/Saved）で fail-closed。失敗時は段階別の復旧文を返す。
-  - 書込 chunk の既定は **`min(MTU ペイロード, 74)`**（RE: 公式書込上限 74B、`MAX_ATT_MTU 92 - 0x12`。静的解析・実機未確認）。`--write-chunk <BYTES>` は接続前に **1..=180**（観測 MTU 200 のペイロード上限）で検証し、任意サイズ（例: 180B、旧 MTU 連動の A/B）を指定可能。接続後は交渉 MTU の上限も検証する。
+  - 書込 chunk の既定は **`min(MTU ペイロード, 74)`**（RE: 公式書込上限 74B、`MAX_ATT_MTU 92 - 0x12`。静的解析。既定 74B での実機 write は確認済み）。`--write-chunk <BYTES>` は接続前に **1..=180**（観測 MTU 200 のペイロード上限）で検証し、任意サイズ（例: 180B、旧 MTU 連動の A/B）を指定可能。接続後は交渉 MTU の上限も検証する。
   - CLI: `config dump` / **`config write --file <2768B>`** / **`config set <field> <value>`** / **`config remap <physical> <target>`** / **`config map show`**。`config write` はファイル読込・既知フィールド検証を **BLE 接続前** に行う。
   - 安全策: **pre-write backup 必須**（`config.bin` + `config.json`、`REVIEW_TIERS` §6 の例外としてマクロ step sector は対象外）、`--yes` なしの対話確認、**前後 SHA-256 表示**、確認後の **TOCTOU 再読込**（変化時は中止）、read-back 検証、ゲームパッドモード / cur_slot 変更とマクロヘッダ（`0x68C..0x914`）変更の警告。
   - 復旧: `config write --file <backup>/config.bin --yes`。device が予約バイトを正規化した場合は `--accept-reserved-drift` で現在の device 予約バイトに合わせる。
-  - **実機確認（2026-11-23、BLE・MTU 200・74B chunk）**: full 2768B write を **39 packets** で送信し、Save 後の read-back SHA-256 が送信内容と一致した。device は送信した CRC を保持し（`stored` 一致、`in_place` 解釈とは不一致）、`config remap A B` の反映（read-back で A→B）と B→A への復帰を同一接続で確認した。書込前後で `config-backup-*` が作成され、各回の before / after SHA-256 が記録されている。
+  - **実機確認（2026-11-23、BLE・MTU 200・74B chunk）**: **確認範囲は `config write --file` の full 2768B write と `config remap` のみ**。full write は **38 write + 1 Save（合計 39 packets）**で送信し、Save 後の read-back SHA-256 が送信内容と一致した。device は送信した CRC を保持し（`stored` 一致、`in_place` 解釈とは不一致）、`config remap A B` の反映（read-back で A→B）と B→A への復帰を同一接続で確認した。書込前後で `config-backup-*` が作成され、各回の before / after SHA-256 が記録されている。**`config set` の各フィールド、`--force-raw` / `--accept-reserved-drift`、MTU 200 以外は未確認。**
   - 検証: `config set` は joy start `0..=127` / end `0..=128`、gyro sensitivity `1..=15`、hotwheel speed `0..=15`、rumble level `0..=5`、flag 類 `0/1`、`gyro.key` は `config remap` と同じ documented single-`KeyMap` ホワイトリスト（227・未知ビット・複合拒否）。
   - raw `config write --file` も同じ検証を行う: 22 `key[]` と `gyro[].key_map` は documented single `KeyMap`、全レコード（joy/trigger/rumble/gyro/special/mapKey/LED/macro）の flag は 0/1、マクロ `max_steps` は 0/0xFFFF/1..=200・`total_cnt <= 4`。**マクロ `key_map` は `macro write --trigger` と同じ任意 KeyMap を受理**する（複合トリガーの復旧経路を塞がないため）。数値範囲（joy/hotwheel/gyro/rumble）は **flag==1 のときのみ**検証し、key_map / flag は常時検証する（disabled レコードは保持）。不明な `cur_slot`（実機観測 6 など）は警告して保持する。
   - 未文書値の復旧用に `config write --force-raw`（whitelist/range/enum を警告に降格。予約領域ガードは維持）を提供する。
-  - **未実装 / 未確認**: USB HID config write（BLE のみ）、MTU 200 以外の実機挙動、`config set` の joy/trigger flag=1・LED color flag=1 の副作用（help に明記）、公式 BLE Save の 2000ms / 2 再送との差（本実装は 3 秒 / リトライなし。`PROTOCOL_SPEC` §6.4 に記録）、device の予約バイト正規化（drift）の実例。
-- **完了条件**: 各セクションの書き込み → 読み戻し一致（実機で確認済み）。
+  - **未実装 / 未確認**: USB HID config write（BLE のみ）、`config set` の各フィールド実機確認、`--force-raw` / `--accept-reserved-drift` の実機確認、MTU 200 以外の実機挙動、`config set` の joy/trigger flag=1・LED color flag=1 の副作用（help に明記）、公式 BLE Save の 2000ms / 2 再送との差（本実装は 3 秒 / リトライなし。`PROTOCOL_SPEC` §6.4 に記録）、device の予約バイト正規化（drift）の実例。
+  - **既知の不整合（別 PR で修正予定）**: 実機の `map_key.flag` は slot 0/1 = `0x20200911`、slot 2 = `0xFFFFFFFF` で意味は未確定（opaque）。現行コードの raw 検証は `flag = 0/1` のみ許可するため、実機 dump の書き戻しには `--force-raw` が必要。
+- **完了条件**: 各セクションの書き込み → 読み戻し一致（**実機確認は full 2768B write と remap のみ。`config set` の各フィールドは未確認**）。
 - **Tier**: **3**。
-- **状態**: **完了（実機確認済み。BLE・MTU 200・74B chunk）**。
+- **状態**: **完了（実機確認範囲: full 2768B write / remap。BLE・MTU 200・74B chunk）**。
 
 ### Phase 2e: USB HID / 2.4G トランスポート（保留）
 - **ゴール**: USB 有線 / 2.4G レシーバ経由の App Mode。
