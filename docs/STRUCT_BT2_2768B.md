@@ -532,25 +532,26 @@ struct Bt2Header {
    - `subcmd = (gamepad_mode << 8) | slot`
    - `offset = (macro_idx << 12) + chunk_index * chunk_size`
    - `total_len = align32(max_steps * 10)`
-   - `chunk_size` は MTU 連動（64 / 32）、`--chunk-size 32` で **32B 均一**（460B → 480B = 15 × 32B、500B → 512B = 16 × 32B）。32/64 以外は `UnsupportedChunkSize`。
+   - `chunk_size` は MTU 連動（64 / 32）、`--chunk-size 32` で **32B 均一**（460B → 480B = 15 × 32B、500B → 512B = 16 × 32B）。`--chunk-size 64` は 64B 基本で最終チャンクが 32B になり得る（均一は 32B 指定のみ）。32/64 以外は `UnsupportedChunkSize`。
    - ペイロード: `max_steps * 10` バイト＋32B アライメント用ゼロパディング。各チャンクに CRC-16/MODBUS。
-   - **最終チャンクの ACK 後 50ms** 待ってから次の Save を送る（`MACRO_WRITE_SETTLE_DELAY`、暫定値）。
+   - slot バッチ restore では、Step 3–4 をバッチ内の各マクロについて繰り返す。**全マクロの最終 Write ACK 後 50ms** 待ってから最終 Save を送る（`MACRO_WRITE_SETTLE_DELAY`、暫定値）。
 5. **Step 5: 最終 Save (`Save`)**
    - **BLE**: `cmd = 0x0006, subcmd = 0x0067, offset = 0, len = 0, total_len = 0`
-   - 公式 `EraseMacroDataDone` / `WriteMacroDataDone` の連鎖後に Save を送る。
+   - slot バッチにつき **1 回だけ**送る。公式 `EraseMacroDataDone` / `WriteMacroDataDone` の連鎖後に Save を送る。
 6. **Step 6: 読み戻し検証 (`Read`)**
    - 最終 Save ACK 後 **300ms** 待ってから `cmd = 0x0002` で 2768B config を読み、対象 slot の **216B ヘッダ**が送信した `header_bytes` と一致することを確認する（`MACRO_VERIFY_DELAY`、暫定値）。
-   - 続けて `cmd = 0x0102` で `(slot, macro_idx)` を読み、`max_steps * 10` バイトが書き込んだ `MacroDatas` と一致することを確認する。
+   - 続けて `cmd = 0x0102` でバッチ内の各 `(slot, macro_idx)` を読み、`max_steps * 10` バイトが書き込んだ `MacroDatas` と一致することを確認する。
+   - full config の `stored_crc` / `computed_crc` も取得し、`config_crc_valid` を返す。invalid でも書き込みは失敗させず、CLI が「config CRC is invalid; a full 2768B config write may be required」と警告する。
 
 > ACK は各コマンド送信後の transport `wait_ack` で待つ。マクロの `Erase` / `Write` / ヘッダは 2 秒（実装定数 `0x44fa0000`）。マクロ `Save` は 3 秒で **リトライしない**（USB HID の仕様記載。BLE は未文書化のため暫定で 3 秒を使う）。OTA の 10 秒 erase / 1 秒 chunk / 64B 固定はマクロに適用しない。
 
 > **実装ノート（Mock 検証済み・実機書き込み未検証）**:
-> - **実機観測（2026-11-22）**: 旧順序（Erase → Write → Header(total_len=0x0AD0) → Save）で macro 0（500B）は成功し、macro 1（460B）だけが全 ACK 後に `0x0102` zeros で Verify 失敗した。216B ヘッダは一致していた。公式 RE の **Header(total_len=0xD8) → Save → Erase/Write → Save** との差分を原因候補とし、本実装を公式順序に変更した。最終 32B チャンク仮説に対しては `--chunk-size 32` も利用できる。RE 根拠: `getBT2_WriteMacroi` / `writeCustomConfig_onfinished` / `writeBT2Macro_onfinished` / `EraseMacroDataDone` / `WriteMacroDataDone`。
-> - **Fail-closed**: Header または最初の Save が失敗したら Erase を送らない。Erase / Write の失敗時はヘッダが既に Save 済みなので `saved = true` とし、バックアップから復元する。最終 Save / Verify の失敗も `saved = true` で、再書き込みしない。
+> - **実機観測（2026-11-22）**: 旧順序（Erase → Write → Header(total_len=0x0AD0) → Save）で macro 0（500B）は成功し、macro 1（460B）だけが全 ACK 後に `0x0102` zeros で Verify 失敗した。216B ヘッダは一致していた。公式 RE の **Header(total_len=0xD8) → Save → Erase/Write → Save** との差分を原因候補とし、本実装を公式順序に変更した。**新順序は実機未検証**。最終 32B チャンク仮説に対しては `--chunk-size 32` も利用できる。Header Save → Erase の settle は 0ms。RE 根拠: `getBT2_WriteMacroi` / `writeCustomConfig_onfinished` / `writeBT2Macro_onfinished` / `EraseMacroDataDone` / `WriteMacroDataDone`。
+> - **Fail-closed / 状態**: `Error::MacroWrite` は `MacroWriteState::{NotSaved, HeaderSaved, DataSaved}` で区別する。Header 失敗は Save/Erase 未送信で sector 未変更（`NotSaved`）。最初の Save 失敗は Erase/Write 未送信で sector 未変更、Erase/Write 失敗はヘッダ Save 済みで sector が消去/部分書込の可能性（`HeaderSaved`）。最終 Save / Verify の失敗はヘッダ + データ送信済み（`DataSaved`）。`HeaderSaved` / `DataSaved` は再書き込みせず、12 マクロ backup から復元する。
 > - **空きマクロ拒否**: `max_steps == 0` / `0xFFFF` への `macro write` は `Error::EmptyMacroWrite` で拒否する。step data の clear が未実装で、`macro write` では新規作成できない。`macro restore` はバックアップが非空なら現在のマクロが空でも書ける（pre-restore backup と 216B ヘッダ更新を使う）。
 > - **ヘッダ値**: `max_steps` は新しいステップ数。`key_map` / `cycles_num` / `interval_ms` / `flag` / `total_cnt` は指定がなければ既存値を保持する。既存の予約バイト（slot `+0x05..+0x07`、record `+0x26..+0x27`）も保持する。
 > - **CRC**: 216B の Header 部分書込には config CRC (`+0x00C`) を含めない（公式の部分書込と同じ）。Save 時に device が CRC を再計算するかは実機未確認。
-> - Header / Write のチャンク長は **MTU 連動**。`max_payload = mtu - 3 - 17` とし、Header は `min(142, max_payload)`、Write は `max_payload >= 64` → 64B、`>= 32` → 32B、それ未満は書き込み開始前に `Error::MtuTooSmall`。MTU 200 は 142 + 74 / 64B、MTU 64 は 44×4 + 40 / 32B、MTU 23 は Header 3×72 だが Write 不可。Mock で全フレームが `mtu - 3` 以下であることを固定済み。実機は MTU 200 のみを想定検証する。
+> - Header / Write のチャンク長は **MTU 連動**。`max_payload = mtu - 3 - 17` とし、Header は `min(142, max_payload)`、Write は `max_payload >= 64` → 64B、`>= 32` → 32B、それ未満は書き込み開始前に `Error::MtuTooSmall`。MTU 200 は 142 + 74 / 64B、MTU 64 は 44×4 + 40 / 32B、MTU 23 は Header 3×72 で header-only restore は実行可、非空マクロの Write は不可。Mock で全フレームが `mtu - 3` 以下であることを固定済み。実機は MTU 200 のみを想定検証する。
 > - **USB**: USB 32B 書き込みは未実装。`SaveTransport::Usb` は `Error::Unsupported` で拒否し、CLI は BLE のみを使う。
 
 #### マクロ読み出し手順

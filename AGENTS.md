@@ -60,7 +60,7 @@
 2. **構造体の未知・予約バイト保全**:
    - 2768 バイト構造体を編集する際は必ず元のバイトバッファを保持した上で変更箇所だけ上書きし、`ANSI_CRC_16_sh` を再計算してから書き込むこと。
 3. **マクロ Flash 書き込み順序**:
-   - 必ず `Erase (0x0104, total_len = chunk_len = 0x1000, ペイロードなし)` → `Write (0x0103, BLE 64B / USB HID 32B（32B アライン。それ以外は拒否。64B 超は 64B にクランプしてから判定）, 最終チャンクは 32B アライン長)` → `Macro ヘッダ更新 (0x0001)` → `Save (0x0006)` の順序を守ること。マクロの `Erase` / `Write` / ヘッダは 2 秒、`Save` は 3 秒・リトライなし（BLE の正式値は未文書化。USB HID は 3 秒）。OTA の 10 秒 / 1 秒 / 64B 固定をマクロに適用しない。
+   - 必ず `Macro ヘッダ更新 (0x0001, total_len=0xD8)` → `Save (0x0006)` → `Erase (0x0104, total_len = chunk_len = 0x1000, ペイロードなし)` → `Write (0x0103, BLE 64B / USB HID 32B（32B アライン。それ以外は拒否。64B 超は 64B にクランプしてから判定）, 最終チャンクは 32B アライン長)` → `Save (0x0006)` の順序を守ること。`macro restore` の slot 単位バッチでは、ヘッダ + 最初の Save を slot に 1 回、最終 Save を全マクロの Erase/Write 後に 1 回だけ送る。マクロの `Erase` / `Write` / ヘッダは 2 秒、`Save` は 3 秒・リトライなし（BLE の正式値は未文書化。USB HID は 3 秒）。OTA の 10 秒 / 1 秒 / 64B 固定をマクロに適用しない。
    - 216B のマクロヘッダ部分書込は config CRC `+0x00C` を wire に載せない（`docs/PROTOCOL_SPEC.md` §6.5）。
 4. **OTA（ファームウェア更新）の安全性**:
    - `enterBoot 0x000C` → BLE Boot は `"8bt"` へ再接続 → `readPID 0x0008` (5s)、USB Boot は **RX** `[0x00,0x05]` → `readPID cmd=0x0000/subcmd=0x0008` (5s) の前提を確認し、`readPID` の結果から `gamepad_type` を判定すること。`readVersionInBoot 0x0005` の offset `0x01017040` は type 1 用で、非 type 1 は推測せず `docs/PROTOCOL_SPEC.md` / Issue を確認して停止すること。
