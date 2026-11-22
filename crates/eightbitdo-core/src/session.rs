@@ -69,7 +69,7 @@ pub const MAX_WAIT: Duration = Duration::from_secs(3600 * 24 * 365 * 30);
 /// [`tokio::time::Instant::add`] panics on overflow, and the CLI accepts
 /// user-supplied durations (`--scan-timeout`, `--timeout`, `--hold`), so every
 /// deadline goes through this helper.
-fn deadline_after(duration: Duration) -> Result<Instant, Error> {
+pub(crate) fn deadline_after(duration: Duration) -> Result<Instant, Error> {
     if duration > MAX_WAIT {
         return Err(Error::InvalidTimeout(duration));
     }
@@ -279,6 +279,12 @@ impl<T: Transport> Session<T> {
         &self.transport
     }
 
+    /// Per-frame wait configured with [`Session::with_timeout`].
+    #[must_use]
+    pub(crate) fn per_frame_timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// Consume the session and return the transport.
     #[must_use]
     pub fn into_inner(self) -> T {
@@ -305,7 +311,7 @@ impl<T: Transport> Session<T> {
     /// A drop (Ctrl-C, `monitor stop`) leaves `needs_resync` false, but the
     /// guard's own `Drop` bumps it back to true for reads: an abandoned read
     /// always leaves a response behind.
-    async fn run_read<F, O>(&self, read: F) -> Result<O, Error>
+    pub(crate) async fn run_read<F, O>(&self, read: F) -> Result<O, Error>
     where
         F: Future<Output = Result<O, Error>>,
     {
@@ -324,7 +330,7 @@ impl<T: Transport> Session<T> {
     /// If stale frames may still be queued, the flag stays set so the next
     /// read retries the drain, and the current read is refused instead of
     /// risking a stale frame being mistaken for its response.
-    async fn prepare_read(&self) -> Result<(), Error> {
+    pub(crate) async fn prepare_read(&self) -> Result<(), Error> {
         if self.needs_resync.load(Ordering::SeqCst) {
             match self.drain_pending(DrainPolicy::RESYNC).await {
                 Ok(DrainOutcome::Quiesced) => {
@@ -840,7 +846,7 @@ impl<T: Transport> Session<T> {
     /// Returns `Ok(None)` for a payload-less acknowledgement or an unrelated
     /// command, and an error for a response envelope that names a different
     /// request or transfer size.
-    fn classify_response(
+    pub(crate) fn classify_response(
         frame: &[u8],
         request_cmd: u16,
         expected_len: usize,
@@ -925,14 +931,14 @@ impl<T: Transport> Session<T> {
 }
 
 /// Byte buffer that tracks which positions have been filled.
-struct TransferBuffer {
+pub(crate) struct TransferBuffer {
     data: Vec<u8>,
     filled: Vec<bool>,
     received: usize,
 }
 
 impl TransferBuffer {
-    fn new(len: usize) -> Self {
+    pub(crate) fn new(len: usize) -> Self {
         Self {
             data: vec![0u8; len],
             filled: vec![false; len],
@@ -940,7 +946,7 @@ impl TransferBuffer {
         }
     }
 
-    fn insert(&mut self, offset: usize, chunk: &[u8]) -> Result<(), Error> {
+    pub(crate) fn insert(&mut self, offset: usize, chunk: &[u8]) -> Result<(), Error> {
         let expected = self.data.len();
         let end = offset
             .checked_add(chunk.len())
@@ -965,20 +971,20 @@ impl TransferBuffer {
         Ok(())
     }
 
-    fn received(&self) -> usize {
+    pub(crate) fn received(&self) -> usize {
         self.received
     }
 
-    fn is_complete(&self) -> bool {
+    pub(crate) fn is_complete(&self) -> bool {
         self.received == self.data.len()
     }
 
-    fn into_vec(self) -> Vec<u8> {
+    pub(crate) fn into_vec(self) -> Vec<u8> {
         self.data
     }
 }
 
-fn out_of_range(offset: usize, expected: usize) -> Error {
+pub(crate) fn out_of_range(offset: usize, expected: usize) -> Error {
     Error::UnexpectedResponse(format!(
         "chunk offset 0x{offset:X} is outside the {expected}-byte transfer"
     ))

@@ -12,6 +12,7 @@
 #![warn(missing_docs)]
 
 pub mod error;
+pub mod macro_ops;
 pub mod mock;
 pub mod session;
 pub mod transport;
@@ -20,6 +21,7 @@ pub mod transport;
 pub mod ble;
 
 pub use error::Error;
+pub use macro_ops::{MacroBackup, MacroEntry, MACRO_READ_TOTAL_TIMEOUT};
 pub use mock::MockTransport;
 pub use session::{
     ConfigSnapshot, Session, VersionInfo, CONFIG_TOTAL_TIMEOUT, DEFAULT_TIMEOUT,

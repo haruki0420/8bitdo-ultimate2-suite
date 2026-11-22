@@ -2,8 +2,8 @@
 //! controller.
 //!
 //! The binary exposes `scan`, `info`, `config dump`, `backup`, `monitor`,
-//! `keepalive` and `session`. No configuration write, macro flash, save or OTA
-//! command is reachable from this binary.
+//! `keepalive`, `session` and `macro backup`. No configuration write, macro
+//! flash write, save or OTA command is reachable from this binary.
 
 use std::future::Future;
 use std::io::{IsTerminal, Write};
@@ -17,10 +17,12 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use eightbitdo_core::{
-    scan_devices, BleOptions, BleTransport, ConfigSnapshot, Error, Session, Transport, VersionInfo,
+    macro_ops::is_skipped_steps, scan_devices, BleOptions, BleTransport, ConfigSnapshot, Error,
+    MacroBackup, MacroEntry, Session, Transport, VersionInfo,
 };
-use eightbitdo_protocol::config_bt2::{Slot, CONFIG_SIZE};
+use eightbitdo_protocol::config_bt2::{MacroIndex, Slot, CONFIG_SIZE, MACROS_PER_SLOT, SLOT_COUNT};
 use eightbitdo_protocol::input_report::InputReport;
+use eightbitdo_protocol::macro_data::MacroStep;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
@@ -69,6 +71,12 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+
+    /// Macro operations (read-only; flash write is not implemented yet).
+    Macro {
+        #[command(subcommand)]
+        command: MacroCommand,
     },
 
     /// Read version and configuration in one connection, optionally holding it.
@@ -126,6 +134,17 @@ enum ConfigCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum MacroCommand {
+    /// Back up all 3 slots × 4 macros (12 entries) into a directory.
+    Backup {
+        /// Output directory for config.bin, config.json, macros.json,
+        /// macros.toml and the per-macro raw .bin files.
+        #[arg(long, value_name = "DIR")]
+        dir: PathBuf,
+    },
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -153,6 +172,11 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
         Command::Config { command } => match command {
             ConfigCommand::Dump { raw, json } => {
                 dump_config(&options, raw.as_deref(), json.as_deref()).await?;
+            }
+        },
+        Command::Macro { command } => match command {
+            MacroCommand::Backup { dir } => {
+                macro_backup(&options, &dir).await?;
             }
         },
         Command::Backup { raw, json, hold } => {
@@ -811,6 +835,231 @@ async fn backup_session<T: Transport>(
             stats.sent, stats.received
         );
     }
+    Ok(())
+}
+
+/// One JSON/TOML entry for one macro in a backup directory.
+#[derive(Debug, serde::Serialize)]
+struct MacroBackupDocumentEntry {
+    /// Slot index (`0..=2`), matching `Macro_Pro3_Struct` order.
+    slot: u8,
+    /// Human-facing profile number (`1..=3`).
+    profile: u8,
+    /// Macro index (`0..=3`), matching `MacroFunPro3Record` order.
+    index: u8,
+    /// Display id (`M1`..`M4`).
+    id: &'static str,
+    /// Stored UTF-16BE name decoded to text.
+    name: String,
+    /// `true` when `max_steps` is `0` or the `0xFFFF` unset marker.
+    skipped: bool,
+    /// Why the flash read was skipped (`None` when read).
+    skip_reason: Option<&'static str>,
+    /// Raw `max_steps` value from the configuration header.
+    max_steps: u16,
+    /// Trigger key mask from the configuration header.
+    key_map: u32,
+    /// Name of the trigger key when it is a known single value.
+    key_map_name: Option<&'static str>,
+    /// Loop count (`0` = hold / infinite).
+    cycles_num: u32,
+    /// Delay between loops in milliseconds.
+    interval_ms: u32,
+    /// Relative file name of the raw step bytes (`None` when skipped).
+    raw_file: Option<String>,
+    /// SHA-256 of the raw step bytes (`None` when skipped).
+    raw_sha256: Option<String>,
+    /// Decoded 10-byte steps for human editing (raw `.bin` is canonical).
+    steps: Vec<MacroStep>,
+}
+
+/// Machine-readable manifest written as both `macros.json` and `macros.toml`.
+#[derive(Debug, serde::Serialize)]
+struct MacroBackupDocument {
+    /// Manifest format version.
+    format: u32,
+    /// Relative file name of the 2768-byte configuration snapshot.
+    config_file: &'static str,
+    /// SHA-256 of the 2768-byte configuration snapshot.
+    config_sha256: String,
+    /// Raw `gamepad_mode` at `+0x010`; the low 8 bits form the macro `subcmd`.
+    gamepad_mode: u16,
+    /// Always 3.
+    slot_count: usize,
+    /// Always 4.
+    macros_per_slot: usize,
+    /// All 12 entries in slot-major order.
+    macros: Vec<MacroBackupDocumentEntry>,
+}
+
+/// Read the configuration and all 3 slots × 4 macros into `dir`.
+async fn macro_backup(options: &BleOptions, dir: &Path) -> Result<(), Error> {
+    let transport = BleTransport::connect(options).await?;
+    let session = Session::new(transport);
+    let result = macro_backup_session(&session, dir).await;
+    best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
+    result
+}
+
+/// One-connection macro backup: config snapshot, then every macro, then files.
+///
+/// Files are written only after every macro read succeeds, so a directory
+/// never looks like a complete backup while one read is missing.
+async fn macro_backup_session<T: Transport>(session: &Session<T>, dir: &Path) -> Result<(), Error> {
+    println!("reading configuration...");
+    let snapshot = session.read_config_snapshot().await?;
+    let config_sha256 = sha256_hex(snapshot.config.as_bytes());
+    println!("read config: {CONFIG_SIZE} bytes, sha256 {config_sha256}");
+    println!(
+        "gamepad_mode: {} ({})",
+        snapshot.config.gamepad_mode_raw(),
+        snapshot
+            .config
+            .gamepad_mode()
+            .map_or_else(|| "unknown".to_string(), |mode| format!("{mode:?}"))
+    );
+
+    let mut entries = Vec::with_capacity(SLOT_COUNT * MACROS_PER_SLOT);
+    for slot in Slot::ALL {
+        for index in MacroIndex::ALL {
+            let entry = session.read_macro(&snapshot, slot, index).await?;
+            print_macro_progress(&entry);
+            entries.push(entry);
+        }
+    }
+    let backup = MacroBackup::new(snapshot.clone(), entries)?;
+
+    write_macro_backup(dir, &snapshot, &backup, &config_sha256)?;
+    println!("wrote macro backup: {}", dir.display());
+    println!("  config.bin / config.json");
+    println!("  macros.json / macros.toml");
+    println!("  per-macro raw .bin files (skipped entries have none)");
+    Ok(())
+}
+
+fn print_macro_progress(entry: &MacroEntry) {
+    let slot = entry.slot();
+    let index = entry.index();
+    let record = entry.record();
+    let label = macro_id(index);
+    if is_skipped_steps(record.max_steps) {
+        let reason = if record.max_steps == 0 {
+            "max_steps = 0"
+        } else {
+            "max_steps = 0xFFFF (unset marker)"
+        };
+        println!(
+            "slot {} (profile {}) macro {} ({}): {}, skipped",
+            slot.index(),
+            slot.number(),
+            index.index(),
+            label,
+            reason
+        );
+    } else {
+        println!(
+            "slot {} (profile {}) macro {} ({}): max_steps = {}, read {} bytes",
+            slot.index(),
+            slot.number(),
+            index.index(),
+            label,
+            record.max_steps,
+            entry.raw().len()
+        );
+    }
+}
+
+fn macro_id(index: MacroIndex) -> &'static str {
+    match index {
+        MacroIndex::M1 => "M1",
+        MacroIndex::M2 => "M2",
+        MacroIndex::M3 => "M3",
+        MacroIndex::M4 => "M4",
+    }
+}
+
+fn macro_skip_reason(max_steps: u16) -> Option<&'static str> {
+    match max_steps {
+        0 => Some("max_steps = 0"),
+        u16::MAX => Some("max_steps = 0xFFFF (unset marker; 実機未確認)"),
+        _ => None,
+    }
+}
+
+/// Write a complete backup directory.
+///
+/// `config.bin` and per-macro `.bin` files are raw bytes. `macros.json` and
+/// `macros.toml` carry the same manifest including SHA-256 digests and decoded
+/// steps. The manifest is written last.
+fn write_macro_backup(
+    dir: &Path,
+    snapshot: &ConfigSnapshot,
+    backup: &MacroBackup,
+    config_sha256: &str,
+) -> Result<(), Error> {
+    std::fs::create_dir_all(dir)?;
+    if !dir.is_dir() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a directory", dir.display()),
+        )));
+    }
+
+    write_atomic(&dir.join("config.bin"), snapshot.config.as_bytes())?;
+    let summary = json_summary(snapshot, config_sha256);
+    let encoded = serde_json::to_string_pretty(&summary).map_err(std::io::Error::other)?;
+    write_atomic(&dir.join("config.json"), format!("{encoded}\n").as_bytes())?;
+
+    let mut entries = Vec::with_capacity(SLOT_COUNT * MACROS_PER_SLOT);
+    for entry in backup.entries() {
+        let slot = entry.slot();
+        let index = entry.index();
+        let record = entry.record();
+        let skipped = is_skipped_steps(record.max_steps);
+
+        let (raw_file, raw_sha256) = if skipped {
+            (None, None)
+        } else {
+            let file_name = format!("slot{}-macro{}.bin", slot.index(), index.index());
+            write_atomic(&dir.join(&file_name), entry.raw())?;
+            (Some(file_name), Some(sha256_hex(entry.raw())))
+        };
+
+        entries.push(MacroBackupDocumentEntry {
+            slot: slot.index() as u8,
+            profile: slot.number(),
+            index: index.index() as u8,
+            id: macro_id(index),
+            name: record.name(),
+            skipped,
+            skip_reason: macro_skip_reason(record.max_steps),
+            max_steps: record.max_steps,
+            key_map: record.key_map.bits(),
+            key_map_name: record.key_map.name(),
+            cycles_num: record.cycles_num,
+            interval_ms: record.interval_ms,
+            raw_file,
+            raw_sha256,
+            steps: entry.steps().to_vec(),
+        });
+    }
+
+    let document = MacroBackupDocument {
+        format: 1,
+        config_file: "config.bin",
+        config_sha256: config_sha256.to_string(),
+        gamepad_mode: snapshot.config.gamepad_mode_raw(),
+        slot_count: SLOT_COUNT,
+        macros_per_slot: MACROS_PER_SLOT,
+        macros: entries,
+    };
+
+    let json = serde_json::to_string_pretty(&document).map_err(std::io::Error::other)?;
+    write_atomic(&dir.join("macros.json"), format!("{json}\n").as_bytes())?;
+    let toml = toml::to_string_pretty(&document).map_err(std::io::Error::other)?;
+    write_atomic(&dir.join("macros.toml"), toml.as_bytes())?;
+
+    println!("config sha256: {config_sha256}");
     Ok(())
 }
 
@@ -4788,5 +5037,97 @@ mod tests {
             version.is_ok(),
             "read_version after an abandoned input poll must succeed: {version:?}"
         );
+    }
+
+    #[test]
+    fn macro_backup_writes_manifest_and_skips_unset_steps() {
+        use eightbitdo_protocol::config_bt2::{GamepadMode, MacroRecord};
+        use eightbitdo_protocol::macro_data::{self, MacroStep};
+        use eightbitdo_protocol::KeyMap;
+
+        let dir = scratch_dir("macro-backup");
+        let mut config = Bt2Config::zeroed();
+        config.set_gamepad_mode(GamepadMode::Switch);
+
+        let mut record = MacroRecord {
+            max_steps: 2,
+            key_map: KeyMap::M1,
+            cycles_num: 3,
+            interval_ms: 20,
+            ..MacroRecord::default()
+        };
+        record.set_name("Combo").unwrap();
+        config.set_macro_record(Slot::S1, MacroIndex::M1, &record);
+
+        let mut unset = MacroRecord {
+            max_steps: u16::MAX,
+            ..MacroRecord::default()
+        };
+        unset.set_name("Unset").unwrap();
+        config.set_macro_record(Slot::S2, MacroIndex::M3, &unset);
+        config.recompute_crc();
+
+        let stored_crc = config.crc16_stored() as u16;
+        let mut check = config.clone();
+        let computed_crc = check.recompute_crc();
+        let snapshot = ConfigSnapshot {
+            config: config.clone(),
+            stored_crc,
+            computed_crc,
+            crc_valid: stored_crc == computed_crc,
+        };
+
+        let steps = vec![MacroStep::neutral(10), MacroStep::neutral(20)];
+        let raw = macro_data::encode_macro_steps(&steps).unwrap()[..20].to_vec();
+        let mut entries = Vec::new();
+        for slot in Slot::ALL {
+            for index in MacroIndex::ALL {
+                let entry_record = config.macro_record(slot, index);
+                let entry_raw = if slot == Slot::S1 && index == MacroIndex::M1 {
+                    raw.clone()
+                } else {
+                    Vec::new()
+                };
+                entries.push(MacroEntry::new(slot, index, entry_record, entry_raw).unwrap());
+            }
+        }
+        let backup = MacroBackup::new(snapshot.clone(), entries).unwrap();
+
+        write_macro_backup(&dir, &snapshot, &backup, "config-sha").unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.join("config.bin")).unwrap().len(),
+            CONFIG_SIZE
+        );
+        assert_eq!(std::fs::read(dir.join("slot0-macro0.bin")).unwrap(), raw);
+        assert!(!dir.join("slot1-macro2.bin").exists());
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("macros.json")).unwrap())
+                .unwrap();
+        assert_eq!(json["macros"].as_array().unwrap().len(), 12);
+        let read = &json["macros"][0];
+        assert_eq!(read["slot"], 0);
+        assert_eq!(read["index"], 0);
+        assert_eq!(read["id"], "M1");
+        assert_eq!(read["max_steps"], 2);
+        assert_eq!(read["raw_file"], "slot0-macro0.bin");
+        assert_eq!(read["steps"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            json["macros"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["skipped"] == true)
+                .count(),
+            11
+        );
+
+        let toml: toml::Value =
+            toml::from_str(&std::fs::read_to_string(dir.join("macros.toml")).unwrap()).unwrap();
+        assert_eq!(toml["macros"].as_array().unwrap().len(), 12);
+        assert_eq!(toml["config_sha256"].as_str(), Some("config-sha"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
