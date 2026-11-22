@@ -7262,4 +7262,150 @@ mod tests {
         assert!(read_restore_backup(Path::new(".")).is_err());
         assert!(read_restore_backup(Path::new("./")).is_err());
     }
+    #[tokio::test]
+    async fn macro_write_session_backs_up_all_macros_then_writes_and_verifies() {
+        let root = scratch_dir("macro-write-success");
+        let fixture_dir = root.join("fixture");
+        let (snapshot, backup) = backup_fixture(&fixture_dir);
+        let backup_dir = root.join("prewrite");
+
+        let mock = MockTransport::with_mtu(200);
+        push_config_responses(&mock, &snapshot.config);
+        push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M1);
+        mock.push_response(&CustomHeader::new(commands::cmd::ERASE_MACRO, 0, 0, 0), &[]);
+        mock.push_response(&CustomHeader::new(commands::cmd::WRITE_MACRO, 0, 0, 0), &[]);
+        mock.push_response(
+            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
+            &[],
+        );
+        mock.push_response(
+            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
+            &[],
+        );
+        mock.push_response(&CustomHeader::new(commands::cmd::SAVE, 0, 0, 0), &[]);
+        push_config_responses(&mock, &snapshot.config);
+        push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M1);
+
+        let session = Session::new(&mock);
+        macro_write_session(
+            &session,
+            Slot::S1,
+            MacroIndex::M1,
+            &test_macro_file(),
+            None,
+            &backup_dir,
+        )
+        .await
+        .expect("full backup -> write -> verify must succeed");
+
+        assert!(backup_dir.join("config.bin").is_file());
+        assert_eq!(
+            std::fs::read(backup_dir.join("config.bin")).unwrap().len(),
+            CONFIG_SIZE
+        );
+        let manifest: MacroBackupDocument =
+            serde_json::from_str(&std::fs::read_to_string(backup_dir.join("macros.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest.macros.len(), 12);
+        let order: Vec<(u8, u8)> = manifest
+            .macros
+            .iter()
+            .map(|entry| (entry.slot, entry.index))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (0, 0),
+                (0, 1),
+                (0, 2),
+                (0, 3),
+                (1, 0),
+                (1, 1),
+                (1, 2),
+                (1, 3),
+                (2, 0),
+                (2, 1),
+                (2, 2),
+                (2, 3),
+            ]
+        );
+
+        let loaded = read_restore_backup(&backup_dir).unwrap();
+        assert_eq!(
+            loaded.get(Slot::S1, MacroIndex::M1).unwrap().steps().len(),
+            2
+        );
+        assert!(loaded.get(Slot::S1, MacroIndex::M2).unwrap().is_empty());
+
+        let sent = mock.sent_frames();
+        let count = |command: u16| {
+            sent.iter()
+                .filter(|frame| CustomHeader::parse(&frame[1..]).unwrap().cmd == command)
+                .count()
+        };
+        assert_eq!(count(commands::cmd::READ_CONFIG), 40);
+        assert_eq!(count(commands::cmd::READ_MACRO), 2);
+        assert_eq!(count(commands::cmd::ERASE_MACRO), 1);
+        assert_eq!(count(commands::cmd::WRITE_MACRO), 1);
+        assert_eq!(count(commands::cmd::WRITE_CONFIG), 2);
+        assert_eq!(count(commands::cmd::SAVE), 1);
+
+        let write = sent
+            .iter()
+            .find(|frame| {
+                CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::WRITE_MACRO
+            })
+            .map(|frame| CustomHeader::parse(&frame[1..]).unwrap())
+            .unwrap();
+        assert_eq!(write.subcmd, 0);
+        assert_eq!(write.offset, 0);
+        assert_eq!(write.total_len, 32);
+        assert_eq!(write.chunk_len, 32);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn macro_write_non_target_unreadable_macro_sends_no_write_frames() {
+        use eightbitdo_protocol::config_bt2::{GamepadMode, MacroRecord};
+
+        let root = scratch_dir("macro-nontarget-unreadable");
+        let backup_dir = root.join("prewrite");
+        let mut config = Bt2Config::zeroed();
+        config.set_gamepad_mode(GamepadMode::Switch);
+        for (slot, index) in [(Slot::S1, MacroIndex::M1), (Slot::S2, MacroIndex::M1)] {
+            config.set_macro_record(
+                slot,
+                index,
+                &MacroRecord {
+                    max_steps: 2,
+                    ..MacroRecord::default()
+                },
+            );
+        }
+        config.recompute_crc();
+        let snapshot = config_snapshot(config);
+
+        let mock = MockTransport::with_mtu(200);
+        push_config_responses(&mock, &snapshot.config);
+        push_macro_read(&mock, &snapshot.config, Slot::S1, MacroIndex::M1);
+        let session = Session::new(&mock);
+        let result = macro_write_session(
+            &session,
+            Slot::S1,
+            MacroIndex::M1,
+            &test_macro_file(),
+            None,
+            &backup_dir,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!mock
+            .sent_frames()
+            .iter()
+            .any(|frame| is_write_command(frame)));
+        assert!(!backup_dir.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
