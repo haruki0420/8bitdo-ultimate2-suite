@@ -6589,7 +6589,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn macro_write_pre_backup_failure_sends_no_write_frames() {
+    async fn macro_write_config_read_failure_sends_no_write_frames() {
         let root = scratch_dir("macro-prebackup-fail");
         let backup_dir = root.join("backup");
         let mock = MockTransport::new();
