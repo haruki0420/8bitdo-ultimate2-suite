@@ -1179,8 +1179,9 @@ fn offset_mode_error(
 ) -> Error {
     Error::UnexpectedResponse(format!(
         "macro chunk response offset 0x{reported:X} does not match requested 0x{requested:X} \
-         (chunk offset 0x{chunk_offset:X}, mode {mode:?}); absolute and relative echoes must not \
-         be mixed within one macro"
+         (chunk offset 0x{chunk_offset:X}, mode {mode:?}); a leading 0 is neither absolute nor \
+         relative, so the next non-zero offset must be the requested absolute offset or the \
+         sector-relative chunk offset, and modes must not be mixed"
     ))
 }
 
@@ -1534,6 +1535,35 @@ mod tests {
         }
         assert_eq!(entry.raw(), raw);
         assert_eq!(entry.read_offsets(), &response_offsets);
+    }
+
+    #[tokio::test]
+    async fn read_macro_rejects_unresolved_leading_zero() {
+        let mut config = config_with_macros();
+        let mut record = config.macro_record(Slot::S1, MacroIndex::M3);
+        record.max_steps = 30;
+        config.set_macro_record(Slot::S1, MacroIndex::M3, &record);
+        config.recompute_crc();
+        let snapshot = snapshot(config);
+
+        let steps = sample_steps(30);
+        let raw = sample_entry_payload(&steps);
+        let mock = MockTransport::new();
+        let mut first = envelope(cmd::READ_MACRO, 300, 0, &raw[..142]);
+        first.crc16 = packet_crc16(&raw[..142]);
+        mock.push_response(&first, &raw[..142]);
+        let mut second = envelope(cmd::READ_MACRO, 300, 999, &raw[142..284]);
+        second.crc16 = packet_crc16(&raw[142..284]);
+        mock.push_response(&second, &raw[142..284]);
+
+        let session = Session::new(&mock);
+        let result = session
+            .read_macro(&snapshot, Slot::S1, MacroIndex::M3)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::UnexpectedResponse(message)) if message.contains("leading 0")
+        ));
     }
 
     #[tokio::test]
@@ -2718,6 +2748,25 @@ mod write_tests {
             MacroBackup::new(snapshot, mismatched),
             Err(Error::UnexpectedResponse(message)) if message.contains("does not match")
         ));
+    }
+
+    #[tokio::test]
+    async fn write_macro_rejects_base_header_total_cnt_above_four() {
+        let mut config = config_with_existing_macro();
+        let mut header = config.macro_slot(Slot::S1);
+        header.total_cnt = 5;
+        config.set_macro_slot(Slot::S1, &header);
+        config.recompute_crc();
+        let backup = backup_from(config);
+        let plan = MacroWritePlan::new(sample_steps(10));
+
+        let transport = ScriptedTransport::new(Vec::new(), true, 200);
+        let session = Session::new(&transport);
+        let result = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await;
+        assert!(matches!(result, Err(Error::Protocol(_))));
+        assert!(transport.sent().is_empty());
     }
 
     #[tokio::test]
