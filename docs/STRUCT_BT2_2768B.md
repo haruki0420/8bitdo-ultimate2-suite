@@ -529,14 +529,18 @@ struct Bt2Header {
    - **BLE**: `cmd = 0x0006, subcmd = 0x0067, offset = 0, len = 0, total_len = 0`
    - **USB**: `cmd = 0x0006, subcmd = 0x0123, offset = 0, len = 0, total_len = 0`
 5. **Step 5: 読み戻し検証 (`Read`)**
-   - `cmd = 0x0102` で `(slot, macro_idx)` を読み、`max_steps * 10` バイトが書き込んだ `MacroDatas` と一致することを確認する。
+   - `cmd = 0x0002` で 2768B config を読み、対象 slot の **216B ヘッダ**が送信した `header_bytes` と一致することを確認する。
+   - 続けて `cmd = 0x0102` で `(slot, macro_idx)` を読み、`max_steps * 10` バイトが書き込んだ `MacroDatas` と一致することを確認する。
 
-> ACK は各コマンド送信後の transport `wait_ack` で待つ。マクロの `Erase` / `Write` / ヘッダは 2 秒（実装定数 `0x44fa0000`）。マクロ `Save` は 3 秒（USB HID の仕様記載。BLE は未文書化のため暫定で 3 秒を使う）。OTA の 10 秒 erase / 1 秒 chunk / 64B 固定はマクロに適用しない。
+> ACK は各コマンド送信後の transport `wait_ack` で待つ。マクロの `Erase` / `Write` / ヘッダは 2 秒（実装定数 `0x44fa0000`）。マクロ `Save` は 3 秒で **リトライしない**（USB HID の仕様記載。BLE は未文書化のため暫定で 3 秒を使う）。OTA の 10 秒 erase / 1 秒 chunk / 64B 固定はマクロに適用しない。
 
 > **実装ノート（Mock 検証済み・実機書き込み未検証）**:
 > - **Fail-closed**: Erase / Write / Header のいずれかが失敗したら Save を送らない。ただし Erase 済み・Write 途中のセクタは変更されている可能性がある。Save 後の ACK または読み戻しが失敗した場合だけ `saved = true` として報告する。どちらも 3 スロット × 4 マクロの完全バックアップから復元する。
-> - **ヘッダ値**: `max_steps` は新しいステップ数。`key_map` / `cycles_num` / `interval_ms` / `flag` / `total_cnt` は指定がなければ既存値を保持する。未使用マクロ（`max_steps == 0` または `0xFFFF`）へ書く場合、CLI は `flag = 1` と `total_cnt = max(existing, macro_idx + 1)` を設定し、`--trigger` がなければ `key_map` を `0` のままにする。**この未使用マクロの有効化ポリシーは実機未確認**。
+> - **空きマクロ拒否**: `max_steps == 0` / `0xFFFF` への書き込みは `Error::EmptyMacroWrite` で拒否する。clear が未実装で restore できないため、既存の非空マクロだけを対象にする。
+> - **ヘッダ値**: `max_steps` は新しいステップ数。`key_map` / `cycles_num` / `interval_ms` / `flag` / `total_cnt` は指定がなければ既存値を保持する。既存の予約バイト（slot `+0x05..+0x07`、record `+0x26..+0x27`）も保持する。
+> - **CRC**: 216B の Header 部分書込には config CRC (`+0x00C`) を含めない（公式の部分書込と同じ）。Save 時に device が CRC を再計算するかは実機未確認。
 > - Header / Write のチャンク長は **MTU 連動**。`max_payload = mtu - 3 - 17` とし、Header は `min(142, max_payload)`、Write は `max_payload >= 64` → 64B、`>= 32` → 32B、それ未満は書き込み開始前に `Error::MtuTooSmall`。MTU 200 は 142 + 74 / 64B、MTU 64 は 44×4 + 40 / 32B、MTU 23 は Header 3×72 だが Write 不可。Mock で全フレームが `mtu - 3` 以下であることを固定済み。実機は MTU 200 のみを想定検証する。
+> - **USB**: USB 32B 書き込みは未実装。`SaveTransport::Usb` は `Error::Unsupported` で拒否し、CLI は BLE のみを使う。
 
 #### マクロ読み出し手順
 

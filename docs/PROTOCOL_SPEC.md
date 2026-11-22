@@ -477,7 +477,13 @@ sequenceDiagram
     - `+0x06` (`u16`): `leftJoy`（左スティック座標パック値）
     - `+0x08` (`u16`): `rightJoy`（右スティック座標パック値）
 
-### 6.5 マクロ書き込み実装ノート（Mock 検証済み・実機未検証）
+### 6.4 USB HID と BLE での Save サブコマンド差異
+
+- **BLE (Android `getSaveCustomConfigChannel`)**: `cmd = 0x0006`, **`subcmd = 0x0067`** を使用。BLE の `Save` タイムアウトは仕様書に記載がないため、本実装は暫定 3 秒・リトライなしとする（§6.5）。
+- **Windows USB HID (`8BitDoAdvance.dll::saveUltimateBT2`)**: `cmd = 0x0006`, **`subcmd = 0x0123`** を使用（**USB HID の Save タイムアウトは `3` 秒**）。
+- いずれも応答で `cmd == 0x0006` と対応する `subcmd` の ACK が返る。プラットフォームやトランスポートに応じて適切な `subcmd` を選択すること（誤った `subcmd` では Flash 保存が確定しない可能性がある）。**USB の 3 秒は Windows USB HID の値であり、BLE の正式値ではない。BLE は §6.5 の暫定 3 秒・リトライなしを使う。**
+
+### 6.5 マクロ書き込み / restore 実装ノート（Mock 検証済み・実機未検証）
 
 `eightbitdo-core` の `write_macro` は次の順序を固定する。実機への書き込みはまだ行っていない。
 
@@ -488,34 +494,45 @@ sequenceDiagram
    - MTU 64: `max_payload = 44` → **44 × 4 + 40**（61B / 61B / 61B / 61B / 57B フレーム）
    - MTU 23: `max_payload = 3` → **3 × 72**（20B フレーム）。ただし `0x0103` は 32B チャンクを作れないため、Header を送る前に `Error::MtuTooSmall` で中止する。
    - すべての送信フレームは `mtu - 3` 以下。`BleTransport::send` の上限に合わせるため、`mtu - 17` ではなく **`mtu - 3 - 17`** を使う。
-4. **Save (`0x0006`)**: BLE `subcmd = 0x0067`。ACK は 3 秒（BLE の正式値は未文書化。Windows USB HID の 3 秒を暫定使用）。
-5. **Read-back (`0x0102`)**: Save ACK 後に同じ `(slot, macro_idx)` を読み、`steps * 10` バイトが一致することを確認する。
+   - 216B の Header 部分書込には config CRC (`+0x00C`) を含めない。これは公式の 216B 部分書込と同じである。Save 時に device が CRC を再計算するかは**実機未確認**。
+4. **Save (`0x0006`)**: BLE `subcmd = 0x0067` のみ。ACK は 3 秒で、**リトライしない**。BLE の正式タイムアウトは未文書化であり、Windows USB HID の 3 秒を暫定使用している。
+5. **Read-back**: Save ACK 後に `0x0002` で 2768B config を読み、対象 slot の **216B ヘッダ**を送信した `header_bytes` とバイト比較する。次に `0x0102` で同じ `(slot, macro_idx)` を読み、`steps * 10` バイトが一致することを確認する。どちらの不一致も `Error::MacroWrite { stage: Verify, saved: true }` になる。
 
 **Fail-closed**: Erase / Write / Header のいずれかで失敗したら Save を送らない。ただし Erase 済み・Write 途中のセクタはすでに変更されている可能性があるため、`Error::MacroWrite` の `saved` が `false` でも「旧マクロが無傷」とはみなさない。`true` は Save 送信後（ACK または読み戻し失敗）である。どちらも 3 スロット × 4 マクロの完全バックアップから復元する。
 
-**ヘッダのフィールド**:
+**書き込み対象とヘッダ**:
 
+- **空きマクロ（`max_steps == 0` / `0xFFFF`）への書き込みは拒否する**（`Error::EmptyMacroWrite`）。clear が未実装であり、restore で元に戻せないため。既存の非空マクロだけを対象にする。
 - `max_steps` は常に新しい `steps.len()`。
-- `key_map` / `cycles_num` / `interval_ms` / `flag` / `total_cnt` は指定がなければバックアップ時点の値を保持する。
-- 未使用マクロ（`max_steps == 0` または `0xFFFF`）へ書く場合、CLI は `flag = 1` と `total_cnt = max(existing, macro_idx + 1)` を設定する。`--trigger` がなければ `key_map` は変更しない（`0` のまま = 未割当）。**この未使用マクロの有効化ポリシーは実機未確認**であり、Mock テストで固定しているだけである。
+- `key_map` / `cycles_num` / `interval_ms` / `flag` / `total_cnt` は指定がなければバックアップ時点の値を保持する。`cycles_num` / `interval_ms` は `MacroFile` で省略可能（`None` = 保持）。
+- `MacroFile.gamepad_mode` は現状**無視**され、現在の device mode が `subcmd` に使われる。CLI は 0 以外のとき警告を表示する。
 - `--trigger` は M1..M4 / KeyMap 名 / `0xHEX` / 10 進数を受け付ける。
+- 書き込み中は Ctrl-C しないよう CLI が警告する。critical section 中も SIGINT を無視する実装はしていない。
+
+**restore**:
+
+- `macro restore` は `--force` なしで「バックアップでは空、現在は非空」のマクロがあれば、対象を列挙して書き込み前に中止する。
+- `--force` 時は pre-restore backup の path を表示する。
+- 空エントリのステップデータは書かない（消去もしない）。ただし slot に 1 つでも非空マクロがあれば、その書き込みで **216B ヘッダ全体**がバックアップ値に上書きされ、空エントリの `max_steps` は 0 になる。全マクロが空の slot は、現在のヘッダと差分がある場合だけ `0x0001` + `0x0006` のヘッダのみ書込で上書きする（stale step data は flash に残る）。
+- 216B ヘッダの更新では、既存の予約バイト（slot `+0x05..+0x07`、record `+0x26..+0x27`）を保持する。既知フィールドだけを変更する。
+- restore 前には必ず現在の 3 スロット × 4 マクロを pre-restore backup に保存する。backup dir は既存の非空ディレクトリを拒否する。
+- restore の最後に config を再読込し、**全 slot の 216B ヘッダ**と**非空マクロの raw steps** を比較する。2768B 全体の SHA-256 は device の CRC 再計算で変わり得るため、情報表示のみ。
+- USB 32B 書き込みは未実装。`SaveTransport::Usb` は `Error::Unsupported` で拒否し、CLI は BLE のみを使う。
+
+**バックアップ出力**: `macro backup` / `macro write` の pre-write backup / `macro restore` の pre-restore backup は、既存の**非空ディレクトリ**（`config.bin` などが 1 つでもある）を拒否する。空ディレクトリまたは新規ディレクトリだけを使い、既存バックアップを上書きしない。
 
 **未確定点**:
 
-- Header / Write のチャンク長は MTU 連動（`max_payload = mtu - 3 - 17`）。実機書き込みで使う想定は MTU 200（Header 142B / Write 64B）だが、実機書き込みは未実施。MTU 64（Header 44B / Write 32B）と MTU 23（Header 3B、Write 不可）は Mock のみ。
+- Header / Write のチャンク長は MTU 連動（`max_payload = mtu - 3 - 17`）。実機書き込みで使う想定は MTU 200（Header 142B / Write 64B）だが、実機書き込みは未実施。MTU 64 / 23 は Mock のみ。
 - BLE Save の正式タイムアウトと、Save ACK の実際の `cmd` / `subcmd` 形状（`0x0006` 直か `0x0004, subcmd=0x0006/0x0067` か）。
 - Erase / Write / Header の ACK 形状（`0x0004` エンベロープか直接エコーか）。実装は両方を受け入れる。
-- 未使用マクロの `flag` / `total_cnt` / `key_map` の実機挙動。
-- `macro restore` は現在の `gamepad_mode`（`+0x010` の下位 8bit）がバックアップと一致しなければ、書き込み前に中止する。
-- `macro restore` はバックアップで `max_steps == 0` / `0xFFFF` だったマクロをスキップする（Flash セクタの削除は未実装）。
+- Save 時の device による config CRC 再計算。
+- Save 直後の `0x0002` / `0x0102` 読み戻しに待機時間を入れていない（実機未確認）。
+- 216B Header 部分書込後の device 側 `flag` / `total_cnt` の解釈。
+- `macro restore` は `gamepad_mode` が一致しない場合に書き込み前に中止する。restore 後の config SHA は情報表示のみ。
+- 空マクロの clear / ステップデータの消去は未実装。
 
 
-
-### 6.4 USB HID と BLE での Save サブコマンド差異
-
-- **BLE (Android `getSaveCustomConfigChannel`)**: `cmd = 0x0006`, **`subcmd = 0x0067`** を使用。BLE の `Save` タイムアウトは仕様書に記載がないため、transport の `wait_ack` 既定値とリトライ方針を実装で記録する。
-- **Windows USB HID (`8BitDoAdvance.dll::saveUltimateBT2`)**: `cmd = 0x0006`, **`subcmd = 0x0123`** を使用（**USB HID の Save タイムアウトは `3` 秒**）。
-- いずれも応答で `cmd == 0x0006` と対応する `subcmd` の ACK が返る。プラットフォームやトランスポートに応じて適切な `subcmd` を選択すること（誤った `subcmd` では Flash 保存が確定しない可能性がある）。**3 秒は Windows USB HID の値であり、BLE に適用しない。**
 
 ---
 

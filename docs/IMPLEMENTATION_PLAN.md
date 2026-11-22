@@ -196,14 +196,18 @@ Track C: モバイル
   - `0x0104` Erase（`total_len = chunk_len = 0x1000`, `crc16 = 0xFFFF`, ペイロードなし、2 秒）
   - `0x0103` Write（`max_payload = mtu - 3 - 17` に応じて 64B / 32B、32B アライン、チャンクごと CRC、2 秒）
   - `0x0001` Header（`offset = 0x68C + slot * 0xD8`, `len = 0xD8`, `total_len = 0xAD0`、216B を `min(142, max_payload)` で分割、2 秒/チャンク）
-  - `0x0006` Save（BLE `subcmd = 0x0067`、3 秒 / transport 方針）
+  - `0x0006` Save（BLE `subcmd = 0x0067`、3 秒・リトライなし）
   - 3 スロット × 4 マクロのバックアップ（raw `.bin` + JSON/TOML + SHA-256 + config snapshot）
   - Mock でパケット列・CRC・チャンク境界・タイムアウト・fail-closed・読み戻し不一致を固定
-  - CLI: `macro backup --dir <DIR>` / `macro write --slot N --index N --file <JSON/TOML> [--trigger M1..M4]` / `macro restore --dir <DIR>`
-  - fail-closed（Erase / Write / Header 失敗時に Save しない）、読み戻し検証、`--trigger` のヘッダ反映
+  - CLI: `macro backup --dir <DIR>` / `macro write --slot N --index N --file <JSON/TOML> [--trigger M1..M4]` / `macro restore --dir <DIR> [--force]`
+  - fail-closed（Erase / Write / Header 失敗時に Save しない）、`0x0002` の 216B ヘッダ検証 + `0x0102` の raw 検証、`--trigger` のヘッダ反映
+  - 空きマクロ（`max_steps == 0` / `0xFFFF`）への write を拒否（clear 未実装）
+  - backup dir は既存の非空ディレクトリを拒否（pre-write / pre-restore 含む）
+  - restore は「backup で空、現在は非空」を `--force` なしで拒否。全空 slot は 216B ヘッダのみ書込
+  - `MacroFile.cycles_num` / `interval_ms` は省略可能（未指定は既存値保持）。`gamepad_mode` は無視
 - **完了条件**: 実機で 1 マクロ書き込み → 読み戻し一致 → Switch 側で発動 → 元のマクロへ復元。
 - **Tier**: **3**（write-path / Flash / CRC / マクロ）。
-- **状態**: 読み取り・バックアップは実機確認済み（142B チャンク、offset エコー）。書き込み・restore は Mock 実装と CLI まで完了し、**実機書き込みは未実施**。実機前に残る未確定点は `PROTOCOL_SPEC.md` §6.5（BLE Save の ACK 形状 / タイムアウト、未使用マクロの `flag` / `total_cnt` / `key_map`、MTU 200 以外での実機挙動）。
+- **状態**: 読み取り・バックアップは実機確認済み（142B チャンク、offset エコー）。書き込み・restore は Mock 実装と CLI まで完了し、**実機書き込みは未実施**。実機前に残る未確定点は `PROTOCOL_SPEC.md` §6.5（BLE Save の ACK 形状 / タイムアウト、Save 時の config CRC 再計算、MTU 200 以外での実機挙動）。
 
 ### Phase 2c: Linux BLE OTA
 - **ゴール**: Linux から BLE Bootloader 経由でファームウェア更新・復旧を行う。
