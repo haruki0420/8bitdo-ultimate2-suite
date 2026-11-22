@@ -194,7 +194,7 @@ Track C: モバイル
 - **実装項目**:
   - `0x0102` ReadBT2Macro（1 要求 = 1 チャンク 142B、`offset = (macro_idx << 12) + chunk_offset`, `total_len = chunk_len = steps * 10`。実機で macro 0 / 500B と macro 1 / 460B の応答 offset を確認）
   - `0x0104` Erase（`total_len = chunk_len = 0x1000`, `crc16 = 0xFFFF`, ペイロードなし、2 秒）
-  - `0x0103` Write（`max_payload = mtu - 3 - 17` に応じて 64B / 32B、32B アライン、チャンクごと CRC、2 秒）
+  - `0x0103` Write（`max_payload = mtu - 3 - 17` に応じて 64B / 32B、`--chunk-size 32|64` で明示指定可能、32B アライン、チャンクごと CRC、2 秒）
   - `0x0001` Header（`offset = 0x68C + slot * 0xD8`, `len = 0xD8`, `total_len = 0xAD0`、216B を `min(142, max_payload)` で分割、2 秒/チャンク）
   - `0x0006` Save（BLE `subcmd = 0x0067`、3 秒・リトライなし）
   - 3 スロット × 4 マクロのバックアップ（raw `.bin` + JSON/TOML + SHA-256 + config snapshot）

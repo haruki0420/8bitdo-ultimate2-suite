@@ -521,7 +521,7 @@ struct Bt2Header {
    - `subcmd = (gamepad_mode << 8) | slot`
    - `offset = (macro_idx << 12) + chunk_index * chunk_size`（`chunk_index` はパケットごとに進む）
    - `total_len = align32(max_steps * 10)`
-   - `chunk_size` は MTU 連動: `max_payload = mtu - 3 - 17` が `64` 以上なら 64B、`32` 以上なら 32B、それ未満は `Error::MtuTooSmall`（32B アライン不能）。最終チャンクは 32B アライン長。46B などの交渉済みサイズは将来拡張で、現在の API は `UnsupportedChunkSize` を返す
+   - `chunk_size` は MTU 連動: `max_payload = mtu - 3 - 17` が `64` 以上なら 64B、`32` 以上なら 32B、それ未満は `Error::MtuTooSmall`（32B アライン不能）。`MacroWritePlan.chunk_size` / CLI `--chunk-size 32` で **32B 均一**を明示できる（460B → 480B = 15 × 32B、最終も 32B）。`--chunk-size 64` は 64B 均一。32/64 以外は `UnsupportedChunkSize`。46B などの交渉済みサイズは将来拡張で、現在の API は `UnsupportedChunkSize` を返す
    - ペイロード: `max_steps * 10` バイト＋32B アライメント用ゼロパディング（BLE 64B / USB HID 32B で分割送信・`Send_CustomCmdPacket` 準拠で各チャンクヘッダ `CRC-16/MODBUS (0xA001)` 付与）
    - **最終チャンクの ACK 後 50ms** 待ってから Header を送る（`MACRO_WRITE_SETTLE_DELAY`、暫定値）
 3. **Step 3: 2768B コンフィグ内のマクロ管理ヘッダ更新**
@@ -537,7 +537,7 @@ struct Bt2Header {
 > ACK は各コマンド送信後の transport `wait_ack` で待つ。マクロの `Erase` / `Write` / ヘッダは 2 秒（実装定数 `0x44fa0000`）。マクロ `Save` は 3 秒で **リトライしない**（USB HID の仕様記載。BLE は未文書化のため暫定で 3 秒を使う）。OTA の 10 秒 erase / 1 秒 chunk / 64B 固定はマクロに適用しない。
 
 > **実装ノート（Mock 検証済み・実機書き込み未検証）**:
-> - **実機観測（2026-11-22）**: slot 0 macro 0（500B）の restore は成功したが、macro 1（460B）は Erase → Write 8 chunks → Header → Save の ACK がすべて返った後、100ms 後の `0x0102` が zeros で Verify 失敗した。216B ヘッダは一致（`max_steps = 46`, `offset = 0x1000`）。Erase ACK 直後に Write を送っていたため、Erase settle 100ms と Save 後 verify 300ms の仮説を採用した（実測で調整）。
+> - **実機観測（2026-11-22）**: slot 0 macro 0（500B）の restore は成功したが、macro 1（460B）は Erase → Write 8 chunks → Header → Save の ACK がすべて返った後、100ms 後の `0x0102` が zeros で Verify 失敗した。216B ヘッダは一致（`max_steps = 46`, `offset = 0x1000`）。Erase ACK 直後に Write を送っていたため、Erase settle 100ms と Save 後 verify 300ms の仮説を採用した（実測で調整）。**追加観測**: delay 追加後も macro 0（500B = 64B × 8、最終も 64B）は成功し、macro 1（460B = 64B × 7 + 最終 32B）だけが全 ACK 後に zeros だった。Header 216B と Save は一致しているため、**最終 32B チャンクで device が write を無効化する可能性**を仮説とし、`--chunk-size 32` で 32B 均一にして切り分ける。
 > - **Fail-closed**: Erase / Write / Header のいずれかが失敗したら Save を送らない。ただし Erase 済み・Write 途中のセクタは変更されている可能性がある。Save 後の ACK または読み戻しが失敗した場合だけ `saved = true` として報告する。どちらも 3 スロット × 4 マクロの完全バックアップから復元する。
 > - **空きマクロ拒否**: `max_steps == 0` / `0xFFFF` への `macro write` は `Error::EmptyMacroWrite` で拒否する。step data の clear が未実装で、`macro write` では新規作成できない。`macro restore` はバックアップが非空なら現在のマクロが空でも書ける（pre-restore backup と 216B ヘッダ更新を使う）。
 > - **ヘッダ値**: `max_steps` は新しいステップ数。`key_map` / `cycles_num` / `interval_ms` / `flag` / `total_cnt` は指定がなければ既存値を保持する。既存の予約バイト（slot `+0x05..+0x07`、record `+0x26..+0x27`）も保持する。
