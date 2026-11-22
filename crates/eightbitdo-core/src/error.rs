@@ -114,6 +114,93 @@ impl fmt::Display for ConfigWriteState {
     }
 }
 
+/// Stage of a BLE OTA update that failed.
+///
+/// The order is EnterBoot → ReadPid → ReadVersion → Erase → Write →
+/// WriteVersion → WriteFirmwareVersion → Jump. `EnterBoot` is an App Mode
+/// command/ACK stage (not a read); it, `ReadPid`, and `ReadVersion` all happen
+/// before the first flash frame. The flash stages are only reachable after a
+/// successful PID check, a matching expected application base, a sufficient
+/// MTU, and an explicit unverified-wire opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtaFailureStage {
+    /// App Mode `0x000C` EnterBoot.
+    EnterBoot,
+    /// Bootloader `0x0008` readPID.
+    ReadPid,
+    /// Bootloader `0x0005` readVersionInBoot.
+    ReadVersion,
+    /// Bootloader `0x0004` EraseFlash.
+    Erase,
+    /// Bootloader `0x0003` WriteFirmware.
+    Write,
+    /// Bootloader `0x00C4` WriteVersion (24-byte image header).
+    WriteVersion,
+    /// Bootloader `0x0002` WriteFirmwareVersion.
+    WriteFirmwareVersion,
+    /// Bootloader `0x0006` JumpApp.
+    Jump,
+}
+
+impl fmt::Display for OtaFailureStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EnterBoot => formatter.write_str("EnterBoot"),
+            Self::ReadPid => formatter.write_str("ReadPid"),
+            Self::ReadVersion => formatter.write_str("ReadVersion"),
+            Self::Erase => formatter.write_str("Erase"),
+            Self::Write => formatter.write_str("Write"),
+            Self::WriteVersion => formatter.write_str("WriteVersion"),
+            Self::WriteFirmwareVersion => formatter.write_str("WriteFirmwareVersion"),
+            Self::Jump => formatter.write_str("Jump"),
+        }
+    }
+}
+
+/// How far a failed BLE OTA update got, measured by **frames the host tried to
+/// send** (not by ACKs received).
+///
+/// The bootloader keeps running after every failed stage (the application area
+/// is only valid again after a full erase + rewrite + JumpApp), so recovery is
+/// always a fresh `OtaUpdate` from `Idle` → `prepare_boot` on `"8bt"` → erase
+/// and rewrite every sector from offset 0. The state tells the caller how much
+/// of that recovery is required. The associated counters
+/// (`OtaUpdate::sectors_erased`, `OtaUpdate::chunks_written`) count only
+/// acknowledged operations and can therefore be lower than the frames sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtaWriteState {
+    /// No EraseFlash or WriteFirmware frame was sent. This covers EnterBoot,
+    /// PID / version read failures, PID mismatch, local image validation,
+    /// expected-base / MTU / unverified-wire refusals, and a send that failed
+    /// before any flash frame. The flash content is assumed unchanged
+    /// (EnterBoot may still have rebooted the controller).
+    Untouched,
+    /// At least one EraseFlash frame was sent and no WriteFirmware frame was
+    /// sent yet. Its ACK may not have arrived, so the sector may be erased,
+    /// partially erased, or still pending; treat the flash content as unknown.
+    EraseStarted,
+    /// At least one WriteFirmware frame was sent (chunk ACKs may be zero or
+    /// more). Part of the image may be written; erase and rewrite the whole
+    /// image from offset 0.
+    PartiallyWritten,
+    /// Every WriteFirmware chunk was acknowledged, but finalization
+    /// (WriteVersion / WriteFirmwareVersion / JumpApp) did not complete. The
+    /// image data may be complete but the application is not confirmed; erase
+    /// and rewrite the whole image before retrying JumpApp.
+    Written,
+}
+
+impl fmt::Display for OtaWriteState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Untouched => formatter.write_str("Untouched"),
+            Self::EraseStarted => formatter.write_str("EraseStarted"),
+            Self::PartiallyWritten => formatter.write_str("PartiallyWritten"),
+            Self::Written => formatter.write_str("Written"),
+        }
+    }
+}
+
 /// Errors returned by `eightbitdo-core`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -139,7 +226,8 @@ pub enum Error {
     #[cfg(feature = "ble")]
     #[error(
         "another process is using the BLE adapter (lock file {}); close the other \
-         scan/session/connect and retry",
+         scan/session/connect and retry (if an App Mode session is open, disconnect/drop it \
+         first: the \"8bt\" boot link takes the same single-owner lock)",
         path.display()
     )]
     BleBusy {
@@ -260,7 +348,69 @@ pub enum Error {
         recovery: &'static str,
     },
 
+    /// A BLE OTA (firmware update) failed.
+    #[error("OTA update failed during {stage} ({state}): {reason}; {recovery}")]
+    Ota {
+        /// Stage that failed.
+        stage: OtaFailureStage,
+        /// How far the update got (whether flash may have changed).
+        state: OtaWriteState,
+        /// Underlying error text.
+        reason: String,
+        /// Operator-facing recovery guidance.
+        recovery: &'static str,
+    },
+
+    /// The bootloader PID is not one whose `readVersionInBoot` / `JumpApp`
+    /// offsets are documented.
+    ///
+    /// Only `gamepad_type == 1` (PID `0x600F`) is documented. The version and
+    /// jump addresses of any other type are unknown, so the update stops after
+    /// `readPID` without sending a read at a guessed offset or any flash write.
+    /// This is a pre-write failure and always carries
+    /// [`OtaWriteState::Untouched`].
+    #[error(
+        "unsupported bootloader PID 0x{pid:04X} ({state}): only gamepad_type 1 (PID 0x600F) has \
+         documented BLE OTA readVersionInBoot/JumpApp offsets; stopping before any flash write"
+    )]
+    OtaUnsupportedPid {
+        /// PID the bootloader reported.
+        pid: u16,
+        /// Always [`OtaWriteState::Untouched`]; no flash frame was sent.
+        state: OtaWriteState,
+    },
+
+    /// A `.dat` firmware image failed local validation before any flash write.
+    ///
+    /// Also used for a `load_base_addr` that does not match the mandatory
+    /// `OtaConfig::expected_load_base` allowlist. This is a pre-write failure
+    /// equivalent to [`OtaWriteState::Untouched`]. Only single-section `.dat`
+    /// files are supported; official multi-section firmware is rejected.
+    #[error("invalid firmware image: {0}")]
+    OtaInvalidFirmware(String),
+
     /// Local file I/O failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+#[cfg(all(test, feature = "ble"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ble_busy_message_mentions_app_mode_disconnect() {
+        let error = Error::BleBusy {
+            path: std::path::PathBuf::from("/tmp/8bitdo-test.lock"),
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("App Mode session"),
+            "BleBusy must explain the App Mode session: {message}"
+        );
+        assert!(
+            message.contains("disconnect/drop"),
+            "BleBusy must tell the caller to disconnect/drop: {message}"
+        );
+    }
 }

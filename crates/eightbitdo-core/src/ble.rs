@@ -26,6 +26,7 @@ use crate::ble_lock::BleLock;
 use crate::transport::Transport;
 use crate::{
     Error, APP_BLE_NAME, APP_CHARACTERISTIC_UUID, APP_CHARACTERISTIC_UUID_ALT, APP_SERVICE_UUID,
+    BOOT_BLE_NAME, BOOT_CHARACTERISTIC_UUID, BOOT_CHARACTERISTIC_UUID_ALT, BOOT_SERVICE_UUID,
 };
 
 /// How often the scan loop refreshes the peripheral list.
@@ -104,6 +105,68 @@ fn acquire_ble_lock_with_default(
     }
 }
 
+/// Options for finding and connecting to the BLE bootloader (`"8bt"`).
+///
+/// The advertised name is fixed to [`BOOT_BLE_NAME`]; only the address filter
+/// and timeouts are configurable.
+#[derive(Debug, Clone)]
+pub struct BleBootOptions {
+    /// Optional Bluetooth address to match in addition to the `"8bt"` name.
+    pub address: Option<String>,
+    /// How long to scan before giving up.
+    pub scan_timeout: Duration,
+    /// Connection and service-discovery timeout.
+    pub connect_timeout: Duration,
+    /// Log every raw TX and RX frame to stderr.
+    pub verbose: bool,
+    /// Override the single-owner BLE lock path.
+    ///
+    /// `None` (the default) uses the production lock path. The boot link takes
+    /// the same lock as the App Mode link, so an OTA cannot race a resident
+    /// `session` / GUI for the adapter. **The App Mode session must already be
+    /// disconnected/dropped before connecting to `"8bt"`**; otherwise connect
+    /// returns [`Error::BleBusy`]. Only tests/tools should override this path
+    /// to a temporary file.
+    pub lock_path: Option<PathBuf>,
+}
+
+impl Default for BleBootOptions {
+    fn default() -> Self {
+        Self {
+            address: None,
+            scan_timeout: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(20),
+            verbose: false,
+            lock_path: None,
+        }
+    }
+}
+
+/// GATT identity of one BLE firmware mode.
+#[derive(Debug, Clone, Copy)]
+struct BleMode {
+    label: &'static str,
+    service_uuid: Uuid,
+    characteristics: [Uuid; 2],
+    is_boot: bool,
+}
+
+impl BleMode {
+    const APP: Self = Self {
+        label: "App Mode",
+        service_uuid: APP_SERVICE_UUID,
+        characteristics: [APP_CHARACTERISTIC_UUID, APP_CHARACTERISTIC_UUID_ALT],
+        is_boot: false,
+    };
+
+    const BOOT: Self = Self {
+        label: "Bootloader",
+        service_uuid: BOOT_SERVICE_UUID,
+        characteristics: [BOOT_CHARACTERISTIC_UUID, BOOT_CHARACTERISTIC_UUID_ALT],
+        is_boot: true,
+    };
+}
+
 /// One device found during a scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BleDevice {
@@ -120,6 +183,32 @@ pub struct BleDevice {
     pub is_app: bool,
 }
 
+/// Owns the single-owner BLE lock for one transport.
+///
+/// The lock is released early by a successful [`Transport::disconnect`], and
+/// unconditionally on drop. The drop path guarantees that a transport dropped
+/// without a successful teardown (process shutdown, error return) does not keep
+/// the adapter locked for the rest of the process lifetime.
+struct BleLockSlot(std::sync::Mutex<Option<BleLock>>);
+
+impl BleLockSlot {
+    fn new(lock: BleLock) -> Self {
+        Self(std::sync::Mutex::new(Some(lock)))
+    }
+
+    fn take(&self) {
+        if let Ok(mut lock) = self.0.lock() {
+            let _ = lock.take();
+        }
+    }
+}
+
+impl Drop for BleLockSlot {
+    fn drop(&mut self) {
+        self.take();
+    }
+}
+
 /// A connected BLE App Mode link.
 pub struct BleTransport {
     peripheral: Peripheral,
@@ -132,12 +221,11 @@ pub struct BleTransport {
     rx: Mutex<mpsc::Receiver<Vec<u8>>>,
     /// Single-owner lock, held from before the scan until disconnect/drop.
     ///
-    /// Wrapped in a mutex so [`Transport::disconnect`] can release it before
-    /// the value is dropped; a process exit releases it through the kernel
-    /// regardless. Declared last so it is the last field dropped: the
-    /// peripheral/notification fields go first and another process cannot take
-    /// the lock while this struct is still tearing down.
-    ble_lock: std::sync::Mutex<Option<BleLock>>,
+    /// [`Transport::disconnect`] releases it early on success; otherwise the
+    /// slot's `Drop` releases it when the transport is dropped. Declared last
+    /// so it is dropped after the peripheral/notification fields: another
+    /// process cannot take the lock while this struct is still tearing down.
+    ble_lock: BleLockSlot,
 }
 
 impl BleTransport {
@@ -159,6 +247,15 @@ impl BleTransport {
     /// lifetime of the returned transport: a resident `session`, a GUI and a
     /// one-shot `scan` cannot scan or reconnect over each other.
     pub async fn connect(options: &BleOptions) -> Result<Self, Error> {
+        Self::connect_mode(options, BleMode::APP).await
+    }
+
+    /// Shared connect path for App Mode and the `"8bt"` bootloader.
+    ///
+    /// The single-owner BLE lock is taken before the adapter is touched and is
+    /// held for the lifetime of the returned transport, including the boot
+    /// phase (the boot transport passes its own `lock_path`).
+    async fn connect_mode(options: &BleOptions, mode: BleMode) -> Result<Self, Error> {
         let lock = acquire_ble_lock(options.lock_path.as_deref())?;
         let manager = Manager::new().await.map_err(ble_error)?;
         let adapters = manager.adapters().await.map_err(ble_error)?;
@@ -171,7 +268,7 @@ impl BleTransport {
             .start_scan(ScanFilter::default())
             .await
             .map_err(ble_error)?;
-        let found = find_app_peripheral(&adapter, options).await;
+        let found = find_peripheral(&adapter, options).await;
         let _ = adapter.stop_scan().await;
         let found = found?;
 
@@ -195,23 +292,31 @@ impl BleTransport {
         let service = match peripheral
             .services()
             .into_iter()
-            .find(|service| service.uuid == APP_SERVICE_UUID)
+            .find(|service| service.uuid == mode.service_uuid)
         {
             Some(service) => service,
             None => {
                 let _ = peripheral.disconnect().await;
                 return Err(Error::Ble(format!(
-                    "App Mode service {APP_SERVICE_UUID} was not found"
+                    "{} service {} was not found",
+                    mode.label, mode.service_uuid
                 )));
             }
         };
-        let characteristic = match choose_characteristic(&service.characteristics) {
-            Some(characteristic) => characteristic,
-            None => {
-                let _ = peripheral.disconnect().await;
-                return Err(Error::CharacteristicNotFound);
-            }
-        };
+        let characteristic =
+            match choose_characteristic(&service.characteristics, &mode.characteristics) {
+                Some(characteristic) => characteristic,
+                None => {
+                    let _ = peripheral.disconnect().await;
+                    if mode.is_boot {
+                        return Err(Error::Ble(format!(
+                            "{} characteristic FF21/FF23 was not found on service {}",
+                            mode.label, mode.service_uuid
+                        )));
+                    }
+                    return Err(Error::CharacteristicNotFound);
+                }
+            };
         let write_type = if characteristic.properties.contains(CharPropFlags::WRITE) {
             WriteType::WithResponse
         } else {
@@ -268,7 +373,7 @@ impl BleTransport {
             name,
             verbose,
             rx: Mutex::new(rx),
-            ble_lock: std::sync::Mutex::new(Some(lock)),
+            ble_lock: BleLockSlot::new(lock),
         })
     }
 
@@ -290,6 +395,88 @@ impl BleTransport {
     #[must_use]
     pub fn characteristic_uuid(&self) -> Uuid {
         self.characteristic.uuid
+    }
+}
+
+/// A connected BLE bootloader link (`"8bt"`, service `FF20`, characteristic
+/// `FF21` or `FF23`).
+///
+/// The App Mode [`BleTransport`] is fixed to `"80ND"` / service `FF10` and can
+/// never reach the bootloader, so it is **not** an
+/// [`OtaTransport`](crate::ota::OtaTransport). This type is the boot-only BLE
+/// transport for the OTA phase.
+pub struct BleBootTransport {
+    inner: BleTransport,
+}
+
+impl BleBootTransport {
+    /// Scan for, connect to, and subscribe to a `"8bt"` bootloader peripheral.
+    ///
+    /// The advertised name is fixed to [`BOOT_BLE_NAME`]; `options.address`,
+    /// timeouts and verbose logging are honored. Service `FF20` is resolved
+    /// with characteristic `FF21` first, then `FF23`.
+    ///
+    /// The App Mode session must be disconnected/dropped first: this call takes
+    /// the same single-owner BLE lock and returns [`Error::BleBusy`] otherwise.
+    /// `OtaUpdate::enter_boot_and_release` closes the App link after EnterBoot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Ble`] for adapter/backend failures or a missing
+    /// `FF20`/`FF21`/`FF23` characteristic, or [`Error::DeviceNotFound`] when
+    /// no `"8bt"` peripheral appears within
+    /// [`BleBootOptions::scan_timeout`].
+    pub async fn connect(options: &BleBootOptions) -> Result<Self, Error> {
+        let mode = BleMode::BOOT;
+        let app_options = BleOptions {
+            name: BOOT_BLE_NAME.to_string(),
+            address: options.address.clone(),
+            scan_timeout: options.scan_timeout,
+            connect_timeout: options.connect_timeout,
+            verbose: options.verbose,
+            lock_path: options.lock_path.clone(),
+        };
+        let inner = BleTransport::connect_mode(&app_options, mode).await?;
+        Ok(Self { inner })
+    }
+
+    /// Bluetooth address of the connected bootloader peripheral.
+    #[must_use]
+    pub fn address(&self) -> String {
+        self.inner.address()
+    }
+
+    /// Advertised name captured during the scan, if any.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.inner.name()
+    }
+
+    /// UUID of the bootloader write/notify characteristic.
+    ///
+    /// This is `FF21` on most units and `FF23` on `_CY` units.
+    #[must_use]
+    pub fn characteristic_uuid(&self) -> Uuid {
+        self.inner.characteristic_uuid()
+    }
+}
+
+#[async_trait]
+impl Transport for BleBootTransport {
+    async fn send(&self, data: &[u8]) -> Result<(), Error> {
+        self.inner.send(data).await
+    }
+
+    async fn recv(&self) -> Result<Vec<u8>, Error> {
+        self.inner.recv().await
+    }
+
+    fn mtu(&self) -> u16 {
+        self.inner.mtu()
+    }
+
+    async fn disconnect(&self) -> Result<(), Error> {
+        self.inner.disconnect().await
     }
 }
 
@@ -358,14 +545,12 @@ impl Transport for BleTransport {
 /// start scanning. The kernel still releases the lock when the transport is
 /// dropped or the process exits; the CLI prints a warning in that case.
 fn release_ble_lock_after_teardown(
-    lock: &std::sync::Mutex<Option<BleLock>>,
+    lock: &BleLockSlot,
     teardown: &Result<(), Error>,
 ) -> Result<(), Error> {
     match teardown {
         Ok(()) => {
-            if let Ok(mut lock) = lock.lock() {
-                let _ = lock.take();
-            }
+            lock.take();
             Ok(())
         }
         Err(error) => Err(Error::Ble(format!(
@@ -456,7 +641,7 @@ async fn collect_devices(adapter: &Adapter, timeout: Duration) -> Result<Vec<Ble
     Ok(devices.into_values().collect())
 }
 
-async fn find_app_peripheral(
+async fn find_peripheral(
     adapter: &Adapter,
     options: &BleOptions,
 ) -> Result<Option<(Peripheral, Option<String>)>, Error> {
@@ -503,17 +688,16 @@ fn normalize_address(address: &str) -> String {
 
 fn choose_characteristic(
     characteristics: &std::collections::BTreeSet<Characteristic>,
+    uuids: &[Uuid],
 ) -> Option<Characteristic> {
-    [APP_CHARACTERISTIC_UUID, APP_CHARACTERISTIC_UUID_ALT]
-        .iter()
-        .find_map(|uuid| {
-            characteristics
-                .iter()
-                .find(|characteristic| {
-                    characteristic.uuid == *uuid && supports_app_traffic(characteristic.properties)
-                })
-                .cloned()
-        })
+    uuids.iter().find_map(|uuid| {
+        characteristics
+            .iter()
+            .find(|characteristic| {
+                characteristic.uuid == *uuid && supports_app_traffic(characteristic.properties)
+            })
+            .cloned()
+    })
 }
 
 fn supports_app_traffic(properties: CharPropFlags) -> bool {
@@ -593,6 +777,29 @@ mod tests {
         assert_eq!(options.address, None);
         assert_eq!(options.scan_timeout, Duration::from_secs(10));
         assert_eq!(options.connect_timeout, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn boot_mode_uses_the_8bt_service_and_characteristics() {
+        assert_eq!(BOOT_BLE_NAME, "8bt");
+        assert_eq!(BleMode::BOOT.label, "Bootloader");
+        assert_eq!(BleMode::BOOT.service_uuid, BOOT_SERVICE_UUID);
+        assert_eq!(
+            BleMode::BOOT.characteristics,
+            [BOOT_CHARACTERISTIC_UUID, BOOT_CHARACTERISTIC_UUID_ALT]
+        );
+        assert_eq!(BleMode::APP.service_uuid, APP_SERVICE_UUID);
+        assert_ne!(BleMode::BOOT.service_uuid, BleMode::APP.service_uuid);
+    }
+
+    #[test]
+    fn default_boot_options_use_the_bootloader_defaults() {
+        let options = BleBootOptions::default();
+        assert_eq!(options.address, None);
+        assert_eq!(options.scan_timeout, Duration::from_secs(10));
+        assert_eq!(options.connect_timeout, Duration::from_secs(20));
+        assert!(!options.verbose);
+        assert_eq!(options.lock_path, None);
     }
 
     #[test]
@@ -778,7 +985,7 @@ mod tests {
     #[test]
     fn failed_teardown_keeps_the_ble_lock() {
         let path = temp_lock_path("teardown-failure");
-        let lock = std::sync::Mutex::new(Some(BleLock::acquire_at(&path).expect("hold the lock")));
+        let lock = BleLockSlot::new(BleLock::acquire_at(&path).expect("hold the lock"));
         let failed: Result<(), Error> = Err(Error::Ble("disconnect: timed out".to_string()));
 
         let error = release_ble_lock_after_teardown(&lock, &failed)
@@ -789,7 +996,7 @@ mod tests {
                 .contains("keeping the single-owner BLE lock"),
             "the failure must explain that the lock is kept: {error}"
         );
-        assert!(lock.lock().expect("lock mutex").is_some());
+        assert!(lock.0.lock().expect("lock mutex").is_some());
         let busy = BleLock::acquire_at(&path).expect_err("another process must still be refused");
         assert!(matches!(busy, Error::BleBusy { .. }), "got {busy:?}");
 
@@ -803,10 +1010,27 @@ mod tests {
     #[test]
     fn successful_teardown_releases_the_ble_lock() {
         let path = temp_lock_path("teardown-ok");
-        let lock = std::sync::Mutex::new(Some(BleLock::acquire_at(&path).expect("hold the lock")));
+        let lock = BleLockSlot::new(BleLock::acquire_at(&path).expect("hold the lock"));
         release_ble_lock_after_teardown(&lock, &Ok(())).expect("release");
-        assert!(lock.lock().expect("lock mutex").is_none());
+        assert!(lock.0.lock().expect("lock mutex").is_none());
         let reacquired = BleLock::acquire_at(&path).expect("lock must be free");
+        drop(reacquired);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dropping_the_transport_lock_slot_releases_the_lock() {
+        // `BleTransport` cannot be constructed without a live btleplug
+        // peripheral, but its lock is held by this exact field type. Verify the
+        // drop path used by the transport releases the flock.
+        let path = temp_lock_path("transport-slot-drop");
+        {
+            let slot = BleLockSlot::new(BleLock::acquire_at(&path).expect("hold the lock"));
+            assert!(BleLock::acquire_at(&path).is_err(), "still held");
+            drop(slot);
+        }
+        let reacquired =
+            BleLock::acquire_at(&path).expect("dropping the transport lock slot must release");
         drop(reacquired);
         let _ = std::fs::remove_file(&path);
     }

@@ -6,9 +6,11 @@
 //! backed by `btleplug`.
 //!
 //! The first slice was read-only (version, configuration and realtime input).
-//! The current core also has macro flash read/write APIs (`macro_ops`) and the
-//! full 2768-byte configuration write path (`config_ops`); both write paths are
-//! fail-closed and currently mock-tested only. OTA is still a separate phase.
+//! The current core also has macro flash read/write APIs (`macro_ops`), the
+//! full 2768-byte configuration write path (`config_ops`), and a BLE-only OTA
+//! state machine (`ota`). Every write path is fail-closed and currently
+//! mock-tested only; no front end is wired to OTA yet, and USB OTA is
+//! intentionally absent (USB Boot TX framing is undocumented).
 //!
 //! Button remapping (`MapKeyRecord`) is implemented in [`config_ops`] from the
 //! official binary layout: [`config_ops::ConfigEdit::ButtonRemap`] changes one
@@ -21,6 +23,7 @@ pub mod config_ops;
 pub mod error;
 pub mod macro_ops;
 pub mod mock;
+pub mod ota;
 pub mod session;
 pub mod transport;
 
@@ -36,7 +39,10 @@ pub use config_ops::{
     OFFICIAL_WRITE_CHUNK,
 };
 pub use error::Error;
-pub use error::{ConfigWriteStage, ConfigWriteState, MacroWriteStage, MacroWriteState};
+pub use error::{
+    ConfigWriteStage, ConfigWriteState, MacroWriteStage, MacroWriteState, OtaFailureStage,
+    OtaWriteState,
+};
 pub use macro_ops::{
     macro_header_chunk_len, macro_write_chunk_len, macro_write_chunk_len_requested,
     max_protocol_payload, validate_macro_chunk_size, MacroBackup, MacroEntry, MacroHeaderOutcome,
@@ -44,6 +50,17 @@ pub use macro_ops::{
     MACRO_HEADER_CHUNK_SIZE, MACRO_READ_TOTAL_TIMEOUT,
 };
 pub use mock::MockTransport;
+#[cfg(feature = "mobile-boot")]
+#[doc(hidden)]
+pub use ota::MobileBootLink;
+pub use ota::{
+    gamepad_type_from_pid, BootReady, FirmwareImage, GamepadType, JumpOutcome, OtaConfig,
+    OtaOutcome, OtaPhase, OtaProgress, OtaTimeouts, OtaTransport, OtaUpdate, OTA_CHUNK_SIZE,
+    OTA_ENTER_BOOT_TIMEOUT, OTA_ERASE_TIMEOUT, OTA_IMAGE_HEADER_LEN, OTA_JUMP_TIMEOUT,
+    OTA_MAX_FRAME_LEN, OTA_MIN_MTU, OTA_PID_TIMEOUT, OTA_SECTOR_SIZE, OTA_VERSION_HEADER_LEN,
+    OTA_VERSION_TIMEOUT, OTA_WRITE_TIMEOUT, OTA_WRITE_VERSION_TIMEOUT, UT2_BOOT_PID,
+    UT2_TYPE1_APP_BASE_MIN, UT2_TYPE1_APP_FLASH_END,
+};
 pub use session::{
     ConfigSnapshot, Session, VersionInfo, CONFIG_TOTAL_TIMEOUT, DEFAULT_TIMEOUT,
     MAX_CONSECUTIVE_DECODE_FAILURES,
@@ -51,7 +68,10 @@ pub use session::{
 pub use transport::Transport;
 
 #[cfg(feature = "ble")]
-pub use ble::{scan_devices, scan_devices_with_lock_path, BleDevice, BleOptions, BleTransport};
+pub use ble::{
+    scan_devices, scan_devices_with_lock_path, BleBootOptions, BleBootTransport, BleDevice,
+    BleOptions, BleTransport,
+};
 #[cfg(feature = "ble")]
 pub use ble_lock::{default_ble_lock_path, BleLock, BLE_LOCK_FILE_NAME, BLE_LOCK_PATH_ENV};
 
@@ -72,3 +92,18 @@ pub const APP_CHARACTERISTIC_UUID: uuid::Uuid =
 /// Alternate App Mode characteristic (`0000FF13-...`) seen on some units.
 pub const APP_CHARACTERISTIC_UUID_ALT: uuid::Uuid =
     uuid::Uuid::from_u128(0x0000_ff13_0000_1000_8000_0080_5f9b_34fb);
+
+/// Advertised name of the BLE bootloader peripheral (`"8bt"`).
+pub const BOOT_BLE_NAME: &str = "8bt";
+
+/// Bootloader GATT service (`0000FF20-...`).
+pub const BOOT_SERVICE_UUID: uuid::Uuid =
+    uuid::Uuid::from_u128(0x0000_ff20_0000_1000_8000_0080_5f9b_34fb);
+
+/// Bootloader write/notify characteristic (`0000FF21-...`).
+pub const BOOT_CHARACTERISTIC_UUID: uuid::Uuid =
+    uuid::Uuid::from_u128(0x0000_ff21_0000_1000_8000_0080_5f9b_34fb);
+
+/// Alternate bootloader characteristic (`0000FF23-...`) seen on `_CY` units.
+pub const BOOT_CHARACTERISTIC_UUID_ALT: uuid::Uuid =
+    uuid::Uuid::from_u128(0x0000_ff23_0000_1000_8000_0080_5f9b_34fb);
