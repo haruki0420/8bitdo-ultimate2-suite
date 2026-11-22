@@ -32,6 +32,8 @@
    - BLE OTA の解析証跡（確定した順序・タイムアウト・`.dat` ヘッダ）と未確認事項の優先順。OTA を触る前に必ず読む。
 5. **[docs/SESSION_OPERATIONS.md](docs/SESSION_OPERATIONS.md)**
    - 常駐 `session` の運用（per-user BLE 単一所有者ロック、degraded 終了コード 3、SIGINT 範囲、`scan --check` と `scripts/session-loop.sh`）
+6. **[docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)**
+   - BLE OTA の実機 btsnoop 採取（Linux `btmon` / Android HCI snoop）・確認項目と判定・EVIDENCE への追記方法、Phase A / Phase B の安全手順。OTA の実機検証前に必ず読む。
 
 ---
 
