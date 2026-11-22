@@ -19,6 +19,10 @@
 #                       (captures may be split between the two processes)
 #   -h, --help          show this help
 #
+# Phase B needs two runs of this script, one per session: session 1 stops
+# right after the first Erase ACK, session 2 starts before the "8bt"
+# connection and stops after the "80ND" reconnect. Use separate output paths.
+#
 # Exit codes:
 #   0   capture finished and looks valid (btsnoop magic present)
 #   2   usage error / btmon could not start / another btmon without
@@ -82,6 +86,7 @@ Environment:
 
 The capture file is btsnoop-YYYYmmddTHHMMSSZ.snoop (UTC), mode 0600.
 See docs/OTA_VERIFICATION_PLAN.md for the procedure and safety rules.
+Phase B needs two runs of this script (one per session, separate output).
 EOF
 }
 
@@ -375,17 +380,20 @@ EOF
             cat <<'EOF'
 --- BLE OTA capture (Phase B: flash) ---------------------------------------
 Do this now (docs/OTA_VERIFICATION_PLAN.md §4 and §8.3). Phase B has TWO
-sessions, each with its own stop point:
+sessions and requires TWO runs of this script, one per session, each with its
+own stop point (use a separate output directory or file per run):
 
-  Session 1 (AfterFirstErase): connect App Mode ("80ND") -> EnterBoot
-  (0x000C) -> "8bt" reconnect -> readPID -> run the checkpoint. STOP right
-  after the FIRST Erase ACK, then verify offset / total_len / ACK shape
-  before deciding whether to continue (plan §8.3).
+  RUN 1 - Session 1 (AfterFirstErase): connect App Mode ("80ND") ->
+  EnterBoot (0x000C) -> "8bt" reconnect -> readPID -> checkpoint. STOP right
+  after the FIRST Erase ACK (the response is cmd=0x0004/subcmd=0x0104 or a
+  direct cmd=0x0104 echo), then verify offset / total_len / ACK shape before
+  deciding whether to continue (plan §8.3).
 
-  Session 2 (full run): scan for "8bt" (do NOT use `scan --check`; it is
-  for "80ND"; do NOT send EnterBoot) -> new OtaUpdate -> prepare_boot ->
+  RUN 2 - Session 2 (full run): scan for "8bt" (do NOT use `scan --check`; it
+  is for "80ND"; do NOT send EnterBoot) -> new OtaUpdate -> prepare_boot ->
   write_firmware -> all writes, WriteVersion, WriteFirmwareVersion, Jump.
-  STOP after the "80ND" reconnect and version read (plan §8.3).
+  STOP after the "80ND" reconnect and version read (plan §8.3). Once started
+  this run cannot be aborted; it either completes or fails.
 
 Ctrl-C also stops; this script always shuts btmon down.
 ---------------------------------------------------------------------------
@@ -400,10 +408,11 @@ Do this now (docs/OTA_VERIFICATION_PLAN.md §4):
   1-2 seconds and stop. Phase A does NOT return to App Mode; do not wait for
   "80ND" (recover with a power cycle, plan §8.2).
 
-  Phase B (flash): two sessions. Session 1 stops right after the FIRST Erase
-  ACK (human checkpoint, plan §8.3). Session 2 connects to "8bt" directly
-  (no EnterBoot), completes the full run, then stops after the "80ND"
-  reconnect and version read.
+  Phase B (flash) requires TWO runs of this script, one per session
+  (separate output per run). Session 1 stops right after the FIRST Erase ACK
+  (human checkpoint, plan §8.3). Session 2 connects to "8bt" directly (no
+  EnterBoot), completes the full run, then stops after the "80ND" reconnect
+  and version read. Session 2 cannot be aborted once started.
 
 Pass -p a or -p b for phase-specific instructions.
 Ctrl-C also stops; this script always shuts btmon down.
@@ -418,7 +427,7 @@ print_instructions
 if [[ -t 0 ]]; then
     case "$PHASE" in
         a) printf 'Press Enter to stop the capture (1-2 s after readVersionInBoot): ' ;;
-        b) printf 'Press Enter to stop the capture (Phase B: after the session-1 Erase ACK, or after the session-2 80ND reconnect): ' ;;
+        b) printf 'Press Enter to stop (Phase B: run this once per session; session 1 after Erase ACK / session 2 after 80ND reconnect): ' ;;
         *) printf 'Press Enter to stop the capture: ' ;;
     esac
     read -r _ || true
