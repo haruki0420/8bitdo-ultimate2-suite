@@ -660,6 +660,16 @@ pub struct OtaBenchOutcome {
     pub packets_sent: u32,
     /// JumpApp result when the pipeline completed; `None` when stopped early.
     pub jump: Option<JumpOutcome>,
+    /// Recovery state of the flash area at return.
+    ///
+    /// After a checkpoint stop this is [`OtaWriteState::EraseStarted`] for
+    /// `AfterFirstErase`, and [`OtaWriteState::Written`] after the writes or
+    /// WriteVersion. [`OtaWriteState::Untouched`] means no flash frame was
+    /// sent (for example a refusal before the first erase).
+    pub write_state: OtaWriteState,
+    /// Phase at return (`BenchStopped` for a checkpoint, `Complete` on a full
+    /// run, `Failed` for a failed gate).
+    pub phase: OtaPhase,
 }
 
 /// One `.dat` firmware image, validated before the first flash frame.
@@ -1019,6 +1029,26 @@ impl OtaUpdate {
         self.packets_sent
     }
 
+    /// How far the flash area has got, derived from frames sent and ACKed.
+    ///
+    /// This is the same classification used by [`Error::Ota`]: no flash frame
+    /// (`Untouched`), erase only (`EraseStarted`), some chunks not acknowledged
+    /// (`PartiallyWritten`), or every chunk acknowledged (`Written`). After a
+    /// successful run it returns `Written`; check [`OtaUpdate::phase`] to tell
+    /// success (`Complete`) from a stopped/failed run.
+    #[must_use]
+    pub const fn write_state(&self) -> OtaWriteState {
+        if self.erase_frames_sent == 0 && self.write_frames_sent == 0 {
+            OtaWriteState::Untouched
+        } else if self.write_frames_sent == 0 {
+            OtaWriteState::EraseStarted
+        } else if self.bytes_written < self.image_len {
+            OtaWriteState::PartiallyWritten
+        } else {
+            OtaWriteState::Written
+        }
+    }
+
     /// Send App Mode `0x000C` EnterBoot and wait for its ACK or the link close.
     ///
     /// Acknowledging the command and closing the App Mode link are both
@@ -1290,6 +1320,8 @@ impl OtaUpdate {
                 bytes_written: self.bytes_written,
                 packets_sent: self.packets_sent,
                 jump: Some(outcome.jump),
+                write_state: self.write_state(),
+                phase: self.phase,
             },
             None => OtaBenchOutcome {
                 checkpoint: Some(checkpoint),
@@ -1298,6 +1330,8 @@ impl OtaUpdate {
                 bytes_written: self.bytes_written,
                 packets_sent: self.packets_sent,
                 jump: None,
+                write_state: self.write_state(),
+                phase: self.phase,
             },
         })
     }
@@ -3556,7 +3590,10 @@ mod tests {
         assert_eq!(outcome.chunks_written, 0);
         assert_eq!(outcome.bytes_written, 0);
         assert_eq!(outcome.packets_sent, 3);
+        assert_eq!(outcome.write_state, OtaWriteState::EraseStarted);
+        assert_eq!(outcome.phase, OtaPhase::BenchStopped);
         assert_eq!(update.phase(), OtaPhase::BenchStopped);
+        assert_eq!(update.write_state(), OtaWriteState::EraseStarted);
         let sent = sent_boot(&mock);
         assert_eq!(sent.len(), 3, "readPID + readVersion + one erase");
         assert_eq!(sent.last().unwrap().0.cmd, boot::CMD_ERASE_FLASH);
@@ -3587,6 +3624,8 @@ mod tests {
         assert_eq!(outcome.sectors_erased, 1);
         assert_eq!(outcome.chunks_written, 64);
         assert_eq!(outcome.bytes_written, 0x1000);
+        assert_eq!(outcome.write_state, OtaWriteState::Written);
+        assert_eq!(outcome.phase, OtaPhase::BenchStopped);
         assert_eq!(update.phase(), OtaPhase::BenchStopped);
         let sent = sent_boot(&mock);
         assert_eq!(sent.len(), 67);
@@ -3629,6 +3668,8 @@ mod tests {
         assert_eq!(outcome.checkpoint, Some(OtaCheckpoint::AfterWriteVersion));
         assert_eq!(outcome.chunks_written, 64);
         assert_eq!(outcome.jump, None);
+        assert_eq!(outcome.write_state, OtaWriteState::Written);
+        assert_eq!(outcome.phase, OtaPhase::BenchStopped);
         assert_eq!(update.phase(), OtaPhase::BenchStopped);
         let sent = sent_boot(&mock);
         assert_eq!(sent.len(), 68);
@@ -3659,6 +3700,38 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, Error::InvalidRequest(_)));
+        let sent = sent_boot(&mock);
+        assert_eq!(sent.len(), 2, "no flash frame may be sent");
+        assert!(sent
+            .iter()
+            .all(|(header, _)| header.cmd != boot::CMD_ERASE_FLASH));
+    }
+
+    #[cfg(feature = "ota-bench")]
+    #[tokio::test]
+    async fn bench_checkpoint_keeps_the_base_gate() {
+        // The base gate lives inside the shared pipeline, so a bench checkpoint
+        // cannot bypass it. PID / gamepad_type are gated even earlier by
+        // prepare_boot (the BootReady guard cannot be obtained otherwise).
+        let image_bytes = dat(0x1000, TEST_BASE + 0x1000);
+        let image = FirmwareImage::parse(&image_bytes).unwrap();
+        let mock = high_mtu_mock();
+        queue_prepare(&mock, UT2_BOOT_PID, 0x0000_0102);
+        let mut update = new_update();
+        let _ready = update.prepare_boot(&mock).await.unwrap();
+
+        let error = update
+            .write_firmware_with_checkpoint(
+                _ready,
+                &image,
+                &mut |_| {},
+                OtaCheckpoint::AfterFirstErase,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::OtaInvalidFirmware(_)));
+        assert_eq!(update.write_state(), OtaWriteState::Untouched);
         let sent = sent_boot(&mock);
         assert_eq!(sent.len(), 2, "no flash frame may be sent");
         assert!(sent
