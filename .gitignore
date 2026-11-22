@@ -8,6 +8,20 @@
 *.dylib
 8BitDo_Ultimate_Software_V2_*/
 
+# Official firmware images and device backups (DO NOT COMMIT)
+# 公式ファームウェアは .dat / .bin で配布され、バックアップはユーザーデータを含み得る。
+*.dat
+*.bin
+/firmware/
+macro-backup-*/
+config-backup-*/
+
+# Test fixtures may legitimately contain .dat / .bin files
+!tests/fixtures/**/*.dat
+!tests/fixtures/**/*.bin
+!crates/**/tests/fixtures/**/*.dat
+!crates/**/tests/fixtures/**/*.bin
+
 # Build artifacts & dependencies
 target/
 build/

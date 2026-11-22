@@ -32,6 +32,7 @@ PR のリスクに応じてレビューの深さを変えます。目的は「do
 - **required check / status コマンド / ruleset / workflow / ゲート手順**を変える。
 - **安全手順**（Flash / OTA / backup / restore / マクロ Flash / ブリック復旧）を変える。
 - チェックリスト項目や安全手順を**削除・無効化**する、または適用条件を広げる。
+- **ライセンス・法務判断を含む docs** を変える: `LICENSE*` / `NOTICE` / `THIRD_PARTY_LICENSES.md` / `TRADEMARKS.md`、およびライセンス節・免責・非公式表記・商標帰属を含む `README.md` や `docs/`。これらは **docs-only でも「自動検証による独立レビュー省略」の対象外**であり、法務判断を含むため独立レビューを必須とする（最低 Tier 2。Tier 3 パスの内容を含む場合は最大 Tier）。
 
 例: PR テンプレートから OTA/バックアップのチェックボックスを消す、`CONTRIBUTING.md` のレビュー手順を短縮する、`docs/REVIEW_TIERS.md` の故障リスト最低数を下げる、`scripts/post-review-status.sh` の SHA pin を外す。これらはすべて Tier 3 です。
 
@@ -106,7 +107,7 @@ Tier 3 のパスに対する変更は、原則として Tier 3 のままです�
 
 ### Tier 1 の例
 
-- `README.md` など通常の docs の散文・リンク、Tier 3 パス以外のコメント・整形、純粋なテスト追加（write-path / Flash / OTA / backup / CRC / golden vector / mock transport / safety-critical test vector / セキュリティ境界 / review-gate script を検証しないもの）。§2 の content-based override に該当しないこと。
+- `README.md` など通常の docs の散文・リンク、Tier 3 パス以外のコメント・整形、純粋なテスト追加（write-path / Flash / OTA / backup / CRC / golden vector / mock transport / safety-critical test vector / セキュリティ境界 / review-gate script を検証しないもの）。§2 の content-based override に該当しないこと。**ライセンス・法務判断を含む docs（§2）はここに含めない（独立レビュー必須）。**
 
 ### Tier 2 以上（パス別の基本 Tier。内容による上書きは §2）
 
@@ -167,6 +168,7 @@ Tier 3 のパスに対する変更は、原則として Tier 3 のままです�
 - コードのリファクタは Tier 1 にしない（Tier 2 以上）。
 - テストの変更・削除は Tier 1 にしない（Tier 2。Tier 3 パス、write-path / Flash / OTA / backup / CRC / golden vector / mock transport / safety-critical test vector / セキュリティ境界 / review-gate script を検証するものは Tier 3）。
 - 規範仕様（`PROTOCOL_SPEC` / `STRUCT` / `IMPLEMENTATION_PLAN`）、ゲート文書、プロセス文書は Tier 1 にはしない（最低 Tier 2、安全-critical は Tier 3）。
+- ライセンス・法務判断を含む docs（`LICENSE*` / `NOTICE` / `THIRD_PARTY_LICENSES.md` / `TRADEMARKS.md`、README のライセンス節・免責など）は Tier 1 にしない（§2。独立レビュー必須、最低 Tier 2）。
 - Tier 3 サブセクションは削除せず、該当しないものは `N/A + 理由` を 1 行記入する（全項目を埋める必要はない）。
 - 振る舞いを変える docs は Tier 2/3 とし、故障リストを必須にする。
 - レビュアー 1 名。diff、関連テスト、リンク、コマンド例を確認する。
