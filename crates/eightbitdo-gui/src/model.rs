@@ -123,7 +123,10 @@ pub struct ConfigView {
     pub gamepad_mode_label: String,
     /// Three profile flags.
     pub slot_flags: [u32; 3],
-    /// Three profile names (unescaped; use [`display_text`] in the UI).
+    /// Three profile names, decoded as UTF-8 by the protocol crate.
+    ///
+    /// The raw value is shown as-is in the UI (the bundled font covers
+    /// Japanese) and is kept unchanged in the JSON backup.
     pub profile_names: [String; 3],
     /// Macro headers for every profile.
     pub macro_slots: [MacroSlotView; 3],
@@ -268,26 +271,6 @@ pub fn keymap_label(map: KeyMap) -> String {
         parts.push(format!("Unknown(0x{unknown:08X})"));
     }
     parts.join(" + ")
-}
-
-/// Escape non-ASCII and control characters for the default (Latin) font.
-///
-/// The GUI does not bundle a CJK font, so a device name such as `プロファイル`
-/// is shown as `\u{30D7}...` instead of missing glyphs. The raw value is kept
-/// unchanged in [`ConfigView`] and in the JSON backup.
-#[must_use]
-pub fn display_text(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    for character in text.chars() {
-        if character.is_ascii_graphic() || character == ' ' {
-            output.push(character);
-        } else if character.is_ascii_control() {
-            output.push_str(&format!("\\x{:02X}", character as u32));
-        } else {
-            output.push_str(&format!("\\u{{{:04X}}}", character as u32));
-        }
-    }
-    output
 }
 
 fn gamepad_mode_name(mode: GamepadMode) -> &'static str {
@@ -453,11 +436,25 @@ mod tests {
     }
 
     #[test]
-    fn display_text_escapes_non_latin_and_control_characters() {
-        assert_eq!(display_text("Profile 1"), "Profile 1");
-        assert_eq!(display_text("Macro\t1"), "Macro\\x091");
-        assert_eq!(display_text("プロ"), "\\u{30D7}\\u{30ED}");
-        assert_eq!(display_text("a\u{7}b"), "a\\x07b");
+    fn japanese_profile_and_macro_names_are_kept_verbatim() {
+        let mut config = Bt2Config::default();
+        config.set_profile_name(Slot::S1, "テスト用").unwrap();
+
+        let mut header = MacroSlot {
+            total_cnt: 1,
+            ..MacroSlot::default()
+        };
+        header.records[0].set_name("連射").unwrap();
+        config.set_macro_slot(Slot::S1, &header);
+
+        let view = ConfigView::from_snapshot(&snapshot(config));
+        assert_eq!(view.profile_names[0], "テスト用");
+        assert_eq!(view.macro_slots[0].records[0].name, "連射");
+        assert_eq!(
+            keymap_label(KeyMap::A | KeyMap::SELECT),
+            "A + Select",
+            "model keeps the platform-neutral English labels; the UI localizes them"
+        );
     }
 
     #[test]

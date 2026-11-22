@@ -27,6 +27,7 @@ use tokio::time::{interval, Interval, MissedTickBehavior};
 
 use crate::backup::BackupReport;
 use crate::driver::{DeviceSession, GuiError};
+use crate::i18n::Key;
 use crate::model::{ConfigView, DeviceInfoView, InputView, ScanEntry, VersionView};
 
 /// Scan duration used by the GUI's Scan button.
@@ -81,6 +82,48 @@ pub enum Command {
     Shutdown,
 }
 
+/// A structured user-facing message.
+///
+/// The worker only picks a translation [`Key`], its format arguments, and a
+/// technical `detail` (English text from `eightbitdo-core`). The UI translates
+/// the key with the current language, so switching languages also re-renders
+/// messages that arrived earlier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    /// Translation key for the message.
+    pub key: Key,
+    /// Arguments for `{}` placeholders in the key, in order.
+    pub args: Vec<String>,
+    /// Technical detail, shown separately and kept untranslated.
+    pub detail: Option<String>,
+}
+
+impl Notice {
+    /// Create a notice for `key` with no arguments or detail.
+    #[must_use]
+    pub fn new(key: Key) -> Self {
+        Self {
+            key,
+            args: Vec::new(),
+            detail: None,
+        }
+    }
+
+    /// Append one `{}` argument.
+    #[must_use]
+    pub fn with_arg(mut self, argument: impl Into<String>) -> Self {
+        self.args.push(argument.into());
+        self
+    }
+
+    /// Attach the technical detail from the core crate.
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+}
+
 /// A notification for the UI thread.
 #[derive(Debug)]
 pub enum Event {
@@ -105,12 +148,12 @@ pub enum Event {
     /// The link is down. `reason` is set when the worker closed it itself.
     Disconnected {
         /// Why the worker disconnected.
-        reason: Option<String>,
+        reason: Option<Notice>,
     },
     /// A non-fatal operation error.
-    Error(String),
+    Error(Notice),
     /// Informational progress message.
-    Log(String),
+    Log(Notice),
     /// The worker finished the current command.
     Idle,
 }
@@ -141,16 +184,16 @@ impl Worker {
                 {
                     Ok(runtime) => runtime.block_on(run_loop(command_rx, thread_events)),
                     Err(error) => {
-                        let _ = thread_events.send(Event::Error(format!(
-                            "Cannot start the BLE worker runtime: {error}"
-                        )));
+                        let _ = thread_events.send(Event::Error(
+                            Notice::new(Key::ErrWorkerRuntime).with_detail(error.to_string()),
+                        ));
                     }
                 }
             });
         if let Err(error) = spawn_result {
-            let _ = event_tx.send(Event::Error(format!(
-                "Cannot start the BLE worker thread: {error}"
-            )));
+            let _ = event_tx.send(Event::Error(
+                Notice::new(Key::ErrWorkerThread).with_detail(error.to_string()),
+            ));
         }
         Self { commands, events }
     }
@@ -226,15 +269,15 @@ async fn run_loop(mut commands: UnboundedReceiver<Command>, events: Sender<Event
                         Err(error) => {
                             link_ref.failures += 1;
                             let detail = error.to_string();
-                            let _ =
-                                events.send(Event::Error(format!("Live input failed: {detail}")));
+                            let _ = events.send(Event::Error(
+                                Notice::new(Key::ErrLiveInputFailed).with_detail(&detail),
+                            ));
                             let fatal =
                                 link_ref.failures >= MAX_LIVE_FAILURES || is_disconnected(&error);
                             if fatal {
-                                let reason = format!(
-                                    "Live input stopped after {} failure(s): {detail}",
-                                    link_ref.failures
-                                );
+                                let reason = Notice::new(Key::ErrLiveStoppedAfterFailures)
+                                    .with_arg(link_ref.failures.to_string())
+                                    .with_detail(detail);
                                 teardown(link.take(), Some(reason), &events).await;
                             }
                         }
@@ -270,7 +313,7 @@ async fn handle_command(command: Command, link: &mut Option<Link>, events: &Send
                 let _ = events.send(Event::Disconnected { reason: None });
             }
             _ => {
-                let _ = events.send(Event::Error("Connect to the controller first.".to_string()));
+                let _ = events.send(Event::Error(Notice::new(Key::ErrConnectFirst)));
             }
         }
         return true;
@@ -282,12 +325,10 @@ async fn handle_command(command: Command, link: &mut Option<Link>, events: &Send
             return false;
         }
         Command::Scan => {
-            let _ = events.send(Event::Error(
-                "Disconnect before scanning again.".to_string(),
-            ));
+            let _ = events.send(Event::Error(Notice::new(Key::ErrDisconnectBeforeScan)));
         }
         Command::Connect { .. } => {
-            let _ = events.send(Event::Error("Already connected.".to_string()));
+            let _ = events.send(Event::Error(Notice::new(Key::ErrAlreadyConnected)));
         }
         Command::Disconnect => {
             teardown(link.take(), None, events).await;
@@ -306,11 +347,13 @@ async fn handle_command(command: Command, link: &mut Option<Link>, events: &Send
                 Err(error) => {
                     let disconnected = is_disconnected(&error);
                     let detail = error.to_string();
-                    let _ = events.send(Event::Error(format!("Version read failed: {detail}")));
+                    let _ = events.send(Event::Error(
+                        Notice::new(Key::ErrVersionReadFailed).with_detail(&detail),
+                    ));
                     if disconnected {
                         teardown(
                             link.take(),
-                            Some(format!("Version read lost the link: {detail}")),
+                            Some(Notice::new(Key::ErrVersionLostLink).with_detail(&detail)),
                             events,
                         )
                         .await;
@@ -332,12 +375,13 @@ async fn handle_command(command: Command, link: &mut Option<Link>, events: &Send
                 Err(error) => {
                     let disconnected = is_disconnected(&error);
                     let detail = error.to_string();
-                    let _ =
-                        events.send(Event::Error(format!("Configuration read failed: {detail}")));
+                    let _ = events.send(Event::Error(
+                        Notice::new(Key::ErrConfigReadFailed).with_detail(&detail),
+                    ));
                     if disconnected {
                         teardown(
                             link.take(),
-                            Some(format!("Configuration read lost the link: {detail}")),
+                            Some(Notice::new(Key::ErrConfigLostLink).with_detail(&detail)),
                             events,
                         )
                         .await;
@@ -360,11 +404,13 @@ async fn handle_command(command: Command, link: &mut Option<Link>, events: &Send
                 Err(error) => {
                     let disconnected = is_disconnected(&error);
                     let detail = error.to_string();
-                    let _ = events.send(Event::Error(format!("Backup failed: {detail}")));
+                    let _ = events.send(Event::Error(
+                        Notice::new(Key::ErrBackupFailed).with_detail(&detail),
+                    ));
                     if disconnected {
                         teardown(
                             link.take(),
-                            Some(format!("Backup lost the link: {detail}")),
+                            Some(Notice::new(Key::ErrBackupLostLink).with_detail(&detail)),
                             events,
                         )
                         .await;
@@ -389,13 +435,13 @@ async fn handle_command(command: Command, link: &mut Option<Link>, events: &Send
             if let Err(error) = result {
                 let disconnected = is_disconnected(&error);
                 let detail = error.to_string();
-                let _ = events.send(Event::Error(format!(
-                    "Cannot stop live input cleanly: {detail}"
-                )));
+                let _ = events.send(Event::Error(
+                    Notice::new(Key::ErrStopLiveFailed).with_detail(&detail),
+                ));
                 if disconnected {
                     teardown(
                         link.take(),
-                        Some(format!("Live input stop lost the link: {detail}")),
+                        Some(Notice::new(Key::ErrLiveStopLostLink).with_detail(detail)),
                         events,
                     )
                     .await;
@@ -414,7 +460,9 @@ async fn scan(events: &Sender<Event>) {
             let _ = events.send(Event::ScanFinished(entries));
         }
         Err(error) => {
-            let _ = events.send(Event::Error(format!("Scan failed: {error}")));
+            let _ = events.send(Event::Error(
+                Notice::new(Key::ErrScanFailed).with_detail(error.to_string()),
+            ));
             let _ = events.send(Event::ScanFinished(Vec::new()));
         }
     }
@@ -425,7 +473,9 @@ async fn connect(address: Option<String>, link: &mut Option<Link>, events: &Send
     let target = address
         .as_deref()
         .map_or_else(|| APP_BLE_NAME.to_string(), |address| address.to_string());
-    let _ = events.send(Event::Log(format!("Connecting to {target}...")));
+    let _ = events.send(Event::Log(
+        Notice::new(Key::LogConnecting).with_arg(&target),
+    ));
 
     let options = BleOptions {
         name: APP_BLE_NAME.to_string(),
@@ -460,9 +510,11 @@ async fn connect(address: Option<String>, link: &mut Option<Link>, events: &Send
         }
         Err(error) => {
             let detail = error.to_string();
-            let _ = events.send(Event::Error(format!("Connection failed: {detail}")));
+            let _ = events.send(Event::Error(
+                Notice::new(Key::ErrConnectionFailed).with_detail(&detail),
+            ));
             let _ = events.send(Event::Disconnected {
-                reason: Some(format!("Connection failed: {detail}")),
+                reason: Some(Notice::new(Key::ErrConnectionFailed).with_detail(detail)),
             });
         }
     }
@@ -488,11 +540,13 @@ async fn enable_live(link: &mut Option<Link>, events: &Sender<Event>) {
         Err(error) => {
             let disconnected = is_disconnected(&error);
             let detail = error.to_string();
-            let _ = events.send(Event::Error(format!("Cannot start live input: {detail}")));
+            let _ = events.send(Event::Error(
+                Notice::new(Key::ErrStartLiveFailed).with_detail(&detail),
+            ));
             if disconnected {
                 teardown(
                     link.take(),
-                    Some(format!("Live input could not start: {detail}")),
+                    Some(Notice::new(Key::ErrLiveStartLostLink).with_detail(detail)),
                     events,
                 )
                 .await;
@@ -516,11 +570,13 @@ async fn refresh_after_connect(link: &mut Option<Link>, events: &Sender<Event>) 
         Err(error) => {
             let disconnected = is_disconnected(&error);
             let detail = error.to_string();
-            let _ = events.send(Event::Error(format!("Version read failed: {detail}")));
+            let _ = events.send(Event::Error(
+                Notice::new(Key::ErrVersionReadFailed).with_detail(&detail),
+            ));
             if disconnected {
                 teardown(
                     link.take(),
-                    Some(format!("Version read lost the link: {detail}")),
+                    Some(Notice::new(Key::ErrVersionLostLink).with_detail(&detail)),
                     events,
                 )
                 .await;
@@ -542,11 +598,13 @@ async fn refresh_after_connect(link: &mut Option<Link>, events: &Sender<Event>) 
         Err(error) => {
             let disconnected = is_disconnected(&error);
             let detail = error.to_string();
-            let _ = events.send(Event::Error(format!("Configuration read failed: {detail}")));
+            let _ = events.send(Event::Error(
+                Notice::new(Key::ErrConfigReadFailed).with_detail(&detail),
+            ));
             if disconnected {
                 teardown(
                     link.take(),
-                    Some(format!("Configuration read lost the link: {detail}")),
+                    Some(Notice::new(Key::ErrConfigLostLink).with_detail(detail)),
                     events,
                 )
                 .await;
@@ -555,7 +613,7 @@ async fn refresh_after_connect(link: &mut Option<Link>, events: &Sender<Event>) 
     }
 }
 
-async fn teardown(link: Option<Link>, reason: Option<String>, events: &Sender<Event>) {
+async fn teardown(link: Option<Link>, reason: Option<Notice>, events: &Sender<Event>) {
     if let Some(mut link) = link {
         // Best effort: stop notifications even if live input was already
         // stopped or never started. The caller still disconnects the link.
