@@ -23,7 +23,7 @@ use eightbitdo_core::{
     map_key_flag, max_protocol_payload, scan_devices, validate_macro_chunk_size, BleOptions,
     BleTransport, ConfigCrcStatus, ConfigEdit, ConfigRegion, ConfigSnapshot, ConfigWritePlan,
     ConfigWriteTimeouts, Error, MacroBackup, MacroEntry, MacroWritePlan, PreparedConfigWrite,
-    Session, Transport, VersionInfo,
+    Session, Transport, VersionInfo, APP_BLE_NAME,
 };
 use eightbitdo_protocol::commands::{MacroWriteLayout, SaveTransport};
 use eightbitdo_protocol::config_bt2::{
@@ -451,6 +451,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
         scan_timeout: Duration::from_secs(cli.scan_timeout),
         connect_timeout: Duration::from_secs(cli.timeout),
         verbose: cli.verbose,
+        lock_path: None,
     };
 
     match cli.command {
@@ -5368,14 +5369,66 @@ fn keepalive_degraded_error(state: &SessionKeepaliveState) -> Option<Error> {
         return None;
     }
     Some(Error::Transport(format!(
-        "keepalive degraded (consecutive failures {}): {}. The controller most likely \
-         left BLE configuration mode; this session does not auto-reconnect. Press \
-         Profile on the controller to re-enter `80ND` and start a new `eightbitdo session`",
+        "keepalive degraded (consecutive failures {}): {}. The controller left BLE App \
+         Mode, so `{APP_BLE_NAME}` no longer advertises and this session does not \
+         auto-reconnect. Press Profile on the controller for about 3 seconds to re-enter \
+         App Mode, then start a new `eightbitdo session`",
         state.consecutive_failures.load(Ordering::SeqCst),
         state
             .last_error()
             .unwrap_or_else(|| "unknown error".to_string())
     )))
+}
+
+/// Process exit code for a degraded keepalive.
+///
+/// This is deliberately distinct from `1` (ordinary error): the resident loop
+/// must stop and wait for a physical Profile press instead of reconnecting,
+/// because a disconnected controller does not advertise `80ND` at all. No
+/// automatic retry can succeed until the user performs the press.
+const EXIT_SESSION_DEGRADED: u8 = 3;
+
+/// Exit code for a session that ended for any reason other than a clean
+/// `quit`.
+const EXIT_SESSION_ERROR: u8 = 1;
+
+/// Map a finished REPL result and the keepalive state to a process exit code.
+///
+/// Kept as a pure function so the degraded/clean/error mapping is testable
+/// without a controller.
+fn session_exit_code(result: &Result<(), Error>, degraded: bool) -> u8 {
+    if degraded {
+        EXIT_SESSION_DEGRADED
+    } else if result.is_ok() {
+        0
+    } else {
+        EXIT_SESSION_ERROR
+    }
+}
+
+/// Tell the operator that SIGINT is about to drop the BLE link.
+///
+/// The session is the only owner of the link while it runs; exiting hands the
+/// controller back to its normal mode and `80ND` disappears, so the next
+/// session needs a physical Profile press. SIGINT is still honoured (it is an
+/// explicit user action); the warning exists so the press is expected.
+fn warn_sigint_disconnects() {
+    warn_app_mode_requires_press("SIGINT received; exiting closes the BLE link and exits App Mode");
+}
+
+/// EOF on the control pipe means the same lost link as `quit`/SIGINT.
+fn warn_eof_disconnects() {
+    warn_app_mode_requires_press(
+        "stdin ended (EOF); exiting closes the BLE link and exits App Mode",
+    );
+}
+
+fn warn_app_mode_requires_press(reason: &str) {
+    eprintln!(
+        "note: {reason}. The controller stops advertising `{APP_BLE_NAME}`; to re-enter \
+         App Mode, press Profile on the controller for about 3 seconds before starting a \
+         new session."
+    );
 }
 
 async fn shutdown_session<T: Transport>(
@@ -6384,11 +6437,10 @@ where
             LoopEvent::CtrlC => {
                 // Ctrl-C while idle: no command future is in flight. If a
                 // command was running, its branch below drops the future
-                // instead. `Session` records abandoned reads through
-                // `ResyncGuard` / `InFlight`; the next read calls
-                // `prepare_read` and drains only when a read (not an input
-                // poll) may have left a response behind. A protocol error from
-                // an input poll marks the session explicitly.
+                // instead; `Session` marks that through `ResyncGuard` /
+                // `InFlight`. Honouring SIGINT is standard, but it costs the
+                // App Mode link, so say so before leaving.
+                warn_sigint_disconnects();
                 break;
             }
             LoopEvent::KeepaliveStopped => {
@@ -6417,7 +6469,10 @@ where
                     }
                 };
                 let text = match read {
-                    LineRead::Eof => break,
+                    LineRead::Eof => {
+                        warn_eof_disconnects();
+                        break;
+                    }
                     LineRead::TooLong { discarded } => {
                         eprintln!(
                             "line too long: discarded {discarded} bytes (limit {MAX_SESSION_LINE_BYTES} per line); command ignored"
@@ -6446,6 +6501,7 @@ where
                     let prepared = tokio::select! {
                         biased;
                         _ = &mut ctrl_c => {
+                            warn_sigint_disconnects();
                             eprintln!(
                                 "note: Ctrl-C received; configuration preparation was cancelled \
                                  before any 0x0001/Save. If a pre-write backup was created it remains."
@@ -6470,6 +6526,7 @@ where
                         let answer = tokio::select! {
                             biased;
                             _ = &mut ctrl_c => {
+                                warn_sigint_disconnects();
                                 eprintln!(
                                     "note: Ctrl-C received; configuration write cancelled before \
                                      any 0x0001/Save. Pre-write backup: {} (plan-time snapshot); \
@@ -6506,6 +6563,7 @@ where
                         biased;
                         result = &mut finish => result,
                         _ = &mut ctrl_c => {
+                            warn_sigint_disconnects();
                             eprintln!(
                                 "note: Ctrl-C received; the configuration flash write \
                                  (0x0001/Save) is not cancellable and will finish before the \
@@ -6562,6 +6620,7 @@ where
                         biased;
                         outcome = &mut command_future => outcome,
                         _ = &mut ctrl_c => {
+                            warn_sigint_disconnects();
                             eprintln!(
                                 "note: Ctrl-C received; the flash operation is not cancellable \
                                  and will finish before the session exits"
@@ -6581,6 +6640,7 @@ where
                             // the next read drains only when a response could
                             // still be in flight. There is no caller-side mark to
                             // clear; `Session::InFlight` makes that decision.
+                            warn_sigint_disconnects();
                             break;
                         }
                         outcome = execute_session_command_with_io(
@@ -6695,13 +6755,37 @@ async fn session(
     )
     .await;
     shutdown_session(&session, keepalive).await;
+    let degraded = state.degraded.load(Ordering::SeqCst);
     let result = finalize_session_result(result, &state);
+
+    if session_exit_code(&result, degraded) == EXIT_SESSION_DEGRADED {
+        // Reuse the keepalive message (it names the failure and the Profile
+        // press), then make the terminal state and exit code explicit: the
+        // resident loop keys on this code to stop instead of reconnecting.
+        if let Some(error) = keepalive_degraded_error(&state) {
+            eprintln!("session error: {error}");
+        }
+        eprintln!(
+            "session exit code {EXIT_SESSION_DEGRADED}: keepalive degraded; the BLE link is \
+             gone and `{APP_BLE_NAME}` is not advertising. Physical controller action \
+             (Profile, about 3 seconds) is required before another session can connect. \
+             This is not retried automatically."
+        );
+        return Ok(ExitCode::from(EXIT_SESSION_DEGRADED));
+    }
 
     match result {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(error) => {
+            let disconnected = matches!(error, Error::Disconnected);
             eprintln!("session error: {error}");
-            Ok(ExitCode::FAILURE)
+            if disconnected {
+                // The link was lost outside the keepalive path (a command
+                // observed the disconnect). The controller is already out of
+                // App Mode, so the same press guidance applies.
+                warn_app_mode_requires_press("the BLE link was lost");
+            }
+            Ok(ExitCode::from(EXIT_SESSION_ERROR))
         }
     }
 }
@@ -9006,6 +9090,147 @@ mod tests {
         assert!(
             matches!(finalized, Err(Error::Transport(ref msg)) if msg.contains("keepalive degraded"))
         );
+    }
+
+    #[test]
+    fn session_exit_code_marks_degraded_as_three() {
+        // The resident loop keys on 3 to stop and wait for a physical Profile
+        // press. A clean quit is 0 and every other error is 1.
+        assert_eq!(session_exit_code(&Ok(()), true), EXIT_SESSION_DEGRADED);
+        assert_eq!(
+            session_exit_code(&Err(Error::Disconnected), true),
+            EXIT_SESSION_DEGRADED
+        );
+        assert_eq!(session_exit_code(&Ok(()), false), 0);
+        assert_eq!(
+            session_exit_code(&Err(Error::Disconnected), false),
+            EXIT_SESSION_ERROR
+        );
+        assert_ne!(EXIT_SESSION_DEGRADED, EXIT_SESSION_ERROR);
+    }
+
+    #[tokio::test]
+    async fn repl_exits_when_keepalive_degrades_with_stdin_still_open() {
+        // The failure mode this guards: a resident session sits in the REPL
+        // line read while the keepalive degrades, so the process keeps waiting
+        // for a command instead of exiting for the next physical press. The
+        // write half is kept alive, so nothing but the keepalive stop can end
+        // the loop.
+        let (_writer, reader) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let session = Arc::new(AsyncMutex::new(Session::new(KeepaliveTestTransport::new())));
+        let state = Arc::new(SessionKeepaliveState::new());
+        state.record_error(&Error::Disconnected);
+        state.consecutive_failures.store(3, Ordering::SeqCst);
+        state.degraded.store(true, Ordering::SeqCst);
+        state.stopped_notify.notify_one();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            session_repl_loop_with_io(
+                &session,
+                &state,
+                Instant::now(),
+                64,
+                Duration::from_millis(10),
+                false,
+                false,
+                &mut reader,
+                std::future::pending::<()>(),
+                false,
+            ),
+        )
+        .await
+        .expect("the REPL must exit on a degraded keepalive instead of waiting for input");
+        assert!(
+            matches!(result, Err(Error::Transport(ref msg)) if msg.contains("keepalive degraded")),
+            "expected the degraded exit, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repl_exits_after_three_real_keepalive_failures_with_stdin_open() {
+        // End-to-end version of the incident: the keepalive task itself fails
+        // three consecutive polls while the REPL is blocked in the line read.
+        // The session must surface the degraded error and stop waiting for
+        // commands, not sit in the REPL until a physical press.
+        let transport = KeepaliveTestTransport::new();
+        // Three consecutive non-`Disconnected` failures: a disconnected recv
+        // degrades on the first failure by design, so use the generic receive
+        // error to exercise the 3-failure threshold.
+        transport.fail_receives();
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let keepalive = start_session_keepalive_with_config(
+            Arc::clone(&session),
+            SessionKeepaliveConfig {
+                interval: Duration::from_millis(1),
+                max_consecutive_failures: 3,
+            },
+            false,
+        )
+        .await
+        .expect("start keepalive");
+        let state = Arc::clone(&keepalive.state);
+        let (_writer, reader) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            session_repl_loop_with_io(
+                &session,
+                &state,
+                Instant::now(),
+                64,
+                Duration::from_millis(1),
+                false,
+                false,
+                &mut reader,
+                std::future::pending::<()>(),
+                false,
+            ),
+        )
+        .await
+        .expect("the REPL must exit after three keepalive failures");
+        assert!(
+            matches!(result, Err(Error::Transport(ref msg)) if msg.contains("keepalive degraded")),
+            "expected the degraded exit, got {result:?}"
+        );
+        assert_eq!(state.consecutive_failures.load(Ordering::SeqCst), 3);
+        assert!(state.degraded.load(Ordering::SeqCst));
+        assert_eq!(session_exit_code(&result, true), EXIT_SESSION_DEGRADED);
+
+        shutdown_session(&session, keepalive).await;
+        assert!(transport.is_disconnected());
+    }
+
+    #[tokio::test]
+    async fn session_refuses_to_start_while_another_process_holds_the_ble_lock() {
+        // The session must fail before touching the adapter, with the ordinary
+        // error exit code (not the degraded 3), so a resident loop cannot
+        // mistake lock contention for a lost link.
+        let path = std::env::temp_dir().join(format!(
+            "eightbitdo-cli-session-lock-{}-{}.lock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        let held = eightbitdo_core::BleLock::acquire_at(&path).expect("hold the lock");
+        let options = BleOptions {
+            lock_path: Some(path.clone()),
+            ..BleOptions::default()
+        };
+        let code = session(&options, Duration::from_millis(20), false, false, true)
+            .await
+            .expect("session returns an exit code instead of an Err");
+        assert_eq!(
+            code,
+            ExitCode::FAILURE,
+            "a lock conflict is an ordinary failure, not a degraded exit"
+        );
+        assert_eq!(session_exit_code(&Ok(()), false), 0);
+        drop(held);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

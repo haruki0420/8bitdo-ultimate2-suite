@@ -10,7 +10,7 @@ authors.workspace = true
 
 [features]
 default = ["ble"]
-ble = ["dep:btleplug", "dep:futures-util"]
+ble = ["dep:btleplug", "dep:futures-util", "dep:fs2"]
 
 [dependencies]
 eightbitdo-protocol = { path = "../eightbitdo-protocol" }
@@ -20,6 +20,7 @@ tokio = { version = "1", features = ["sync", "time", "rt"] }
 uuid = "1"
 btleplug = { version = "0.13", optional = true }
 futures-util = { version = "0.3", optional = true }
+fs2 = { version = "0.4.3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "time"] }

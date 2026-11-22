@@ -9,6 +9,7 @@
 //! live in later phases.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -21,6 +22,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::Instant;
 use uuid::Uuid;
 
+use crate::ble_lock::{default_ble_lock_path, BleLock};
 use crate::transport::Transport;
 use crate::{
     Error, APP_BLE_NAME, APP_CHARACTERISTIC_UUID, APP_CHARACTERISTIC_UUID_ALT, APP_SERVICE_UUID,
@@ -55,6 +57,12 @@ pub struct BleOptions {
     pub connect_timeout: Duration,
     /// Log every raw TX and RX frame to stderr.
     pub verbose: bool,
+    /// Override the single-owner BLE lock path.
+    ///
+    /// `None` (the default) uses [`crate::default_ble_lock_path`]. Tests and
+    /// wrappers set this to keep a temporary or per-user lock; see
+    /// [`crate::BleLock`].
+    pub lock_path: Option<PathBuf>,
 }
 
 impl Default for BleOptions {
@@ -65,6 +73,7 @@ impl Default for BleOptions {
             scan_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(20),
             verbose: false,
+            lock_path: None,
         }
     }
 }
@@ -95,6 +104,12 @@ pub struct BleTransport {
     name: Option<String>,
     verbose: bool,
     rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+    /// Single-owner lock, held from before the scan until disconnect/drop.
+    ///
+    /// Wrapped in a mutex so [`Transport::disconnect`] can release it before
+    /// the value is dropped; a process exit releases it through the kernel
+    /// regardless.
+    ble_lock: std::sync::Mutex<Option<BleLock>>,
 }
 
 impl BleTransport {
@@ -108,9 +123,20 @@ impl BleTransport {
     ///
     /// Returns [`Error::Ble`] for adapter/backend failures,
     /// [`Error::DeviceNotFound`] when no matching peripheral appears within
-    /// [`BleOptions::scan_timeout`], or [`Error::CharacteristicNotFound`] when
-    /// service `FF10` has no usable App Mode characteristic.
+    /// [`BleOptions::scan_timeout`], [`Error::CharacteristicNotFound`] when
+    /// service `FF10` has no usable App Mode characteristic, or
+    /// [`Error::BleBusy`] when another process holds the single-owner BLE lock.
+    ///
+    /// The lock is taken before the adapter is touched and is held for the
+    /// lifetime of the returned transport: a resident `session`, a GUI and a
+    /// one-shot `scan` cannot scan or reconnect over each other.
     pub async fn connect(options: &BleOptions) -> Result<Self, Error> {
+        let lock = BleLock::acquire_at(
+            options
+                .lock_path
+                .clone()
+                .unwrap_or_else(default_ble_lock_path),
+        )?;
         let manager = Manager::new().await.map_err(ble_error)?;
         let adapters = manager.adapters().await.map_err(ble_error)?;
         let adapter = adapters
@@ -219,6 +245,7 @@ impl BleTransport {
             name,
             verbose,
             rx: Mutex::new(rx),
+            ble_lock: std::sync::Mutex::new(Some(lock)),
         })
     }
 
@@ -284,6 +311,11 @@ impl Transport for BleTransport {
         // from the caller's point of view.
         let _ = self.peripheral.unsubscribe(&self.characteristic).await;
         let _ = self.peripheral.disconnect().await;
+        // Release the single-owner lock only after the link is torn down, so a
+        // reconnect in another process cannot race the old connection.
+        if let Ok(mut lock) = self.ble_lock.lock() {
+            let _ = lock.take();
+        }
         Ok(())
     }
 }
@@ -294,8 +326,28 @@ impl Transport for BleTransport {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Ble`] when no adapter is available or the backend fails.
+/// Returns [`Error::Ble`] when no adapter is available or the backend fails,
+/// and [`Error::BleBusy`] when another process (for example a resident
+/// `session`) holds the single-owner BLE lock.
 pub async fn scan_devices(timeout: Duration) -> Result<Vec<BleDevice>, Error> {
+    scan_devices_with_lock_path(timeout, None).await
+}
+
+/// [`scan_devices`] with an explicit lock path override.
+///
+/// `None` uses [`crate::default_ble_lock_path`]. Exposed so tests and wrappers
+/// can share a private lock without touching the developer's real one.
+///
+/// # Errors
+///
+/// Same as [`scan_devices`].
+pub async fn scan_devices_with_lock_path(
+    timeout: Duration,
+    lock_path: Option<PathBuf>,
+) -> Result<Vec<BleDevice>, Error> {
+    // Hold the lock for the whole scan: two scans at once are what makes the
+    // controller report `In Progress` on the next connect.
+    let _lock = BleLock::acquire_at(lock_path.unwrap_or_else(default_ble_lock_path))?;
     let manager = Manager::new().await.map_err(ble_error)?;
     let adapters = manager.adapters().await.map_err(ble_error)?;
     let adapter = adapters
@@ -558,5 +610,65 @@ mod tests {
             compute_write_timeout(Duration::from_secs(2)),
             Duration::from_secs(2)
         );
+    }
+
+    fn temp_lock_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "eightbitdo-ble-{label}-{}-{}.lock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ))
+    }
+
+    #[test]
+    fn connect_options_default_to_the_shared_lock() {
+        assert_eq!(BleOptions::default().lock_path, None);
+    }
+
+    #[tokio::test]
+    async fn connect_is_refused_while_another_process_holds_the_lock() {
+        let path = temp_lock_path("connect-busy");
+        let _held = BleLock::acquire_at(&path).expect("hold the lock");
+        let options = BleOptions {
+            lock_path: Some(path.clone()),
+            ..BleOptions::default()
+        };
+        let error = match BleTransport::connect(&options).await {
+            Ok(_) => panic!("connect must refuse while the lock is held"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, Error::BleBusy { path: ref held } if held == &path),
+            "expected BleBusy before the adapter is touched, got {error:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn scan_is_refused_while_an_external_flock_is_held() {
+        use fs2::FileExt;
+
+        let path = temp_lock_path("scan-busy");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .expect("open lock file");
+        // `flock(1)`-style holder: the CLI must report busy, not block, and it
+        // must not touch the adapter.
+        FileExt::try_lock_exclusive(&file).expect("external flock");
+        let error = scan_devices_with_lock_path(Duration::from_millis(1), Some(path.clone()))
+            .await
+            .expect_err("scan must refuse while the lock is held");
+        assert!(
+            matches!(error, Error::BleBusy { path: ref held } if held == &path),
+            "expected BleBusy, got {error:?}"
+        );
+        FileExt::unlock(&file).expect("unlock");
+        let _ = std::fs::remove_file(&path);
     }
 }
