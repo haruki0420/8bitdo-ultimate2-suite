@@ -24,6 +24,56 @@ use crate::error::{Error, MacroWriteStage};
 use crate::session::{deadline_after, ConfigSnapshot, Session, TransferBuffer};
 use crate::transport::Transport;
 
+/// Payload budget for one BLE frame: `mtu - 3` (ATT overhead) minus the
+/// 1-byte packet prefix and 16-byte custom header.
+///
+/// This is the value the macro chunk sizes must respect; using `mtu - 17`
+/// alone would exceed [`crate::ble::BleTransport`]'s `mtu - 3` send limit.
+#[must_use]
+pub fn max_protocol_payload(mtu: u16) -> usize {
+    usize::from(mtu.saturating_sub(3)).saturating_sub(17)
+}
+
+/// Header (`0x0001`) chunk length for the negotiated MTU.
+///
+/// # Errors
+///
+/// Returns [`Error::MtuTooSmall`] when no payload byte fits.
+pub fn macro_header_chunk_len(mtu: u16) -> Result<usize, Error> {
+    let max_payload = max_protocol_payload(mtu);
+    if max_payload == 0 {
+        return Err(Error::MtuTooSmall {
+            mtu,
+            reason: "no room for 1-byte prefix + 16-byte header".to_string(),
+        });
+    }
+    Ok(max_payload.min(MACRO_HEADER_CHUNK_SIZE))
+}
+
+/// `0x0103` chunk length for the negotiated MTU.
+///
+/// Macro writes support only 32- and 64-byte chunks (32-byte alignment).
+///
+/// # Errors
+///
+/// Returns [`Error::MtuTooSmall`] when even a 32-byte chunk does not fit.
+pub fn macro_write_chunk_len(mtu: u16) -> Result<usize, Error> {
+    let max_payload = max_protocol_payload(mtu);
+    if max_payload >= commands::MACRO_MAX_CHUNK_SIZE {
+        Ok(commands::MACRO_MAX_CHUNK_SIZE)
+    } else if max_payload >= commands::MACRO_USB_CHUNK_SIZE {
+        Ok(commands::MACRO_USB_CHUNK_SIZE)
+    } else {
+        Err(Error::MtuTooSmall {
+            mtu,
+            reason: format!(
+                "macro writes need a 32-byte chunk but only {max_payload} bytes fit after \
+                 the 1-byte prefix, 16-byte header and 3-byte ATT overhead"
+            ),
+        })
+    }
+}
+
 /// Overall deadline for assembling one macro read.
 ///
 /// A full 200-step macro is 2000 bytes and may arrive in several
@@ -43,8 +93,8 @@ pub const MACRO_HEADER_TIMEOUT: Duration = Duration::from_secs(2);
 /// Header payload chunk size used for `0x0001`.
 ///
 /// A 216-byte header does not fit one BLE frame at MTU 200: `1 + 16 + 216 =
-/// 233` exceeds the usable `mtu - 3 = 197` bytes. The implementation sends
-/// 142 + 74 bytes (`1 + 16 + 142 = 159`). `total_len` stays `0x0AD0` and each
+/// 233` exceeds the usable `mtu - 3 = 197` bytes. The default is 142 bytes,
+/// further reduced by the negotiated MTU. `total_len` stays `0x0AD0` and each
 /// packet's `offset` advances by the actual chunk length.
 pub const MACRO_HEADER_CHUNK_SIZE: usize = 142;
 
@@ -100,8 +150,6 @@ pub struct MacroWritePlan {
     pub flag: Option<u32>,
     /// Registered macro count (`0..=4`); `None` preserves the existing value.
     pub total_cnt: Option<u8>,
-    /// `0x0103` chunk size (`32` or `64`).
-    pub chunk_size: usize,
     /// Save sub-command variant.
     pub save_transport: SaveTransport,
     /// ACK timeouts.
@@ -120,7 +168,6 @@ impl MacroWritePlan {
             interval_ms: None,
             flag: None,
             total_cnt: None,
-            chunk_size: commands::MACRO_MAX_CHUNK_SIZE,
             save_transport: SaveTransport::Ble,
             timeouts: MacroTimeouts::default(),
         }
@@ -159,13 +206,6 @@ impl MacroWritePlan {
     pub fn with_header_state(mut self, flag: u32, total_cnt: u8) -> Self {
         self.flag = Some(flag);
         self.total_cnt = Some(total_cnt);
-        self
-    }
-
-    /// Set the `0x0103` chunk size.
-    #[must_use]
-    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
-        self.chunk_size = chunk_size;
         self
     }
 
@@ -614,9 +654,20 @@ impl<T: Transport> Session<T> {
             )));
         }
 
+        let mtu = self.transport().mtu();
+        let header_chunk_size = macro_header_chunk_len(mtu)?;
+        let write_chunk_size = macro_write_chunk_len(mtu)?;
+
         self.prepare_read().await?;
-        self.run_write(self.write_macro_inner(backup, slot, index, plan))
-            .await
+        self.run_write(self.write_macro_inner(
+            backup,
+            slot,
+            index,
+            plan,
+            header_chunk_size,
+            write_chunk_size,
+        ))
+        .await
     }
 
     async fn write_macro_inner(
@@ -625,6 +676,8 @@ impl<T: Transport> Session<T> {
         slot: Slot,
         index: MacroIndex,
         plan: &MacroWritePlan,
+        header_chunk_size: usize,
+        write_chunk_size: usize,
     ) -> Result<MacroWriteOutcome, Error> {
         let base_config = &backup.snapshot().config;
         let mode = base_config.gamepad_mode_raw() & 0xFF;
@@ -670,12 +723,9 @@ impl<T: Transport> Session<T> {
         // leave the sector erased without new data.
         let erase = commands::erase_macro(mode, slot, index);
         let write_packets =
-            commands::write_macro_steps(mode, slot, index, &plan.steps, plan.chunk_size)?;
-        let header_request = commands::write_config_packets(
-            header_offset as u32,
-            &header_bytes,
-            MACRO_HEADER_CHUNK_SIZE,
-        )?;
+            commands::write_macro_steps(mode, slot, index, &plan.steps, write_chunk_size)?;
+        let header_request =
+            commands::write_config_packets(header_offset as u32, &header_bytes, header_chunk_size)?;
         let save = commands::save(plan.save_transport);
 
         let mut packets_sent = 0usize;
@@ -1297,7 +1347,7 @@ mod write_tests {
         plan.cycles_num = Some(5);
         plan.interval_ms = Some(30);
 
-        let mock = MockTransport::new();
+        let mock = MockTransport::with_mtu(200);
         push_ack(&mock, cmd::ERASE_MACRO, true);
         for _ in 0..4 {
             push_ack(&mock, cmd::WRITE_MACRO, false);
@@ -1421,18 +1471,20 @@ mod write_tests {
     }
 
     #[tokio::test]
-    async fn write_macro_uses_32_byte_usb_chunks() {
+    async fn mtu_64_uses_44_byte_header_chunks_and_32_byte_writes() {
         let backup = backup_from(config_with_existing_macro());
         let steps = sample_steps(10);
-        let plan = MacroWritePlan::new(steps.clone()).with_chunk_size(32);
+        let plan = MacroWritePlan::new(steps.clone());
 
-        let mock = MockTransport::new();
+        let mock = MockTransport::with_mtu(64);
         push_ack(&mock, cmd::ERASE_MACRO, false);
         for _ in 0..4 {
             push_ack(&mock, cmd::WRITE_MACRO, false);
         }
-        push_ack(&mock, cmd::WRITE_CONFIG, false);
-        push_ack(&mock, cmd::WRITE_CONFIG, false);
+        // 216 bytes at 44 bytes per header chunk: 44*4 + 40.
+        for _ in 0..5 {
+            push_ack(&mock, cmd::WRITE_CONFIG, false);
+        }
         push_ack(&mock, cmd::SAVE, false);
         push_readback(&mock, &steps);
 
@@ -1443,6 +1495,10 @@ mod write_tests {
             .unwrap();
 
         let sent = mock.sent_frames();
+        assert!(
+            sent.iter().all(|frame| frame.len() <= 61),
+            "every frame must fit mtu - 3 = 61 bytes"
+        );
         // 100 bytes -> 128 aligned -> 4 x 32.
         for (i, request) in sent[1..5].iter().enumerate() {
             let header = CustomHeader::parse(&request[1..]).unwrap();
@@ -1450,10 +1506,24 @@ mod write_tests {
             assert_eq!(header.chunk_len, 32);
             assert_eq!(header.offset, (i * 32) as u32);
         }
-        assert_eq!(
-            CustomHeader::parse(&sent[5][1..]).unwrap().cmd,
-            cmd::WRITE_CONFIG
-        );
+        let header_frames: Vec<_> = sent
+            .iter()
+            .filter(|frame| frame_cmd(frame) == cmd::WRITE_CONFIG)
+            .collect();
+        assert_eq!(header_frames.len(), 5);
+        let expected_lengths = [44u16, 44, 44, 44, 40];
+        let expected_offsets = [0x68Cu32, 0x6B8, 0x6E4, 0x710, 0x73C];
+        for ((frame, length), offset) in header_frames
+            .iter()
+            .zip(expected_lengths)
+            .zip(expected_offsets)
+        {
+            let header = CustomHeader::parse(&frame[1..]).unwrap();
+            assert_eq!(header.total_len, 0x0AD0);
+            assert_eq!(header.chunk_len, length);
+            assert_eq!(header.offset, offset);
+            assert_eq!(frame.len(), 17 + usize::from(length));
+        }
     }
 
     #[tokio::test]
@@ -1464,7 +1534,7 @@ mod write_tests {
             .with_key_map(KeyMap::P1)
             .with_header_state(1, 2);
 
-        let mock = MockTransport::new();
+        let mock = MockTransport::with_mtu(200);
         push_ack(&mock, cmd::ERASE_MACRO, true);
         for _ in 0..4 {
             push_ack(&mock, cmd::WRITE_MACRO, true);
@@ -1496,14 +1566,16 @@ mod write_tests {
         incoming: Mutex<VecDeque<Vec<u8>>>,
         sent: Mutex<Vec<Vec<u8>>>,
         stall_when_empty: bool,
+        mtu: u16,
     }
 
     impl ScriptedTransport {
-        fn new(frames: Vec<Vec<u8>>, stall_when_empty: bool) -> Self {
+        fn new(frames: Vec<Vec<u8>>, stall_when_empty: bool, mtu: u16) -> Self {
             Self {
                 incoming: Mutex::new(frames.into()),
                 sent: Mutex::new(Vec::new()),
                 stall_when_empty,
+                mtu,
             }
         }
 
@@ -1535,7 +1607,7 @@ mod write_tests {
         }
 
         fn mtu(&self) -> u16 {
-            64
+            self.mtu
         }
 
         async fn disconnect(&self) -> Result<(), Error> {
@@ -1568,7 +1640,7 @@ mod write_tests {
     ) -> (Result<MacroWriteOutcome, Error>, Vec<Vec<u8>>) {
         let backup = backup_from(config_with_existing_macro());
         let plan = MacroWritePlan::new(steps.to_vec()).with_timeouts(short_timeouts());
-        let transport = ScriptedTransport::new(script, stall_when_empty);
+        let transport = ScriptedTransport::new(script, stall_when_empty, 200);
         let session = Session::new(&transport);
         let result = session
             .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
@@ -1777,7 +1849,7 @@ mod write_tests {
     #[tokio::test]
     async fn backup_timeout_starts_no_write() {
         let backup = backup_from(config_with_existing_macro());
-        let transport = ScriptedTransport::new(Vec::new(), true);
+        let transport = ScriptedTransport::new(Vec::new(), true, 200);
         let session = Session::new(&transport).with_timeout(Duration::from_millis(10));
         let result = session.read_macro_backup(backup.snapshot()).await;
         assert!(result.is_err());
@@ -1824,7 +1896,7 @@ mod write_tests {
         let backup = backup_from(config_with_existing_macro());
         let plan = MacroWritePlan::new(steps.clone());
         let transport = LimitedTransport {
-            inner: ScriptedTransport::new(full_success_script(&steps), true),
+            inner: ScriptedTransport::new(full_success_script(&steps), true, 200),
             limit: 200 - 3,
         };
         let session = Session::new(&transport);
@@ -1857,6 +1929,46 @@ mod write_tests {
         assert_eq!(
             CustomHeader::parse(&headers[1][1..]).unwrap().total_len,
             0x0AD0
+        );
+    }
+    #[test]
+    fn mtu_chunk_helpers_follow_att_limit() {
+        assert_eq!(max_protocol_payload(200), 180);
+        assert_eq!(macro_header_chunk_len(200).unwrap(), 142);
+        assert_eq!(macro_write_chunk_len(200).unwrap(), 64);
+
+        assert_eq!(max_protocol_payload(64), 44);
+        assert_eq!(macro_header_chunk_len(64).unwrap(), 44);
+        assert_eq!(macro_write_chunk_len(64).unwrap(), 32);
+
+        assert_eq!(max_protocol_payload(23), 3);
+        assert_eq!(macro_header_chunk_len(23).unwrap(), 3);
+        assert!(matches!(
+            macro_write_chunk_len(23),
+            Err(Error::MtuTooSmall { mtu: 23, .. })
+        ));
+
+        assert_eq!(max_protocol_payload(20), 0);
+        assert!(matches!(
+            macro_header_chunk_len(20),
+            Err(Error::MtuTooSmall { mtu: 20, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn mtu_23_rejects_macro_write_before_sending() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(10);
+        let plan = MacroWritePlan::new(steps).with_timeouts(short_timeouts());
+        let transport = ScriptedTransport::new(Vec::new(), true, 23);
+        let session = Session::new(&transport);
+        let result = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await;
+        assert!(matches!(result, Err(Error::MtuTooSmall { mtu: 23, .. })));
+        assert!(
+            transport.sent().is_empty(),
+            "MTU 23 must fail before Erase/Write/Header/Save"
         );
     }
 }

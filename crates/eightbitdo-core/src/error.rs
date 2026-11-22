@@ -77,6 +77,15 @@ pub enum Error {
     #[error("timeout of {0:?} is too large (maximum is 30 years)")]
     InvalidTimeout(std::time::Duration),
 
+    /// The negotiated MTU leaves no usable macro payload.
+    #[error("MTU {mtu} is too small for this operation: {reason}")]
+    MtuTooSmall {
+        /// Negotiated ATT MTU.
+        mtu: u16,
+        /// Why the operation cannot proceed.
+        reason: String,
+    },
+
     /// A response carried an unexpected command or range.
     #[error("unexpected response: {0}")]
     UnexpectedResponse(String),

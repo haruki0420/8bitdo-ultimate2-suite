@@ -1058,19 +1058,6 @@ fn parse_macro_index(value: u8) -> Result<MacroIndex, Error> {
         .ok_or_else(|| invalid_input(format!("macro index must be 0..=3, got {value}")))
 }
 
-/// Pick a BLE chunk size that fits the negotiated MTU.
-///
-/// The macro write supports only 32 and 64 bytes. A 64-byte chunk needs
-/// `1 + 16 + 64` bytes plus 3 bytes of ATT overhead, so small MTUs fall back
-/// to 32.
-fn macro_chunk_size(mtu: u16) -> usize {
-    if u32::from(mtu) >= 64 + 16 + 1 + 3 {
-        64
-    } else {
-        32
-    }
-}
-
 fn default_backup_dir(prefix: &str) -> PathBuf {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1142,21 +1129,11 @@ async fn macro_write(
 
     let transport = BleTransport::connect(options).await?;
     let session = Session::new(transport);
-    let chunk_size = macro_chunk_size(session.transport().mtu());
     let backup_dir = backup_dir.map_or_else(
         || default_backup_dir("macro-backup"),
         std::path::Path::to_path_buf,
     );
-    let result = macro_write_session(
-        &session,
-        slot,
-        index,
-        &file,
-        trigger,
-        &backup_dir,
-        chunk_size,
-    )
-    .await;
+    let result = macro_write_session(&session, slot, index, &file, trigger, &backup_dir).await;
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
 }
@@ -1168,7 +1145,6 @@ async fn macro_write_session<T: Transport>(
     file: &MacroFile,
     trigger: Option<KeyMap>,
     backup_dir: &Path,
-    chunk_size: usize,
 ) -> Result<(), Error> {
     println!("reading configuration and full 3-slot × 4-macro backup...");
     let snapshot = session.read_config_snapshot().await?;
@@ -1200,17 +1176,16 @@ async fn macro_write_session<T: Transport>(
     }
 
     let mut plan = build_macro_write_plan(file, trigger, &backup, slot, index);
-    plan.chunk_size = chunk_size;
     plan.save_transport = SaveTransport::Ble;
 
     println!(
-        "writing slot {} (profile {}) macro {} ({}): {} steps, {}B chunks",
+        "writing slot {} (profile {}) macro {} ({}): {} steps (chunk size from MTU {})",
         slot.index(),
         slot.number(),
         index.index(),
         macro_id(index),
         plan.steps.len(),
-        plan.chunk_size
+        session.transport().mtu()
     );
     let outcome = session.write_macro(&backup, slot, index, &plan).await?;
 
@@ -1396,8 +1371,7 @@ fn ensure_backup_gamepad_mode(
 async fn macro_restore(options: &BleOptions, dir: &Path) -> Result<(), Error> {
     let transport = BleTransport::connect(options).await?;
     let session = Session::new(transport);
-    let chunk_size = macro_chunk_size(session.transport().mtu());
-    let result = macro_restore_session(&session, dir, chunk_size).await;
+    let result = macro_restore_session(&session, dir).await;
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
 }
@@ -1405,7 +1379,6 @@ async fn macro_restore(options: &BleOptions, dir: &Path) -> Result<(), Error> {
 async fn macro_restore_session<T: Transport>(
     session: &Session<T>,
     dir: &Path,
-    chunk_size: usize,
 ) -> Result<(), Error> {
     let backup = read_restore_backup(dir)?;
     println!("loaded backup: {}", dir.display());
@@ -1445,7 +1418,6 @@ async fn macro_restore_session<T: Transport>(
                 .with_cycles_num(record.cycles_num)
                 .with_interval_ms(record.interval_ms)
                 .with_header_state(header.flag, header.total_cnt)
-                .with_chunk_size(chunk_size)
                 .with_save_transport(SaveTransport::Ble);
             println!(
                 "restoring slot {} macro {} ({} steps)...",

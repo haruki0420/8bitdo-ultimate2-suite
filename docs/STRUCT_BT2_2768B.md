@@ -520,11 +520,11 @@ struct Bt2Header {
    - `subcmd = (gamepad_mode << 8) | slot`
    - `offset = (macro_idx << 12) + chunk_index * chunk_size`（`chunk_index` はパケットごとに進む）
    - `total_len = align32(max_steps * 10)`
-   - `chunk_size` は BLE 64B / USB HID 32B（32B アライン。それ以外は拒否。64B 超は 64B にクランプしてから判定）。最終チャンクは 32B アライン長。46B などの交渉済みサイズは将来拡張で、現在の API は `UnsupportedChunkSize` を返す
+   - `chunk_size` は MTU 連動: `max_payload = mtu - 3 - 17` が `64` 以上なら 64B、`32` 以上なら 32B、それ未満は `Error::MtuTooSmall`（32B アライン不能）。最終チャンクは 32B アライン長。46B などの交渉済みサイズは将来拡張で、現在の API は `UnsupportedChunkSize` を返す
    - ペイロード: `max_steps * 10` バイト＋32B アライメント用ゼロパディング（BLE 64B / USB HID 32B で分割送信・`Send_CustomCmdPacket` 準拠で各チャンクヘッダ `CRC-16/MODBUS (0xA001)` 付与）
 3. **Step 3: 2768B コンフィグ内のマクロ管理ヘッダ更新**
    - `max_steps`, `key_map`, `cycles_num`, `interval_ms`, `filename`, `total_cnt`, `flag` 等を `0x68C + slot * 0xD8` に反映し、`ANSI_CRC_16_sh` を再計算する。
-   - 部分書込 (`cmd = 0x0001, subcmd = 0x0000, offset = 0x68C + slot * 0xD8, len = 0xD8, total_len = 0x0AD0`) または全体書込を送信する。216B は MTU 200 を前提に **142B + 74B** に分割する（`total_len` は各パケットで `0x0AD0` のまま、`chunk_len = 142 / 74`、2 パケット目の `offset = 先頭 + 142`）。
+   - 部分書込 (`cmd = 0x0001, subcmd = 0x0000, offset = 0x68C + slot * 0xD8, len = 0xD8, total_len = 0x0AD0`) または全体書込を送信する。216B は `chunk_len = min(142, mtu - 3 - 17)` で分割する（`total_len` は各パケットで `0x0AD0` のまま、`offset` は実チャンク長だけ進む）。MTU 200 なら 142 + 74、MTU 64 なら 44×4 + 40、MTU 23 なら 3×72。
 4. **Step 4: 不揮発メモリへのコミット (`Save`)**
    - **BLE**: `cmd = 0x0006, subcmd = 0x0067, offset = 0, len = 0, total_len = 0`
    - **USB**: `cmd = 0x0006, subcmd = 0x0123, offset = 0, len = 0, total_len = 0`
@@ -536,7 +536,7 @@ struct Bt2Header {
 > **実装ノート（Mock 検証済み・実機書き込み未検証）**:
 > - **Fail-closed**: Erase / Write / Header のいずれかが失敗したら Save を送らない。ただし Erase 済み・Write 途中のセクタは変更されている可能性がある。Save 後の ACK または読み戻しが失敗した場合だけ `saved = true` として報告する。どちらも 3 スロット × 4 マクロの完全バックアップから復元する。
 > - **ヘッダ値**: `max_steps` は新しいステップ数。`key_map` / `cycles_num` / `interval_ms` / `flag` / `total_cnt` は指定がなければ既存値を保持する。未使用マクロ（`max_steps == 0` または `0xFFFF`）へ書く場合、CLI は `flag = 1` と `total_cnt = max(existing, macro_idx + 1)` を設定し、`--trigger` がなければ `key_map` を `0` のままにする。**この未使用マクロの有効化ポリシーは実機未確認**。
-> - 216B の Header は **142B + 74B** に分割して送る。`total_len = 0x0AD0` は各パケットで維持し、`chunk_len = 142 / 74`、2 パケット目の `offset = 先頭 + 142`。MTU 200 の `mtu - 3 = 197B` 上限に収まる（`1 + 16 + 142 = 159B` / `1 + 16 + 74 = 91B`）。
+> - Header / Write のチャンク長は **MTU 連動**。`max_payload = mtu - 3 - 17` とし、Header は `min(142, max_payload)`、Write は `max_payload >= 64` → 64B、`>= 32` → 32B、それ未満は書き込み開始前に `Error::MtuTooSmall`。MTU 200 は 142 + 74 / 64B、MTU 64 は 44×4 + 40 / 32B、MTU 23 は Header 3×72 だが Write 不可。Mock で全フレームが `mtu - 3` 以下であることを固定済み。実機は MTU 200 のみを想定検証する。
 
 #### マクロ読み出し手順
 

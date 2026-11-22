@@ -482,8 +482,12 @@ sequenceDiagram
 `eightbitdo-core` の `write_macro` は次の順序を固定する。実機への書き込みはまだ行っていない。
 
 1. **Erase (`0x0104`)**: `total_len = chunk_len = 0x1000`, `offset = macro_idx << 12`, `crc16 = 0xFFFF`, ペイロードなし。ACK は 2 秒。
-2. **Write (`0x0103`)**: `total_len = align32(steps * 10)`、BLE 64B / USB HID 32B、`offset = (macro_idx << 12) + chunk_index * chunk_size`、各チャンクの CRC-16/MODBUS。ACK は 2 秒。
-3. **Header (`0x0001`)**: `offset = 0x68C + slot * 0xD8`, `len = 0xD8`, `total_len = 0x0AD0`。`ANSI_CRC_16_sh` を 2768B 全体で再計算した後に 216B を切り出す。216B は **142B + 74B の 2 パケット**に分割し、`total_len = 0x0AD0` を維持したまま `chunk_len = 142 / 74`、`offset = 0x68C + slot * 0xD8` / `+142` とする。各チャンクの ACK は 2 秒。MTU 200 では `1 + 16 + 142 = 159B`、`1 + 16 + 74 = 91B` で、`mtu - 3 = 197B` に収まる。
+2. **Write (`0x0103`)**: `total_len = align32(steps * 10)`、`offset = (macro_idx << 12) + chunk_index * chunk_size`、各チャンクの CRC-16/MODBUS。ACK は 2 秒。チャンクは MTU 連動で、`max_payload = mtu - 3 - 17`（ATT 3B + 1B prefix + 16B header）が `64` 以上なら 64B、`32` 以上なら 32B、それ未満は `Error::MtuTooSmall` で書き込みを開始しない（32B アライン不能）。
+3. **Header (`0x0001`)**: `offset = 0x68C + slot * 0xD8`, `len = 0xD8`, `total_len = 0x0AD0`。`ANSI_CRC_16_sh` を 2768B 全体で再計算した後に 216B を切り出す。216B は `chunk_len = min(142, max_payload)` で分割し、`total_len = 0x0AD0` を維持したまま `offset` を実チャンク長だけ進める。各チャンクの ACK は 2 秒。
+   - MTU 200: `max_payload = 180` → **142 + 74**（159B / 91B フレーム）
+   - MTU 64: `max_payload = 44` → **44 × 4 + 40**（61B / 61B / 61B / 61B / 57B フレーム）
+   - MTU 23: `max_payload = 3` → **3 × 72**（20B フレーム）。ただし `0x0103` は 32B チャンクを作れないため、Header を送る前に `Error::MtuTooSmall` で中止する。
+   - すべての送信フレームは `mtu - 3` 以下。`BleTransport::send` の上限に合わせるため、`mtu - 17` ではなく **`mtu - 3 - 17`** を使う。
 4. **Save (`0x0006`)**: BLE `subcmd = 0x0067`。ACK は 3 秒（BLE の正式値は未文書化。Windows USB HID の 3 秒を暫定使用）。
 5. **Read-back (`0x0102`)**: Save ACK 後に同じ `(slot, macro_idx)` を読み、`steps * 10` バイトが一致することを確認する。
 
@@ -498,7 +502,7 @@ sequenceDiagram
 
 **未確定点**:
 
-- 216B の Header は **142B + 74B** に分割する。`total_len = 0x0AD0` は各パケットで維持し、`chunk_len = 142 / 74`、`offset = 0x68C + slot * 0xD8` と `+142`。MTU 200 の `mtu - 3 = 197B` 上限に対して `1 + 16 + 142 = 159B` / `1 + 16 + 74 = 91B` で収まることを Mock で固定した。これより小さい MTU での挙動は実機未確認。
+- Header / Write のチャンク長は MTU 連動（`max_payload = mtu - 3 - 17`）。実機書き込みで使う想定は MTU 200（Header 142B / Write 64B）だが、実機書き込みは未実施。MTU 64（Header 44B / Write 32B）と MTU 23（Header 3B、Write 不可）は Mock のみ。
 - BLE Save の正式タイムアウトと、Save ACK の実際の `cmd` / `subcmd` 形状（`0x0006` 直か `0x0004, subcmd=0x0006/0x0067` か）。
 - Erase / Write / Header の ACK 形状（`0x0004` エンベロープか直接エコーか）。実装は両方を受け入れる。
 - 未使用マクロの `flag` / `total_cnt` / `key_map` の実機挙動。
