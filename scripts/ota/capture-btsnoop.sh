@@ -11,7 +11,8 @@
 #   scripts/ota/capture-btsnoop.sh [-o DIR] [-i HCI]
 #
 #   -o, --out-dir DIR   capture directory (default: <repo>/.tmp/ota-capture)
-#   -i, --index HCI     only monitor this adapter (passed to btmon -i)
+#   -i, --index HCI     only monitor this adapter (passed to btmon -i;
+#                       required when the host has multiple adapters)
 #   -h, --help          show this help
 #
 # Environment:
@@ -26,6 +27,7 @@
 # Requirements: bash >= 4, BlueZ btmon, and root or CAP_NET_ADMIN.
 
 set -euo pipefail
+shopt -s nullglob
 umask 077
 
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -42,7 +44,8 @@ Start a btmon btsnoop capture, wait for the operator, then stop btmon.
 
 Options:
   -o, --out-dir DIR   capture directory (default: <repo>/.tmp/ota-capture)
-  -i, --index HCI     only monitor this adapter (btmon -i, e.g. hci0)
+  -i, --index HCI     only monitor this adapter (btmon -i, e.g. hci0).
+                      Required when the host has more than one adapter.
   -h, --help          show this help
 
 Environment:
@@ -95,6 +98,25 @@ fi
 
 command -v "$BTMON_BIN" >/dev/null 2>&1 \
     || die "btmon not found: $BTMON_BIN (install BlueZ, e.g. bluez / bluez-utils)"
+
+# btmon subscribes to every adapter, so a multi-adapter host would mix other
+# devices into the capture. Require an explicit -i hciX in that case.
+adapters=(/sys/class/bluetooth/hci*)
+if (( ${#adapters[@]} > 1 )); then
+    adapter_names=''
+    for adapter in "${adapters[@]}"; do
+        adapter_names+=" ${adapter##*/}"
+    done
+    log "detected Bluetooth adapters:${adapter_names}"
+    if [[ -z "$BTMON_INDEX" ]]; then
+        die "multiple Bluetooth adapters detected; pass -i hciX (one of:${adapter_names})" \
+            "so the capture contains only the controller's adapter"
+    fi
+fi
+if [[ -n "$BTMON_INDEX" && ! -e "/sys/class/bluetooth/$BTMON_INDEX" ]]; then
+    log "warning: /sys/class/bluetooth/$BTMON_INDEX does not exist;" \
+        "check the adapter name passed to -i"
+fi
 
 if command -v pgrep >/dev/null 2>&1; then
     other_btmon=$(pgrep -x btmon 2>/dev/null || true)

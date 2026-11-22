@@ -24,20 +24,25 @@
 
 | 決めたいこと | 現在の状態 | 本書での扱い |
 | --- | --- | --- |
-| Bootloader RX フレーミング | 仮定（prefix なし） | 採取項目 1 |
-| `readPID` / `readVersionInBoot` 応答 | 仮定（envelope または直エコー） | 採取項目 2・3 |
-| ready ACK / 完了 ACK の区別 | 未確認（実装は既定 off のオプトイン） | 採取項目 4・5 |
-| `gamepad_type` の由来 | プロジェクト規約（PID ホワイトリスト） | 採取項目 14 |
-| Erase / Write のアドレス規約 | spec と証跡が矛盾 | 採取項目 7・8 |
-| `WriteVersion` payload | spec と証跡が矛盾 | 採取項目 11 |
-| `EraseFlash` の `chunk_len` | spec と実装が不一致 | 採取項目 9 |
-| `WriteFirmware` のフレーム長 | spec と証跡が矛盾 | 採取項目 10 |
-| `enterBoot` の成立 | 未確認 | 採取項目 12 |
-| タイムアウト差 | spec と証跡が矛盾 | 採取項目 15 |
-| Bootloader MTU | 未確認 | 採取項目 13 |
-| Jump と App Mode 復帰 | 未確認 | 採取項目 16 |
+| Bootloader RX フレーミング | 仮定（prefix なし） | 採取項目 1（**Phase A**） |
+| `readPID` / `readVersionInBoot` 応答 | 仮定（envelope または直エコー） | 採取項目 2・3（**Phase A**） |
+| ready ACK / 完了 ACK の区別 | 未確認（実装は既定 off のオプトイン） | 採取項目 4・5（**Phase B**） |
+| `gamepad_type` の由来 | プロジェクト規約（PID ホワイトリスト） | 採取項目 14（**Phase A**） |
+| Erase / Write のアドレス規約 | spec と証跡が矛盾 | 採取項目 7・8（**Phase B**） |
+| `WriteVersion` payload | spec と証跡が矛盾 | 採取項目 11（**Phase B**） |
+| `EraseFlash` の `chunk_len` | spec と実装が不一致 | 採取項目 9（**Phase B**） |
+| `WriteFirmware` のフレーム長 | spec と証跡が矛盾 | 採取項目 10（**Phase B**） |
+| `enterBoot` の成立 | 未確認 | 採取項目 12（**Phase A**） |
+| タイムアウト差 | spec と証跡が矛盾 | 採取項目 15（read は Phase A、書込は Phase B） |
+| Bootloader MTU | 未確認 | 採取項目 13（**Phase A**） |
+| Jump と App Mode 復帰 | 未確認 | 採取項目 16（**Phase B**） |
 | マルチセクション `.dat` | blocker | `.dat` の静的確認（btsnoop 不要） |
-| 遅延 / 重複 ACK の誤帰属 | 未確認 | 採取項目 3〜6・15 の順序と `offset`/`total_len` |
+| 遅延 / 重複 ACK の誤帰属 | 未確認 | 採取項目 3〜6・15 の順序と `offset`/`total_len`（**Phase B**） |
+
+> **Phase A と Phase B の非対称性**: Erase / Write の ACK・アドレス・`chunk_len`・
+> `WriteFirmware` / `WriteVersion` のフレーム長・Jump は **書込を送らないと観測できない**。
+> Phase A で確定できるのは RX フレーミング・read 応答・MTU・characteristic・enterBoot までで、
+> これらが揃っても「書込 wire は確定」ではない（§2.3）。
 
 判定結果は [OTA_BLE_EVIDENCE.md](OTA_BLE_EVIDENCE.md) に追記し、確定した項目だけ
 [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §8.5 を更新する（§7）。
@@ -57,31 +62,64 @@
 - `OtaConfig::require_completion_ack` も **既定 false**（ready/completion ACK の実形状が
   未確認のため）。MTU は `mtu - 3 >= 81`（`OTA_MIN_MTU = 84`）を Erase 前に検査する。
 - リトライは無い。ACK / 応答タイムアウトで即 fail-closed。復旧は **最初から全消去・再書込**。
-- **CLI / GUI / UniFFI への配線は無い**（§8.5 のとおり配線は保留）。したがって現時点の
+- **CLI / GUI / UniFFI への配線は無い**（PROTOCOL_SPEC §8.5 のとおり配線は保留）。したがって現時点の
   リポジトリには「実機 OTA を駆動するコマンド」が存在しない。
 
 ### 2.2 採取を駆動する手段（本書の範囲外）
 
 btsnoop を取るには、実際に wire を流す駆動側が必要になる。次のいずれかを使う。
 
-| 手段 | 状態 | 注意 |
-| --- | --- | --- |
-| (a) 配線済みフロントエンド | 未実装（未マージ） | `OtaUpdate` を呼ぶだけの薄い CLI で足りる |
-| (b) コミットしない一時ベンチハーネス | 未作成 | `OtaUpdate` / `BleTransport` / `BleBootTransport` を直接呼ぶ。**Phase B では `with_unverified_wire_allowed(true)` が必要** |
-| (c) 公式 Windows ソフト | 挙動未検証 | バージョン・コマンド列・btsnoop 相当の取得可否が未確認。**証跡として採用しない** |
+| 優先 | 手段 | 状態 | 注意 |
+| --- | --- | --- | --- |
+| 1 | **(d) 公式アプリ + HCI btsnoop** | 未試行 | **最初に試す**。Android 公式アプリで OTA を完遂し、HCI スヌープログ（§3.2、root 不要の bugreport 経路を含む）を取る。自前コードを書込経路に載せないため、最も安全な一次証跡になる |
+| 2 | (a) 配線済みフロントエンド | 未実装（未マージ） | `OtaUpdate` を呼ぶだけの薄い CLI で足りる |
+| 3 | (b) コミットしない一時ベンチハーネス | 未作成 | `OtaUpdate` / `BleTransport` / `BleBootTransport` を直接呼ぶ。**Phase B では `with_unverified_wire_allowed(true)` が必要** |
+| — | (c) 公式 Windows ソフト | 挙動未検証 | バージョン・コマンド列・btsnoop 相当の取得可否が未確認。**証跡として採用しない** |
 
-本 plan は (a) / (b) のどちらでも使える採取・判定手順として書く。駆動手段の実装判断は
-本書の範囲外とする（残課題 §9-1）。
+- **(d) を最初に試す**。公式アプリが boot 遷移・書込・Jump まで実行できるなら、Erase / Write /
+  ACK / アドレス / Jump の実形状が自作コードなしで手に入る。EVIDENCE §4 の静的解析では
+  Android APK の `enterBoot` / `readPID` / `jumpApp` に call が無い（dead code）ため
+  **完遂できる保証はない**が、試行して「不可」と判定した場合は、その理由（どの段階で止まったか、
+  どのコマンドが wire に出なかったか）を EVIDENCE に記録する。
+- **(d) が不可である理由を記録できた場合に限り** Phase B（§8.3）へ進む。理由の記録が無いまま
+  Phase B を実施しない。
+- 本 plan の採取・判定手順（§3〜§7）は、(d) 公式アプリでも (a) / (b) でも使える。駆動手段の
+  実装判断は本書の範囲外とする（残課題 §9-2）。
+- **(b) 一時ハーネスの必須仕様**:
+  - `erase` / `write` / `finalize` 区間を **非キャンセル**にする（タイムアウトや UI からの
+    キャンセルで future を drop しない）。
+  - **no retry**: `OtaUpdate` の「タイムアウトで即 fail-closed、同じコマンドを再送しない」
+    挙動をラップして再試行しない。
+  - 各ステップで `OtaWriteState` / `OtaPhase` / `packets_sent` / `sectors_erased` /
+    `chunks_written` を**標準エラーまたはログに記録**する（失敗時にどの段階で止まったかを
+    capture と突き合わせる）。
+  - **通常使用していない個体**（復旧可能な専用コントローラ）と、可能なら検証専用ホストで
+    実行する。通常使用のコントローラ・ホストでは行わない。
+  - ハーネスはコミットしない。`with_unverified_wire_allowed(true)` はハーネス内で明示する。
 
 ### 2.3 段階（Phase A / Phase B）
 
 | Phase | 内容 | フラッシュ | `allow_unverified_wire` |
 | --- | --- | --- | --- |
 | **A（読み取りのみ）** | enterBoot → `"8bt"` 再接続 → `readPID` → `readVersionInBoot` | 送らない | **false のままで可**（`prepare_boot` はフラッシュを送らない） |
-| **B（フラッシュ形状）** | Erase / Write / WriteVersion / WriteFirmwareVersion / Jump | 送る | **true が必須**（一時ハーネスのみ） |
+| **B（初回書込）** | Erase / Write / WriteVersion / WriteFirmwareVersion / Jump | 送る | **true が必須**（一時ハーネスのみ） |
 
-- Phase A の時点で RX フレーミング・read 応答・`"8bt"` の MTU・使用 characteristic が分かる。
-- Phase B は **Phase A の判定結果が揃い、ユーザーの承認がある場合のみ**実施する（§8.3）。
+- **Phase A で確定できるのは次の範囲だけ**（フラッシュを送らないため）:
+  1. Bootloader RX フレーミング（prefix の有無）
+  2. `readPID` / `readVersionInBoot` の応答形状（envelope / 直エコー、payload 長）
+  3. `"8bt"` の MTU
+  4. 使用 characteristic（FF21 / FF23）と `gamepad_type` の手掛かり
+  5. `enterBoot` の ACK / link close
+  6. read のタイムアウト実測
+- **Phase A では確定できない**: Erase / Write の ACK 形状、アドレス規約、Erase の `chunk_len`、
+  `WriteFirmware` / `WriteVersion` のフレーム長、Jump。これらは **Phase B の書込でしか
+  観測できない**（Phase A の結果だけでは「ACK / アドレス確定」とは言えない）。
+- **Phase B は「未確定 wire での初回書込」**である。したがって:
+  - (d) 公式アプリ capture を先に試し、不可の理由を記録済みであること（§2.2）
+  - 復旧可能な専用個体・検証専用ホストで行うこと
+  - **最初の Erase で ACK 不明 / タイムアウト / アドレス疑いが出たら、その場で中止**する
+    （再試行しない。§8.4 (i)）
+  - ユーザーの承認があること
 - どちらの Phase も enterBoot 後は App Mode に自動復帰しない。終了時は電源再投入で復帰させる
   （§8.2）。
 
@@ -101,6 +139,7 @@ btsnoop を取るには、実際に wire を流す駆動側が必要になる。
 | ツール | BlueZ の `btmon`（`command -v btmon` で存在確認。`btmon --help` でオプション確認） |
 | 権限 | HCI monitor の購読に **root または `CAP_NET_ADMIN`** が必要。`sudo btmon ...` |
 | アダプタ | コントローラを接続する BLE アダプタ 1 つ。他の BLE 用途と共有しない |
+| 複数アダプタ | **`-i hciX` で対象を必ず指定**する（`btmon` は全アダプタを購読し、他アダプタの他機器の通信も混入する）。使用アダプタ名を操作ログと EVIDENCE に記録する |
 | ホスト | AC 給電、スリープ / ハイバネート無効、Bluetooth の省電力設定を変更しない |
 | 時刻 | ホストの時計を NTP 等で合わせる（btsnoop は絶対時刻を持つ） |
 
@@ -113,7 +152,7 @@ btsnoop を取るには、実際に wire を流す駆動側が必要になる。
 - `btmon` は全アダプタを購読する。対象を絞る場合は `-i hciX` を使う
   （[scripts/ota/capture-btsnoop.sh](../scripts/ota/capture-btsnoop.sh) は `-i` を透過する）。
 
-### 3.2 Android btsnoop（補助・現状は Phase A を駆動できない）
+### 3.2 Android btsnoop（(d) の主経路。root 不要の bugreport を含む）
 
 | 手順 | 内容 |
 | --- | --- |
@@ -123,10 +162,12 @@ btsnoop を取るには、実際に wire を流す駆動側が必要になる。
 | 取得（旧 Android） | `adb pull /sdcard/btsnoop_hci.log` |
 | 解析 | そのまま Wireshark で開ける（btsnoop 形式） |
 
-- **制約**: 公式 Android APK v2.01 は `enterBoot` / `readPID` / `readVersionInBoot` /
-  `jumpApp` を送出しない（[OTA_BLE_EVIDENCE.md](OTA_BLE_EVIDENCE.md) §4 の dead code 判定）。
-  そのため **現状の Android 単独採取では Phase A 以降を駆動できない**。将来モバイルに
-  OTA を配線した後の採取経路として位置づける。
+- **現状の制約（静的解析）**: 公式 Android APK v2.01 は `enterBoot` / `readPID` /
+  `readVersionInBoot` / `jumpApp` を送出しない（[OTA_BLE_EVIDENCE.md](OTA_BLE_EVIDENCE.md)
+  §4 の dead code 判定）。**ただしこれは静的解析の結論であり、実機の公式アプリ OTA が
+  boot 遷移を行うかは未確認**なので、まず (d)（§2.2）として実機で試す。不可と確認できた
+  場合に限り「Android 単独では駆動できない」を確定させ、理由を EVIDENCE に記録する。
+  将来モバイルに OTA を配線した後の採取経路にもなる。
 - ログのバッファは有限でローテート / 切り詰めがある。採取直後に取得し、可能なら取得前に
   ログを新規化する。Android のバージョンによってパスが異なるため、bugreport 内を検索する。
 
@@ -171,8 +212,14 @@ scripts/ota/capture-btsnoop.sh -o .tmp/ota-capture
 #   → 案内に従って OTA を実施し、App Mode 復帰後に Enter（または SIGINT）で停止
 ```
 
+- **（d) の Android 採取ではこのスクリプトを使わない**。端末の HCI スヌープログを §3.2 の
+  手順で取得し、§4.1 の採取ウィンドウ（enterBoot 前〜 App Mode 復帰後）に相当する範囲を
+  切り出す。
 - スクリプトは `btmon -w` を起動し、停止時に `SIGINT` → `SIGTERM` → `SIGKILL` の順で
   **確実に btmon を終了**させる。`umask 077` でファイルを作る（BD_ADDR を含むため）。
+- **複数アダプタがある場合は `-i hciX` を必ず指定**する（スクリプトは複数検出時に `-i` 無しを
+  拒否する）。使用アダプタ名を操作ログと EVIDENCE に記録する。`btmon` は全アダプタを購読する
+  ため、指定しないと他アダプタの他機器の通信が混入する（§7.4）。
 - 手動で行う場合は `sudo btmon -w capture.snoop`、停止は Ctrl-C（btmon が btsnoop を閉じる）。
 - 出力先 `.tmp/` は `.gitignore` 済み。**capture ファイルはコミットしない**（§7.4）。
 
@@ -182,7 +229,7 @@ scripts/ota/capture-btsnoop.sh -o .tmp/ota-capture
 
 ### 5.1 項目表
 
-| # | 確認項目 | btsnoop での見方 | 仕様 / 実装の期待 | 証跡（EVIDENCE）との差 | §8.5 |
+| # | 確認項目 | btsnoop での見方 | 仕様 / 実装の期待 | 証跡（EVIDENCE）との差 | PROTOCOL_SPEC §8.5 |
 | --- | --- | --- | --- | --- | --- |
 | 1 | **Bootloader RX フレーミング** | `"8bt"` の Notification の先頭バイト | 16B ヘッダ + payload、**prefix なし**（App の実測と同じ）。`0x05` は TX のみ | 未確認 | 1 |
 | 2 | **`readPID` 応答** | `0x0008` 送信後の Notification | `cmd=0x0004` envelope（`subcmd=0x0008`）または `cmd=0x0008` 直エコー。payload 2B、`total_len`/`offset`/`crc16` を記録 | 未確認（payload 長 2B は実装仮定） | 2 |
@@ -203,6 +250,9 @@ scripts/ota/capture-btsnoop.sh -o .tmp/ota-capture
 
 補足:
 
+- **Phase A で確定できるのは #1〜#3・#13・#14（と #15 の read 部分）だけ**である。
+  **#4〜#12・#16 は Phase B（初回書込）でしか観測できない**。Phase A の結果だけで
+  「ACK / アドレス / フレーム長が確定した」と扱わない。
 - **#10 の payload 元**は、先頭 64B を `.dat[0x00..0x40]`（28B ヘッダ込み）と
   `.dat[0x1C..0x5C]`（イメージ先頭）のどちらと一致するかで判定する。EVIDENCE §7 は
   Android 実装が先頭に 28B ヘッダを混ぜる可能性を報告しており、実装差がそのまま出る。
@@ -210,7 +260,7 @@ scripts/ota/capture-btsnoop.sh -o .tmp/ota-capture
   `file_size > 28 + header[8]` なら trailing data（2 セクション目）がある。現実装は
   `OtaInvalidFirmware` で拒否する（blocker）。
 - ACK にシーケンス番号が無いため、#4〜#6 は「**要求と ACK の対応が一意に取れるか**」を
-  タイムラインで確認する。遅延 ACK の誤帰属（§8.5 13）の判断材料になる。
+  タイムラインで確認する。遅延 ACK の誤帰属（PROTOCOL_SPEC §8.5 13）の判断材料になる。
 
 ### 5.2 比較用の期待フレーム（HEAD `4004757` の実装が送る形）
 
@@ -241,10 +291,10 @@ CRC は payload に対する CRC-16/MODBUS（`0xA001`）。
 
 | 判定 | 意味 | 次の動作 |
 | --- | --- | --- |
-| **仕様一致** | spec / 実装の期待どおり | §8.5 を「確定」に更新 |
+| **仕様一致** | spec / 実装の期待どおり | PROTOCOL_SPEC §8.5 を「確定」に更新 |
 | **証跡一致** | Android 実装の報告どおり（spec と違う） | どちらが実機の正かを記録。実装変更は別 PR（Tier 3） |
 | **どちらとも違う** | 第 3 の形状 | **未確定のまま**。この項目に依存する実装・配線を止める |
-| **応答なし / 切断** | コマンド不成立 | そのコマンドの成立条件をやり直す。フラッシュは触らない |
+| **応答なし / 切断** | コマンド不成立 | Phase B の**初回 Erase** なら §8.4 (i) で中止（再試行しない）。それ以外は成立条件をやり直す。フラッシュは触らない |
 
 ---
 
@@ -327,11 +377,12 @@ tshark -r .tmp/ota-capture/btsnoop-YYYYmmddTHHMMSSZ.snoop \
 | 項目 | 値 |
 | --- | --- |
 | ホスト / kernel / BlueZ | ... |
+| 使用アダプタ（`-i hciX`） | ... |
 | コントローラ FW version（App Mode `0x000B`） | ... |
 | `"8bt"` の characteristic | FF21 / FF23 |
 | Bootloader MTU | ... |
 | 採取開始 / 停止（UTC） | ... |
-| 駆動手段 | (a) 配線済み / (b) 一時ハーネス |
+| 駆動手段 | (d) 公式アプリ / (a) 配線済み / (b) 一時ハーネス |
 
 ### 13.2 ファームウェアとキャプチャ
 | 項目 | 値 |
@@ -339,7 +390,7 @@ tshark -r .tmp/ota-capture/btsnoop-YYYYmmddTHHMMSSZ.snoop \
 | `.dat` ファイル名 | ... |
 | `.dat` size / SHA-256 | ... |
 | `.dat` version / `load_base_addr` / `image_len` / セクション数 | ... |
-| capture size / SHA-256 | ... |
+| capture size / SHA-256（**必須**） | ... |
 
 ### 13.3 確認項目の判定
 | # | 項目 | 判定（確定 / 仕様一致 / 証跡一致 / 未確認） | 根拠（フレーム番号・時刻） |
@@ -354,6 +405,8 @@ tshark -r .tmp/ota-capture/btsnoop-YYYYmmddTHHMMSSZ.snoop \
 ### 7.2 追記時のルール
 
 - 既存の判定ラベル（**確定** = 直接確認 / **推測** / **未確認**）を踏襲する。
+- **capture の SHA-256 は必須**。size と SHA-256 を記録できない capture は証跡として採用しない
+  （`btmon -w` が途中で切れた、ファイルが空、コピーが壊れた等はやり直す）。
 - 確定した項目だけ [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §8.5 を更新する。矛盾が残る項目は
   未検証のまま残し、EVIDENCE に両論を書く。
 - 実装と食い違った場合、**その場でコードを直さない**。EVIDENCE に記録し、実装変更は
@@ -363,19 +416,26 @@ tshark -r .tmp/ota-capture/btsnoop-YYYYmmddTHHMMSSZ.snoop \
 
 ### 7.3 PROTOCOL_SPEC の更新
 
-- §8.5 の該当項目を「確定」にし、根拠として EVIDENCE の節番号をリンクする。
+- PROTOCOL_SPEC §8.5 の該当項目を「確定」にし、根拠として EVIDENCE の節番号をリンクする。
 - §8.2 / §8.3 のフレーム表（アドレス規約・`chunk_len`・payload 長）が実機と違えば、
   spec 側を実機に合わせて修正する。**実装を先に変えない**。
-- `require_completion_ack` の既定値は、実 wire の ACK 形状が確定してから決める（§8.5
-  「CLI / GUI / UniFFI 配線時の必須検証」4）。
+- `require_completion_ack` の既定値は、実 wire の ACK 形状が確定してから決める
+  （PROTOCOL_SPEC §8.5「CLI / GUI / UniFFI 配線時の必須検証」4）。
 
 ### 7.4 capture ファイルの扱い
 
-- btsnoop には **BD_ADDR（デバイスの MAC アドレス）**が含まれる。生ファイルは
-  **コミットしない**。`.tmp/`（gitignore 済み）に置き、共有・issue 添付もしない。
-- コミットするのは判定表・環境表・SHA-256・伏字済みのフレーム抜粋のみ。
+- btsnoop には **BD_ADDR（デバイスの MAC アドレス）が多数**含まれる。対象コントローラだけでなく、
+  **周囲の他機器（スマホ・イヤホン・PC・テレビ等）の BD_ADDR・広告名・接続履歴**も同じ
+  ファイルに入る。生ファイルは**コミットしない**。`.tmp/`（gitignore 済み、スクリプトは
+  `umask 077`）に置き、共有・issue 添付・チャット貼り付けもしない。
+- Android の `adb bugreport` は btsnoop 以外に**端末のアカウント・アプリ・設定などの広範な
+  PII** を含む。bugreport zip 自体を共有・コミットせず、btsnoop だけを `.tmp/` に取り出して
+  残りは破棄する。
+- コミットするのは判定表・環境表・SHA-256・**全 BD_ADDR を伏字にした**フレーム抜粋のみ。
+  伏字は対象コントローラだけでなく、capture 内の**すべての** BD_ADDR / 広告名に適用する。
 - 抜粋からもシリアル / 個体識別子を除く（`WriteAPPID` は type 1 では送らないが、
   ペイロードに個体情報が混ざる可能性があるため値は最小限にする）。
+- 共有が必要な場合は、生ファイルではなく「判定表 + SHA-256 + 伏字済み抜粋」を共有する。
 
 ---
 
@@ -386,9 +446,12 @@ tshark -r .tmp/ota-capture/btsnoop-YYYYmmddTHHMMSSZ.snoop \
 1. **`allow_unverified_wire = false`（既定）のままでは書込不可**。`write_firmware` は
    フラッシュフレームを 1 つも送らず `InvalidRequest` で拒否する。この既定を実機で
    破らない（破るのは Phase B の一時ハーネスのみ）。
-2. **実機書込は ACK / アドレス / フレーミングが確定した後**。Phase A の判定（RX
-   フレーミング、read 応答、Erase/Write の ACK、アドレス規約、`chunk_len`、フレーム長、
-   MTU）が揃い、ユーザーの承認があるまで Phase B を実施しない。
+2. **実機書込は「未確定 wire での初回書込」であることを認識して行う**。Phase A で確定できるのは
+   RX フレーミング・read 応答・MTU・characteristic・enterBoot まで（§2.3）。Erase / Write の
+   ACK・アドレス・`chunk_len`・フレーム長は Phase B でしか観測できないため、「ACK / アドレスが
+   確定してから書込む」という前提は**循環する**。したがって Phase B は
+   (d) 公式アプリ capture を先に試して不可の理由を記録し、復旧可能な専用個体で行い、
+   **初回 Erase の異常で即中止する**という条件でのみ実施する（§8.3）。
 3. **公式ファームウェアのみ**を使う。配信元から取得し、ファイルサイズと SHA-256 を記録する。
    マルチセクション `.dat` は現実装では拒否される（blocker）。書込前に
    `28 + header[8] == file_size` を確認する。
@@ -400,6 +463,9 @@ tshark -r .tmp/ota-capture/btsnoop-YYYYmmddTHHMMSSZ.snoop \
    （[SESSION_OPERATIONS.md](SESSION_OPERATIONS.md) と AGENTS.md §6.4 の運用）。
    更新後に読み戻して比較し、消えていれば `config write` / `macro restore` で復元する。
 7. **単一所有**。`eightbitdo session` や他の BLE 接続ツールを停止してから開始する。
+8. **初回 Erase の異常で即中止**。最初の `EraseFlash` の ACK が不明 / タイムアウト /
+   アドレス規約に疑いがある場合は、再試行せず、全消去・再書込に進まず、ベンダ復旧
+   （§8.4 (i)）へ移る。
 
 ### 8.2 Phase A（読み取りのみ）の安全
 
@@ -412,35 +478,63 @@ tshark -r .tmp/ota-capture/btsnoop-YYYYmmddTHHMMSSZ.snoop \
 - `"80ND"` が戻らない場合は、まず scan と再接続を試す。物理操作（ボタン押下）は
   最後の手段とし、推測で手順を作らない。
 
-### 8.3 Phase B（書込形状の採取）の前提
+### 8.3 Phase B（初回書込）の前提
 
-- §8.1 の 1〜7 を満たすこと。
-- Phase A の判定が EVIDENCE に記録されていること。
-- **復旧可能な個体**（可能なら専用機）で行う。通常使用中の個体では行わない。
-- 一時ハーネスは `OtaConfig::with_unverified_wire_allowed(true)` を明示し、
-  `require_completion_ack` は Phase A の結果に合わせて選ぶ。**この設定をコミットしない**
-  （§8.5 の設計意図。`allow_unverified_wire` は削除またはベンチ専用に限定するのが最終形）。
-- 書込前に `expected_load_base` が `.dat +0x04` と一致することを確認する（不一致なら
-  Erase 前に `OtaInvalidFirmware` で停止する）。
-- 失敗しても **同じチャンクから再送しない**（実装は no retry）。復旧は §8.4。
+Phase B は **未確定 wire に対する最初のフラッシュ書込**である。次をすべて満たす場合のみ実施する。
 
-### 8.4 失敗時の復旧
+1. (d) 公式アプリ capture を先に試し、「不可」の理由（どの段階で止まったか、どのコマンドが
+   wire に出なかったか）を [OTA_BLE_EVIDENCE.md](OTA_BLE_EVIDENCE.md) に記録済み（§2.2）。
+2. Phase A が完了し、RX フレーミング・read 応答・`"8bt"` の MTU・characteristic が
+   EVIDENCE に記録済み（§8.2）。**Phase A で書込 wire は確定しない**ことを前提に置く。
+3. §8.1 の 1〜8 を満たす。
+4. **復旧可能な専用個体**（通常使用していないコントローラ）と、可能なら検証専用ホストで行う。
+   通常使用中の個体・ホストでは行わない。
+5. 一時ハーネスは §2.2 の必須仕様（非キャンセル / no retry / `OtaWriteState` ログ）を満たし、
+   `OtaConfig::with_unverified_wire_allowed(true)` を明示する。**この設定をコミットしない**
+   （`allow_unverified_wire` は削除またはベンチ専用に限定するのが最終形）。
+6. `require_completion_ack` は Phase A / (d) の結果で決める。決められない場合は既定（off）で
+   進め、ACK 形状を採取結果から確定する（§7.3）。
+7. 書込前に `expected_load_base` が `.dat +0x04` と一致することを確認する（不一致なら
+   Erase 前に `OtaInvalidFirmware` で停止する）。
+8. **最初の Erase で ACK 不明 / タイムアウト / アドレス疑いが出たら、即中止**する
+   （再試行も全消去・再書込もしない。§8.4 (i)）。
+9. ユーザーの承認がある。
 
-1. **中断・失敗したら再試行せず、状態を記録する**。最後に成功した段階
-   （`OtaWriteState::Untouched` / `EraseStarted` / `PartiallyWritten` / `Written`）と
-   capture を保存する。btmon は復旧が終わるまで止めない。
-2. **Bootloader にいる場合（`"8bt"` が広告される）**: `"8bt"` に再接続 → `readPID`（`0x0008`）
-   → `.dat` と `expected_load_base` を再確認 → **最初のセクタから全消去 → 全チャンク書込 →
-   `WriteVersion` → `WriteFirmwareVersion` → `JumpApp`** を実行する。新しい `OtaUpdate`
-   （`Idle`）で `prepare_boot` からやり直す。
-3. **App Mode が動く場合（`"80ND"` が広告される）**: 再接続して `ReadVersion`（`0x000B`）で
-   バージョンを確認する。更新前と同じなら書込は未確定なので、App Mode から再度 enterBoot →
-   `"8bt"` 再接続 → **全消去・再書込**をやり直す。更新後の値なら成功。config / マクロを
-   読み戻して SHA-256 を比較し、必要なら復元する。
-4. **どちらの広告も見えない場合**: コントローラの電源を切って再投入 → scan。
-   それでも見えない場合は、**推測で物理操作を繰り返さない**。capture と最後のステップを
-   記録して停止し、報告する（USB 復旧は未文書化のため使わない）。
-5. 復旧中も BLE の単一所有を守る（他の BLE ツールを起動しない）。
+### 8.4 失敗時の復旧（失敗段階ごとの分岐）
+
+**共通**: 再試行しない。最後の段階（`OtaWriteState::Untouched` / `EraseStarted` /
+`PartiallyWritten` / `Written`）と capture を保存し、btmon は復旧が終わるまで止めない。
+
+**(i) 最初の Erase で異常（ACK 不明 / タイムアウト / アドレス疑い）**
+
+- **その場で中止**する。同じ Erase も Write も再送しない。
+- 全消去・再書込に進まない（wire 未確定のまま書込を重ねない）。
+- **ベンダ復旧**へ移る: 公式アプリ / 公式サポートの復旧手順に従う。本リポジトリにはベンダ復旧手順が
+  無いため、推測で代替しない。コントローラの状態（`"8bt"` / `"80ND"` のどちらが広告されるか）と
+  capture、最後に送ったフレームを記録して報告する。
+
+**(ii) wire 確定後の中断（ACK 形状・アドレスが確定済みで、途中で失敗 / 切断）**
+
+- `"8bt"` に再接続 → `readPID`（`0x0008`）→ `.dat` と `expected_load_base` を再確認 →
+  **最初のセクタから全消去 → 全チャンク書込 → `WriteVersion` → `WriteFirmwareVersion` →
+  `JumpApp`** を、新しい `OtaUpdate`（`Idle`）で `prepare_boot` からやり直す。
+- 「wire 確定後」とは、EVIDENCE に ACK 形状とアドレス規約が記録され、同じ設定で再現できる
+  状態を指す。確定していない場合は **(i)** として扱う。
+
+**(iii) App Mode が正常（`"80ND"` が広告され、`ReadVersion` が返る）**
+
+- **原則そのまま**にする。バージョン・config・マクロを確認し、**更新が必要な場合だけ**再更新する。
+- 更新前と同じバージョンなら書込は未確定なので、「必要なら」enterBoot からやり直す。
+  不要なら触らない（中途半端な再書込を増やさない）。
+- config / マクロを読み戻して SHA-256 を比較し、消えていればバックアップから復元する。
+
+**(iv) どちらの広告も見えない**
+
+- コントローラの電源を切って再投入 → scan。それでも見えない場合は、**推測で物理操作を
+  繰り返さない**。capture と最後のステップを記録して停止・報告する（USB 復旧は未文書化の
+  ため使わない）。
+
+復旧中も BLE の単一所有を守る（他の BLE ツールを起動しない）。
 
 ### 8.5 実施前チェックリスト
 
@@ -448,37 +542,47 @@ tshark -r .tmp/ota-capture/btsnoop-YYYYmmddTHHMMSSZ.snoop \
 - [ ] `eightbitdo session` など BLE を使うプロセスを停止した
 - [ ] コントローラを `"80ND"` で接続できることを `scan --check` で確認した
 - [ ] ホストは AC 給電・スリープ無効・時刻合わせ済み
+- [ ] 複数アダプタ環境では `-i hciX` を指定し、使用アダプタを操作ログに記録した
 - [ ] `btmon` を起動し、capture ファイルが作られることを確認した（enterBoot 前）
+- [ ] Phase B の場合: (d) 公式アプリ capture を試し、不可の理由を EVIDENCE に記録した
 - [ ] Phase B の場合: Phase A の判定が EVIDENCE に記録済みで、ユーザーの承認がある
 - [ ] Phase B の場合: 公式 `.dat` の size / SHA-256 / `load_base` / `image_len` /
       セクション数を確認した
 - [ ] Phase B の場合: バッテリー残量を確認した（50% 未満なら中止）
 - [ ] Phase B の場合: `allow_unverified_wire=true` は一時ハーネスのみで、コミットしない
+- [ ] Phase B の場合: ハーネスが非キャンセル / no retry / `OtaWriteState` ログを満たす
+- [ ] Phase B の場合: 最初の Erase の異常（ACK 不明 / タイムアウト / アドレス疑い）で
+      即中止する手順を確認した（再試行しない）
 
 ### 8.6 実施後チェックリスト
 
-- [ ] btmon を停止し、capture ファイルの size / SHA-256 を記録した
+- [ ] btmon を停止し、capture ファイルの size / **SHA-256（必須）** / 使用アダプタを記録した
 - [ ] App Mode `"80ND"` へ復帰し、`ReadVersion` でバージョンを確認した
 - [ ] config / マクロを読み戻し、バックアップと SHA-256 を比較した
 - [ ] 判定表を [OTA_BLE_EVIDENCE.md](OTA_BLE_EVIDENCE.md) に追記した
 - [ ] capture 生ファイルをコミットしていない（`.tmp/` のみ）
+- [ ] 抜粋に含めた**すべての** BD_ADDR / 広告名（周囲の他機器を含む）を伏字にした
 
 ---
 
 ## 9. 残課題
 
-1. **駆動手段が無い**: CLI / GUI / UniFFI に OTA が未配線。Phase A から一時ハーネスか
+1. **(d) 公式アプリ capture の可否判定（未試行）**: 公式アプリで OTA を完遂できるか、HCI
+   スヌープログに boot 遷移から Jump まで残るかを最初に確認する。不可なら「どの段階で止まったか」
+   を EVIDENCE に記録する（§2.2）。
+2. **駆動手段が無い**: CLI / GUI / UniFFI に OTA が未配線。Phase A から一時ハーネスか
    配線済みフロントエンドが必要（§2.2）。ハーネスはコミットしない。
-2. **公式 `.dat` の入手・検証**: 配信 API のレスポンス（`md5` のクセを含む）と、
+3. **公式 `.dat` の入手・検証**: 配信 API のレスポンス（`md5` のクセを含む）と、
    ダウンロードしたファイルの SHA-256 / セクション数の記録方法を決める。
-3. **マルチセクション `.dat` の blocker**: 現実装は単一セクションのみ。公式 `.dat` が
-   マルチセクションなら更新できない（§8.5 12）。実測して対応方針を決める。
-4. **ACK の `offset` / `total_len` 照合**: 採取後に実装する（§8.5 13）。遅延 ACK の
+4. **マルチセクション `.dat` の blocker**: 現実装は単一セクションのみ。公式 `.dat` が
+   マルチセクションなら更新できない（PROTOCOL_SPEC §8.5 12）。実測して対応方針を決める。
+5. **ACK の `offset` / `total_len` 照合**: 採取後に実装する（PROTOCOL_SPEC §8.5 13）。遅延 ACK の
    誤帰属を防ぐ必須項目。
-5. **`load_base_addr` とフラッシュサイズの確定**: `UT2_TYPE1_APP_BASE_MIN` /
+6. **`load_base_addr` とフラッシュサイズの確定**: `UT2_TYPE1_APP_BASE_MIN` /
    `UT2_TYPE1_APP_FLASH_END` の暫定ウィンドウを実測値に置き換える。
-6. **capture の保管・共有ポリシー**: BD_ADDR を含むため、共有範囲を決める（§7.4）。
-7. **Android / Windows 経路**: 現状は採取も駆動もできない。配線後に別 plan で扱う。
+7. **capture の保管・共有ポリシー**: BD_ADDR（対象外の他機器を含む）と Android bugreport の
+   PII 範囲を踏まえ、共有範囲を決める（§7.4）。
+8. **Android / Windows 経路**: 現状は採取も駆動もできない。配線後に別 plan で扱う。
 
 ---
 
