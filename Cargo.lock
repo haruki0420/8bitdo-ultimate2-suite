@@ -1188,7 +1188,10 @@ dependencies = [
  "async-trait",
  "btleplug",
  "eightbitdo-protocol",
+ "fs2",
  "futures-util",
+ "nix",
+ "rustix 1.1.6",
  "thiserror 2.0.21",
  "tokio",
  "uuid",
@@ -1395,6 +1398,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]

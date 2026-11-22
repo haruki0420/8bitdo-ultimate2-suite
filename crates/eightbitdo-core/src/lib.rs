@@ -26,6 +26,8 @@ pub mod transport;
 
 #[cfg(feature = "ble")]
 pub mod ble;
+#[cfg(feature = "ble")]
+pub mod ble_lock;
 
 pub use config_ops::{
     button_mapping, button_mappings, config_write_chunk_len, map_key_flag, ConfigCrcStatus,
@@ -49,7 +51,9 @@ pub use session::{
 pub use transport::Transport;
 
 #[cfg(feature = "ble")]
-pub use ble::{scan_devices, BleDevice, BleOptions, BleTransport};
+pub use ble::{scan_devices, scan_devices_with_lock_path, BleDevice, BleOptions, BleTransport};
+#[cfg(feature = "ble")]
+pub use ble_lock::{default_ble_lock_path, BleLock, BLE_LOCK_FILE_NAME, BLE_LOCK_PATH_ENV};
 
 /// 8BitDo vendor ID.
 pub const VENDOR_ID: u16 = 0x2DC8;

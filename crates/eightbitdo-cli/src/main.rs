@@ -23,7 +23,7 @@ use eightbitdo_core::{
     map_key_flag, max_protocol_payload, scan_devices, validate_macro_chunk_size, BleOptions,
     BleTransport, ConfigCrcStatus, ConfigEdit, ConfigRegion, ConfigSnapshot, ConfigWritePlan,
     ConfigWriteTimeouts, Error, MacroBackup, MacroEntry, MacroWritePlan, PreparedConfigWrite,
-    Session, Transport, VersionInfo,
+    Session, Transport, VersionInfo, APP_BLE_NAME,
 };
 use eightbitdo_protocol::commands::{MacroWriteLayout, SaveTransport};
 use eightbitdo_protocol::config_bt2::{
@@ -74,7 +74,14 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// List nearby BLE devices and mark App Mode candidates.
-    Scan,
+    ///
+    /// With `--check`, print one line and exit 0 when an App Mode device is
+    /// present or 3 when it is not, without parsing the human-readable table.
+    Scan {
+        /// Exit 0 when an App Mode (`80ND`) device is found, 3 when none is.
+        #[arg(long)]
+        check: bool,
+    },
 
     /// Connect and read the firmware version.
     Info,
@@ -451,138 +458,28 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
         scan_timeout: Duration::from_secs(cli.scan_timeout),
         connect_timeout: Duration::from_secs(cli.timeout),
         verbose: cli.verbose,
+        lock_path: None,
     };
 
     match cli.command {
-        Command::Scan => scan(Duration::from_secs(cli.scan_timeout)).await?,
-        Command::Info => info(&options).await?,
-        Command::Config { command } => match command {
-            ConfigCommand::Dump { raw, json } => {
-                dump_config(&options, raw.as_deref(), json.as_deref()).await?;
-            }
-            ConfigCommand::Write {
-                file,
-                backup_dir,
-                accept_reserved_drift,
-                force_raw,
-                write_chunk,
-                yes,
-            } => {
-                config_write(
-                    &options,
-                    &file,
-                    backup_dir.as_deref(),
-                    accept_reserved_drift,
-                    force_raw,
-                    write_chunk,
-                    yes,
-                )
-                .await?;
-            }
-            ConfigCommand::Set {
-                field,
-                value,
-                slot,
-                backup_dir,
-                write_chunk,
-                yes,
-            } => {
-                let slot = parse_slot(slot)?;
-                let set = parse_config_set(&field, &value, slot)?;
-                config_set(&options, &set, backup_dir.as_deref(), write_chunk, yes).await?;
-            }
-            ConfigCommand::Remap {
-                from,
-                to,
-                slot,
-                backup_dir,
-                write_chunk,
-                yes,
-            } => {
-                let slot = parse_slot(slot)?;
-                let button = parse_physical_button(&from)?;
-                let target = parse_remap_target(&to)?;
-                config_remap(
-                    &options,
-                    slot,
-                    button,
-                    target,
-                    backup_dir.as_deref(),
-                    write_chunk,
-                    yes,
-                )
-                .await?;
-            }
-            ConfigCommand::Map { command } => match command {
-                MapCommand::Show { slot } => {
-                    let slot = parse_slot(slot)?;
-                    config_map_show(&options, slot).await?;
-                }
-            },
-        },
-        Command::Macro { command } => match command {
-            MacroCommand::Backup {
-                dir,
-                poll_interval_ms,
-                report_enable,
-            } => {
-                macro_backup(&options, &dir, poll_interval_ms, report_enable).await?;
-            }
-            MacroCommand::Write {
-                slot,
-                index,
-                file,
-                trigger,
-                backup_dir,
-                chunk_size,
-                write_total_relative,
-                poll_interval_ms,
-                report_enable,
-            } => {
-                macro_write(
-                    &options,
-                    slot,
-                    index,
-                    &file,
-                    trigger.as_deref(),
-                    backup_dir.as_deref(),
-                    chunk_size,
-                    macro_write_layout(write_total_relative),
-                    poll_interval_ms,
-                    report_enable,
-                )
-                .await?;
-            }
-            MacroCommand::Restore {
-                dir,
-                force,
-                chunk_size,
-                write_total_relative,
-                poll_interval_ms,
-                report_enable,
-            } => {
-                macro_restore(
-                    &options,
-                    &dir,
-                    force,
-                    chunk_size,
-                    macro_write_layout(write_total_relative),
-                    poll_interval_ms,
-                    report_enable,
-                )
-                .await?;
-            }
-        },
+        // `scan` only touches the adapter, not the controller link: SIGINT keeps
+        // its default termination and there is no App Mode to warn about.
+        Command::Scan { check } => {
+            return scan(Duration::from_secs(cli.scan_timeout), check).await;
+        }
+        // `backup` and `monitor` own their full duration; both race the whole
+        // body (connect, reads, optional hold) against SIGINT so a Ctrl-C
+        // cannot be swallowed while the link is held.
         Command::Backup { raw, json, hold } => {
-            backup(
+            return backup(
                 &options,
                 raw.as_deref(),
                 json.as_deref(),
                 Duration::from_secs(hold),
             )
-            .await?;
+            .await;
         }
-        Command::Monitor { count } => monitor(&options, count).await?,
+        Command::Monitor { count } => return monitor(&options, count).await,
         Command::Keepalive {
             interval_ms,
             duration,
@@ -609,19 +506,248 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
             )
             .await;
         }
+        // Everything else holds the link through `BleTransport::connect` and
+        // would otherwise die on SIGINT before the operator learns that 80ND
+        // is gone. Wrap connect + command as one cancellable unit; flash
+        // commands use the two-phase `with_sigint_flash` instead.
+        command @ (Command::Info | Command::Config { .. } | Command::Macro { .. }) => {
+            if is_flash_command(&command) {
+                // Two phases: the prepare/prompt/backup part is cancellable,
+                // the write part is not (see `with_sigint_flash`).
+                reset_flash_write_active();
+                let outcome = with_sigint_flash(
+                    dispatch_connected_command(&options, command),
+                    wait_for_sigint(),
+                )
+                .await;
+                reset_flash_write_active();
+                match outcome {
+                    FlashSigintOutcome::Finished(result) => result?,
+                    FlashSigintOutcome::FinishedAfterInterrupt(result) => {
+                        if let Err(error) = &result {
+                            eprintln!("error: {error}");
+                        }
+                        warn_flash_interrupted_recovery();
+                        return Ok(ExitCode::from(if result.is_ok() {
+                            EXIT_INTERRUPTED
+                        } else {
+                            EXIT_SESSION_ERROR
+                        }));
+                    }
+                    FlashSigintOutcome::Cancelled => {
+                        // Dropped during prepare; no flash frame was sent.
+                        warn_sigint_disconnects();
+                        return Ok(ExitCode::from(EXIT_INTERRUPTED));
+                    }
+                }
+            } else {
+                match with_sigint(
+                    dispatch_connected_command(&options, command),
+                    wait_for_sigint(),
+                )
+                .await
+                {
+                    SigintOutcome::Finished(result) => result?,
+                    SigintOutcome::Interrupted => {
+                        warn_sigint_disconnects();
+                        return Ok(ExitCode::from(EXIT_INTERRUPTED));
+                    }
+                }
+            }
+        }
     }
 
     Ok(ExitCode::SUCCESS)
 }
 
-async fn scan(timeout: Duration) -> Result<(), Error> {
+/// Dispatch the commands whose whole duration owns the BLE link.
+///
+/// Only the variants wrapped by [`with_sigint`] in [`run`] reach here; the
+/// lifecycle-owning commands (`scan`, `backup`, `monitor`, `keepalive`,
+/// `session`) are handled by `run` directly.
+async fn dispatch_connected_command(options: &BleOptions, command: Command) -> Result<(), Error> {
+    match command {
+        Command::Info => info(options).await,
+        Command::Config { command } => dispatch_config_command(options, command).await,
+        Command::Macro { command } => dispatch_macro_command(options, command).await,
+        Command::Scan { .. }
+        | Command::Backup { .. }
+        | Command::Monitor { .. }
+        | Command::Keepalive { .. }
+        | Command::Session { .. } => {
+            unreachable!("only SIGINT-wrapped connected commands are dispatched here")
+        }
+    }
+}
+
+/// Whether a connected subcommand writes flash and therefore must not be
+/// cancelled in the middle of the write.
+fn is_flash_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Config {
+            command: ConfigCommand::Write { .. }
+                | ConfigCommand::Set { .. }
+                | ConfigCommand::Remap { .. }
+        } | Command::Macro {
+            command: MacroCommand::Write { .. } | MacroCommand::Restore { .. }
+        }
+    )
+}
+
+async fn dispatch_config_command(
+    options: &BleOptions,
+    command: ConfigCommand,
+) -> Result<(), Error> {
+    match command {
+        ConfigCommand::Dump { raw, json } => {
+            dump_config(options, raw.as_deref(), json.as_deref()).await?;
+        }
+        ConfigCommand::Write {
+            file,
+            backup_dir,
+            accept_reserved_drift,
+            force_raw,
+            write_chunk,
+            yes,
+        } => {
+            config_write(
+                options,
+                &file,
+                backup_dir.as_deref(),
+                accept_reserved_drift,
+                force_raw,
+                write_chunk,
+                yes,
+            )
+            .await?;
+        }
+        ConfigCommand::Set {
+            field,
+            value,
+            slot,
+            backup_dir,
+            write_chunk,
+            yes,
+        } => {
+            let slot = parse_slot(slot)?;
+            let set = parse_config_set(&field, &value, slot)?;
+            config_set(options, &set, backup_dir.as_deref(), write_chunk, yes).await?;
+        }
+        ConfigCommand::Remap {
+            from,
+            to,
+            slot,
+            backup_dir,
+            write_chunk,
+            yes,
+        } => {
+            let slot = parse_slot(slot)?;
+            let button = parse_physical_button(&from)?;
+            let target = parse_remap_target(&to)?;
+            config_remap(
+                options,
+                slot,
+                button,
+                target,
+                backup_dir.as_deref(),
+                write_chunk,
+                yes,
+            )
+            .await?;
+        }
+        ConfigCommand::Map { command } => match command {
+            MapCommand::Show { slot } => {
+                let slot = parse_slot(slot)?;
+                config_map_show(options, slot).await?;
+            }
+        },
+    }
+    Ok(())
+}
+
+async fn dispatch_macro_command(options: &BleOptions, command: MacroCommand) -> Result<(), Error> {
+    match command {
+        MacroCommand::Backup {
+            dir,
+            poll_interval_ms,
+            report_enable,
+        } => {
+            macro_backup(options, &dir, poll_interval_ms, report_enable).await?;
+        }
+        MacroCommand::Write {
+            slot,
+            index,
+            file,
+            trigger,
+            backup_dir,
+            chunk_size,
+            write_total_relative,
+            poll_interval_ms,
+            report_enable,
+        } => {
+            macro_write(
+                options,
+                slot,
+                index,
+                &file,
+                trigger.as_deref(),
+                backup_dir.as_deref(),
+                chunk_size,
+                macro_write_layout(write_total_relative),
+                poll_interval_ms,
+                report_enable,
+            )
+            .await?;
+        }
+        MacroCommand::Restore {
+            dir,
+            force,
+            chunk_size,
+            write_total_relative,
+            poll_interval_ms,
+            report_enable,
+        } => {
+            macro_restore(
+                options,
+                &dir,
+                force,
+                chunk_size,
+                macro_write_layout(write_total_relative),
+                poll_interval_ms,
+                report_enable,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn scan(timeout: Duration, check: bool) -> Result<ExitCode, Error> {
     let mut devices = scan_devices(timeout).await?;
+    if check {
+        let code = scan_check_exit_code(&devices);
+        if code == 0 {
+            if let Some(device) = devices.iter().find(|device| device.is_app) {
+                println!(
+                    "App Mode device found: {}",
+                    device.name.as_deref().unwrap_or("<unnamed>")
+                );
+            }
+        } else {
+            eprintln!(
+                "no App Mode (`{APP_BLE_NAME}`) device found within {} seconds",
+                timeout.as_secs_f64()
+            );
+        }
+        return Ok(ExitCode::from(code));
+    }
     if devices.is_empty() {
         println!(
             "no BLE devices found within {} seconds",
             timeout.as_secs_f64()
         );
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     devices.sort_by_key(|device| std::cmp::Reverse(device.rssi));
@@ -637,7 +763,20 @@ async fn scan(timeout: Duration) -> Result<(), Error> {
             address = device.address
         );
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Machine-readable result of `scan --check`.
+///
+/// Exit 0 when an App Mode (`80ND`) device is visible, 3 when none is. This is
+/// the contract `scripts/session-loop.sh` relies on instead of grepping the
+/// human-readable table.
+fn scan_check_exit_code(devices: &[eightbitdo_core::BleDevice]) -> u8 {
+    if devices.iter().any(|device| device.is_app) {
+        0
+    } else {
+        EXIT_SCAN_NO_APP_MODE
+    }
 }
 
 /// Best-effort timeout for teardown operations (`set_report_enable(false)` and
@@ -649,7 +788,138 @@ async fn best_effort_disable_reports<T: Transport>(session: &Session<T>, timeout
 }
 
 async fn best_effort_disconnect<T: Transport>(transport: &T, timeout: Duration) {
-    let _ = tokio::time::timeout(timeout, transport.disconnect()).await;
+    match tokio::time::timeout(timeout, transport.disconnect()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            // `BleTransport::disconnect` keeps the single-owner lock after a
+            // partial teardown. The link may still be half-closed, so warn
+            // instead of silently starting the next command.
+            eprintln!(
+                "warning: BLE teardown failed: {error}. The single-owner BLE lock is held \
+                 until this process exits; wait for it to exit before scanning or \
+                 connecting again."
+            );
+        }
+        Err(_) => eprintln!(
+            "warning: BLE disconnect did not finish within {timeout:?}. The single-owner BLE \
+             lock is held until this process exits; wait for it to exit before scanning or \
+             connecting again."
+        ),
+    }
+}
+
+/// Wait for SIGINT and resolve; the value itself is ignored.
+async fn wait_for_sigint() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Result of racing a cancellable BLE command against SIGINT.
+#[derive(Debug)]
+enum SigintOutcome<T> {
+    /// The command finished before a signal arrived.
+    Finished(T),
+    /// SIGINT arrived first; the command future was dropped.
+    Interrupted,
+}
+
+/// Race a cancellable BLE-owning future against SIGINT.
+///
+/// Completion is preferred when both are ready: a command that finished at the
+/// same moment as the signal keeps its result.
+async fn with_sigint<T, F, S>(future: F, signal: S) -> SigintOutcome<T>
+where
+    F: Future<Output = T>,
+    S: Future<Output = ()>,
+{
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        value = &mut future => SigintOutcome::Finished(value),
+        _ = signal => SigintOutcome::Interrupted,
+    }
+}
+
+/// Set when the first flash frame is about to be sent.
+///
+/// The top-level SIGINT wrapper uses this to split a flash command into a
+/// cancellable prepare phase (connect, reads, pre-write backup, confirmation
+/// prompt, plan) and a non-cancellable write phase. A single CLI command runs
+/// per process; tests exercise the wrapper with an explicit reset.
+static FLASH_WRITE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn mark_flash_write_active() {
+    FLASH_WRITE_ACTIVE.store(true, Ordering::SeqCst);
+}
+
+fn reset_flash_write_active() {
+    FLASH_WRITE_ACTIVE.store(false, Ordering::SeqCst);
+}
+
+/// Result of racing a two-phase flash command against SIGINT.
+#[derive(Debug)]
+enum FlashSigintOutcome<T> {
+    /// The command finished before any signal arrived.
+    Finished(T),
+    /// SIGINT arrived after the write started; the write was allowed to
+    /// finish and its result is reported here.
+    FinishedAfterInterrupt(T),
+    /// SIGINT arrived during the cancellable prepare phase; the future was
+    /// dropped before any flash frame was sent.
+    Cancelled,
+}
+
+/// Race a two-phase flash command against SIGINT.
+///
+/// Before [`mark_flash_write_active`] the future is dropped on SIGINT (prompt,
+/// pre-write backup and file reads are all cancellable). Once the first flash
+/// frame is about to be sent the signal is handled once (the App Mode warning
+/// is printed immediately) and the future is allowed to complete, so a
+/// partially written sector/configuration is not abandoned.
+async fn with_sigint_flash<T, F, S>(future: F, signal: S) -> FlashSigintOutcome<T>
+where
+    F: Future<Output = T>,
+    S: Future<Output = ()>,
+{
+    with_sigint_flash_gate(future, signal, &FLASH_WRITE_ACTIVE).await
+}
+
+/// Inner form of [`with_sigint_flash`] with the write-active gate injected so
+/// tests do not race the process-wide flag.
+async fn with_sigint_flash_gate<T, F, S>(
+    future: F,
+    signal: S,
+    write_active: &AtomicBool,
+) -> FlashSigintOutcome<T>
+where
+    F: Future<Output = T>,
+    S: Future<Output = ()>,
+{
+    tokio::pin!(future);
+    tokio::pin!(signal);
+    let mut signalled = false;
+    loop {
+        tokio::select! {
+            biased;
+            value = &mut future => {
+                return if signalled {
+                    FlashSigintOutcome::FinishedAfterInterrupt(value)
+                } else {
+                    FlashSigintOutcome::Finished(value)
+                };
+            }
+            _ = &mut signal, if !signalled => {
+                if write_active.load(Ordering::SeqCst) {
+                    signalled = true;
+                    warn_app_mode_requires_press(
+                        "SIGINT received; the flash write has started and is not cancellable, \
+                         so it will finish before the process exits",
+                    );
+                } else {
+                    return FlashSigintOutcome::Cancelled;
+                }
+            }
+        }
+    }
 }
 
 /// Convert `--poll-interval-ms` into the session keepalive interval.
@@ -1820,12 +2090,8 @@ async fn config_remap(
     validate_write_chunk_preconnect(write_chunk)?;
     let transport = BleTransport::connect(options).await?;
     let session = Session::new(transport);
-    let mut prompt = || confirm_config_write(&mut std::io::stdin().lock());
-    let confirmation = if assume_yes {
-        ConfigConfirmation::AssumeYes
-    } else {
-        ConfigConfirmation::Reader(&mut prompt)
-    };
+    let mut confirmation_io = TopLevelConfirmation::new(assume_yes);
+    let confirmation = confirmation_io.confirmation();
     let result = config_remap_session(
         &session,
         slot,
@@ -1896,9 +2162,10 @@ fn config_readback_crc_label(crc: ConfigCrcStatus) -> &'static str {
 enum ConfigConfirmation<'a> {
     /// `--yes` was passed: write without prompting.
     AssumeYes,
-    /// Prompt on stderr and read one line through this synchronous callback
-    /// (top-level stdin, or a cursor in tests). A `FnMut` keeps the whole
-    /// confirmation enum `Send` even when the REPL loop is spawned.
+    /// Prompt on stderr and read one line through this synchronous callback.
+    /// Kept for the existing unit tests; production top-level commands use
+    /// [`ConfigConfirmation::AsyncReader`] so SIGINT can cancel the prompt.
+    #[cfg_attr(not(test), allow(dead_code))]
     Reader(&'a mut (dyn FnMut() -> Result<bool, Error> + Send)),
     /// Prompt and read one line from the session REPL's async reader so the
     /// operator answers on the same input stream. `LineState` keeps the REPL's
@@ -1926,7 +2193,41 @@ impl ConfigConfirmation<'_> {
 /// The confirmation prompt shared by the sync and async readers.
 const CONFIG_CONFIRM_PROMPT: &str = "Type 'yes' to write the 2768-byte configuration: ";
 
-/// Ask for confirmation unless `--yes` was passed.
+/// Top-level `yes/no` confirmation that is assembled lazily.
+///
+/// The async stdin reader must outlive the `ConfigConfirmation` borrow, so it
+/// lives in this struct and [`TopLevelConfirmation::confirmation`] borrows it.
+/// Confirming through async I/O (instead of a blocking `std::io::stdin` read)
+/// lets SIGINT cancel the top-level prompt before any flash frame is sent.
+struct TopLevelConfirmation {
+    assume_yes: bool,
+    stdin: tokio::io::BufReader<tokio::io::Stdin>,
+    line_state: LineState,
+}
+
+impl TopLevelConfirmation {
+    fn new(assume_yes: bool) -> Self {
+        Self {
+            assume_yes,
+            stdin: tokio::io::BufReader::new(tokio::io::stdin()),
+            line_state: LineState::default(),
+        }
+    }
+
+    fn confirmation(&mut self) -> ConfigConfirmation<'_> {
+        if self.assume_yes {
+            ConfigConfirmation::AssumeYes
+        } else {
+            ConfigConfirmation::AsyncReader {
+                reader: &mut self.stdin,
+                line_state: &mut self.line_state,
+            }
+        }
+    }
+}
+
+/// Ask for confirmation unless `--yes` was passed (synchronous test helper).
+#[cfg_attr(not(test), allow(dead_code))]
 fn confirm_config_write(reader: &mut impl std::io::BufRead) -> Result<bool, Error> {
     eprint!("{CONFIG_CONFIRM_PROMPT}");
     std::io::stderr().flush()?;
@@ -2415,6 +2716,7 @@ async fn finish_config_prepared<T: Transport>(
         "writing 2768 bytes + Save; do not interrupt (Ctrl-C or power loss can leave the commit \
          unconfirmed)"
     );
+    mark_flash_write_active();
     let outcome = match session
         .write_full_config_with_chunk(
             &state.snapshot,
@@ -2807,12 +3109,8 @@ async fn config_write(
     let edited = read_and_validate_config_file(file, force_raw)?;
     let transport = BleTransport::connect(options).await?;
     let session = Session::new(transport);
-    let mut prompt = || confirm_config_write(&mut std::io::stdin().lock());
-    let confirmation = if assume_yes {
-        ConfigConfirmation::AssumeYes
-    } else {
-        ConfigConfirmation::Reader(&mut prompt)
-    };
+    let mut confirmation_io = TopLevelConfirmation::new(assume_yes);
+    let confirmation = confirmation_io.confirmation();
     let result = config_write_session(
         &session,
         &edited,
@@ -2836,12 +3134,8 @@ async fn config_set(
     validate_write_chunk_preconnect(write_chunk)?;
     let transport = BleTransport::connect(options).await?;
     let session = Session::new(transport);
-    let mut prompt = || confirm_config_write(&mut std::io::stdin().lock());
-    let confirmation = if assume_yes {
-        ConfigConfirmation::AssumeYes
-    } else {
-        ConfigConfirmation::Reader(&mut prompt)
-    };
+    let mut confirmation_io = TopLevelConfirmation::new(assume_yes);
+    let confirmation = confirmation_io.confirmation();
     let result = config_set_session(&session, set, backup_dir, confirmation, write_chunk).await;
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
@@ -2996,16 +3290,44 @@ async fn backup(
     raw_path: Option<&Path>,
     json_path: Option<&Path>,
     hold: Duration,
-) -> Result<(), Error> {
+) -> Result<ExitCode, Error> {
     validate_output_paths(raw_path, json_path)?;
-    let transport = BleTransport::connect(options).await?;
-    let session = Session::new(transport);
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+    let transport = match with_sigint(BleTransport::connect(options), wait_for_sigint()).await {
+        SigintOutcome::Finished(Ok(transport)) => transport,
+        SigintOutcome::Finished(Err(error)) => return Err(error),
+        SigintOutcome::Interrupted => {
+            warn_sigint_disconnects();
+            return Ok(ExitCode::from(EXIT_INTERRUPTED));
+        }
     };
-    let result = backup_session(&session, raw_path, json_path, hold, shutdown).await;
+    let session = Session::new(transport);
+    // Race every read (and the optional hold) against SIGINT. `backup_session`
+    // keeps its shutdown parameter for tests, but production passes a pending
+    // future: this outer race owns the signal so a Ctrl-C during the reads
+    // cannot be swallowed.
+    let outcome = with_sigint(
+        backup_session(
+            &session,
+            raw_path,
+            json_path,
+            hold,
+            std::future::pending::<()>(),
+        ),
+        wait_for_sigint(),
+    )
+    .await;
+    best_effort_disable_reports(&session, CLEANUP_TIMEOUT).await;
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
-    result
+    match outcome {
+        SigintOutcome::Finished(result) => {
+            result?;
+            Ok(ExitCode::SUCCESS)
+        }
+        SigintOutcome::Interrupted => {
+            warn_sigint_disconnects();
+            Ok(ExitCode::from(EXIT_INTERRUPTED))
+        }
+    }
 }
 
 /// One-connection backup: ReadVersion, the 2768-byte config, optional hold.
@@ -3545,6 +3867,7 @@ async fn macro_write_session_inner<T: Transport>(
         macro_id(index),
         plan.steps.len(),
     );
+    mark_flash_write_active();
     let outcome = session.write_macro(&backup, slot, index, &plan).await?;
     warn_if_config_crc_invalid(outcome.config_crc_valid);
 
@@ -4144,6 +4467,7 @@ async fn macro_restore_session_core<T: Transport>(
             slot.index(),
             plans.len()
         );
+        mark_flash_write_active();
         match session.write_macro_slot(&backup, slot, &plans).await {
             Ok(outcome) => {
                 println!(
@@ -4520,19 +4844,46 @@ fn write_macro_backup(
     Ok(())
 }
 
-async fn monitor(options: &BleOptions, count: Option<u64>) -> Result<(), Error> {
+async fn monitor(options: &BleOptions, count: Option<u64>) -> Result<ExitCode, Error> {
     if count == Some(0) {
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
-    let transport = BleTransport::connect(options).await?;
-    let session = Session::new(transport);
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+    let transport = match with_sigint(BleTransport::connect(options), wait_for_sigint()).await {
+        SigintOutcome::Finished(Ok(transport)) => transport,
+        SigintOutcome::Finished(Err(error)) => return Err(error),
+        SigintOutcome::Interrupted => {
+            warn_sigint_disconnects();
+            return Ok(ExitCode::from(EXIT_INTERRUPTED));
+        }
     };
-    let result = monitor_connection(&session, Duration::from_millis(20), count, shutdown).await;
-    best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
-    result.map(|_| ())
+    let session = Session::new(transport);
+    // Race the whole monitor (including its initial 0x0007 enable and the poll
+    // loop) against SIGINT. The inner shutdown stays pending so this outer
+    // race is the only signal consumer.
+    let outcome = with_sigint(
+        monitor_connection(
+            &session,
+            Duration::from_millis(20),
+            count,
+            std::future::pending::<()>(),
+        ),
+        wait_for_sigint(),
+    )
+    .await;
+    match outcome {
+        SigintOutcome::Finished(result) => {
+            best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
+            result.map(|_| ExitCode::SUCCESS)
+        }
+        SigintOutcome::Interrupted => {
+            // The cancelled monitor did not reach its own report disable.
+            best_effort_disable_reports(&session, CLEANUP_TIMEOUT).await;
+            best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
+            warn_sigint_disconnects();
+            Ok(ExitCode::from(EXIT_INTERRUPTED))
+        }
+    }
 }
 
 /// Run the top-level monitor against an already connected session.
@@ -4573,33 +4924,51 @@ async fn keepalive(
     }
 
     let started = Instant::now();
-    let transport = match BleTransport::connect(options).await {
-        Ok(transport) => transport,
-        Err(error) => {
+    let transport = match with_sigint(BleTransport::connect(options), wait_for_sigint()).await {
+        SigintOutcome::Finished(Ok(transport)) => transport,
+        SigintOutcome::Finished(Err(error)) => {
             eprintln!("keepalive error after 0.0s: {error}");
             return Ok(ExitCode::FAILURE);
+        }
+        SigintOutcome::Interrupted => {
+            warn_sigint_disconnects();
+            return Ok(ExitCode::from(EXIT_INTERRUPTED));
         }
     };
     let session = Session::new(transport);
 
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    let result = run_keepalive(&session, interval, duration, shutdown).await;
-    best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
-
+    // Race the whole keepalive (including its initial 0x0007 enable and the
+    // poll loop) against SIGINT. The inner shutdown stays pending so this
+    // outer race is the only signal consumer.
+    let outcome = with_sigint(
+        run_keepalive(&session, interval, duration, std::future::pending::<()>()),
+        wait_for_sigint(),
+    )
+    .await;
     let elapsed = started.elapsed().as_secs_f64();
-    match result {
-        Ok(stats) => {
-            println!(
-                "keepalive finished: elapsed={elapsed:.1}s sent={} received={}",
-                stats.sent, stats.received
-            );
-            Ok(ExitCode::SUCCESS)
+    match outcome {
+        SigintOutcome::Finished(result) => {
+            best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
+            match result {
+                Ok(stats) => {
+                    println!(
+                        "keepalive finished: elapsed={elapsed:.1}s sent={} received={}",
+                        stats.sent, stats.received
+                    );
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err(error) => {
+                    eprintln!("keepalive error after {elapsed:.1}s: {error}");
+                    Ok(ExitCode::FAILURE)
+                }
+            }
         }
-        Err(error) => {
-            eprintln!("keepalive error after {elapsed:.1}s: {error}");
-            Ok(ExitCode::FAILURE)
+        SigintOutcome::Interrupted => {
+            // The cancelled loop did not reach its own report disable.
+            best_effort_disable_reports(&session, CLEANUP_TIMEOUT).await;
+            best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
+            warn_sigint_disconnects();
+            Ok(ExitCode::from(EXIT_INTERRUPTED))
         }
     }
 }
@@ -5368,14 +5737,105 @@ fn keepalive_degraded_error(state: &SessionKeepaliveState) -> Option<Error> {
         return None;
     }
     Some(Error::Transport(format!(
-        "keepalive degraded (consecutive failures {}): {}. The controller most likely \
-         left BLE configuration mode; this session does not auto-reconnect. Press \
-         Profile on the controller to re-enter `80ND` and start a new `eightbitdo session`",
+        "keepalive degraded (consecutive failures {}): {}. The last few keepalive ticks failed \
+         with I/O errors (a missing input report is normal idle and is not counted as a \
+         failure). The controller left BLE App Mode, so `{APP_BLE_NAME}` no longer advertises \
+         and this session does not auto-reconnect. Press Profile on the controller for about \
+         3 seconds to re-enter App Mode, then start a new `eightbitdo session`",
         state.consecutive_failures.load(Ordering::SeqCst),
         state
             .last_error()
             .unwrap_or_else(|| "unknown error".to_string())
     )))
+}
+
+/// Process exit code for a degraded keepalive.
+///
+/// This is deliberately distinct from `1` (ordinary error): the resident loop
+/// must stop and wait for a physical Profile press instead of reconnecting,
+/// because a disconnected controller does not advertise `80ND` at all. No
+/// automatic retry can succeed until the user performs the press.
+const EXIT_SESSION_DEGRADED: u8 = 3;
+
+/// Exit code for a session that ended for any reason other than a clean
+/// `quit`.
+const EXIT_SESSION_ERROR: u8 = 1;
+
+/// Exit code for a top-level BLE command interrupted by SIGINT.
+///
+/// `130` is the conventional shell status for a process terminated by
+/// `SIGINT`; the command itself still prints the App Mode press warning first.
+const EXIT_INTERRUPTED: u8 = 130;
+
+/// `scan --check` result when no App Mode (`80ND`) device is visible.
+const EXIT_SCAN_NO_APP_MODE: u8 = 3;
+
+/// Map a finished REPL result and the keepalive state to a process exit code.
+///
+/// Kept as a pure function so the degraded/clean/error mapping is testable
+/// without a controller.
+fn session_exit_code(result: &Result<(), Error>, degraded: bool) -> u8 {
+    if degraded {
+        EXIT_SESSION_DEGRADED
+    } else if result.is_ok() {
+        0
+    } else {
+        EXIT_SESSION_ERROR
+    }
+}
+
+/// Tell the operator that SIGINT is about to drop the BLE link.
+///
+/// The session is the only owner of the link while it runs; exiting hands the
+/// controller back to its normal mode and `80ND` disappears, so the next
+/// session needs a physical Profile press. SIGINT is still honoured (it is an
+/// explicit user action); the warning exists so the press is expected.
+fn warn_sigint_disconnects() {
+    warn_app_mode_requires_press("SIGINT received; exiting closes the BLE link and exits App Mode");
+}
+
+/// EOF on the control pipe means the same lost link as `quit`/SIGINT.
+fn warn_eof_disconnects() {
+    warn_app_mode_requires_press(
+        "stdin ended (EOF); exiting closes the BLE link and exits App Mode",
+    );
+}
+
+fn warn_app_mode_requires_press(reason: &str) {
+    eprintln!("{}", app_mode_press_message(reason));
+}
+
+/// Recovery guidance after a flash write was interrupted by SIGINT.
+///
+/// The write itself is allowed to finish (it is not cancellable), but the
+/// operator still needs to confirm the device state and know how to restore
+/// the pre-write backup if the write was partially applied.
+fn warn_flash_interrupted_recovery() {
+    eprintln!("{}", flash_interrupted_recovery_message());
+}
+
+/// Recovery text for [`warn_flash_interrupted_recovery`].
+///
+/// Separate from printing so the required recovery commands and the
+/// read-back instruction are testable.
+fn flash_interrupted_recovery_message() -> &'static str {
+    "warning: SIGINT interrupted a flash write. The write was allowed to finish, but the \
+     device may be partially updated: verify it with a read-back, and if the write failed \
+     or the data looks wrong, restore the pre-write backup with \
+     `eightbitdo macro restore <DIR>` (macro) or \
+     `eightbitdo config write --file <BACKUP>/config.bin` (config), then read it back."
+}
+
+/// The operator-facing warning shared by SIGINT, EOF and a lost link.
+///
+/// Kept separate from the printing so the required content (`80ND` stops
+/// advertising, Profile ~3 seconds) is testable without capturing stderr.
+fn app_mode_press_message(reason: &str) -> String {
+    format!(
+        "note: {reason}. The controller stops advertising `{APP_BLE_NAME}`; to re-enter \
+         App Mode, press Profile on the controller for about 3 seconds before starting a \
+         new session."
+    )
 }
 
 async fn shutdown_session<T: Transport>(
@@ -6384,11 +6844,10 @@ where
             LoopEvent::CtrlC => {
                 // Ctrl-C while idle: no command future is in flight. If a
                 // command was running, its branch below drops the future
-                // instead. `Session` records abandoned reads through
-                // `ResyncGuard` / `InFlight`; the next read calls
-                // `prepare_read` and drains only when a read (not an input
-                // poll) may have left a response behind. A protocol error from
-                // an input poll marks the session explicitly.
+                // instead; `Session` marks that through `ResyncGuard` /
+                // `InFlight`. Honouring SIGINT is standard, but it costs the
+                // App Mode link, so say so before leaving.
+                warn_sigint_disconnects();
                 break;
             }
             LoopEvent::KeepaliveStopped => {
@@ -6417,7 +6876,10 @@ where
                     }
                 };
                 let text = match read {
-                    LineRead::Eof => break,
+                    LineRead::Eof => {
+                        warn_eof_disconnects();
+                        break;
+                    }
                     LineRead::TooLong { discarded } => {
                         eprintln!(
                             "line too long: discarded {discarded} bytes (limit {MAX_SESSION_LINE_BYTES} per line); command ignored"
@@ -6446,6 +6908,7 @@ where
                     let prepared = tokio::select! {
                         biased;
                         _ = &mut ctrl_c => {
+                            warn_sigint_disconnects();
                             eprintln!(
                                 "note: Ctrl-C received; configuration preparation was cancelled \
                                  before any 0x0001/Save. If a pre-write backup was created it remains."
@@ -6470,6 +6933,7 @@ where
                         let answer = tokio::select! {
                             biased;
                             _ = &mut ctrl_c => {
+                                warn_sigint_disconnects();
                                 eprintln!(
                                     "note: Ctrl-C received; configuration write cancelled before \
                                      any 0x0001/Save. Pre-write backup: {} (plan-time snapshot); \
@@ -6506,6 +6970,7 @@ where
                         biased;
                         result = &mut finish => result,
                         _ = &mut ctrl_c => {
+                            warn_sigint_disconnects();
                             eprintln!(
                                 "note: Ctrl-C received; the configuration flash write \
                                  (0x0001/Save) is not cancellable and will finish before the \
@@ -6562,6 +7027,7 @@ where
                         biased;
                         outcome = &mut command_future => outcome,
                         _ = &mut ctrl_c => {
+                            warn_sigint_disconnects();
                             eprintln!(
                                 "note: Ctrl-C received; the flash operation is not cancellable \
                                  and will finish before the session exits"
@@ -6581,6 +7047,7 @@ where
                             // the next read drains only when a response could
                             // still be in flight. There is no caller-side mark to
                             // clear; `Session::InFlight` makes that decision.
+                            warn_sigint_disconnects();
                             break;
                         }
                         outcome = execute_session_command_with_io(
@@ -6643,11 +7110,17 @@ async fn session(
         eprintln!("session error: --interval-ms must be greater than zero");
         return Ok(ExitCode::FAILURE);
     }
-    let transport = match BleTransport::connect(options).await {
-        Ok(transport) => transport,
-        Err(error) => {
+    // The connect scan can take seconds and already leaves App Mode when it is
+    // interrupted: warn instead of dying silently under the default SIGINT.
+    let transport = match with_sigint(BleTransport::connect(options), wait_for_sigint()).await {
+        SigintOutcome::Finished(Ok(transport)) => transport,
+        SigintOutcome::Finished(Err(error)) => {
             eprintln!("session error: {error}");
             return Ok(ExitCode::FAILURE);
+        }
+        SigintOutcome::Interrupted => {
+            warn_sigint_disconnects();
+            return Ok(ExitCode::from(EXIT_INTERRUPTED));
         }
     };
     let session = Arc::new(AsyncMutex::new(Session::new(transport)));
@@ -6655,20 +7128,27 @@ async fn session(
         let guard = session.lock().await;
         guard.transport().mtu()
     };
-    let keepalive = match start_session_keepalive_with_config(
+    // The startup `0x0007` enable is also part of the link-owning phase.
+    let keepalive_start = start_session_keepalive_with_config(
         Arc::clone(&session),
         SessionKeepaliveConfig::with_interval(interval),
         report_enable,
-    )
-    .await
-    {
-        Ok(keepalive) => keepalive,
-        Err(error) => {
+    );
+    let keepalive = match with_sigint(keepalive_start, wait_for_sigint()).await {
+        SigintOutcome::Finished(Ok(keepalive)) => keepalive,
+        SigintOutcome::Finished(Err(error)) => {
             if let Ok(guard) = tokio::time::timeout(CLEANUP_TIMEOUT, session.lock()).await {
                 best_effort_disconnect(guard.transport(), CLEANUP_TIMEOUT).await;
             }
             eprintln!("session error: {error}");
             return Ok(ExitCode::FAILURE);
+        }
+        SigintOutcome::Interrupted => {
+            warn_sigint_disconnects();
+            if let Ok(guard) = tokio::time::timeout(CLEANUP_TIMEOUT, session.lock()).await {
+                best_effort_disconnect(guard.transport(), CLEANUP_TIMEOUT).await;
+            }
+            return Ok(ExitCode::from(EXIT_INTERRUPTED));
         }
     };
     // Make the 0x0007 state explicit: a REPL macro write happens while this
@@ -6695,13 +7175,37 @@ async fn session(
     )
     .await;
     shutdown_session(&session, keepalive).await;
+    let degraded = state.degraded.load(Ordering::SeqCst);
     let result = finalize_session_result(result, &state);
+
+    if session_exit_code(&result, degraded) == EXIT_SESSION_DEGRADED {
+        // Reuse the keepalive message (it names the failure and the Profile
+        // press), then make the terminal state and exit code explicit: the
+        // resident loop keys on this code to stop instead of reconnecting.
+        if let Some(error) = keepalive_degraded_error(&state) {
+            eprintln!("session error: {error}");
+        }
+        eprintln!(
+            "session exit code {EXIT_SESSION_DEGRADED}: keepalive degraded; the BLE link is \
+             gone and `{APP_BLE_NAME}` is not advertising. Physical controller action \
+             (Profile, about 3 seconds) is required before another session can connect. \
+             This is not retried automatically."
+        );
+        return Ok(ExitCode::from(EXIT_SESSION_DEGRADED));
+    }
 
     match result {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(error) => {
+            let disconnected = matches!(error, Error::Disconnected);
             eprintln!("session error: {error}");
-            Ok(ExitCode::FAILURE)
+            if disconnected {
+                // The link was lost outside the keepalive path (a command
+                // observed the disconnect). The controller is already out of
+                // App Mode, so the same press guidance applies.
+                warn_app_mode_requires_press("the BLE link was lost");
+            }
+            Ok(ExitCode::from(EXIT_SESSION_ERROR))
         }
     }
 }
@@ -9006,6 +9510,370 @@ mod tests {
         assert!(
             matches!(finalized, Err(Error::Transport(ref msg)) if msg.contains("keepalive degraded"))
         );
+    }
+
+    #[test]
+    fn app_mode_press_message_names_the_link_the_press_and_the_wait() {
+        for reason in [
+            "SIGINT received; exiting closes the BLE link and exits App Mode",
+            "stdin ended (EOF); exiting closes the BLE link and exits App Mode",
+            "the BLE link was lost",
+        ] {
+            let message = app_mode_press_message(reason);
+            assert!(message.contains(reason), "reason missing: {message}");
+            assert!(message.contains("80ND"), "80ND missing: {message}");
+            assert!(
+                message.contains("Profile"),
+                "press instruction missing: {message}"
+            );
+            assert!(
+                message.contains("3 seconds"),
+                "press duration missing: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_commands_use_the_conventional_sigint_exit_code() {
+        // 128 + SIGINT(2), distinct from the degraded exit code 3 so the
+        // resident loop cannot confuse a user interrupt with a lost link.
+        assert_eq!(EXIT_INTERRUPTED, 130);
+        assert_ne!(EXIT_INTERRUPTED, EXIT_SESSION_DEGRADED);
+    }
+
+    #[tokio::test]
+    async fn with_sigint_prefers_completed_results_and_reports_interruption() {
+        // Completion wins when both are ready, so a command that finished at
+        // the same moment as the signal keeps its result.
+        let finished = with_sigint(async { Ok::<u8, Error>(7) }, std::future::ready(())).await;
+        assert!(
+            matches!(finished, SigintOutcome::Finished(Ok(7))),
+            "completion must win the race"
+        );
+
+        let interrupted = with_sigint(
+            std::future::pending::<Result<u8, Error>>(),
+            std::future::ready(()),
+        )
+        .await;
+        assert!(
+            matches!(interrupted, SigintOutcome::Interrupted),
+            "a pending command must yield to the signal"
+        );
+
+        let failed = with_sigint(
+            async { Err::<u8, Error>(Error::Disconnected) },
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(
+            matches!(failed, SigintOutcome::Finished(Err(Error::Disconnected))),
+            "a command error must not be mistaken for an interruption"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_sigint_flash_cancels_only_before_the_write_starts() {
+        let write_active = AtomicBool::new(false);
+
+        // Prepare phase: the pending future is dropped at once, i.e. no flash
+        // frame is sent.
+        let outcome = with_sigint_flash_gate(
+            std::future::pending::<Result<u8, Error>>(),
+            std::future::ready(()),
+            &write_active,
+        )
+        .await;
+        assert!(
+            matches!(outcome, FlashSigintOutcome::Cancelled),
+            "a signal during prepare must cancel before any flash frame"
+        );
+
+        // Write phase: the future is allowed to finish.
+        write_active.store(true, Ordering::SeqCst);
+        let future = async {
+            tokio::task::yield_now().await;
+            Ok::<u8, Error>(9)
+        };
+        let outcome = with_sigint_flash_gate(future, std::future::ready(()), &write_active).await;
+        assert!(
+            matches!(outcome, FlashSigintOutcome::FinishedAfterInterrupt(Ok(9))),
+            "a signal after the write started must not abandon the write"
+        );
+
+        let outcome = with_sigint_flash_gate(
+            async { Ok::<u8, Error>(9) },
+            std::future::pending::<()>(),
+            &write_active,
+        )
+        .await;
+        assert!(
+            matches!(outcome, FlashSigintOutcome::Finished(Ok(9))),
+            "without a signal the result is a plain finished outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_prompt_sigint_cancels_before_any_flash_frame() {
+        // Real top-level flow: read + pre-write backup + async prompt. SIGINT
+        // while the prompt is pending must drop the future before the first
+        // 0x0001/Save frame is sent.
+        let dir = scratch_dir("flash-prompt-cancel");
+        let initial = config_write_fixture();
+        let mut edited = initial.clone();
+        edited.set_profile_name(Slot::S2, "Edited").unwrap();
+        let transport = ConfigDeviceTransport::new(initial.clone());
+        let session = Session::new(&transport);
+        let (_writer, reader) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line_state = LineState::default();
+        let confirmation = ConfigConfirmation::AsyncReader {
+            reader: &mut reader,
+            line_state: &mut line_state,
+        };
+        let backup = dir.join("backup");
+        let write_active = AtomicBool::new(false);
+
+        let outcome = with_sigint_flash_gate(
+            async {
+                config_write_session(&session, &edited, Some(&backup), false, confirmation, None)
+                    .await
+            },
+            std::future::ready(()),
+            &write_active,
+        )
+        .await;
+        assert!(
+            matches!(outcome, FlashSigintOutcome::Cancelled),
+            "a prompt SIGINT must cancel before the flash phase"
+        );
+
+        let sent = transport.sent();
+        let flash_frame = sent.iter().any(|frame| {
+            let cmd = CustomHeader::parse(&frame[1..]).unwrap().cmd;
+            cmd == commands::cmd::WRITE_CONFIG || cmd == commands::cmd::SAVE
+        });
+        assert!(
+            !flash_frame,
+            "the cancelled prompt must not send any 0x0001/Save frame"
+        );
+        assert!(
+            backup.join("config.bin").is_file(),
+            "the pre-write backup (prepare phase) still exists"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flash_interrupted_recovery_names_the_restore_commands() {
+        let message = flash_interrupted_recovery_message();
+        assert!(message.contains("partially updated"), "{message}");
+        assert!(message.contains("macro restore"), "{message}");
+        assert!(message.contains("config write"), "{message}");
+        assert!(message.contains("read it back"), "{message}");
+    }
+
+    #[test]
+    fn scan_check_uses_app_mode_presence() {
+        let app = eightbitdo_core::BleDevice {
+            name: Some("80ND".to_string()),
+            address: "aa:bb:cc:dd:ee:ff".to_string(),
+            rssi: Some(-40),
+            is_app: true,
+        };
+        let other = eightbitdo_core::BleDevice {
+            name: Some("Something".to_string()),
+            address: "11:22:33:44:55:66".to_string(),
+            rssi: Some(-60),
+            is_app: false,
+        };
+        assert_eq!(scan_check_exit_code(&[app, other.clone()]), 0);
+        assert_eq!(scan_check_exit_code(&[other]), EXIT_SCAN_NO_APP_MODE);
+        assert_eq!(scan_check_exit_code(&[]), EXIT_SCAN_NO_APP_MODE);
+        assert_eq!(EXIT_SCAN_NO_APP_MODE, 3);
+    }
+
+    #[test]
+    fn flash_command_classification_covers_every_write() {
+        fn parse(args: &[&str]) -> Command {
+            Cli::try_parse_from(args).expect("parse command").command
+        }
+        for args in [
+            vec![
+                "eightbitdo",
+                "macro",
+                "write",
+                "--slot",
+                "1",
+                "--index",
+                "1",
+                "--file",
+                "steps.toml",
+            ],
+            vec!["eightbitdo", "macro", "restore", "--dir", "backup-dir"],
+            vec!["eightbitdo", "config", "write", "--file", "config.bin"],
+            vec!["eightbitdo", "config", "set", "profile_name", "p1"],
+            vec!["eightbitdo", "config", "remap", "a", "b"],
+        ] {
+            assert!(
+                is_flash_command(&parse(&args)),
+                "expected a flash command: {args:?}"
+            );
+        }
+        for args in [
+            vec!["eightbitdo", "info"],
+            vec!["eightbitdo", "scan"],
+            vec!["eightbitdo", "scan", "--check"],
+            vec!["eightbitdo", "macro", "backup", "--dir", "dir"],
+            vec!["eightbitdo", "config", "dump"],
+            vec!["eightbitdo", "config", "map", "show"],
+        ] {
+            assert!(
+                !is_flash_command(&parse(&args)),
+                "expected a read-only command: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_exit_code_marks_degraded_as_three() {
+        // The resident loop keys on 3 to stop and wait for a physical Profile
+        // press. A clean quit is 0 and every other error is 1.
+        assert_eq!(session_exit_code(&Ok(()), true), EXIT_SESSION_DEGRADED);
+        assert_eq!(
+            session_exit_code(&Err(Error::Disconnected), true),
+            EXIT_SESSION_DEGRADED
+        );
+        assert_eq!(session_exit_code(&Ok(()), false), 0);
+        assert_eq!(
+            session_exit_code(&Err(Error::Disconnected), false),
+            EXIT_SESSION_ERROR
+        );
+        assert_ne!(EXIT_SESSION_DEGRADED, EXIT_SESSION_ERROR);
+    }
+
+    #[tokio::test]
+    async fn repl_exits_when_keepalive_degrades_with_stdin_still_open() {
+        // The failure mode this guards: a resident session sits in the REPL
+        // line read while the keepalive degrades, so the process keeps waiting
+        // for a command instead of exiting for the next physical press. The
+        // write half is kept alive, so nothing but the keepalive stop can end
+        // the loop.
+        let (_writer, reader) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let session = Arc::new(AsyncMutex::new(Session::new(KeepaliveTestTransport::new())));
+        let state = Arc::new(SessionKeepaliveState::new());
+        state.record_error(&Error::Disconnected);
+        state.consecutive_failures.store(3, Ordering::SeqCst);
+        state.degraded.store(true, Ordering::SeqCst);
+        state.stopped_notify.notify_one();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            session_repl_loop_with_io(
+                &session,
+                &state,
+                Instant::now(),
+                64,
+                Duration::from_millis(10),
+                false,
+                false,
+                &mut reader,
+                std::future::pending::<()>(),
+                false,
+            ),
+        )
+        .await
+        .expect("the REPL must exit on a degraded keepalive instead of waiting for input");
+        assert!(
+            matches!(result, Err(Error::Transport(ref msg)) if msg.contains("keepalive degraded")),
+            "expected the degraded exit, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repl_exits_after_three_real_keepalive_failures_with_stdin_open() {
+        // End-to-end version of the incident: the keepalive task itself fails
+        // three consecutive polls while the REPL is blocked in the line read.
+        // The session must surface the degraded error and stop waiting for
+        // commands, not sit in the REPL until a physical press.
+        let transport = KeepaliveTestTransport::new();
+        // Three consecutive non-`Disconnected` failures: a disconnected recv
+        // degrades on the first failure by design, so use the generic receive
+        // error to exercise the 3-failure threshold.
+        transport.fail_receives();
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let keepalive = start_session_keepalive_with_config(
+            Arc::clone(&session),
+            SessionKeepaliveConfig {
+                interval: Duration::from_millis(1),
+                max_consecutive_failures: 3,
+            },
+            false,
+        )
+        .await
+        .expect("start keepalive");
+        let state = Arc::clone(&keepalive.state);
+        let (_writer, reader) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            session_repl_loop_with_io(
+                &session,
+                &state,
+                Instant::now(),
+                64,
+                Duration::from_millis(1),
+                false,
+                false,
+                &mut reader,
+                std::future::pending::<()>(),
+                false,
+            ),
+        )
+        .await
+        .expect("the REPL must exit after three keepalive failures");
+        assert!(
+            matches!(result, Err(Error::Transport(ref msg)) if msg.contains("keepalive degraded")),
+            "expected the degraded exit, got {result:?}"
+        );
+        assert_eq!(state.consecutive_failures.load(Ordering::SeqCst), 3);
+        assert!(state.degraded.load(Ordering::SeqCst));
+        assert_eq!(session_exit_code(&result, true), EXIT_SESSION_DEGRADED);
+
+        shutdown_session(&session, keepalive).await;
+        assert!(transport.is_disconnected());
+    }
+
+    #[tokio::test]
+    async fn session_refuses_to_start_while_another_process_holds_the_ble_lock() {
+        // The session must fail before touching the adapter, with the ordinary
+        // error exit code (not the degraded 3), so a resident loop cannot
+        // mistake lock contention for a lost link.
+        let path = std::env::temp_dir().join(format!(
+            "eightbitdo-cli-session-lock-{}-{}.lock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        let held = eightbitdo_core::BleLock::acquire_at(&path).expect("hold the lock");
+        let options = BleOptions {
+            lock_path: Some(path.clone()),
+            ..BleOptions::default()
+        };
+        let code = session(&options, Duration::from_millis(20), false, false, true)
+            .await
+            .expect("session returns an exit code instead of an Err");
+        assert_eq!(
+            code,
+            ExitCode::FAILURE,
+            "a lock conflict is an ordinary failure, not a degraded exit"
+        );
+        assert_eq!(session_exit_code(&Ok(()), false), 0);
+        drop(held);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
