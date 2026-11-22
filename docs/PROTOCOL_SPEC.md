@@ -43,9 +43,9 @@ graph LR
 **公式 Android v2.01 の観測（DEX 解析）**:
 
 - 専用の keepalive コマンドは存在しない。
-- 接続時に `SetReportEnable`（`cmd 0x0007`, subcmd `1`）でリアルタイム入力通知を有効化する。subcmd `1` を有効として送る（`0` / `1` の解釈は実機で親が確認）。
-- 前面表示中は `MainActivity` が **20ms 周期**で `ReadKeysAndJoy`（`cmd 0x0003`, `total_len=0x0C`, `offset=0x0C`）を送る。ネイティブ `readKeysAndJoy` は応答タイムアウト 0・再送なしの投げっぱなしである。
-- 背面ではこのループが止まり、無通信になる。
+- `SetReportEnable`（`cmd 0x0007`）の状態遷移: **接続直後は disable(0)** を送り、**初期設定読取後に enable(1)** を送る。以後 UI 稼働中は enable のまま。**マクロ書込中も enable のまま**（UT2 では書込前に disable する処理が無い）。〔静的解析（2026-11-22、btsnoop 未取得）。実機未検証〕
+- **20ms `ReadKeysAndJoy`**（`cmd 0x0003`, `total_len=0x0C`, `offset=0x0C`）は、周期タスクが `Const.background != 0 && mode.Const.m_isshow != 0` のときだけ試行する。ネイティブ `readKeysAndJoy` は `isSendCoustom(3)` が false の間（cmd 1/2/6 の in-flight 中）は送らず、応答タイムアウト 0・再送なしの投げっぱなしである。したがって **`m_isshow == 0` の書込中は 20ms `0x0003` を送らない**。〔静的解析（2026-11-22、btsnoop 未取得）。実機未検証〕
+- `background == 0` または `m_isshow == 0` のときは送らない（背面時の挙動はユーザー観測ベースで未検証）。
 - `ReadVersion`（`0x000B`）は keepalive には使わない。`session` の `info` 実行ごとに送る。2 回目以降の実機応答は未確認（公式 Android v2.01 は接続時に 1 回送る）。`0x0011` は Android v2.01 では未使用。`0x0010` は `gamepad_type == 1` で native が即 return するため UT2 では送られない。
 - **ユーザー観測（未検証）**: 公式アプリをバックグラウンドにすると `80ND` が見えなくなることがある。前面時の 20ms `0x0003` が背面で止まることが原因の可能性が高いが、ファームウェア側の idle タイマー値・正確な条件は未確定である。
 - したがって、CLI が長寿命セッションを維持するには、前面アプリ相当の定期通信（`0x0007` + 20ms `0x0003`）が必要になる可能性がある（未検証）。
@@ -485,9 +485,9 @@ sequenceDiagram
 - **Windows USB HID (`8BitDoAdvance.dll::saveUltimateBT2`)**: `cmd = 0x0006`, **`subcmd = 0x0123`** を使用（**USB HID の Save タイムアウトは `3` 秒**）。
 - いずれも応答で `cmd == 0x0006` と対応する `subcmd` の ACK が返る。プラットフォームやトランスポートに応じて適切な `subcmd` を選択すること（誤った `subcmd` では Flash 保存が確定しない可能性がある）。**USB の 3 秒は Windows USB HID の値であり、BLE の正式値ではない。BLE は §6.5 の暫定 3 秒・リトライなしを使う。**
 
-### 6.5 マクロ書き込み / restore 実装ノート（新順序は実機未検証）
+### 6.5 マクロ書き込み / restore 実装ノート（新順序は実機試行済み・データ未永続）
 
-`eightbitdo-core` の `write_macro` と `write_macro_slot` は次の順序を固定する。`macro restore` は slot ごとに 1 回の `write_macro_slot` を呼び、**ヘッダ × N → Save → 各マクロの Erase/Write → 最終 Save 1 回** とする。旧順序（Erase → Write → Header → Save）は実機で試行済み（macro 0 は成功、macro 1 の 460B は verify 失敗）。新順序は**実機未検証**である。
+`eightbitdo-core` の `write_macro` と `write_macro_slot` は次の順序を固定する。`macro restore` は slot ごとに 1 回の `write_macro_slot` を呼び、**ヘッダ × N → Save → 各マクロの Erase/Write → 最終 Save 1 回** とする。旧順序（Erase → Write → Header → Save）は実機で試行済み（macro 0 は成功、macro 1 の 460B は verify 失敗）。新順序は 2026-11-22 に実機で試行し、**全 ACK は成功したが読み戻したステップデータが 0x00 のままで未永続**（原因未確定。差分節と未確定点を参照）。
 
 1. **Header (`0x0001`)**: `offset = 0x68C + slot * 0xD8`, `len = 0xD8`, **`total_len = 0xD8` (216)**。公式 `getBT2_WriteMacroi`（`writeBT2Macro` から呼ばれる）は descriptor `+0x40` に 216 を設定し、`Generate_CustomDataCmd` の `cmd 0x0001` 特例で `+0x04` の descriptor offset を使う。216B は `chunk_len = min(142, max_payload)` で分割し、`offset` を実チャンク長だけ進める。各チャンクの ACK は 2 秒。
    - MTU 200: `max_payload = 180` → **142 + 74**（159B / 91B フレーム）
@@ -501,7 +501,16 @@ sequenceDiagram
 5. **Final Save (`0x0006`)**: BLE `subcmd = 0x0067` のみ。slot バッチ内の全マクロを Erase/Write した後に **1 回だけ**送る。ACK は 3 秒・リトライなし。公式は `EraseMacroDataDone` / `WriteMacroDataDone` の連鎖後に Save を送る。
 6. **Read-back**: 最終 Save ACK 後に **300ms** 待ってから `0x0002` で 2768B config を読み、対象 slot の **216B ヘッダ**を送信した `header_bytes` とバイト比較する。続けて `0x0102` でバッチ内の各 `(slot, macro_idx)` を読み、`steps * 10` バイトが一致することを確認する。ヘッダ + データを書いた `macro write` / 非空 slot の restore では、どちらの不一致も `Error::MacroWrite { stage: Verify, state: DataSaved }` になる。ヘッダのみを書く空 slot の restore は step data を送っていないため、Verify 不一致は `state: HeaderSaved` になる。ヘッダ不一致のメッセージは、flag / total_cnt / 予約バイトのどこが違うかと「device が正規化した可能性、Save 送信済みなので再書き込みしない」を含む。300ms は暫定値で実機未確認。
    - 公式順序の RE 根拠: `writeCustomConfig`（ヘッダ書込）→ `writeCustomConfig_onfinished` で **Save** → Java `writeCustomConfigDone` → `Erase(0) → Write(0) → Erase(1) → Write(1) …` → 最後に Save（`EraseMacroDataDone` / `WriteMacroDataDone`）。本実装はこの順序に合わせた。
-   - 実機観測（2026-11-22）: 旧順序（Erase → Write → Header(total_len=0x0AD0) → Save）で macro 0（500B）は成功し、macro 1（460B）だけが全 ACK 後に `0x0102` zeros で Verify 失敗した。216B ヘッダは一致していた。公式の **Header(total_len=0xD8) → Save → Erase/Write → Save** との差分を原因候補とし、本 PR で順序を変更した（新順序は実機未検証）。最終 32B チャンク仮説に対しては `--chunk-size 32` も指定できる。
+   - 実機観測（2026-11-22）: 旧順序（Erase → Write → Header(total_len=0x0AD0) → Save）で macro 0（500B）は成功し、macro 1（460B）だけが全 ACK 後に `0x0102` zeros で Verify 失敗した。216B ヘッダは一致していた。公式の **Header(total_len=0xD8) → Save → Erase/Write → Save** との差分を原因候補とし、本 PR で順序を変更した（新順序は 2026-11-22 に実機試行: 全 ACK 成功、ステップデータは 0x00 のまま）。最終 32B チャンク仮説に対しては `--chunk-size 32` も指定できる。
+
+**公式実装との差分（2026-11-22、Android APK の静的解析。実機での `0x0003` 送出有無は未検証 / btsnoop 未取得）**:
+
+- **書込中の `0x0003` は送らない**: 公式は 20ms 入力ポーリングの Runnable を `m_isshow != 0` で止め、`m_isshow` は初回 Save の ACK で 0 に落ちる。ネイティブ `isSendCoustom(3)` も type 1/2/6 の in-flight 中は `0x0003` を拒否する。`0x0003` は入力読み取り専用（12B）で、Flash commit には関与しない（commit は `Save 0x0006`）。本実装は `--poll-interval-ms` の既定 **0** で書込中に `0x0003` を送らない。
+- **`0x0007` の状態**: 公式はマクロ書込中も enable のまま（接続時 disable(0) → 初期設定読取後 enable(1)）。本実装の既定は enable を送らない（後方互換の保守的選択であり、公式再現ではない）。`--report-enable` は操作前に enable(1) を送るが、接続時 disable(0) は送らないため部分再現。A/B は enable あり/なしの比較であり、この差を踏まえて解釈する。〔静的解析（2026-11-22、btsnoop 未取得）〕
+- **タイムアウトと再送**: 公式のマクロ系（Header `0x0001` / Erase `0x0104` / Write `0x0103` / Save `0x0006`）はすべて **2 秒**で、タイムアウト時は最大 **2 回**まで同一チャネルを再送する〔静的解析ノート（2026-11-22）でタイムアウト 2 秒・再送上限 2 を確認。実機で再送が実際に発火するかは未検証〕。本実装は Header / Erase / Write が 2 秒で一致するが、Save のみ **3 秒・リトライなし**で相違（未確定。実害は不明）。
+- **読み戻し検証は本プロジェクト独自**: 公式は最終 Save の完了コールバックでカウンタと `m_isshow` を戻すだけで、書込後の読み戻し検証を行わない（手順 6 の検証は独自拡張）。
+- **ACK 照合**: 公式は `(subcmd, total_len)` の 2 要素で照合する。本実装は cmd/subcmd のみで `total_len` を照合せず、`offset` / `chunk_len` も見ない（残存リスク。未確定点の ACK 項目）。
+- **実機結果（2026-11-22）**: 新順序で全 ACK は成功したが、読み戻したステップデータは `0x00` のままだった（原因未確定）。`0x0007` enable の有無が次の実験候補（CLI `--report-enable` / `--poll-interval-ms` の A/B）。
 
 **Fail-closed / 状態**: `Error::MacroWrite` は `MacroWriteState` で 3 段階を区別する。
 
@@ -537,11 +546,11 @@ Header または最初の Save が失敗した場合、Erase は送らない。�
 
 **未確定点**:
 
-- Header / Write のチャンク長は MTU 連動（`max_payload = mtu - 3 - 17`）。実機書き込みで使う想定は MTU 200（Header 142B / Write 64B）だが、**新順序（Header 0xD8 → Save → Erase/Write → Save）での実機書き込みは未実施**（旧順序は試行済み: macro0 成功、macro1 は Verify 失敗）。MTU 64 / 23 は Mock のみ。
-- BLE Save の正式タイムアウトと、Save ACK の実際の `cmd` / `subcmd` 形状（`0x0006` 直か `0x0004, subcmd=0x0006/0x0067` か）。
-- Erase / Write / Header の ACK 形状（`0x0004` エンベロープか直接エコーか）。実装は両方を受け入れる。`0x600F` の BLE App チャネルでは受信フレームに prefix は付かない（§4.3）。USB HID の `[0x02,0x04]` や BLE Boot の `0x05` は別 framing である。先頭 16B をヘッダとして解析し、payload が付いていても ACK 判定に影響させない。`0x04` で始まる frame は先頭 2 バイトで cmd が決まり、`04 00` は `cmd=0x0004`（RESPONSE）、`04 01` は `cmd=0x0104`（Erase の直接 ACK）である。ACK は cmd/subcmd で判定し、envelope は `subcmd = 要求コマンド ID`（Header `0x0001` / Erase `0x0104` / Write `0x0103`）、Save は `0x0067` も許容する。envelope の `subcmd` として `macro_subcmd` は受理しない（Switch slot 0 の裸 envelope と区別できないため）。direct ACK は `cmd` のみで判定し、`subcmd` を見ない。実機観測は Erase の `cmd=0x0004, subcmd=0x0104` のみで、Header / Write の envelope 形状は未確認。ACK は `offset` / `total_len` / `chunk_len` を照合しないため、重複・遅延 ACK を区別しない。実機で ACK が offset を echo するなら照合追加を検討する。
+- Header / Write のチャンク長は MTU 連動（`max_payload = mtu - 3 - 17`）。実機書き込みで使う想定は MTU 200（Header 142B / Write 64B）。**新順序（Header 0xD8 → Save → Erase/Write → Save）は 2026-11-22 に実機試行し、全 ACK 成功後もステップデータが `0x00` のままで未永続**（原因未確定。旧順序は macro0 成功、macro1 は Verify 失敗）。次の実験は `0x0007` enable の有無（`--report-enable`）と書込中の `0x0003` 送出（`--poll-interval-ms`）の A/B。MTU 64 / 23 は Mock のみ。
+- BLE Save のタイムアウトは公式 2 秒・再送最大 2 回だが〔静的解析ノート（2026-11-22）〕、本実装は 3 秒・リトライなし（相違。実害は未確定）。Save ACK の実際の `cmd` / `subcmd` 形状（`0x0006` 直か `0x0004, subcmd=0x0006/0x0067` か）。
+- Erase / Write / Header の ACK 形状（`0x0004` エンベロープか直接エコーか）。実装は両方を受け入れる。`0x600F` の BLE App チャネルでは受信フレームに prefix は付かない（§4.3）。USB HID の `[0x02,0x04]` や BLE Boot の `0x05` は別 framing である。先頭 16B をヘッダとして解析し、payload が付いていても ACK 判定に影響させない。`0x04` で始まる frame は先頭 2 バイトで cmd が決まり、`04 00` は `cmd=0x0004`（RESPONSE）、`04 01` は `cmd=0x0104`（Erase の直接 ACK）である。ACK は cmd/subcmd で判定し、envelope は `subcmd = 要求コマンド ID`（Header `0x0001` / Erase `0x0104` / Write `0x0103`）、Save は `0x0067` も許容する。envelope の `subcmd` として `macro_subcmd` は受理しない（Switch slot 0 の裸 envelope と区別できないため）。direct ACK は `cmd` のみで判定し、`subcmd` を見ない。実機観測は Erase の `cmd=0x0004, subcmd=0x0104` のみで、Header / Write の envelope 形状は未確認。公式は `(subcmd, total_len)` の 2 要素で照合するが、本実装は cmd/subcmd のみで `total_len` を照合せず、`offset` / `chunk_len` も見ないため重複・遅延 ACK を区別しない（残存リスク）。実機で ACK が offset を echo するなら照合追加を検討する。
 - Save 時の device による config CRC 再計算。
-- 最終 Save 後の読み戻し待機は暫定 300ms（実機未確認）。Header Save → Erase の settle は 0ms。実機でまだ verify が落ちる場合、次の候補はこの区間への settle delay 追加と `--chunk-size 32` の再確認。
+- 最終 Save 後の読み戻し待機は暫定 300ms（実機未確認）。Header Save → Erase の settle は 0ms。実機でまだ verify が落ちる場合、次の候補はこの区間への settle delay 追加と `--chunk-size 32` の再確認。データが `0x00` のままの場合は、まず `0x0007` enable の有無（`--report-enable`）と `--poll-interval-ms` の A/B を優先する。
 - 216B Header 部分書込後の device 側 `flag` / `total_cnt` の解釈。
 - `macro restore` は `gamepad_mode` が一致しない場合に書き込み前に中止する。restore 後の config SHA は情報表示のみ。
 - 空マクロの clear / ステップデータの消去は未実装。
