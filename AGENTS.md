@@ -106,7 +106,7 @@
 | 1 | `eightbitdo-protocol`（CRC / ヘッダ / コマンド / 2768B 構造体 / KeyMap / マクロ / 入力レポート） | 完了。`cargo test -p eightbitdo-protocol` は **単体 100 件 + doc test 4 件** |
 | 2a | `eightbitdo-core` + CLI 読み取り専用 + `session` REPL（per-user BLE 単一所有、keepalive、degraded 終了コード 3） | 完了。実機で version / config dump / backup / monitor / keepalive を確認 |
 | 2b | BLE マクロ読み書き（3 slot × 4 macro、backup / write / restore） | 完了。実機で slot S1 の M1/M2 の書込・読み戻し・復元を確認（M3/M4・S2/S3 は外挿）。**Switch 側でのマクロ発動は未確認** |
-| 2c | BLE OTA 状態機械（`crates/eightbitdo-core/src/ota.rs`） | **core 実装済み・Mock 55 テスト（`mobile-boot` 有効時。既定 52）。CLI / GUI / UniFFI 未配線、実機 btsnoop 未取得・実機書込未検証** |
+| 2c | BLE OTA 状態機械（`crates/eightbitdo-core/src/ota.rs`） | **core 実装済み・Mock 52 テスト（既定）/ 55（`mobile-boot`）/ 58（`ota-bench`）/ 61（`--all-features`）。CLI / GUI / UniFFI 未配線、実機 btsnoop 未取得・実機書込未検証。実機採取用の `ota-bench` feature（既定 OFF、`write_firmware_with_checkpoint` / `OtaCheckpoint::AfterFirstErase` 等、`OtaBenchOutcome.write_state` / `phase`）あり** |
 | 2d | 2768B 設定書き込み / `config set` / `config remap`（BLE のみ） | 完了。実機（BLE・MTU 200・74B chunk）で full write → Save → read-back 一致、remap A→B→A を確認。**実機確認は full write / remap のみ（`config set` 各フィールド・`--force-raw`・MTU 200 以外は未確認）** |
 | 3a | 読み取り専用 GUI（egui、日本語、燻しスレート、デバイス / ライブ入力 / 設定値 / ログ） | 完了（PR #9）。読み取り専用の 4 タブ |
 | 3b / 3d | GUI 書込 UI（設定タブ / 22 ボタンリマップ / マクロエディタ・録音） | **実装（PR #16）。確認ダイアログ、pre-write backup、read-back、TOCTOU 付き。実機未検証・Tier 3** |
@@ -147,6 +147,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
 cargo test --workspace --all-features --locked
+cargo test -p eightbitdo-core --features ota-bench --locked
 cargo test -p eightbitdo-protocol --no-default-features --locked
 cargo +1.85.0 check --workspace --all-targets --all-features --locked
 ```

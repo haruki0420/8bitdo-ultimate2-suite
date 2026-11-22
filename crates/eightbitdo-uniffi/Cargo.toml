@@ -21,7 +21,10 @@ default = []
 cli = ["uniffi/cli"]
 
 [dependencies]
-eightbitdo-core = { path = "../eightbitdo-core", default-features = false }
+# `mobile-boot` is required so the mobile/native OTA path can use the
+# sealed-preserving MobileBootLink adapter. It is not used by the desktop build
+# and adds no dependencies; see docs/PROTOCOL_SPEC.md §8.5.
+eightbitdo-core = { path = "../eightbitdo-core", default-features = false, features = ["mobile-boot"] }
 eightbitdo-protocol = { path = "../eightbitdo-protocol", features = ["serde"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
