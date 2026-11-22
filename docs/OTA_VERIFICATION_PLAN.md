@@ -113,6 +113,8 @@ btsnoop を取るには、実際に wire を流す駆動側が必要になる。
     再定義しない**）。
     - feature: **`eightbitdo-core/ota-bench`**（**既定 OFF**。無効時は型・メソッドが存在しない。
       ハーネスは `#[cfg(feature = "ota-bench")]` で使う）
+    - ハーネス側の例: `eightbitdo-core = { path = "...", features = ["ota-bench"] }`、
+      または `cargo run -p <harness> --features eightbitdo-core/ota-bench`
     - `OtaUpdate::write_firmware_with_checkpoint(ready, image, progress, checkpoint)`
     - `OtaCheckpoint::{AfterFirstErase, AfterWrites, AfterWriteVersion}`
     - 戻り値 `OtaBenchOutcome { checkpoint, sectors_erased, chunks_written, bytes_written,
@@ -156,7 +158,7 @@ btsnoop を取るには、実際に wire を流す駆動側が必要になる。
     確認してから Write へ進む**こと（timeout では誤受理 ACK・誤アドレスを検知できない）。
     停止は
     **`OtaUpdate::write_firmware_with_checkpoint(.., OtaCheckpoint::AfterFirstErase)`**
-    で行う（§2.2）。**Phase B の解禁条件は §8.3 の 7 条件すべて**（「bench API +
+    で行う（§2.2）。**Phase B の解禁条件は §8.3 の 8 条件すべて**（「bench API +
     `allow_unverified_wire` + 人間チェックポイント」は最低限の要約にすぎない）。
   - **最初の Erase で ACK 不明 / タイムアウト / アドレス疑いが出たら、その場で中止**する
     （再試行しない。§8.4 (i)）
@@ -281,6 +283,9 @@ scripts/ota/capture-btsnoop.sh -o .tmp/ota-capture -p b
   （`--allow-concurrent` 無し） / 3 = capture が INVALID（空・btsnoop magic 不正・SIGKILL
   停止）**。exit 3 の capture は証跡にしない（§6.4）。他の btmon が稼働中なら中止する。
   既存の出力先ディレクトリは所有者を確認し、mode を `700` に締める（symlink は拒否）。
+- `od` が無い環境ではスクリプトは magic を検証できない（警告のみ）。終了後に手動で
+  `od -An -tx1 -N8 <file>` が `62 74 73 6e 6f 6f 70 00` であることを確認し、確認できなければ
+  証跡にしない。
 - 出力先 `.tmp/` は `.gitignore` 済み。**capture ファイルはコミットしない**（§7.4）。
 
 ---
@@ -432,7 +437,8 @@ capture は証跡にしない）。
    **SIGKILL で止めた capture は btsnoop の最終フレームが欠ける可能性があり、完全性を
    保証しない**。スクリプトは空ファイル / magic 不正 / SIGKILL 停止を `INVALID` として
    非 0 で終了する。
-2. **btsnoop 形式**: 先頭 8 バイトが `btsnoop\0`（スクリプトは終了時にこの magic を検査する）。
+2. **btsnoop 形式**: 先頭 8 バイトが `btsnoop\0`（スクリプトは終了時にこの magic を検査する。
+   `od` が無い環境では未検証になるため、§4.2 の手動確認を行う）。
 3. **最終フレーム**: Phase B は Jump の link close と `"80ND"` 再広告 / 再接続、
    Phase A は `readVersionInBoot` の応答が記録されている。
 4. **期待フレーム数**（Phase B）: `image_len / 64` 個の `0x0003`、`ceil(image_len / 4096)` 個の
@@ -496,6 +502,9 @@ capture は証跡にしない）。
 | セッション | checkpoint | ACK 形状（payload-less / envelope / 直エコー） | `offset` / `total_len` | 続行可否 | 判断者・根拠 |
 | --- | --- | --- | --- | --- | --- |
 | 1 | AfterFirstErase | ... | ... | 可 / 不可 | ... |
+| 2 | full run の最初の Erase | ... | ... | 可 / 不可 | ... |
+
+（セッション 2 の最初の Erase も未確定 wire なので判定対象に含める。）
 ```
 
 ### 7.2 追記時のルール
@@ -606,7 +615,7 @@ tshark -r excerpt.pcapng -Y 'btatt.handle == <target handle>' \
    (d) 公式アプリ capture を先に試して不可の理由を記録し、復旧可能な専用個体で行い、
    **Erase チェックポイント（`write_firmware_with_checkpoint` +
    `OtaCheckpoint::AfterFirstErase`）を置き、初回 Erase の異常で即中止する**という条件でのみ
-   実施する（§8.3）。**解禁条件は §8.3 の 7 条件すべて**（bench API + `allow_unverified_wire` +
+   実施する（§8.3）。**解禁条件は §8.3 の 8 条件すべて**（bench API + `allow_unverified_wire` +
    人間チェックポイントは最低限の要約）。
 3. **公式ファームウェアのみ**を使う。配信元から取得し、ファイルサイズと SHA-256 を記録する。
    マルチセクション `.dat` は現実装では拒否される（blocker）。書込前に
@@ -638,7 +647,7 @@ tshark -r excerpt.pcapng -Y 'btatt.handle == <target handle>' \
 
 ### 8.3 Phase B（初回書込）の前提と解禁条件
 
-Phase B は **未確定 wire に対する最初のフラッシュ書込**である。次の **7 条件をすべて**満たし、
+Phase B は **未確定 wire に対する最初のフラッシュ書込**である。次の **8 条件をすべて**満たし、
 §8.1 の不変条件も満たす場合のみ実施する（「bench API + `allow_unverified_wire` + 人間
 チェックポイント」は**最低限の要約**であり、これだけでは解禁しない）。
 
@@ -663,9 +672,12 @@ Phase B は **未確定 wire に対する最初のフラッシュ書込**であ�
    **この設定をコミットしない。**
 7. **人間チェックポイント**: 最初の Erase ACK を受けた時点で停止し、人間が btmon で
    `offset` / `total_len` / ACK 形状を確認する。timeout では誤受理 ACK・誤アドレスを
-   検知できないため省略しない。
+   検知できないため省略しない。判定の合格条件は「実行手順」に列挙する。
+8. **`require_completion_ack` の値を決めて EVIDENCE に記録する**。Phase A / (d) の結果から
+   決め、決められない場合は既定（off）で進める（§7.3）。**セッション 2 の最初の Erase も
+   未確定 wire であり、認証済みの ACK 形状ではない**ことに注意する。
 
-上記 7 条件に加えて**ユーザーの承認**を要する。
+上記 8 条件に加えて**ユーザーの承認**を要する。
 
 **実行手順（セッション最小構成は 2 セッション）**
 
@@ -673,28 +685,63 @@ Phase B は **未確定 wire に対する最初のフラッシュ書込**であ�
    - `OtaUpdate::write_firmware_with_checkpoint(.., OtaCheckpoint::AfterFirstErase)`。
      **最初の 1 セクタの Erase のみ**を行い、ACK 後に `OtaPhase::BenchStopped` で停止する
      （**全消去ではない**）。
-   - 人間が Erase 要求 / ACK の `offset` / `total_len` / 形状を確認し、**続行可否を判断**する。
-   - 判断は EVIDENCE 13.6 に記録する（ACK 形状 / 続行可否 / 判断者・根拠）。
+   - 人間が次を確認し、**続行可否を判断**する。初回 Phase B では「確定済み wire との一致」は
+     成立しないため、次の**初回合格条件**で判定する:
+     1. 応答の `cmd` / `subcmd` が期待どおり（`cmd=0x0004` envelope の `subcmd=0x0004`、
+        または `cmd=0x0004` 直エコー）
+     2. `0x000E` などのエラー通知がない
+     3. **要求**の `offset` が `.dat +0x04` の `load_base` + `0*0x1000` と一致し、
+        `total_len = 0x1000` である
+     4. ACK 後に一定時間（例: 1〜2 秒）**次のフレームが来ない**（重複 ACK・追加フレームなし）
+     5. リンクが維持されている（切断なし）
+   - 判断は EVIDENCE 13.6 に記録する（ACK 形状 / `offset`・`total_len` / 続行可否 /
+     判断者・根拠）。ACK 側の `offset` / `total_len` は要求と一致するか、0 か、未確定の値かを
+     そのまま記録する。
+   - **このチェックポイントは ACK 形状と要求値の確認であり、アドレス規約（絶対 vs イメージ
+     相対）の正しさを保証しない**。誤アドレスを消去するリスクは残り、**専用個体とベンダ復旧で
+     しか吸収できない**（§8.4 (i)）。
    - 停止時点で **先頭 1 セクタだけが消去された状態**になる。電源断・放置で App 領域が
      部分的に消えた状態が残るリスクを認識し、次セッションまで時間を置かない。
 2. **セッション 2: 通常の full run**
-   - 新しい `OtaUpdate`（`Idle`）で `"8bt"` に再接続 → `prepare_boot` → 通常の
-     `write_firmware` を完走。**先頭から全消去 → 全チャンク書込 → `WriteVersion` →
-     `WriteFirmwareVersion` → `JumpApp`**。これで残りの全 wire が記録でき、`"80ND"` 復帰と
-     version で成功確認する。
-   - `OtaCheckpoint::AfterWrites` / `AfterWriteVersion` は、**Write 層や WriteVersion の
-     切り分けが必要な場合だけ条件付き**で挟む（セッション数・書込回数が増える）。
-3. **各セッションの前に**バッテリー残量を再確認し、`"8bt"` が広告されていることを確認する。
+   - 新しい `OtaUpdate`（`Idle`）で、**`"80ND"` 接続 → enterBoot `0x000C` → `"8bt"` 再接続 →
+     `prepare_boot` → 通常の `write_firmware`** の順で実行し完走する。**先頭から全消去 →
+     全チャンク書込 → `WriteVersion` → `WriteFirmwareVersion` → `JumpApp`**。これで残りの
+     全 wire が記録でき、`"80ND"` 復帰と version で成功確認する。
+   - **セッション 2 の最初の Erase も未確定 wire で実行される**（セッション 1 は形状確認だけ
+     でアドレス規約を確定しない）。セッション 2 の Erase ACK も同様に監視し、異常なら即中止
+     する（§8.4 (i)）。
+   - `OtaCheckpoint::AfterWrites` / `AfterWriteVersion` は次の**追加条件**を満たす場合だけ
+     挟む: `AfterWrites` は Write ACK の形状・数・フレーム長を切り分ける必要がある場合、
+     `AfterWriteVersion` は WriteVersion ACK / payload を切り分ける必要がある場合。どちらも
+     1 セッション = 全消去・再書込が増えるため、バッテリー・時間・書込回数のコストを許容できる
+     場合に限る。
+3. **各セッションの前に**バッテリー残量（**50% 未満なら中止**）と `"8bt"` の広告を再確認する。
    **セッション 1 以外は先頭から全消去・再書込**であり、**レジュームできない**（API doc
    どおり停止後は新しい `OtaUpdate` + full erase/rewrite）。
 
+**2 セッションの capture 運用**
+
+- セッション 1 は **`AfterFirstErase` の ACK を確認したら btmon を停止**する。ファイルは
+  **形状確認専用**（完了証跡にしない）とし、btsnoop magic / enterBoot / readPID /
+  readVersion / Erase 要求 1 件 + ACK / Write が無いこと / SHA-256 / フレーム番号を記録する。
+- セッション 1 と 2 の間は**コントローラを電源再投入して App Mode に戻す**。`"80ND"` が
+  広告されるまで `scan --check` で待つ（**最大 5 分**）。5 分待っても出ない場合は
+  [SESSION_OPERATIONS.md](SESSION_OPERATIONS.md) §2 の手順（scan 確認 → Profile 約 3 秒押し）に
+  従い、それでも戻らなければ中止する（推測で操作を繰り返さない）。
+- **セッション 2 の btmon は enterBoot より前（可能なら App Mode 接続前）から開始**する。
+- **完全性検証（§6.4）はセッション 2 の capture を対象**にする。セッション 1 は形状確認用
+  として SHA-256 / フレーム番号のみを記録する。
+- EVIDENCE 13.1 / 13.5 は **capture ごとに複数行**で記録する（session 1 / 2 を区別）。
+
 **計画的停止と異常停止の分岐（§8.4 (i) との関係）**
 
-- **計画的継続**: セッション 1 の Erase ACK が期待どおり（`offset` / `total_len` / 形状が
-  仕様または確定済み wire と一致し、アドレス疑いなし）で、人間が「続行可」と判断した場合。
+- **計画的継続**: セッション 1 の Erase ACK が**上記の初回合格条件を満たし**（`cmd` /
+  `subcmd` が期待どおり、エラーなし、要求 `offset` / `total_len` が一致、追加フレームなし、
+  リンク維持）、人間が「続行可」と判断した場合。
   → セッション 2 の**新しい `OtaUpdate` による先頭からの全消去・再書込**へ進む。
   これは「部分記録の復旧」ではなく**計画されたベンチ継続**であり、§8.4 (i) の
-  「自前で全消去・再書込しない」対象ではない。
+  「自前で全消去・再書込しない」対象ではない。**ただし合格条件は ACK 形状と要求値の確認で
+  あり、アドレス規約の正しさは保証しない**（残存リスクは専用個体＋ベンダ復旧で吸収）。
 - **異常停止**: ACK 不明 / タイムアウト / 形状不一致 / アドレス疑い / 人間が「不可」と判断。
   → その場で中止し、**§8.4 (i) のベンダ復旧**へ。自前の全消去・再書込は行わない。
 - 判断と根拠（フレーム番号・値・判断者）は EVIDENCE 13.6 に記録する。
@@ -768,16 +815,31 @@ Write / WriteVersion / WriteFirmwareVersion / Jump の**全 wire が記録済み
 - [ ] Phase B の場合: 公式 `.dat` の size / SHA-256 / `load_base` / `image_len` /
       セクション数を確認した
 - [ ] Phase B の場合: `allow_unverified_wire=true` は一時ハーネスのみで、コミットしない
+- [ ] Phase B の場合: `require_completion_ack` の値を Phase A / (d) の結果から決め、
+      EVIDENCE に記録した
 - [ ] Phase B の場合: ハーネスが非キャンセル / no retry / `OtaWriteState`・
       `OtaBenchOutcome` ログを満たす
 - [ ] Phase B の場合: ハーネスを `tmux` / `setsid` 等で端末から切り離して実行する
 - [ ] Phase B の場合: ユーザーの承認がある
-- [ ] Phase B の場合: **各セッション前に**バッテリー残量と `"8bt"` 広告を再確認した
+- [ ] Phase B の場合: **各セッション前に**バッテリー残量（**50% 未満なら中止**）と
+      `"8bt"` 広告を再確認した
 - [ ] Phase B の場合: セッション 1 は `AfterFirstErase` で**最初の 1 セクタ Erase のみ**
-      （全消去ではない）を行い、人間が ACK 形状 / `offset` / `total_len` と**続行可否**を
-      判断した
-- [ ] Phase B の場合: セッション 2 は新しい `OtaUpdate` で通常の `write_firmware` を完走した
-      （**2 セッション最小**。`AfterWrites` / `AfterWriteVersion` は切り分けが必要な場合のみ）
+      （全消去ではない）を行い、**初回合格条件**（cmd/subcmd・エラーなし・要求
+      `offset`/`total_len`・追加フレームなし・リンク維持）で人間が**続行可否**を判断し、
+      13.6 に記録した
+- [ ] Phase B の場合: セッション 1 の btmon を停止し、capture は**形状確認専用**として
+      SHA-256 / フレーム番号だけを記録した（完全性検証の対象にしない）
+- [ ] Phase B の場合: セッション 1→2 の間に電源再投入し、`scan --check` で `"80ND"` 復帰を
+      待った（**最大 5 分**。戻らなければ SESSION_OPERATIONS §2 → それでも不可なら中止）
+- [ ] Phase B の場合: セッション 2 の btmon を **enterBoot 前（可能なら App 接続前）**から
+      開始した
+- [ ] Phase B の場合: セッション 2 は `"80ND"` 接続 → enterBoot → `"8bt"` 再接続 →
+      `prepare_boot` → 通常の `write_firmware` を完走した（**2 セッション最小**。
+      `AfterWrites` / `AfterWriteVersion` は切り分け条件を満たす場合のみ）
+- [ ] Phase B の場合: セッション 2 の最初の Erase も**未確定 wire**として監視し、異常なら
+      即中止した
+- [ ] Phase B の場合: **完全性検証（§6.4）はセッション 2 の capture を対象**にした
+- [ ] Phase B の場合: EVIDENCE 13.1 / 13.5 を capture ごと（session 1 / 2）に複数行で記録した
 - [ ] Phase B の場合: 異常時（ACK 不明 / タイムアウト / 形状不一致 / アドレス疑い / 人間が
       不可）は中止してベンダ復旧へ移る（自前の全消去・再書込をしない）
 
@@ -823,7 +885,7 @@ Write / WriteVersion / WriteFirmwareVersion / Jump の**全 wire が記録済み
    `OtaUpdate::write_firmware_with_checkpoint`、`OtaCheckpoint`、`OtaBenchOutcome`、
    `OtaPhase::BenchStopped` が実装された。plan は実 API 名に更新済みだが、**レビューで
    API が変わり得るため main 統合後の reviewed SHA の rustdoc を正**とする。**main へ
-   統合されたら**、Phase B を §8.3 の 7 条件（＋ユーザー承認）で解禁する。**main 未統合の
+   統合されたら**、Phase B を §8.3 の 8 条件（＋ユーザー承認）で解禁する。**main 未統合の
    間は Phase B を実施しない。**
 3. **駆動手段が無い**: CLI / GUI / UniFFI に OTA が未配線。Phase A から一時ハーネスか
    配線済みフロントエンドが必要（§2.2）。ハーネスはコミットしない。
