@@ -56,6 +56,7 @@ pub use ota::{
     OTA_ENTER_BOOT_TIMEOUT, OTA_ERASE_TIMEOUT, OTA_IMAGE_HEADER_LEN, OTA_JUMP_TIMEOUT,
     OTA_MAX_FRAME_LEN, OTA_MIN_MTU, OTA_PID_TIMEOUT, OTA_SECTOR_SIZE, OTA_VERSION_HEADER_LEN,
     OTA_VERSION_TIMEOUT, OTA_WRITE_TIMEOUT, OTA_WRITE_VERSION_TIMEOUT, UT2_BOOT_PID,
+    UT2_TYPE1_APP_BASE_MIN, UT2_TYPE1_APP_FLASH_END,
 };
 pub use session::{
     ConfigSnapshot, Session, VersionInfo, CONFIG_TOTAL_TIMEOUT, DEFAULT_TIMEOUT,
@@ -64,7 +65,10 @@ pub use session::{
 pub use transport::Transport;
 
 #[cfg(feature = "ble")]
-pub use ble::{scan_devices, scan_devices_with_lock_path, BleDevice, BleOptions, BleTransport};
+pub use ble::{
+    scan_devices, scan_devices_with_lock_path, BleBootOptions, BleBootTransport, BleDevice,
+    BleOptions, BleTransport,
+};
 #[cfg(feature = "ble")]
 pub use ble_lock::{default_ble_lock_path, BleLock, BLE_LOCK_FILE_NAME, BLE_LOCK_PATH_ENV};
 
@@ -85,3 +89,18 @@ pub const APP_CHARACTERISTIC_UUID: uuid::Uuid =
 /// Alternate App Mode characteristic (`0000FF13-...`) seen on some units.
 pub const APP_CHARACTERISTIC_UUID_ALT: uuid::Uuid =
     uuid::Uuid::from_u128(0x0000_ff13_0000_1000_8000_0080_5f9b_34fb);
+
+/// Advertised name of the BLE bootloader peripheral (`"8bt"`).
+pub const BOOT_BLE_NAME: &str = "8bt";
+
+/// Bootloader GATT service (`0000FF20-...`).
+pub const BOOT_SERVICE_UUID: uuid::Uuid =
+    uuid::Uuid::from_u128(0x0000_ff20_0000_1000_8000_0080_5f9b_34fb);
+
+/// Bootloader write/notify characteristic (`0000FF21-...`).
+pub const BOOT_CHARACTERISTIC_UUID: uuid::Uuid =
+    uuid::Uuid::from_u128(0x0000_ff21_0000_1000_8000_0080_5f9b_34fb);
+
+/// Alternate bootloader characteristic (`0000FF23-...`) seen on `_CY` units.
+pub const BOOT_CHARACTERISTIC_UUID_ALT: uuid::Uuid =
+    uuid::Uuid::from_u128(0x0000_ff23_0000_1000_8000_0080_5f9b_34fb);
