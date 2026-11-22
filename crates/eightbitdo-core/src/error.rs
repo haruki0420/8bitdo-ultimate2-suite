@@ -114,6 +114,84 @@ impl fmt::Display for ConfigWriteState {
     }
 }
 
+/// Stage of a BLE OTA update that failed.
+///
+/// The order is EnterBoot → ReadPid → ReadVersion → Erase → Write →
+/// WriteVersion → WriteFirmwareVersion → Jump. A failure in any read stage
+/// (`EnterBoot`, `ReadPid`, `ReadVersion`) happens before the first flash
+/// write; the write stages are only reachable after a successful PID check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtaFailureStage {
+    /// App Mode `0x000C` EnterBoot.
+    EnterBoot,
+    /// Bootloader `0x0008` readPID.
+    ReadPid,
+    /// Bootloader `0x0005` readVersionInBoot.
+    ReadVersion,
+    /// Bootloader `0x0004` EraseFlash.
+    Erase,
+    /// Bootloader `0x0003` WriteFirmware.
+    Write,
+    /// Bootloader `0x00C4` WriteVersion (24-byte image header).
+    WriteVersion,
+    /// Bootloader `0x0002` WriteFirmwareVersion.
+    WriteFirmwareVersion,
+    /// Bootloader `0x0006` JumpApp.
+    Jump,
+}
+
+impl fmt::Display for OtaFailureStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EnterBoot => formatter.write_str("EnterBoot"),
+            Self::ReadPid => formatter.write_str("ReadPid"),
+            Self::ReadVersion => formatter.write_str("ReadVersion"),
+            Self::Erase => formatter.write_str("Erase"),
+            Self::Write => formatter.write_str("Write"),
+            Self::WriteVersion => formatter.write_str("WriteVersion"),
+            Self::WriteFirmwareVersion => formatter.write_str("WriteFirmwareVersion"),
+            Self::Jump => formatter.write_str("Jump"),
+        }
+    }
+}
+
+/// How far a failed BLE OTA update got.
+///
+/// The bootloader keeps running after every failed stage (the application area
+/// is only valid again after a full erase + rewrite + JumpApp), so recovery is
+/// always "reconnect to `\"8bt\"`, read the PID, and rewrite every sector from
+/// offset 0". The state tells the caller how much of that recovery is required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtaWriteState {
+    /// Nothing was erased or written: the failure happened in EnterBoot, the
+    /// PID / version read, local image validation, or before the first Erase
+    /// frame was sent. The flash content is unchanged.
+    Untouched,
+    /// At least one EraseFlash frame was sent. The application area may be
+    /// erased (or partially erased), so the image must be rewritten from the
+    /// first sector and the controller must not be jumped to the app.
+    EraseStarted,
+    /// At least one WriteFirmware chunk was acknowledged. The image is
+    /// partially written and the whole image must be erased and rewritten.
+    PartiallyWritten,
+    /// Every firmware chunk was acknowledged; only the finalization
+    /// (WriteVersion / WriteFirmwareVersion / JumpApp) failed. The device stays
+    /// in the bootloader and the image still has to be erased and rewritten
+    /// before JumpApp is safe.
+    Written,
+}
+
+impl fmt::Display for OtaWriteState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Untouched => formatter.write_str("Untouched"),
+            Self::EraseStarted => formatter.write_str("EraseStarted"),
+            Self::PartiallyWritten => formatter.write_str("PartiallyWritten"),
+            Self::Written => formatter.write_str("Written"),
+        }
+    }
+}
+
 /// Errors returned by `eightbitdo-core`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -259,6 +337,38 @@ pub enum Error {
         /// Operator-facing recovery guidance.
         recovery: &'static str,
     },
+
+    /// A BLE OTA (firmware update) failed.
+    #[error("OTA update failed during {stage} ({state}): {reason}; {recovery}")]
+    Ota {
+        /// Stage that failed.
+        stage: OtaFailureStage,
+        /// How far the update got (whether flash may have changed).
+        state: OtaWriteState,
+        /// Underlying error text.
+        reason: String,
+        /// Operator-facing recovery guidance.
+        recovery: &'static str,
+    },
+
+    /// The bootloader PID is not one whose `readVersionInBoot` / `JumpApp`
+    /// offsets are documented.
+    ///
+    /// Only `gamepad_type == 1` (PID `0x600F`) is documented. The version and
+    /// jump addresses of any other type are unknown, so the update stops after
+    /// `readPID` without sending a read at a guessed offset or any flash write.
+    #[error(
+        "unsupported bootloader PID 0x{pid:04X}: only gamepad_type 1 (PID 0x600F) has documented \
+         BLE OTA readVersionInBoot/JumpApp offsets; stopping before any flash write"
+    )]
+    OtaUnsupportedPid {
+        /// PID the bootloader reported.
+        pid: u16,
+    },
+
+    /// A `.dat` firmware image failed local validation before any flash write.
+    #[error("invalid firmware image: {0}")]
+    OtaInvalidFirmware(String),
 
     /// Local file I/O failed.
     #[error("I/O error: {0}")]
