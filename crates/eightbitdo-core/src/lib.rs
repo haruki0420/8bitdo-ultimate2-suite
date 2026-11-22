@@ -49,11 +49,11 @@ pub use macro_ops::{
 };
 pub use mock::MockTransport;
 pub use ota::{
-    gamepad_type_from_pid, FirmwareImage, GamepadType, OtaConfig, OtaOutcome, OtaPhase,
-    OtaProgress, OtaTimeouts, OtaUpdate, OTA_CHUNK_SIZE, OTA_ENTER_BOOT_TIMEOUT, OTA_ERASE_TIMEOUT,
-    OTA_IMAGE_HEADER_LEN, OTA_JUMP_TIMEOUT, OTA_PID_TIMEOUT, OTA_SECTOR_SIZE,
-    OTA_VERSION_HEADER_LEN, OTA_VERSION_TIMEOUT, OTA_WRITE_TIMEOUT, OTA_WRITE_VERSION_TIMEOUT,
-    UT2_BOOT_PID,
+    gamepad_type_from_pid, BootReady, FirmwareImage, GamepadType, JumpOutcome, OtaConfig,
+    OtaOutcome, OtaPhase, OtaProgress, OtaTimeouts, OtaTransport, OtaUpdate, OTA_CHUNK_SIZE,
+    OTA_ENTER_BOOT_TIMEOUT, OTA_ERASE_TIMEOUT, OTA_IMAGE_HEADER_LEN, OTA_JUMP_TIMEOUT,
+    OTA_MAX_FRAME_LEN, OTA_MIN_MTU, OTA_PID_TIMEOUT, OTA_SECTOR_SIZE, OTA_VERSION_HEADER_LEN,
+    OTA_VERSION_TIMEOUT, OTA_WRITE_TIMEOUT, OTA_WRITE_VERSION_TIMEOUT, UT2_BOOT_PID,
 };
 pub use session::{
     ConfigSnapshot, Session, VersionInfo, CONFIG_TOTAL_TIMEOUT, DEFAULT_TIMEOUT,
