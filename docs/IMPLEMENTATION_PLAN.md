@@ -224,14 +224,20 @@ Track C: モバイル
   - Mock で正常系・タイムアウト・CRC 不一致・途中切断を固定
 - **完了条件**: 同一バージョン再書き込み → 最新版更新 → 復旧確認。
 - **Tier**: **3**（OTA / Flash / セキュリティ境界）。
-- **状態**: **core 実装済み（Mock テストのみ。CLI / GUI / UniFFI 未配線、実機未検証）**。2026-11-23 にブランチ `feat/ble-ota` で追加。
-  - `crates/eightbitdo-core/src/ota.rs`: BLE 専用の状態機械 `OtaUpdate`（`Idle` → `EnteringBoot` → `AwaitingBootReconnect` → `PreparingBoot` → `Ready` → `Erasing` / `Writing` / `Finalizing` → `Complete`）。`enter_boot` は App Mode `Session`、`prepare_boot` / `write_firmware` は Bootloader `Transport` を受ける。
-  - `gamepad_type` ゲート: `readPID 0x0008` の結果が `0x600F` のときだけ type 1 として続行。非 type 1 は `OtaUnsupportedPid` で停止し、`readVersionInBoot` の offset を推測しない。`0x01017040` / `0x01018000` のみ実装（非 type 1 の offset は未実装）。
-  - 書込順序: 全フレームを最初の Erase 前に構築し、4KB セクタごとに `EraseFlash 0x0004`（10s）→ `WriteFirmware 0x0003` 64B + CRC（1s/チャンク）→ 最後に `WriteVersion 0x00C4`（24B、3s）→ `WriteFirmwareVersion 0x0002`（4B、send-only）→ `JumpApp 0x0006`（best-effort）。
-  - `.dat` 検証: 28B ヘッダ、`image_len` 64B 倍数、`load_base_addr` 64B / 4KB アライン、`28 + image_len` の厳密一致。trailing data（マルチセクション）は拒否。
-  - fail-closed: `Error::Ota { stage, state, recovery }`（`OtaWriteState::{Untouched, EraseStarted, PartiallyWritten, Written}`）。進捗は `OtaProgress` コールバック。
-  - MockTransport 23 テスト: 全パケット列・CRC・チャンク境界・セクタ境界・ACK 順序・Erase/Write/WriteVersion 失敗・PID 不一致・ACK タイムアウト・PID ゲート迂回拒否・ローカル検証先行。
-  - **未検証 / 残課題**: `PROTOCOL_SPEC` §8.5 を参照。Bootloader RX フレーミング、`readPID` 応答形状、PID→type 対応（`evidence.md` §5 はキャラクタリスティック index 由来と報告）、Erase/Write のアドレス規約（仕様の `load_base+sector_off` と `evidence.md` §6 のイメージ相対が矛盾）、`WriteVersion` の payload 長（24B vs 16B）、`WriteFirmware` の 64B payload（`evidence.md` §7.3 の 16B 問題）、`EraseFlash` の chunk_len（0 vs 0x1000）、タイムアウト差（5s vs Android 2s）は実機 btsnoop 待ち。USB OTA は `N/A + 理由（USB Boot TX 未文書化）`。バッテリー警告・ファームウェア取得/検証は未実装。
+- **状態**: **core 実装済み（Mock テストのみ。CLI / GUI / UniFFI 未配線、実機未検証。実機書込は保留）**。2026-11-23 にブランチ `feat/ble-ota` で追加。解析証跡は [docs/OTA_BLE_EVIDENCE.md](OTA_BLE_EVIDENCE.md)。
+  - `crates/eightbitdo-core/src/ota.rs`: BLE 専用の状態機械 `OtaUpdate`（`Idle` → `EnteringBoot` → `AwaitingBootReconnect` → `PreparingBoot` → `Ready` → `Erasing` / `Writing` / `Finalizing` → `Complete`、失敗時 `Failed`）。
+  - **transport 結合**: `prepare_boot` が boot transport を借用する `BootReady<'a, T>` ガードを返し、`write_firmware` はそのガードのみ受け付ける（生成元 `OtaUpdate` の ID も照合）。`OtaTransport` マーカーは Mock / BLE のみ実装し、USB transport は型で拒否。
+  - **app base 必須**: `OtaConfig::new(expected_load_base)` が非 0・4KB アラインを要求。`.dat +0x04` が期待 base と一致しない画像は最初の Erase 前に `OtaInvalidFirmware` で拒否（`load_base = 0` 等で bootloader 領域を消さない）。bootloader / flash 領域の列挙はせず、`expected_load_base` が唯一の allowlist（呼び出し元の trust boundary）。
+  - **MTU 事前検証**: 最初の Erase 前に `mtu - 3 >= 81`（`OTA_MIN_MTU = 84`）を検証。不足なら `MtuTooSmall` で停止。最大フレームは 64B WriteFirmware の 81B。Bootloader 実 MTU は未確認。
+  - **未確認 wire ゲート**: `allow_unverified_wire` 既定 false。false の間は `write_firmware` がフラッシュフレームを送らない。Mock / ベンチ実験のみ明示的に opt-in。
+  - **ready/completion ACK**: 既定は仕様どおり最初の matching ACK を完了とみなす。`require_completion_ack = true` で Erase/Write の最初の payload-less envelope を ready ACK としてスキップし、完了 ACK を待つ（未検証前提のオプトイン、単独 ACK はタイムアウト）。ACK 形状確定まで CLI 配線は保留。
+  - `gamepad_type` ゲート: `readPID 0x0008` が `0x600F` のときだけ type 1 として続行。非 type 1 は `OtaUnsupportedPid` で停止し、`readVersionInBoot` の offset を推測しない。`0x01017040` / `0x01018000` のみ実装。
+  - 書込順序: 全フレームを最初の Erase 前に構築し、4KB セクタごとに `EraseFlash 0x0004`（10s）→ `WriteFirmware 0x0003` 64B + CRC（1s/チャンク）→ 最後に `WriteVersion 0x00C4`（24B、3s）→ `WriteFirmwareVersion 0x0002`（4B、send-only）→ `JumpApp 0x0006`（ACK またはリンククローズのみ成功、タイムアウトは失敗）。**リトライなし**。
+  - `.dat` 検証: 28B ヘッダ、`image_len` 64B 倍数、`load_base_addr` 64B アライン、`28 + image_len` の厳密一致。**単一セクションのみ対応**。trailing data（マルチセクション）は明確なエラーで拒否し、公式 `.dat` がマルチセクションの場合は更新できない可能性がある。
+  - fail-closed: `Error::Ota { stage, state, recovery }`（`OtaWriteState::{Untouched, EraseStarted, PartiallyWritten, Written}`、**送信試行**基準）。`sectors_erased` / `chunks_written` は ACK 数。進捗は `OtaProgress`。キャンセルされた Future は recovery を返さないため、フロントエンドはフラッシュ区間を非キャンセルにする契約。
+  - MockTransport **42 テスト**: 全パケット列・CRC・チャンク/セクタ境界・部分セクタ・複数セクタ進捗・ACK 順序、Erase/Write/WriteVersion/WriteFirmwareVersion/Jump 失敗、送信失敗、ACK タイムアウト（リトライなし）、PID 不一致、ready/completion ACK ガード、MTU 不足、expected base 不一致/0/非アライン、transport 不一致、未確認 wire ゲート、`0x000E`、キャンセル、マルチセクション拒否メッセージ、`load_base + image_len` の 2^32 境界。
+  - **未検証 / 残課題**: `PROTOCOL_SPEC` §8.5 を参照。Bootloader RX フレーミング、`readPID` 応答形状、ready/完了 ACK 形状、PID→type 対応、Erase/Write のアドレス規約（仕様の `load_base+sector_off` と証跡のイメージ相対が矛盾）、`WriteVersion` の payload 長（24B vs 16B）、`WriteFirmware` の 64B payload（証跡の 16B 問題）、`EraseFlash` の chunk_len（0 vs 0x1000）、タイムアウト差（5s vs Android 2s）、Bootloader MTU は実機 btsnoop 待ち。USB OTA は `N/A + 理由（USB Boot TX 未文書化）`。バッテリー警告・ファームウェア取得/検証は未実装。
+  - **次 PR の必須項目**: マルチセクション `.dat` 対応（または公式 `.dat` 非対応の明示）、実機 btsnoop による wire / ACK / アドレス / MTU の確定、CLI / GUI / UniFFI 配線（確定後）、バッテリー警告・バージョン/ダウングレード判定・ファームウェア取得/検証。
 
 ### Phase 2d: 設定書き込み（config apply）
 - **ゴール**: 2768B 全体の書込み + Save を CLI から安全に実行する。

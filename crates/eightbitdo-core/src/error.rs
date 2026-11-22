@@ -117,9 +117,11 @@ impl fmt::Display for ConfigWriteState {
 /// Stage of a BLE OTA update that failed.
 ///
 /// The order is EnterBoot → ReadPid → ReadVersion → Erase → Write →
-/// WriteVersion → WriteFirmwareVersion → Jump. A failure in any read stage
-/// (`EnterBoot`, `ReadPid`, `ReadVersion`) happens before the first flash
-/// write; the write stages are only reachable after a successful PID check.
+/// WriteVersion → WriteFirmwareVersion → Jump. `EnterBoot` is an App Mode
+/// command/ACK stage (not a read); it, `ReadPid`, and `ReadVersion` all happen
+/// before the first flash frame. The flash stages are only reachable after a
+/// successful PID check, a matching expected application base, a sufficient
+/// MTU, and an explicit unverified-wire opt-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OtaFailureStage {
     /// App Mode `0x000C` EnterBoot.
@@ -155,29 +157,36 @@ impl fmt::Display for OtaFailureStage {
     }
 }
 
-/// How far a failed BLE OTA update got.
+/// How far a failed BLE OTA update got, measured by **frames the host tried to
+/// send** (not by ACKs received).
 ///
 /// The bootloader keeps running after every failed stage (the application area
 /// is only valid again after a full erase + rewrite + JumpApp), so recovery is
-/// always "reconnect to `\"8bt\"`, read the PID, and rewrite every sector from
-/// offset 0". The state tells the caller how much of that recovery is required.
+/// always a fresh `OtaUpdate` from `Idle` → `prepare_boot` on `"8bt"` → erase
+/// and rewrite every sector from offset 0. The state tells the caller how much
+/// of that recovery is required. The associated counters
+/// (`OtaUpdate::sectors_erased`, `OtaUpdate::chunks_written`) count only
+/// acknowledged operations and can therefore be lower than the frames sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OtaWriteState {
-    /// Nothing was erased or written: the failure happened in EnterBoot, the
-    /// PID / version read, local image validation, or before the first Erase
-    /// frame was sent. The flash content is unchanged.
+    /// No EraseFlash or WriteFirmware frame was sent. This covers EnterBoot,
+    /// PID / version read failures, PID mismatch, local image validation,
+    /// expected-base / MTU / unverified-wire refusals, and a send that failed
+    /// before any flash frame. The flash content is assumed unchanged
+    /// (EnterBoot may still have rebooted the controller).
     Untouched,
-    /// At least one EraseFlash frame was sent. The application area may be
-    /// erased (or partially erased), so the image must be rewritten from the
-    /// first sector and the controller must not be jumped to the app.
+    /// At least one EraseFlash frame was sent and no WriteFirmware frame was
+    /// sent yet. Its ACK may not have arrived, so the sector may be erased,
+    /// partially erased, or still pending; treat the flash content as unknown.
     EraseStarted,
-    /// At least one WriteFirmware chunk was acknowledged. The image is
-    /// partially written and the whole image must be erased and rewritten.
+    /// At least one WriteFirmware frame was sent (chunk ACKs may be zero or
+    /// more). Part of the image may be written; erase and rewrite the whole
+    /// image from offset 0.
     PartiallyWritten,
-    /// Every firmware chunk was acknowledged; only the finalization
-    /// (WriteVersion / WriteFirmwareVersion / JumpApp) failed. The device stays
-    /// in the bootloader and the image still has to be erased and rewritten
-    /// before JumpApp is safe.
+    /// Every WriteFirmware chunk was acknowledged, but finalization
+    /// (WriteVersion / WriteFirmwareVersion / JumpApp) did not complete. The
+    /// image data may be complete but the application is not confirmed; erase
+    /// and rewrite the whole image before retrying JumpApp.
     Written,
 }
 
@@ -357,6 +366,8 @@ pub enum Error {
     /// Only `gamepad_type == 1` (PID `0x600F`) is documented. The version and
     /// jump addresses of any other type are unknown, so the update stops after
     /// `readPID` without sending a read at a guessed offset or any flash write.
+    /// This is a pre-write failure: it is equivalent to
+    /// [`OtaWriteState::Untouched`] (the error variant itself carries no state).
     #[error(
         "unsupported bootloader PID 0x{pid:04X}: only gamepad_type 1 (PID 0x600F) has documented \
          BLE OTA readVersionInBoot/JumpApp offsets; stopping before any flash write"
@@ -367,6 +378,11 @@ pub enum Error {
     },
 
     /// A `.dat` firmware image failed local validation before any flash write.
+    ///
+    /// Also used for a `load_base_addr` that does not match the mandatory
+    /// `OtaConfig::expected_load_base` allowlist. This is a pre-write failure
+    /// equivalent to [`OtaWriteState::Untouched`]. Only single-section `.dat`
+    /// files are supported; official multi-section firmware is rejected.
     #[error("invalid firmware image: {0}")]
     OtaInvalidFirmware(String),
 
