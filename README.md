@@ -147,6 +147,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 | **[docs/DEVICE_CONFIG_EVIDENCE.md](docs/DEVICE_CONFIG_EVIDENCE.md)** | 実機 2768B ダンプ（SHA-256 `1dca47fa…`）の実バイト証跡: `slot_flags` / `map_key.flag` の非 0/1 値、`config remap` の差分、raw 検証エラーと再現コマンド |
 | **[docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)** | Rust + SwiftUI + Jetpack Compose のアーキテクチャ設計、ワークスペース構成、Phase 1〜5 ロードマップ、現在の状態・残課題、安全検証手順 |
 | **[docs/OTA_BLE_EVIDENCE.md](docs/OTA_BLE_EVIDENCE.md)** | BLE OTA の解析証跡（確定した順序・タイムアウト・`.dat` ヘッダ）と未確認事項の優先順 |
+| **[docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)** | BLE OTA 実機検証の準備: btsnoop 採取（Linux `btmon` / Android HCI snoop）、確認項目と判定、EVIDENCE への追記、Phase A / B の安全手順 |
 | **[mobile/README.md](mobile/README.md)** | iOS / Android のビルド手順、UniFFI 公開 API、到達点と制約（unsigned IPA / Kotlin-only APK / 未公開の書込） |
 | **[docs/SESSION_OPERATIONS.md](docs/SESSION_OPERATIONS.md)** | 常駐 `session` の運用（per-user BLE 単一所有者ロック、degraded 終了コード 3、SIGINT 範囲、押下依頼前の `scan` 確認手順、`scripts/session-loop.sh` の scan 契約と backoff） |
 | **[AGENTS.md](AGENTS.md)** | AI エージェント／開発者向け引き継ぎガイド（[CLAUDE.md](CLAUDE.md) からも参照） |

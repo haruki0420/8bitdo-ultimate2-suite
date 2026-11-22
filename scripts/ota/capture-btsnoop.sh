@@ -8,11 +8,13 @@
 # script only wraps btmon; it never talks to the controller itself.
 #
 # Usage:
-#   scripts/ota/capture-btsnoop.sh [-o DIR] [-i HCI]
+#   scripts/ota/capture-btsnoop.sh [-o DIR] [-i HCI] [-p a|b]
 #
 #   -o, --out-dir DIR   capture directory (default: <repo>/.tmp/ota-capture)
-#   -i, --index HCI     only monitor this adapter (passed to btmon -i;
-#                       required when the host has multiple adapters)
+#   -i, --index HCI     only monitor this adapter (0 or hci0; passed to btmon -i).
+#                       Required when the host has more than one adapter.
+#   -p, --phase a|b     print the stop instructions for Phase A (read-only) or
+#                       Phase B (flash). Without it both are printed.
 #   -h, --help          show this help
 #
 # Environment:
@@ -35,17 +37,20 @@ CAPTURE_DIR=${CAPTURE_DIR:-"$ROOT_DIR/.tmp/ota-capture"}
 BTMON_BIN=${BTMON_BIN:-btmon}
 STOP_TIMEOUT=${STOP_TIMEOUT:-10}
 BTMON_INDEX=''
+PHASE=''
 
 usage() {
     cat <<'EOF'
-Usage: scripts/ota/capture-btsnoop.sh [-o DIR] [-i HCI]
+Usage: scripts/ota/capture-btsnoop.sh [-o DIR] [-i HCI] [-p a|b]
 
 Start a btmon btsnoop capture, wait for the operator, then stop btmon.
 
 Options:
   -o, --out-dir DIR   capture directory (default: <repo>/.tmp/ota-capture)
-  -i, --index HCI     only monitor this adapter (btmon -i, e.g. hci0).
+  -i, --index HCI     only monitor this adapter (0 or hci0; btmon -i).
                       Required when the host has more than one adapter.
+  -p, --phase a|b     stop instructions for Phase A (read-only) or Phase B
+                      (flash). Without it both variants are printed.
   -h, --help          show this help
 
 Environment:
@@ -79,6 +84,11 @@ while (( $# > 0 )); do
             BTMON_INDEX=$2
             shift 2
             ;;
+        -p|--phase)
+            if (( $# < 2 )); then die "$1 requires 'a' or 'b'"; fi
+            PHASE=$2
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -95,27 +105,57 @@ done
 if ! [[ "$STOP_TIMEOUT" =~ ^[0-9]+$ ]] || (( STOP_TIMEOUT < 1 || STOP_TIMEOUT > 60 )); then
     die "STOP_TIMEOUT must be an integer between 1 and 60 (got '$STOP_TIMEOUT')"
 fi
+if [[ -n "$PHASE" && "$PHASE" != "a" && "$PHASE" != "b" ]]; then
+    die "--phase must be 'a' or 'b' (got '$PHASE')"
+fi
 
 command -v "$BTMON_BIN" >/dev/null 2>&1 \
     || die "btmon not found: $BTMON_BIN (install BlueZ, e.g. bluez / bluez-utils)"
 
+# btmon takes a numeric index (-i 0) but hci0 is easier to type; accept both.
+BTMON_INDEX_NUM=''
+BTMON_INDEX_NAME=''
+if [[ -n "$BTMON_INDEX" ]]; then
+    if [[ "$BTMON_INDEX" =~ ^[0-9]+$ ]]; then
+        BTMON_INDEX_NUM=$BTMON_INDEX
+    elif [[ "$BTMON_INDEX" =~ ^hci([0-9]+)$ ]]; then
+        BTMON_INDEX_NUM=${BASH_REMATCH[1]}
+    else
+        die "invalid adapter '$BTMON_INDEX'; pass 0 or hci0"
+    fi
+    BTMON_INDEX_NAME="hci$BTMON_INDEX_NUM"
+fi
+
 # btmon subscribes to every adapter, so a multi-adapter host would mix other
-# devices into the capture. Require an explicit -i hciX in that case.
+# devices into the capture. Require an explicit -i in that case.
 adapters=(/sys/class/bluetooth/hci*)
-if (( ${#adapters[@]} > 1 )); then
+if (( ${#adapters[@]} == 0 )); then
+    log "warning: no adapter detected under /sys/class/bluetooth;" \
+        "if this host has multiple adapters, pass -i hciX explicitly"
+else
     adapter_names=''
     for adapter in "${adapters[@]}"; do
         adapter_names+=" ${adapter##*/}"
     done
-    log "detected Bluetooth adapters:${adapter_names}"
-    if [[ -z "$BTMON_INDEX" ]]; then
-        die "multiple Bluetooth adapters detected; pass -i hciX (one of:${adapter_names})" \
-            "so the capture contains only the controller's adapter"
+    if (( ${#adapters[@]} > 1 )); then
+        log "detected Bluetooth adapters:${adapter_names}"
+        if [[ -z "$BTMON_INDEX_NUM" ]]; then
+            die "multiple Bluetooth adapters detected; pass -i hciX (one of:${adapter_names})" \
+                "so the capture contains only the controller's adapter"
+        fi
     fi
-fi
-if [[ -n "$BTMON_INDEX" && ! -e "/sys/class/bluetooth/$BTMON_INDEX" ]]; then
-    log "warning: /sys/class/bluetooth/$BTMON_INDEX does not exist;" \
-        "check the adapter name passed to -i"
+    if [[ -n "$BTMON_INDEX_NAME" ]]; then
+        found=0
+        for adapter in "${adapters[@]}"; do
+            if [[ "${adapter##*/}" == "$BTMON_INDEX_NAME" ]]; then
+                found=1
+            fi
+        done
+        if (( found == 0 )); then
+            log "warning: $BTMON_INDEX_NAME not found under /sys/class/bluetooth;" \
+                "check the adapter passed to -i"
+        fi
+    fi
 fi
 
 if command -v pgrep >/dev/null 2>&1; then
@@ -197,10 +237,19 @@ finish() {
         size=$(wc -c < "$out" | tr -d ' ')
         if [[ "$size" -gt 0 ]]; then
             log "capture saved: $out (${size} bytes)"
+            if command -v od >/dev/null 2>&1; then
+                magic=$(od -An -tx1 -N8 -- "$out" 2>/dev/null | tr -d ' \n')
+                if [[ -n "$magic" && "$magic" != "6274736e6f6f7000" ]]; then
+                    log "warning: capture does not start with the btsnoop magic;" \
+                        "it may be corrupt or truncated"
+                fi
+            fi
             if command -v sha256sum >/dev/null 2>&1; then
                 log "sha256: $(sha256sum "$out" | awk '{print $1}')"
             fi
             log "read it back with: btmon -r '$out' -T -P"
+            log "verify completeness (normal exit, final frame, expected frame counts) per" \
+                "docs/OTA_VERIFICATION_PLAN.md §6.4"
             log "record size/SHA-256 and redacted excerpts in docs/OTA_BLE_EVIDENCE.md;" \
                 "do not commit the capture"
         else
@@ -219,8 +268,8 @@ trap 'log "SIGTERM received; stopping capture"; exit 143' TERM
 trap 'log "SIGHUP received; stopping capture"; exit 129' HUP
 
 log "starting btmon (output: $out)"
-if [[ -n "$BTMON_INDEX" ]]; then
-    "$BTMON_BIN" -w "$out" -i "$BTMON_INDEX" &
+if [[ -n "$BTMON_INDEX_NUM" ]]; then
+    "$BTMON_BIN" -w "$out" -i "$BTMON_INDEX_NUM" &
 else
     "$BTMON_BIN" -w "$out" &
 fi
@@ -239,23 +288,70 @@ fi
 
 log "capture started at $(date -u +%Y-%m-%dT%H:%M:%SZ) (UTC)"
 
-cat <<'EOF'
---- BLE OTA capture is running ---------------------------------------------
+print_instructions() {
+    case "$PHASE" in
+        a)
+            cat <<'EOF'
+--- BLE OTA capture (Phase A: read-only) -----------------------------------
 Do this now (docs/OTA_VERIFICATION_PLAN.md §4):
 
-  1. Connect the controller in App Mode ("80ND") if it is not connected.
+  1. Connect the controller in App Mode ("80ND").
   2. Send EnterBoot (0x000C) and wait for the "8bt" reconnect.
-  3. Phase A: readPID (0x0008) -> readVersionInBoot (0x0005).
-     Phase B: Erase / Write / WriteVersion / WriteFirmwareVersion / Jump.
-  4. After Jump, wait for the "80ND" reconnect and read the version.
+  3. readPID (0x0008) -> readVersionInBoot (0x0005).
+  4. Wait 1-2 seconds after the readVersionInBoot response, then stop.
 
-Press Enter after the App Mode reconnect is confirmed to stop the capture.
+Phase A does NOT return to App Mode. Do not wait for "80ND": stop here, then
+recover with a power cycle and `eightbitdo scan --check` (plan §8.2).
 Ctrl-C also stops; this script always shuts btmon down.
 ---------------------------------------------------------------------------
 EOF
+            ;;
+        b)
+            cat <<'EOF'
+--- BLE OTA capture (Phase B: flash) ---------------------------------------
+Do this now (docs/OTA_VERIFICATION_PLAN.md §4):
+
+  1. Connect the controller in App Mode ("80ND").
+  2. Send EnterBoot (0x000C) and wait for the "8bt" reconnect.
+  3. readPID (0x0008) -> readVersionInBoot (0x0005).
+  4. Erase / Write / WriteVersion / WriteFirmwareVersion / Jump.
+  5. After Jump, wait for the "80ND" reconnect and read the version, then stop.
+
+HUMAN CHECKPOINT: stop after the FIRST Erase ACK and verify offset, total_len
+and the ACK shape in btmon before continuing to Write (plan §8.3).
+Ctrl-C also stops; this script always shuts btmon down.
+---------------------------------------------------------------------------
+EOF
+            ;;
+        *)
+            cat <<'EOF'
+--- BLE OTA capture is running ---------------------------------------------
+Do this now (docs/OTA_VERIFICATION_PLAN.md §4):
+
+  Phase A (read-only): EnterBoot -> readPID -> readVersionInBoot, then wait
+  1-2 seconds and stop. Phase A does NOT return to App Mode; do not wait for
+  "80ND" (recover with a power cycle, plan §8.2).
+
+  Phase B (flash): add Erase / Write / WriteVersion / WriteFirmwareVersion /
+  Jump, then wait for the "80ND" reconnect and version read. Stop after the
+  FIRST Erase ACK once for the human checkpoint (plan §8.3).
+
+Pass -p a or -p b for phase-specific instructions.
+Ctrl-C also stops; this script always shuts btmon down.
+---------------------------------------------------------------------------
+EOF
+            ;;
+    esac
+}
+
+print_instructions
 
 if [[ -t 0 ]]; then
-    printf 'Press Enter to stop the capture: '
+    case "$PHASE" in
+        a) printf 'Press Enter to stop the capture (1-2 s after readVersionInBoot): ' ;;
+        b) printf 'Press Enter to stop the capture (after the 80ND reconnect): ' ;;
+        *) printf 'Press Enter to stop the capture: ' ;;
+    esac
     read -r _ || true
 else
     log "stdin is not a terminal; waiting for SIGINT/SIGTERM to stop" \
