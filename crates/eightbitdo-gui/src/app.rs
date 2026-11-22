@@ -19,8 +19,12 @@ use eframe::egui::{
     self, Align, Align2, Color32, FontId, Frame, Id, Layout, Margin, Pos2, Rangef, Rect, RichText,
     Sense, Stroke, UiBuilder, Vec2,
 };
+use eightbitdo_core::ConfigSnapshot;
+use eightbitdo_protocol::config_bt2::{Argb, MacroIndex, Slot, SpecialFeature};
+use eightbitdo_protocol::keymap::{ButtonIndex, KeyMap};
 
-use crate::backup::{default_backup_dir, BackupReport};
+use crate::backup::{default_backup_dir, BackupRef, BackupReport};
+use crate::driver::{ConfigWriteReport, MacroWriteReport, WriteFailure, WritePhase};
 use crate::i18n::{self, Key, Lang};
 use crate::model::{
     format_rssi, format_u16_hex, format_u32_hex, ConfigView, DeviceInfoView, InputView,
@@ -28,6 +32,10 @@ use crate::model::{
 };
 use crate::theme;
 use crate::worker::{Command, Event, Notice, Worker};
+use crate::write::{
+    self, DraftError, MacroEditor, PendingPlan, PendingWrite, SettingsDraft, WriteTarget,
+    GAMEPAD_MODES, KEY_TARGETS, MAX_CYCLES, MAX_INTERVAL_MS, SPECIAL_FEATURES,
+};
 
 const MAX_LOG_ENTRIES: usize = 500;
 
@@ -70,17 +78,28 @@ enum Tab {
     Device,
     Input,
     Config,
+    Settings,
+    Macro,
     Log,
 }
 
 impl Tab {
-    const ALL: [Self; 4] = [Self::Device, Self::Input, Self::Config, Self::Log];
+    const ALL: [Self; 6] = [
+        Self::Device,
+        Self::Input,
+        Self::Config,
+        Self::Settings,
+        Self::Macro,
+        Self::Log,
+    ];
 
     fn key(self) -> Key {
         match self {
             Self::Device => Key::NavDevice,
             Self::Input => Key::NavInput,
             Self::Config => Key::NavConfig,
+            Self::Settings => Key::NavSettings,
+            Self::Macro => Key::NavMacro,
             Self::Log => Key::NavLog,
         }
     }
@@ -96,6 +115,9 @@ enum Busy {
     ReadConfig,
     Backup,
     Disconnecting,
+    ReadMacro,
+    WriteConfig,
+    WriteMacro,
 }
 
 impl Busy {
@@ -109,6 +131,9 @@ impl Busy {
             Self::ReadConfig => Key::BusyReadConfig,
             Self::Backup => Key::BusyBackup,
             Self::Disconnecting => Key::BusyDisconnecting,
+            Self::ReadMacro => Key::BusyReadMacro,
+            Self::WriteConfig => Key::BusyWriteConfig,
+            Self::WriteMacro => Key::BusyWriteMacro,
         }
     }
 }
@@ -138,6 +163,13 @@ enum ValueKind {
     Strong,
 }
 
+/// Completed write shown in the result banner.
+#[derive(Debug, Clone)]
+enum WriteOutcome {
+    Config(Box<ConfigWriteReport>),
+    Macro(Box<MacroWriteReport>),
+}
+
 /// Main application state.
 pub struct App {
     worker: Worker,
@@ -147,6 +179,15 @@ pub struct App {
     device: Option<DeviceInfoView>,
     version: Option<VersionView>,
     config: Option<ConfigView>,
+    config_snapshot: Option<ConfigSnapshot>,
+    settings: Option<SettingsDraft>,
+    settings_slot: Slot,
+    macro_editor: MacroEditor,
+    pending: Option<PendingWrite>,
+    draft_error: Option<DraftError>,
+    write_failure: Option<Box<WriteFailure>>,
+    write_result: Option<WriteOutcome>,
+    last_write_backup: Option<BackupRef>,
     input: Option<InputView>,
     live: bool,
     busy: Option<Busy>,
@@ -184,6 +225,15 @@ impl App {
             device: None,
             version: None,
             config: None,
+            config_snapshot: None,
+            settings: None,
+            settings_slot: Slot::S1,
+            macro_editor: MacroEditor::default(),
+            pending: None,
+            draft_error: None,
+            write_failure: None,
+            write_result: None,
+            last_write_backup: None,
             input: None,
             live: false,
             busy: None,
@@ -257,6 +307,14 @@ impl App {
                 self.device = Some(info);
                 self.version = None;
                 self.config = None;
+                self.config_snapshot = None;
+                self.settings = None;
+                self.macro_editor = MacroEditor::default();
+                self.pending = None;
+                self.draft_error = None;
+                self.write_failure = None;
+                self.write_result = None;
+                self.last_write_backup = None;
                 self.input = None;
                 self.live = false;
                 self.backup = None;
@@ -280,16 +338,46 @@ impl App {
                 );
                 self.version = Some(version);
             }
-            Event::Config(config) => {
+            Event::Config { snapshot, view } => {
                 self.push_notice(
                     LogLevel::Info,
                     Notice::new(Key::LogConfig)
-                        .with_arg(config.size.to_string())
-                        .with_arg(config.sha256.clone()),
+                        .with_arg(view.size.to_string())
+                        .with_arg(view.sha256.clone()),
                 );
-                self.config = Some(*config);
+                if self.macro_editor.is_loaded()
+                    && !self.macro_editor.record_matches_config(&snapshot.config)
+                {
+                    let was_recording = self.macro_editor.recording;
+                    self.macro_editor.unload();
+                    if was_recording {
+                        self.push_notice(LogLevel::Info, Notice::new(Key::LogRecordingStopped));
+                    }
+                    self.push_notice(LogLevel::Info, Notice::new(Key::LogMacroReload));
+                }
+                self.settings = Some(SettingsDraft::from_config(&snapshot.config));
+                self.config_snapshot = Some(*snapshot);
+                self.config = Some(*view);
+            }
+            Event::MacroLoaded { slot, index, entry } => {
+                if self.macro_editor.load(*entry) {
+                    self.push_notice(LogLevel::Info, Notice::new(Key::LogRecordingStopped));
+                }
+                self.push_notice(
+                    LogLevel::Info,
+                    Notice::new(Key::LogMacroRead)
+                        .with_arg((index.index() + 1).to_string())
+                        .with_arg(slot.number().to_string()),
+                );
             }
             Event::Input(input) => {
+                if self.macro_editor.recording {
+                    let was_full = self.macro_editor.recorder.is_full();
+                    self.macro_editor.record(&input);
+                    if !was_full && self.macro_editor.recorder.is_full() {
+                        self.push_notice(LogLevel::Info, Notice::new(Key::MacroRecordingFull));
+                    }
+                }
                 self.input = Some(input);
                 self.left_trail.push_back((
                     f32::from(input.left_stick.0) / 128.0,
@@ -309,6 +397,9 @@ impl App {
             }
             Event::Live(enabled) => {
                 self.live = enabled;
+                if !enabled && self.macro_editor.recording {
+                    self.macro_editor.stop_recording();
+                }
                 self.push_notice(
                     LogLevel::Info,
                     Notice::new(if enabled {
@@ -327,9 +418,45 @@ impl App {
                 );
                 self.backup = Some(*report);
             }
+            Event::WriteBackup(backup) => {
+                self.last_write_backup = Some(backup);
+            }
+            Event::ConfigWritten(report) => {
+                self.last_write_backup = Some(BackupRef::from(&report.backup));
+                self.write_failure = None;
+                self.draft_error = None;
+                self.error = None;
+                self.write_result = Some(WriteOutcome::Config(report));
+                self.push_notice(LogLevel::Info, Notice::new(Key::LogConfigWritten));
+            }
+            Event::MacroWritten(report) => {
+                self.last_write_backup = Some(BackupRef::from(&report.backup));
+                self.write_failure = None;
+                self.draft_error = None;
+                self.error = None;
+                if self.macro_editor.load(report.readback.clone()) {
+                    self.push_notice(LogLevel::Info, Notice::new(Key::LogRecordingStopped));
+                }
+                self.write_result = Some(WriteOutcome::Macro(report.clone()));
+                self.push_notice(
+                    LogLevel::Info,
+                    Notice::new(Key::LogMacroWritten)
+                        .with_arg(self.macro_editor.slot.number().to_string())
+                        .with_arg((self.macro_editor.index.index() + 1).to_string()),
+                );
+            }
+            Event::WriteFailed(failure) => {
+                self.write_failure = Some(failure);
+                self.write_result = None;
+            }
             Event::Disconnected { reason } => {
                 self.connection = ConnectionState::Disconnected;
                 self.live = false;
+                self.pending = None;
+                self.draft_error = None;
+                if self.macro_editor.recording {
+                    self.macro_editor.stop_recording();
+                }
                 self.input = None;
                 self.scan_started_at = None;
                 self.busy = None;
@@ -344,6 +471,9 @@ impl App {
                 self.push_notice(LogLevel::Error, notice.clone());
                 self.error = Some(notice);
                 self.busy = None;
+                if self.macro_editor.recording {
+                    self.macro_editor.stop_recording();
+                }
             }
             Event::Log(notice) => {
                 self.push_notice(LogLevel::Info, notice);
@@ -391,6 +521,106 @@ impl App {
 
     fn can_read(&self) -> bool {
         self.connection.is_connected() && self.busy.is_none()
+    }
+
+    /// True when the settings controls can be edited.
+    fn can_edit_settings(&self) -> bool {
+        self.connection.is_connected()
+            && self.busy.is_none()
+            && self.config_snapshot.is_some()
+            && self.settings.is_some()
+    }
+
+    /// True when a write may be confirmed: connected, idle, configuration read,
+    /// and no macro recording is running.
+    ///
+    /// Recording is excluded on purpose: the confirmation dialog is
+    /// non-modal, so the user can start a recording behind it, and a write
+    /// pauses the 20 ms keepalive (missing reports) or replaces the take in
+    /// `MacroEditor::load`. The user must stop recording first.
+    fn can_write(&self) -> bool {
+        self.can_edit_settings() && !self.macro_editor.recording
+    }
+
+    /// Open the confirmation dialog for the current settings draft.
+    fn review_settings(&mut self) {
+        if self.macro_editor.recording {
+            self.draft_error = Some(DraftError::Recording);
+            return;
+        }
+        let (Some(snapshot), Some(settings)) =
+            (self.config_snapshot.clone(), self.settings.clone())
+        else {
+            self.draft_error = Some(DraftError::NoChanges);
+            return;
+        };
+        match settings.pending_write(&snapshot, self.settings_slot) {
+            Ok(pending) => {
+                self.draft_error = None;
+                self.pending = Some(pending);
+            }
+            Err(error) => {
+                self.draft_error = Some(error);
+            }
+        }
+    }
+
+    /// Open the confirmation dialog for the loaded macro.
+    fn review_macro(&mut self) {
+        if self.macro_editor.recording {
+            self.draft_error = Some(DraftError::Recording);
+            return;
+        }
+        let Some(snapshot) = self.config_snapshot.clone() else {
+            self.draft_error = Some(DraftError::NoSnapshot);
+            return;
+        };
+        match self.macro_editor.pending_write(&snapshot) {
+            Ok(pending) => {
+                self.draft_error = None;
+                self.pending = Some(pending);
+            }
+            Err(error) => {
+                self.draft_error = Some(error);
+            }
+        }
+    }
+
+    /// Send the confirmed write. The confirmation dialog is the only caller.
+    fn confirm_write(&mut self, pending: PendingWrite) {
+        if self.macro_editor.recording {
+            // Keep the dialog open; the confirm key is disabled until the
+            // recording is stopped.
+            self.draft_error = Some(DraftError::Recording);
+            self.pending = Some(pending);
+            return;
+        }
+        if !self.can_write() {
+            self.pending = None;
+            return;
+        }
+        let dir = self.backup_dir.clone();
+        if let Some((command, busy)) = pending_command(pending, dir) {
+            self.send(command, Some(busy));
+        }
+        self.pending = None;
+        self.write_result = None;
+        self.write_failure = None;
+    }
+
+    /// Discard the settings draft and reload it from the last read block.
+    fn reset_settings(&mut self) {
+        if let Some(snapshot) = &self.config_snapshot {
+            self.settings = Some(SettingsDraft::from_config(&snapshot.config));
+            self.draft_error = None;
+        }
+    }
+
+    /// Read the macro selected in the macro tab.
+    fn request_read_macro(&mut self) {
+        let (slot, index) = (self.macro_editor.slot, self.macro_editor.index);
+        self.macro_editor.select(slot, index);
+        self.send(Command::ReadMacro { slot, index }, Some(Busy::ReadMacro));
     }
 
     fn selected_app_address(&self) -> Option<String> {
@@ -506,7 +736,9 @@ impl App {
                 );
                 bar.vertical(|ui| {
                     ui.add(egui::Label::new(theme::job_title(self.text(Key::AppTitle))));
-                    ui.add(egui::Label::new(theme::job_meta(self.text(Key::ReadOnly))));
+                    ui.add(egui::Label::new(theme::job_meta(
+                        self.text(Key::WriteCapable),
+                    )));
                 });
                 bar.add_space(theme::SPACE_5);
                 let status = self.connection;
@@ -890,10 +1122,20 @@ impl App {
                             self.error_notice(ui, error);
                             ui.add_space(theme::SPACE_4);
                         }
+                        if self.write_result.is_some() {
+                            self.write_result_banner(ui);
+                            ui.add_space(theme::SPACE_3);
+                        }
+                        if self.write_failure.is_some() {
+                            self.write_failure_banner(ui);
+                            ui.add_space(theme::SPACE_3);
+                        }
                         match self.tab {
                             Tab::Device => self.device_tab(ui),
                             Tab::Input => self.input_tab(ui),
                             Tab::Config => self.config_tab(ui),
+                            Tab::Settings => self.settings_tab(ui),
+                            Tab::Macro => self.macro_tab(ui),
                             Tab::Log => self.log_tab(ui),
                         }
                     });
@@ -1080,7 +1322,7 @@ impl App {
         let width = ui.available_width().min(theme::CONTENT_MAX_WIDTH);
         let card_height = match tab {
             Tab::Device => 224.0,
-            Tab::Input | Tab::Config | Tab::Log => 200.0,
+            Tab::Input | Tab::Config | Tab::Settings | Tab::Macro | Tab::Log => 200.0,
         };
         let (rect, _) = ui.allocate_exact_size(Vec2::new(width, card_height), Sense::hover());
         let painter = ui.painter();
@@ -1176,6 +1418,8 @@ impl App {
             let heading = match tab {
                 Tab::Device => Key::SectionConnectSteps,
                 Tab::Log => Key::NavLog,
+                Tab::Settings => Key::SectionWriteSettings,
+                Tab::Macro => Key::SectionMacroEditor,
                 Tab::Input | Tab::Config => Key::SectionNextSteps,
             };
             section_label(&mut right, self.lang, heading);
@@ -1249,6 +1493,21 @@ impl App {
                             .wrap(),
                     );
                 }
+                Tab::Settings => {
+                    right.add(
+                        egui::Label::new(theme::job_body(self.text(Key::SettingsNeedsConfig)))
+                            .wrap(),
+                    );
+                }
+                Tab::Macro => {
+                    right.add(
+                        egui::Label::new(theme::job_body(self.text(Key::MacroNeedsConfig))).wrap(),
+                    );
+                    right.add_space(theme::SPACE_1);
+                    right.add(
+                        egui::Label::new(theme::job_meta(self.text(Key::MacroNotLoaded))).wrap(),
+                    );
+                }
                 Tab::Log => {
                     right.add(egui::Label::new(theme::job_body(self.text(Key::LogEmpty))).wrap());
                     right.add_space(theme::SPACE_1);
@@ -1277,7 +1536,7 @@ impl App {
                         self.request_scan();
                     }
                 }
-                (Tab::Config, true, _) => {
+                (Tab::Config | Tab::Settings | Tab::Macro, true, _) => {
                     if secondary_key(
                         &mut right,
                         "empty-read-config",
@@ -1756,6 +2015,498 @@ impl App {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Settings tab (write path)
+    // -----------------------------------------------------------------------
+
+    fn settings_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(snapshot) = self.config_snapshot.clone() else {
+            self.empty_state(ui, Tab::Settings);
+            return;
+        };
+        let Some(mut settings) = self.settings.take() else {
+            self.empty_state(ui, Tab::Settings);
+            return;
+        };
+        if self.stale_config() {
+            self.stale_warning(ui, Key::SettingsStale);
+            ui.add_space(theme::SPACE_4);
+        }
+
+        let config = snapshot.config.clone();
+        let lang = self.lang;
+        let edit_enabled = self.can_edit_settings();
+        let enabled = self.can_write();
+        let mut slot = self.settings_slot;
+        ui.add_enabled_ui(edit_enabled, |ui| {
+            settings_editor(ui, lang, &config, &mut settings, &mut slot);
+        });
+        self.settings = Some(settings);
+        self.settings_slot = slot;
+
+        if !self.can_write() {
+            let reason = if self.macro_editor.recording {
+                Key::RecordingBlocksWrite
+            } else if self.connection.is_connected() {
+                Key::BusyHint
+            } else {
+                Key::ConnectFirstHint
+            };
+            ui.add_space(theme::SPACE_2);
+            ui.add(egui::Label::new(theme::job_meta(self.text(reason))).wrap());
+        }
+
+        ui.add_space(theme::SPACE_4);
+        let (changes, valid) = self
+            .settings
+            .as_ref()
+            .map(|settings| {
+                (
+                    settings.changes(&config).len(),
+                    settings.validate(&config).is_ok(),
+                )
+            })
+            .unwrap_or((0, false));
+        let mut review = false;
+        let mut discard = false;
+        let review_label = self.text(Key::ApplySettings).to_owned();
+        let discard_label = self.text(Key::DiscardChanges).to_owned();
+        ui.horizontal(|ui| {
+            if secondary_key(
+                ui,
+                "settings-review",
+                enabled && changes > 0 && valid,
+                &review_label,
+                theme::BG,
+            )
+            .on_hover_text(self.text(Key::SettingsDirtyHint))
+            .clicked()
+            {
+                review = true;
+            }
+            if secondary_key(
+                ui,
+                "settings-discard",
+                enabled && changes > 0,
+                &discard_label,
+                theme::BG,
+            )
+            .clicked()
+            {
+                discard = true;
+            }
+            if changes > 0 {
+                ui.add(egui::Label::new(theme::job_meta(&i18n::format(
+                    self.lang,
+                    Key::ConfirmChangeCount,
+                    &[changes.to_string()],
+                ))));
+            }
+        });
+        if review {
+            self.review_settings();
+        }
+        if discard {
+            self.reset_settings();
+        }
+        self.draft_error_line(ui);
+        self.write_backup_line(ui);
+    }
+
+    /// Show the most recent pre-write backup path and SHA-256, so the backup is
+    /// visible on the editing tab while a write is running.
+    fn write_backup_line(&mut self, ui: &mut egui::Ui) {
+        let Some(backup) = self.last_write_backup.clone() else {
+            return;
+        };
+        ui.add_space(theme::SPACE_3);
+        ui.add(egui::Label::new(theme::job_meta(&i18n::format(
+            self.lang,
+            Key::WriteBackup,
+            &[
+                backup.config_path.display().to_string(),
+                backup.config_sha256.clone(),
+            ],
+        ))));
+        if let Some(dir) = backup.macro_dir {
+            ui.add(egui::Label::new(theme::job_meta(&i18n::format(
+                self.lang,
+                Key::WriteMacroBackup,
+                &[dir.display().to_string(), backup.config_sha256.clone()],
+            ))));
+        }
+    }
+
+    /// One red line describing why the draft cannot be written.
+    fn draft_error_line(&mut self, ui: &mut egui::Ui) {
+        let Some(error) = self.draft_error.as_ref() else {
+            return;
+        };
+        let text = i18n::draft_error_text(self.lang, error);
+        ui.add_space(theme::SPACE_2);
+        ui.add(egui::Label::new(theme::job_body_color(&text, theme::RED)).wrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // Macro tab (write path)
+    // -----------------------------------------------------------------------
+
+    fn macro_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(config) = self.config.clone() else {
+            self.empty_state(ui, Tab::Macro);
+            return;
+        };
+        if self.stale_config() {
+            self.stale_warning(ui, Key::SettingsStale);
+            ui.add_space(theme::SPACE_4);
+        }
+        let lang = self.lang;
+        let mut editor = std::mem::take(&mut self.macro_editor);
+        let signals = macro_editor_ui(
+            ui,
+            lang,
+            &config,
+            &mut editor,
+            self.live,
+            self.can_read(),
+            self.can_write(),
+        );
+        self.macro_editor = editor;
+
+        if signals.read {
+            self.request_read_macro();
+        }
+        if signals.start_live {
+            self.send(Command::StartLive, None);
+            self.macro_editor.begin_recording();
+        }
+        if signals.record {
+            self.macro_editor.begin_recording();
+        }
+        if signals.stop_record {
+            self.macro_editor.stop_recording();
+        }
+        if signals.review {
+            self.review_macro();
+        }
+        self.draft_error_line(ui);
+        self.write_backup_line(ui);
+    }
+
+    // -----------------------------------------------------------------------
+    // Write result and failure
+    // -----------------------------------------------------------------------
+
+    fn write_result_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(result) = self.write_result.clone() else {
+            return;
+        };
+        let lang = self.lang;
+        let mut close = false;
+        Frame::none()
+            .fill(theme::SURFACE_2)
+            .rounding(theme::RADIUS_KEY)
+            .inner_margin(Margin::symmetric(theme::SPACE_3, 12.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (bar, _) = ui.allocate_exact_size(Vec2::new(2.0, 22.0), Sense::hover());
+                    ui.painter().rect_filled(bar, 1.0, theme::LED);
+                    ui.add_space(theme::SPACE_2);
+                    ui.add(egui::Label::new(theme::job_body_color(
+                        i18n::t(lang, Key::WriteSuccess),
+                        theme::TEXT,
+                    )));
+                });
+                ui.add_space(theme::SPACE_2);
+                match &result {
+                    WriteOutcome::Config(report) => {
+                        write_banner_row(
+                            ui,
+                            lang,
+                            Key::WriteBackup,
+                            &[
+                                report.backup.raw_path.display().to_string(),
+                                report.backup.sha256.clone(),
+                            ],
+                        );
+                        write_banner_row(
+                            ui,
+                            lang,
+                            Key::WritePackets,
+                            &[report.packets_sent.to_string()],
+                        );
+                        write_banner_row(
+                            ui,
+                            lang,
+                            Key::WriteChangedRegions,
+                            &[report.changed.len().to_string()],
+                        );
+                        let crc = if report.crc.is_valid() {
+                            i18n::t(lang, Key::WriteCrcOk)
+                        } else {
+                            i18n::t(lang, Key::WriteCrcMismatch)
+                        };
+                        ui.add(egui::Label::new(theme::job_meta(crc)));
+                    }
+                    WriteOutcome::Macro(report) => {
+                        write_banner_row(
+                            ui,
+                            lang,
+                            Key::WriteMacroBackup,
+                            &[
+                                report.backup.dir.display().to_string(),
+                                report.backup.config_sha256.clone(),
+                            ],
+                        );
+                        ui.add(egui::Label::new(theme::job_meta(&i18n::format(
+                            lang,
+                            Key::WriteMacroVerified,
+                            &[
+                                report.slot.number().to_string(),
+                                (report.index.index() + 1).to_string(),
+                                report.steps.to_string(),
+                            ],
+                        ))));
+                        write_banner_row(
+                            ui,
+                            lang,
+                            Key::WritePackets,
+                            &[report.packets_sent.to_string()],
+                        );
+                    }
+                }
+                ui.add_space(theme::SPACE_2);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(ui.available_width(), 32.0),
+                    Layout::right_to_left(Align::Center),
+                    |ui| {
+                        let label = i18n::t(lang, Key::WriteCloseResult).to_owned();
+                        if secondary_key(ui, "result-close", true, &label, theme::SURFACE_2)
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                        let copy = i18n::t(lang, Key::CopySha256).to_owned();
+                        let sha = match &result {
+                            WriteOutcome::Config(report) => report.backup.sha256.clone(),
+                            WriteOutcome::Macro(report) => report.backup.config_sha256.clone(),
+                        };
+                        if secondary_key(ui, "result-copy", true, &copy, theme::SURFACE_2).clicked()
+                        {
+                            ui.output_mut(|output| output.copied_text = sha);
+                        }
+                    },
+                );
+            });
+        if close {
+            self.write_result = None;
+        }
+    }
+
+    fn write_failure_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(failure) = self.write_failure.clone() else {
+            return;
+        };
+        let lang = self.lang;
+        let mut close = false;
+        let headline = match failure.phase {
+            WritePhase::Read => Key::WriteReadFailed,
+            WritePhase::Prepare => Key::WritePrepareFailed,
+            WritePhase::Backup => Key::WriteBackupFailed,
+            WritePhase::ConfigChanged => Key::WriteChanged,
+            WritePhase::Device => Key::WriteDeviceFailed,
+        };
+        Frame::none()
+            .fill(theme::SURFACE_2)
+            .rounding(theme::RADIUS_KEY)
+            .inner_margin(Margin::symmetric(theme::SPACE_3, 12.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (bar, _) = ui.allocate_exact_size(Vec2::new(2.0, 22.0), Sense::hover());
+                    ui.painter().rect_filled(bar, 1.0, theme::RED);
+                    ui.add_space(theme::SPACE_2);
+                    ui.add(egui::Label::new(theme::job_body_color(
+                        i18n::t(lang, Key::WriteFailureTitle),
+                        theme::RED,
+                    )));
+                });
+                ui.add_space(theme::SPACE_1);
+                ui.add(egui::Label::new(theme::job_body(i18n::t(lang, headline))).wrap());
+                if let Some(backup) = &failure.backup {
+                    ui.add_space(theme::SPACE_2);
+                    ui.add(egui::Label::new(theme::job_meta(i18n::t(
+                        lang,
+                        Key::WriteFailureBackup,
+                    ))));
+                    ui.add(egui::Label::new(theme::job_data(
+                        &backup.config_path.display().to_string(),
+                        theme::TEXT_BODY,
+                    )));
+                    ui.add(egui::Label::new(theme::job_data(
+                        &backup.config_sha256,
+                        theme::TEXT_MUTED,
+                    )));
+                    if let Some(dir) = &backup.macro_dir {
+                        ui.add(egui::Label::new(theme::job_data(
+                            &dir.display().to_string(),
+                            theme::TEXT_BODY,
+                        )));
+                    }
+                    ui.add(egui::Label::new(theme::job_meta(i18n::t(
+                        lang,
+                        Key::WriteFailureRecovery,
+                    ))));
+                    ui.add(
+                        egui::Label::new(theme::job_body(i18n::t(
+                            lang,
+                            Key::WriteFailureRecoveryText,
+                        )))
+                        .wrap(),
+                    );
+                    if backup.macro_dir.is_some() {
+                        ui.add(
+                            egui::Label::new(theme::job_meta(i18n::t(
+                                lang,
+                                Key::WriteFailureMacroRestore,
+                            )))
+                            .wrap(),
+                        );
+                    } else {
+                        ui.add(
+                            egui::Label::new(theme::job_meta(i18n::t(
+                                lang,
+                                Key::WriteFailureConfigRestore,
+                            )))
+                            .wrap(),
+                        );
+                    }
+                }
+                if let Some(recovery) = &failure.recovery {
+                    egui::CollapsingHeader::new(theme::job_meta(i18n::t(lang, Key::ErrorDetails)))
+                        .id_salt("write-failure-detail")
+                        .show(ui, |ui| {
+                            ui.add(egui::Label::new(theme::job_data(
+                                recovery,
+                                theme::TEXT_MUTED,
+                            )));
+                            ui.add(egui::Label::new(theme::job_data(
+                                &failure.detail,
+                                theme::TEXT_MUTED,
+                            )));
+                        });
+                } else {
+                    ui.add(egui::Label::new(theme::job_data(
+                        &failure.detail,
+                        theme::TEXT_MUTED,
+                    )));
+                }
+                ui.add_space(theme::SPACE_1);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(ui.available_width(), 32.0),
+                    Layout::right_to_left(Align::Center),
+                    |ui| {
+                        let label = i18n::t(lang, Key::Dismiss).to_owned();
+                        if secondary_key(ui, "failure-close", true, &label, theme::SURFACE_2)
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                    },
+                );
+            });
+        if close {
+            self.write_failure = None;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Confirmation dialog
+    // -----------------------------------------------------------------------
+
+    /// Non-modal confirmation dialog.
+    ///
+    /// Background controls stay interactive, so the actual write is re-guarded
+    /// at confirm time: `can_write` (connection, busy, recording), the reviewed
+    /// target (not the current editor selection), and the expected configuration
+    /// SHA-256 in the worker. The dialog itself is only the review surface.
+    fn write_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending.clone() else {
+            return;
+        };
+        let lang = self.lang;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new(i18n::t(lang, Key::ConfirmTitle))
+            .id(Id::new("write-confirm"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(520.0);
+                write_dialog_target(ui, lang, &pending.target);
+                ui.add_space(theme::SPACE_3);
+                ui.add(
+                    egui::Label::new(theme::job_meta(i18n::t(lang, Key::ConfirmBackupNote))).wrap(),
+                );
+                ui.add(egui::Label::new(theme::job_meta(&i18n::format(
+                    lang,
+                    Key::ConfirmBackupDir,
+                    &[self.backup_dir.display().to_string()],
+                ))));
+                ui.add_space(theme::SPACE_2);
+                ui.add(
+                    egui::Label::new(theme::job_meta_color(
+                        i18n::t(lang, Key::ConfirmWarning),
+                        theme::AMBER,
+                    ))
+                    .wrap(),
+                );
+                if self.macro_editor.recording {
+                    ui.add(
+                        egui::Label::new(theme::job_meta_color(
+                            i18n::t(lang, Key::RecordingBlocksWrite),
+                            theme::AMBER,
+                        ))
+                        .wrap(),
+                    );
+                }
+                ui.add_space(theme::SPACE_3);
+                ui.horizontal(|ui| {
+                    let confirm_label = i18n::t(lang, Key::WriteConfirm).to_owned();
+                    if key(
+                        ui,
+                        "write-confirm-yes",
+                        self.can_write(),
+                        KeyKind::Primary,
+                        &confirm_label,
+                        0.10,
+                        theme::SURFACE_2,
+                    )
+                    .clicked()
+                    {
+                        confirm = true;
+                    }
+                    let cancel_label = i18n::t(lang, Key::WriteCancel).to_owned();
+                    if secondary_key(
+                        ui,
+                        "write-confirm-no",
+                        true,
+                        &cancel_label,
+                        theme::SURFACE_2,
+                    )
+                    .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            self.confirm_write(pending);
+        } else if cancel {
+            self.pending = None;
+        }
+    }
+
     fn log_tab(&mut self, ui: &mut egui::Ui) {
         if self.log.is_empty() {
             self.empty_state(ui, Tab::Log);
@@ -1836,6 +2587,7 @@ impl App {
         self.top_bar(ctx);
         self.side_panel(ctx);
         self.central_panel(ctx);
+        self.write_dialog(ctx);
     }
 }
 
@@ -2521,6 +3273,962 @@ fn rssi_bars(rssi: Option<i16>) -> u8 {
     }
 }
 
+/// Turn a reviewed [`PendingWrite`] into the worker command.
+///
+/// The macro target comes from the pending write, not from the current editor
+/// selection: the user can still click the profile/macro combo boxes behind the
+/// dialog, and the reviewed target must be the written one.
+fn pending_command(pending: PendingWrite, backup_dir: PathBuf) -> Option<(Command, Busy)> {
+    let PendingWrite {
+        target,
+        plan,
+        expected_config_sha256,
+        expected_macro_raw_sha256,
+    } = pending;
+    match plan {
+        PendingPlan::Config(plan) => Some((
+            Command::WriteConfig {
+                plan,
+                backup_dir,
+                expected_config_sha256,
+            },
+            Busy::WriteConfig,
+        )),
+        PendingPlan::Macro(plan) => match target {
+            WriteTarget::Macro { slot, index, .. } => {
+                let expected_macro_raw_sha256 = expected_macro_raw_sha256?;
+                Some((
+                    Command::WriteMacro {
+                        slot,
+                        index,
+                        plan,
+                        backup_dir,
+                        expected_config_sha256,
+                        expected_macro_raw_sha256,
+                    },
+                    Busy::WriteMacro,
+                ))
+            }
+            WriteTarget::Config { .. } => None,
+        },
+    }
+}
+
+/// Signals from the macro editor to the application shell.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct MacroTabSignals {
+    read: bool,
+    start_live: bool,
+    record: bool,
+    stop_record: bool,
+    review: bool,
+}
+
+/// The 16 buttons a macro step can hold, in bit order.
+const MACRO_STEP_KEYS: [(&str, KeyMap); 16] = [
+    ("Start", KeyMap::START),
+    ("L3", KeyMap::L3),
+    ("R3", KeyMap::R3),
+    ("Select", KeyMap::SELECT),
+    ("X", KeyMap::X),
+    ("Y", KeyMap::Y),
+    ("Right", KeyMap::RIGHT),
+    ("Left", KeyMap::LEFT),
+    ("Down", KeyMap::DOWN),
+    ("Up", KeyMap::UP),
+    ("L1", KeyMap::L1),
+    ("R1", KeyMap::R1),
+    ("B", KeyMap::B),
+    ("A", KeyMap::A),
+    ("L2", KeyMap::L2),
+    ("R2", KeyMap::R2),
+];
+
+fn write_banner_row(ui: &mut egui::Ui, lang: Lang, key: Key, args: &[String]) {
+    let text = i18n::format(lang, key, args);
+    ui.add(egui::Label::new(theme::job_meta(&text)).wrap());
+}
+
+fn write_dialog_target(ui: &mut egui::Ui, lang: Lang, target: &WriteTarget) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [120.0, theme::LINE_HEIGHT_META],
+            egui::Label::new(theme::job_meta(i18n::t(lang, Key::ConfirmTarget))),
+        );
+        match target {
+            WriteTarget::Config { changes, focus } => {
+                ui.add(egui::Label::new(theme::job_body(i18n::t(
+                    lang,
+                    Key::ConfirmConfigTarget,
+                ))));
+                ui.add_space(theme::SPACE_2);
+                ui.add(egui::Label::new(theme::job_meta(&i18n::format(
+                    lang,
+                    Key::ConfirmChangeCount,
+                    &[changes.len().to_string()],
+                ))));
+                let _ = focus;
+            }
+            WriteTarget::Macro {
+                slot,
+                index,
+                steps,
+                total_ms,
+                ..
+            } => {
+                ui.add(egui::Label::new(theme::job_body(&i18n::format(
+                    lang,
+                    Key::ConfirmMacroTarget,
+                    &[slot.number().to_string(), (index.index() + 1).to_string()],
+                ))));
+                let _ = (steps, total_ms);
+            }
+        }
+    });
+    ui.add_space(theme::SPACE_1);
+    match target {
+        WriteTarget::Config { changes, .. } => {
+            if !changes.is_empty() {
+                ui.scope(|ui| {
+                    ui.spacing_mut().interact_size.y = theme::LINE_HEIGHT_META;
+                    for change in changes {
+                        ui.add(egui::Label::new(theme::job_data(
+                            &i18n::change_text(lang, *change),
+                            theme::TEXT_BODY,
+                        )));
+                    }
+                });
+            }
+        }
+        WriteTarget::Macro {
+            slot,
+            index,
+            steps,
+            total_ms,
+            name,
+            trigger,
+            cycles,
+            interval_ms,
+            changes,
+        } => {
+            ui.add(
+                egui::Label::new(theme::job_body(&i18n::format(
+                    lang,
+                    Key::ConfirmMacroSummary,
+                    &[
+                        slot.number().to_string(),
+                        (index.index() + 1).to_string(),
+                        steps.to_string(),
+                        total_ms.to_string(),
+                    ],
+                )))
+                .wrap(),
+            );
+            ui.add_space(theme::SPACE_1);
+            ui.add(
+                egui::Label::new(theme::job_data(
+                    &i18n::format(
+                        lang,
+                        Key::ConfirmMacroHeader,
+                        &[
+                            name.clone(),
+                            i18n::key_target_text(lang, *trigger),
+                            cycles.to_string(),
+                            interval_ms.to_string(),
+                        ],
+                    ),
+                    theme::TEXT_BODY,
+                ))
+                .wrap(),
+            );
+            if !changes.is_empty() {
+                ui.add(egui::Label::new(theme::job_meta(
+                    &changes
+                        .iter()
+                        .map(|change| i18n::macro_change_text(lang, *change))
+                        .collect::<Vec<_>>()
+                        .join(" / "),
+                )));
+            }
+        }
+    }
+}
+
+fn labeled_control(ui: &mut egui::Ui, label: impl Into<String>, add: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [180.0, theme::LINE_HEIGHT_CONTROL],
+            egui::Label::new(theme::job_meta(&label.into())),
+        );
+        add(ui);
+    });
+}
+
+fn checkbox_flag(ui: &mut egui::Ui, label: &str, flag: &mut u32) -> bool {
+    let mut on = *flag == 1;
+    let changed = ui.checkbox(&mut on, label).changed();
+    if changed {
+        *flag = u32::from(on);
+    }
+    changed
+}
+
+fn argb_picker(ui: &mut egui::Ui, argb: &mut Argb) -> bool {
+    let mut rgb = [argb.r(), argb.g(), argb.b()];
+    let changed = ui.color_edit_button_srgb(&mut rgb).changed();
+    if changed {
+        *argb = Argb::from_rgba(rgb[0], rgb[1], rgb[2], 0xFF);
+    }
+    changed
+}
+
+fn key_target_combo(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    lang: Lang,
+    value: &mut KeyMap,
+) -> bool {
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(i18n::key_target_text(lang, *value))
+        .width(180.0)
+        .show_ui(ui, |ui| {
+            for target in KEY_TARGETS {
+                if ui
+                    .selectable_value(value, target, i18n::key_target_text(lang, target))
+                    .changed()
+                {
+                    changed = true;
+                }
+            }
+        });
+    changed
+}
+
+/// Settings editor. Pure UI over a [`SettingsDraft`]; the caller owns the
+/// enabled/disabled wrapper and the write actions.
+fn settings_editor(
+    ui: &mut egui::Ui,
+    lang: Lang,
+    config: &eightbitdo_protocol::config_bt2::Bt2Config,
+    settings: &mut SettingsDraft,
+    slot: &mut Slot,
+) {
+    section_label(ui, lang, Key::SectionProfileSettings);
+    ui.add_space(theme::SPACE_2);
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [180.0, theme::LINE_HEIGHT_CONTROL],
+            egui::Label::new(theme::job_meta(i18n::t(lang, Key::MacroProfile))),
+        );
+        for candidate in Slot::ALL {
+            let label = i18n::profile_text(lang, candidate.number());
+            if ui.selectable_label(*slot == candidate, label).clicked() {
+                *slot = candidate;
+            }
+        }
+    });
+    let index = slot.index();
+
+    let mut mode_selected = settings.gamepad_mode;
+    labeled_control(ui, i18n::t(lang, Key::GamepadMode), |ui| {
+        let selected = mode_selected.map_or_else(
+            || i18n::gamepad_mode_text(lang, config.gamepad_mode_raw()),
+            |mode| i18n::gamepad_mode_text(lang, mode as u16),
+        );
+        egui::ComboBox::from_id_salt("settings-gamepad-mode")
+            .selected_text(selected)
+            .width(180.0)
+            .show_ui(ui, |ui| {
+                for mode in GAMEPAD_MODES {
+                    ui.selectable_value(
+                        &mut settings.gamepad_mode,
+                        Some(mode),
+                        i18n::gamepad_mode_text(lang, mode as u16),
+                    );
+                }
+            });
+        mode_selected = settings.gamepad_mode;
+    });
+
+    labeled_control(ui, i18n::t(lang, Key::ActiveProfile), |ui| {
+        let selected = settings.cur_slot.map_or_else(
+            || i18n::t(lang, Key::ProfileNoSelection).to_string(),
+            |slot| i18n::profile_text(lang, slot.number()),
+        );
+        egui::ComboBox::from_id_salt("settings-active-profile")
+            .selected_text(selected)
+            .width(180.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut settings.cur_slot,
+                    None,
+                    i18n::t(lang, Key::ProfileNoSelection),
+                );
+                for candidate in Slot::ALL {
+                    ui.selectable_value(
+                        &mut settings.cur_slot,
+                        Some(candidate),
+                        i18n::profile_text(lang, candidate.number()),
+                    );
+                }
+            });
+    });
+
+    labeled_control(ui, i18n::t(lang, Key::ProfileNameLabel), |ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut settings.profile_names[index])
+                .desired_width(260.0)
+                .hint_text(i18n::t(lang, Key::ProfileNameHint)),
+        );
+    });
+    if let Err(error) = write::validate_name(&settings.profile_names[index], *slot) {
+        ui.add(egui::Label::new(theme::job_meta_color(
+            &i18n::draft_error_text(lang, &error),
+            theme::RED,
+        )));
+    }
+    ui.add(egui::Label::new(theme::job_meta(i18n::t(
+        lang,
+        Key::ProfileNameHint,
+    ))));
+
+    ui.add_space(theme::SPACE_4);
+    section_label(ui, lang, Key::SectionRumble);
+    ui.add_space(theme::SPACE_2);
+    checkbox_flag(
+        ui,
+        i18n::t(lang, Key::RumbleEnabled),
+        &mut settings.rumble[index].flag,
+    );
+    labeled_control(ui, i18n::t(lang, Key::RumbleLeft), |ui| {
+        ui.add(egui::Slider::new(&mut settings.rumble[index].left, 0.0..=1.0).fixed_decimals(2));
+    });
+    labeled_control(ui, i18n::t(lang, Key::RumbleRight), |ui| {
+        ui.add(egui::Slider::new(&mut settings.rumble[index].right, 0.0..=1.0).fixed_decimals(2));
+    });
+
+    ui.add_space(theme::SPACE_4);
+    section_label(ui, lang, Key::SectionSticks);
+    ui.add_space(theme::SPACE_2);
+    checkbox_flag(
+        ui,
+        i18n::t(lang, Key::StickEnabled),
+        &mut settings.joy[index].flag,
+    );
+    ui.scope(|ui| {
+        ui.spacing_mut().slider_width = 160.0;
+        labeled_control(ui, i18n::t(lang, Key::StickLeftStart), |ui| {
+            ui.add(egui::Slider::new(
+                &mut settings.joy[index].left_start_value,
+                0..=127,
+            ));
+        });
+        labeled_control(ui, i18n::t(lang, Key::StickLeftEnd), |ui| {
+            ui.add(egui::Slider::new(
+                &mut settings.joy[index].left_end_value,
+                0..=128,
+            ));
+        });
+        labeled_control(ui, i18n::t(lang, Key::StickRightStart), |ui| {
+            ui.add(egui::Slider::new(
+                &mut settings.joy[index].right_start_value,
+                0..=127,
+            ));
+        });
+        labeled_control(ui, i18n::t(lang, Key::StickRightEnd), |ui| {
+            ui.add(egui::Slider::new(
+                &mut settings.joy[index].right_end_value,
+                0..=128,
+            ));
+        });
+    });
+
+    ui.add_space(theme::SPACE_4);
+    section_label(ui, lang, Key::SectionTriggers);
+    ui.add_space(theme::SPACE_2);
+    checkbox_flag(
+        ui,
+        i18n::t(lang, Key::TriggerEnabled),
+        &mut settings.trigger[index].flag,
+    );
+    ui.scope(|ui| {
+        ui.spacing_mut().slider_width = 160.0;
+        labeled_control(ui, i18n::t(lang, Key::TriggerLeftStart), |ui| {
+            ui.add(egui::Slider::new(
+                &mut settings.trigger[index].left_start_value,
+                0..=255,
+            ));
+        });
+        labeled_control(ui, i18n::t(lang, Key::TriggerLeftEnd), |ui| {
+            ui.add(egui::Slider::new(
+                &mut settings.trigger[index].left_end_value,
+                0..=255,
+            ));
+        });
+        labeled_control(ui, i18n::t(lang, Key::TriggerRightStart), |ui| {
+            ui.add(egui::Slider::new(
+                &mut settings.trigger[index].right_start_value,
+                0..=255,
+            ));
+        });
+        labeled_control(ui, i18n::t(lang, Key::TriggerRightEnd), |ui| {
+            ui.add(egui::Slider::new(
+                &mut settings.trigger[index].right_end_value,
+                0..=255,
+            ));
+        });
+    });
+
+    ui.add_space(theme::SPACE_4);
+    section_label(ui, lang, Key::SectionSpecial);
+    ui.add_space(theme::SPACE_2);
+    checkbox_flag(
+        ui,
+        i18n::t(lang, Key::SpecialEnabled),
+        &mut settings.special[index].flag,
+    );
+    ui.horizontal_wrapped(|ui| {
+        let mut bits = settings.special[index].features.bits();
+        for feature in SPECIAL_FEATURES {
+            let mut on = bits & feature.bits() != 0;
+            if ui
+                .checkbox(&mut on, i18n::special_feature_text(lang, feature))
+                .changed()
+            {
+                if on {
+                    bits |= feature.bits();
+                } else {
+                    bits &= !feature.bits();
+                }
+            }
+        }
+        settings.special[index].features = SpecialFeature(bits);
+    });
+
+    ui.add_space(theme::SPACE_4);
+    section_label(ui, lang, Key::SectionGyro);
+    ui.add_space(theme::SPACE_2);
+    let gyro = &mut settings.six_axis[index];
+    checkbox_flag(ui, i18n::t(lang, Key::GyroEnabled), &mut gyro.flag);
+    labeled_control(ui, i18n::t(lang, Key::GyroTriggerMode), |ui| {
+        ui.selectable_value(
+            &mut gyro.trigger_mode,
+            eightbitdo_protocol::config_bt2::gyro_trigger::HOLD,
+            i18n::t(lang, Key::GyroHold),
+        );
+        ui.selectable_value(
+            &mut gyro.trigger_mode,
+            eightbitdo_protocol::config_bt2::gyro_trigger::TOGGLE,
+            i18n::t(lang, Key::GyroToggle),
+        );
+    });
+    labeled_control(ui, i18n::t(lang, Key::GyroSensitivity), |ui| {
+        ui.add(egui::Slider::new(&mut gyro.sensitivity, 1..=15));
+    });
+    labeled_control(ui, i18n::t(lang, Key::GyroDeadCompensate), |ui| {
+        ui.add(egui::Slider::new(&mut gyro.dead_compensate, 0..=255));
+    });
+    labeled_control(ui, i18n::t(lang, Key::GyroMapping), |ui| {
+        ui.selectable_value(
+            &mut gyro.mapping_type,
+            eightbitdo_protocol::config_bt2::gyro_target::LEFT_STICK,
+            i18n::t(lang, Key::LeftStick),
+        );
+        ui.selectable_value(
+            &mut gyro.mapping_type,
+            eightbitdo_protocol::config_bt2::gyro_target::RIGHT_STICK,
+            i18n::t(lang, Key::RightStick),
+        );
+        ui.selectable_value(
+            &mut gyro.mapping_type,
+            eightbitdo_protocol::config_bt2::gyro_target::MOUSE,
+            i18n::t(lang, Key::GyroMouse),
+        );
+    });
+    labeled_control(ui, i18n::t(lang, Key::GyroButton), |ui| {
+        key_target_combo(ui, ("gyro-key", index), lang, &mut gyro.key_map);
+    });
+
+    ui.add_space(theme::SPACE_4);
+    section_label(ui, lang, Key::SectionLed);
+    ui.add_space(theme::SPACE_2);
+    ui.collapsing(i18n::t(lang, Key::LedDynamic), |ui| {
+        let theme = &mut settings.dynamic[index];
+        checkbox_flag(ui, i18n::t(lang, Key::LedEnabled), &mut theme.flag);
+        labeled_control(ui, i18n::t(lang, Key::LedForeground), |ui| {
+            argb_picker(ui, &mut theme.color);
+        });
+        labeled_control(ui, i18n::t(lang, Key::LedBackground), |ui| {
+            argb_picker(ui, &mut theme.bg_color);
+        });
+    });
+    ui.collapsing(i18n::t(lang, Key::LedHotWheel), |ui| {
+        let theme = &mut settings.hotwheel[index];
+        checkbox_flag(ui, i18n::t(lang, Key::LedEnabled), &mut theme.flag);
+        labeled_control(ui, i18n::t(lang, Key::LedForeground), |ui| {
+            argb_picker(ui, &mut theme.color);
+        });
+        labeled_control(ui, i18n::t(lang, Key::LedBackground), |ui| {
+            argb_picker(ui, &mut theme.bg_color);
+        });
+        labeled_control(ui, i18n::t(lang, Key::LedSpeed), |ui| {
+            ui.add(egui::Slider::new(&mut theme.speed, 0..=15));
+        });
+    });
+    ui.collapsing(i18n::t(lang, Key::LedSingle), |ui| {
+        let theme = &mut settings.single[index];
+        checkbox_flag(ui, i18n::t(lang, Key::LedEnabled), &mut theme.flag);
+        let mut color = theme.colors[0];
+        labeled_control(ui, i18n::t(lang, Key::LedAllColor), |ui| {
+            if argb_picker(ui, &mut color) {
+                settings.set_single_color(*slot, color);
+            }
+        });
+    });
+
+    ui.add_space(theme::SPACE_4);
+    section_label(ui, lang, Key::SectionRemap);
+    ui.add_space(theme::SPACE_2);
+    // The draft stores the flag as a bool so the written value stays 0/1.
+    let mut remap_on = settings.remap[index].enabled;
+    if ui
+        .checkbox(&mut remap_on, i18n::t(lang, Key::RemapEnabled))
+        .changed()
+    {
+        settings.remap[index].enabled = remap_on;
+        settings.remap[index].flag_touched = true;
+    }
+    ui.add(egui::Label::new(theme::job_meta(i18n::t(
+        lang,
+        Key::RemapHint,
+    ))));
+    ui.add_space(theme::SPACE_1);
+    let mut preserved_unsupported = 0usize;
+    for button in ButtonIndex::ALL {
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [150.0, theme::LINE_HEIGHT_CONTROL],
+                egui::Label::new(theme::text_job(
+                    i18n::button_name(lang, button.label()),
+                    theme::medium(theme::FONT_BODY),
+                    theme::TEXT_BODY,
+                    0.0,
+                    Some(theme::LINE_HEIGHT_CONTROL),
+                )),
+            );
+            let current = settings.remap[index].keys[button.index()];
+            key_target_combo(
+                ui,
+                ("remap", index, button.index()),
+                lang,
+                &mut settings.remap[index].keys[button.index()],
+            );
+            let target = settings.remap[index].keys[button.index()];
+            if !write::is_valid_key_target(target) {
+                if target == current {
+                    preserved_unsupported += 1;
+                } else {
+                    // The combo only offers valid keys, so this is a defensive
+                    // path for a hand-built draft.
+                    ui.add(egui::Label::new(theme::job_meta_color(
+                        &i18n::format(
+                            lang,
+                            Key::RemapUnsupported,
+                            &[format!("{:08X}", target.bits())],
+                        ),
+                        theme::AMBER,
+                    )));
+                }
+            }
+        });
+    }
+    if preserved_unsupported > 0 {
+        ui.add(egui::Label::new(theme::job_meta_color(
+            &i18n::format(
+                lang,
+                Key::RemapPreservedCount,
+                &[preserved_unsupported.to_string()],
+            ),
+            theme::AMBER,
+        )));
+    }
+    let _ = *slot;
+}
+
+/// Macro editor UI. The application shell handles the returned signals.
+fn macro_editor_ui(
+    ui: &mut egui::Ui,
+    lang: Lang,
+    config: &ConfigView,
+    editor: &mut MacroEditor,
+    live: bool,
+    can_read: bool,
+    can_write: bool,
+) -> MacroTabSignals {
+    let mut signals = MacroTabSignals::default();
+
+    section_label(ui, lang, Key::SectionMacroEditor);
+    ui.add_space(theme::SPACE_2);
+    let mut slot = editor.slot;
+    let mut index = editor.index;
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [120.0, theme::LINE_HEIGHT_CONTROL],
+            egui::Label::new(theme::job_meta(i18n::t(lang, Key::MacroProfile))),
+        );
+        egui::ComboBox::from_id_salt("macro-slot")
+            .selected_text(i18n::profile_text(lang, slot.number()))
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                for candidate in Slot::ALL {
+                    ui.selectable_value(
+                        &mut slot,
+                        candidate,
+                        i18n::profile_text(lang, candidate.number()),
+                    );
+                }
+            });
+        ui.add_space(theme::SPACE_3);
+        ui.add_sized(
+            [80.0, theme::LINE_HEIGHT_CONTROL],
+            egui::Label::new(theme::job_meta(i18n::t(lang, Key::MacroIndexLabel))),
+        );
+        egui::ComboBox::from_id_salt("macro-index")
+            .selected_text(format!("M{}", index.index() + 1))
+            .width(110.0)
+            .show_ui(ui, |ui| {
+                for candidate in MacroIndex::ALL {
+                    ui.selectable_value(
+                        &mut index,
+                        candidate,
+                        format!("M{}", candidate.index() + 1),
+                    );
+                }
+            });
+    });
+    if slot != editor.slot || index != editor.index {
+        editor.select(slot, index);
+    }
+    ui.add_space(theme::SPACE_2);
+    ui.horizontal(|ui| {
+        let read_label = i18n::t(lang, Key::MacroLoad).to_owned();
+        if secondary_key(ui, "macro-read", can_read, &read_label, theme::BG)
+            .on_hover_text(i18n::t(lang, Key::MacroLoadHint))
+            .clicked()
+        {
+            signals.read = true;
+        }
+    });
+
+    let target = &config.macro_slots[editor.slot.index()].records[editor.index.index()];
+    ui.add_space(theme::SPACE_2);
+    data_grid(
+        ui,
+        &[
+            (
+                i18n::t(lang, Key::TableName).to_owned(),
+                if target.name.is_empty() {
+                    i18n::t(lang, Key::EmptyProfileName).to_owned()
+                } else {
+                    target.name.clone()
+                },
+                ValueKind::Text,
+            ),
+            (
+                i18n::t(lang, Key::TableSteps).to_owned(),
+                target.max_steps.to_string(),
+                ValueKind::Data,
+            ),
+            (
+                i18n::t(lang, Key::TableKeyMap).to_owned(),
+                target.key_map.clone(),
+                ValueKind::Data,
+            ),
+        ],
+    );
+    let target_empty = target.max_steps == 0 || target.max_steps == u16::MAX;
+    if target_empty {
+        ui.add_space(theme::SPACE_2);
+        ui.add(
+            egui::Label::new(theme::job_body_color(
+                i18n::t(lang, Key::MacroEmptyTarget),
+                theme::AMBER,
+            ))
+            .wrap(),
+        );
+        return signals;
+    }
+
+    if !editor.is_loaded() || editor.draft.is_none() || editor.original.is_none() {
+        ui.add_space(theme::SPACE_3);
+        ui.add(egui::Label::new(theme::job_meta(i18n::t(lang, Key::MacroNotLoaded))).wrap());
+        return signals;
+    }
+
+    ui.add_space(theme::SPACE_3);
+    let original = editor
+        .original
+        .as_ref()
+        .expect("the editor was checked to have an original")
+        .clone();
+
+    ui.horizontal(|ui| {
+        if editor.recording {
+            let stop_label = i18n::t(lang, Key::MacroStopRecording).to_owned();
+            if secondary_key(ui, "macro-record-stop", true, &stop_label, theme::BG).clicked() {
+                signals.stop_record = true;
+            }
+        } else {
+            let start_label = i18n::t(lang, Key::MacroStartRecording).to_owned();
+            if secondary_key(
+                ui,
+                "macro-record-start",
+                can_read && !target_empty,
+                &start_label,
+                theme::BG,
+            )
+            .clicked()
+            {
+                if live {
+                    signals.record = true;
+                } else {
+                    signals.start_live = true;
+                }
+            }
+            if !live {
+                ui.add(egui::Label::new(theme::job_meta(i18n::t(
+                    lang,
+                    Key::MacroRecordingNeedsLive,
+                ))));
+            }
+        }
+    });
+    ui.add(egui::Label::new(theme::job_meta(i18n::t(
+        lang,
+        Key::MacroRecordingHint,
+    ))));
+    ui.add_space(theme::SPACE_3);
+
+    {
+        let draft = editor
+            .draft
+            .as_mut()
+            .expect("the editor was checked to have a draft");
+        section_label(ui, lang, Key::SectionMacroHeader);
+        ui.add_space(theme::SPACE_2);
+        labeled_control(ui, i18n::t(lang, Key::Name), |ui| {
+            ui.add(egui::TextEdit::singleline(&mut draft.name).desired_width(220.0));
+        });
+        labeled_control(ui, i18n::t(lang, Key::MacroTrigger), |ui| {
+            key_target_combo(ui, "macro-trigger", lang, &mut draft.key_map);
+        });
+        labeled_control(ui, i18n::t(lang, Key::MacroCycles), |ui| {
+            ui.add(egui::DragValue::new(&mut draft.cycles_num).range(0..=MAX_CYCLES));
+        });
+        labeled_control(ui, i18n::t(lang, Key::MacroInterval), |ui| {
+            ui.add(egui::DragValue::new(&mut draft.interval_ms).range(0..=MAX_INTERVAL_MS));
+        });
+    }
+
+    ui.add_space(theme::SPACE_4);
+    section_label(ui, lang, Key::SectionMacroSteps);
+    ui.add_space(theme::SPACE_2);
+    {
+        let draft = editor
+            .draft
+            .as_ref()
+            .expect("the editor was checked to have a draft");
+        ui.add(egui::Label::new(theme::job_meta(&i18n::format(
+            lang,
+            Key::MacroTotalDuration,
+            &[draft.total_ms().to_string(), draft.steps.len().to_string()],
+        ))));
+        ui.add(egui::Label::new(theme::job_meta(i18n::t(
+            lang,
+            Key::MacroSelectStepHint,
+        ))));
+    }
+    ui.add_space(theme::SPACE_1);
+    let mut selected = editor.selected_step;
+    {
+        let draft = editor
+            .draft
+            .as_ref()
+            .expect("the editor was checked to have a draft");
+        egui::ScrollArea::vertical()
+            .id_salt("macro-steps")
+            .max_height(280.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("macro-steps-horizontal")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for (index, step) in draft.steps.iter().enumerate() {
+                            let is_selected = selected == Some(index);
+                            let keys =
+                                i18n::keymap_text(lang, KeyMap::from_bits(u32::from(step.keys)));
+                            let sticks = format!(
+                                "x={} y={} / x={} y={}",
+                                step.left_x, step.left_y, step.right_x, step.right_y
+                            );
+                            let triggers = format!(
+                                "{} / {}",
+                                i18n::format(lang, Key::TriggerL, &[step.lt_value.to_string()]),
+                                i18n::format(lang, Key::TriggerR, &[step.rt_value.to_string()])
+                            );
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .selectable_label(is_selected, format!("#{}", index + 1))
+                                    .clicked()
+                                {
+                                    selected = Some(index);
+                                }
+                                ui.add_sized(
+                                    [72.0, theme::LINE_HEIGHT_META],
+                                    egui::Label::new(theme::job_data(
+                                        &format!("{} ms", step.ms_times),
+                                        theme::TEXT_BODY,
+                                    )),
+                                );
+                                ui.add_sized(
+                                    [170.0, theme::LINE_HEIGHT_META],
+                                    egui::Label::new(theme::job_data(&keys, theme::TEXT_BODY))
+                                        .truncate(),
+                                );
+                                ui.add_sized(
+                                    [190.0, theme::LINE_HEIGHT_META],
+                                    egui::Label::new(theme::job_data(&sticks, theme::TEXT_MUTED))
+                                        .truncate(),
+                                );
+                                ui.add_sized(
+                                    [160.0, theme::LINE_HEIGHT_META],
+                                    egui::Label::new(theme::job_data(&triggers, theme::TEXT_MUTED))
+                                        .truncate(),
+                                );
+                            });
+                        }
+                    });
+            });
+    }
+    editor.selected_step = selected;
+
+    if let Some(index) = editor.selected_step {
+        if let Some(draft) = editor.draft.as_mut() {
+            if let Some(step) = draft.steps.get_mut(index) {
+                ui.add_space(theme::SPACE_2);
+                labeled_control(ui, i18n::t(lang, Key::MacroStepMs), |ui| {
+                    ui.add(egui::DragValue::new(&mut step.ms_times).range(1..=u16::MAX));
+                });
+                labeled_control(ui, i18n::t(lang, Key::MacroStepKeys), |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, flag) in MACRO_STEP_KEYS {
+                            let mut on = step.keys & flag.bits() as u16 != 0;
+                            if ui.checkbox(&mut on, label).changed() {
+                                if on {
+                                    step.keys |= flag.bits() as u16;
+                                } else {
+                                    step.keys &= !(flag.bits() as u16);
+                                }
+                            }
+                        }
+                    });
+                });
+                ui.add(egui::Label::new(theme::job_meta(i18n::t(
+                    lang,
+                    Key::MacroKeysHint,
+                ))));
+                ui.scope(|ui| {
+                    ui.spacing_mut().slider_width = 80.0;
+                    labeled_control(ui, i18n::t(lang, Key::MacroStepSticks), |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add(egui::Slider::new(&mut step.left_x, 0..=255).text("LX"));
+                            ui.add(egui::Slider::new(&mut step.left_y, 0..=255).text("LY"));
+                            ui.add(egui::Slider::new(&mut step.right_x, 0..=255).text("RX"));
+                            ui.add(egui::Slider::new(&mut step.right_y, 0..=255).text("RY"));
+                        });
+                    });
+                    labeled_control(ui, i18n::t(lang, Key::MacroStepTriggers), |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add(egui::Slider::new(&mut step.lt_value, 0..=255).text("L2"));
+                            ui.add(egui::Slider::new(&mut step.rt_value, 0..=255).text("R2"));
+                        });
+                    });
+                });
+            }
+        }
+    }
+
+    ui.add_space(theme::SPACE_2);
+    let can_delete = editor
+        .draft
+        .as_ref()
+        .is_some_and(|draft| draft.steps.len() > 1);
+    ui.horizontal(|ui| {
+        let delete_label = i18n::t(lang, Key::MacroDeleteStep).to_owned();
+        if secondary_key(
+            ui,
+            "macro-delete",
+            editor.selected_step.is_some() && can_delete,
+            &delete_label,
+            theme::BG,
+        )
+        .clicked()
+        {
+            editor.delete_selected();
+        }
+        let insert_label = i18n::t(lang, Key::MacroInsertWait).to_owned();
+        if secondary_key(ui, "macro-insert-wait", true, &insert_label, theme::BG).clicked() {
+            editor.insert_wait();
+        }
+        ui.add(egui::Label::new(theme::job_meta(i18n::t(
+            lang,
+            Key::MacroWaitMs,
+        ))));
+        ui.add(egui::DragValue::new(&mut editor.wait_ms).range(1..=u16::MAX));
+    });
+
+    let (validation, changes) = {
+        let draft = editor
+            .draft
+            .as_ref()
+            .expect("the editor was checked to have a draft");
+        (draft.validate(&original), draft.changes(&original))
+    };
+    if !changes.is_empty() {
+        ui.add_space(theme::SPACE_2);
+        ui.add(egui::Label::new(theme::job_meta(
+            &changes
+                .iter()
+                .map(|change| i18n::macro_change_text(lang, *change))
+                .collect::<Vec<_>>()
+                .join(" / "),
+        )));
+    }
+    if let Err(error) = &validation {
+        ui.add(egui::Label::new(theme::job_body_color(
+            &i18n::draft_error_text(lang, error),
+            theme::RED,
+        )));
+    }
+    ui.add_space(theme::SPACE_2);
+    let review_label = i18n::t(lang, Key::MacroWriteAction).to_owned();
+    if secondary_key(
+        ui,
+        "macro-review",
+        can_write && !editor.recording && validation.is_ok() && !changes.is_empty(),
+        &review_label,
+        theme::BG,
+    )
+    .clicked()
+    {
+        signals.review = true;
+    }
+
+    signals
+}
+
 #[cfg(test)]
 mod tests {
     use eightbitdo_core::ConfigSnapshot;
@@ -2528,17 +4236,74 @@ mod tests {
 
     use super::*;
 
-    fn config_view() -> ConfigView {
+    fn config_snapshot() -> ConfigSnapshot {
         let config = Bt2Config::default();
         let stored_crc = config.crc16_stored() as u16;
         let mut check = config.clone();
         let computed_crc = check.recompute_crc();
-        ConfigView::from_snapshot(&ConfigSnapshot {
+        ConfigSnapshot {
             config,
             stored_crc,
             computed_crc,
             crc_valid: stored_crc == computed_crc,
-        })
+        }
+    }
+
+    fn config_view() -> ConfigView {
+        ConfigView::from_snapshot(&config_snapshot())
+    }
+
+    fn config_event() -> Event {
+        config_event_with(config_snapshot())
+    }
+
+    fn config_event_with(snapshot: ConfigSnapshot) -> Event {
+        Event::Config {
+            snapshot: Box::new(snapshot.clone()),
+            view: Box::new(ConfigView::from_snapshot(&snapshot)),
+        }
+    }
+
+    fn config_snapshot_with_macro() -> ConfigSnapshot {
+        use eightbitdo_protocol::config_bt2::MacroSlot;
+
+        let mut config = Bt2Config::default();
+        let mut header = MacroSlot::default();
+        header.records[0].max_steps = 2;
+        config.set_macro_slot(Slot::S1, &header);
+        config.recompute_crc();
+        let stored_crc = config.crc16_stored() as u16;
+        let mut check = config.clone();
+        let computed_crc = check.recompute_crc();
+        ConfigSnapshot {
+            config,
+            stored_crc,
+            computed_crc,
+            crc_valid: stored_crc == computed_crc,
+        }
+    }
+
+    fn loaded_macro() -> eightbitdo_core::macro_ops::MacroEntry {
+        use eightbitdo_protocol::config_bt2::MacroRecord;
+        use eightbitdo_protocol::macro_data::{encode_macro_steps, MacroStep};
+
+        let steps = vec![MacroStep::neutral(20), MacroStep::neutral(20)];
+        let raw = encode_macro_steps(&steps).unwrap()[..steps.len() * 10].to_vec();
+        let record = MacroRecord {
+            max_steps: steps.len() as u16,
+            ..MacroRecord::default()
+        };
+        eightbitdo_core::macro_ops::MacroEntry::new(Slot::S1, MacroIndex::M1, record, raw).unwrap()
+    }
+
+    fn backup_report() -> BackupReport {
+        BackupReport {
+            raw_path: PathBuf::from("target/test-backups/prewrite-config.bin"),
+            json_path: PathBuf::from("target/test-backups/prewrite-config.json"),
+            sha256: "0".repeat(64),
+            bytes: 2768,
+            warnings: Vec::new(),
+        }
     }
 
     fn device() -> DeviceInfoView {
@@ -2598,7 +4363,7 @@ mod tests {
         }));
         assert!(app.busy.is_some(), "auto configuration read still runs");
 
-        app.handle_event(Event::Config(Box::new(config_view())));
+        app.handle_event(config_event());
         app.handle_event(Event::Live(true));
         app.handle_event(Event::Input(InputView::default()));
         assert!(app.input.is_some());
@@ -2756,6 +4521,211 @@ mod tests {
     }
 
     #[test]
+    fn write_events_populate_results_failures_and_the_macro_editor() {
+        let mut app = app();
+        app.handle_event(config_event());
+        assert!(app.settings.is_some());
+        assert!(app.config_snapshot.is_some());
+
+        app.handle_event(Event::WriteBackup(BackupRef::from(&backup_report())));
+        assert!(app.last_write_backup.is_some());
+
+        app.handle_event(Event::ConfigWritten(Box::new(ConfigWriteReport {
+            backup: backup_report(),
+            snapshot: config_snapshot(),
+            view: config_view(),
+            changed: Vec::new(),
+            packets_sent: 1,
+            crc: eightbitdo_core::config_ops::ConfigCrcStatus {
+                expected: 0,
+                stored: 0,
+                recomputed: 0,
+                recomputed_from_sent: 0,
+            },
+        })));
+        assert!(matches!(app.write_result, Some(WriteOutcome::Config(_))));
+        assert!(app.write_failure.is_none());
+
+        app.handle_event(Event::WriteFailed(Box::new(WriteFailure {
+            phase: WritePhase::Device,
+            detail: "timeout".to_string(),
+            backup: Some(BackupRef::from(&backup_report())),
+            recovery: Some("recovery".to_string()),
+            disconnected: false,
+        })));
+        assert!(app.write_result.is_none());
+        assert!(app.write_failure.is_some());
+
+        app.handle_event(Event::MacroLoaded {
+            slot: Slot::S1,
+            index: MacroIndex::M1,
+            entry: Box::new(loaded_macro()),
+        });
+        assert!(app.macro_editor.is_loaded());
+
+        app.macro_editor.begin_recording();
+        assert!(app.macro_editor.recording);
+        app.handle_event(Event::Input(InputView::default()));
+        assert!(!app.macro_editor.recorder.is_empty());
+        app.handle_event(Event::Live(false));
+        assert!(!app.macro_editor.recording);
+    }
+
+    #[test]
+    fn review_opens_a_pending_write_only_for_a_change_and_confirmation_needs_the_link() {
+        let mut app = app();
+        app.handle_event(config_event());
+        assert!(!app.can_write(), "a disconnected link cannot write");
+
+        app.settings.as_mut().unwrap().profile_names[0] = "Edited".to_string();
+        app.review_settings();
+        assert!(
+            matches!(
+                app.pending,
+                Some(PendingWrite {
+                    target: WriteTarget::Config { .. },
+                    ..
+                })
+            ),
+            "review opens the confirmation dialog for a real change"
+        );
+        let pending = app.pending.take().unwrap();
+        app.confirm_write(pending);
+        assert!(app.pending.is_none());
+        assert!(
+            app.busy.is_none(),
+            "confirming while disconnected must not start a write"
+        );
+
+        app.connection = ConnectionState::Connected;
+        app.settings = Some(SettingsDraft::from_config(&config_snapshot().config));
+        app.review_settings();
+        assert_eq!(app.draft_error, Some(DraftError::NoChanges));
+        assert!(app.pending.is_none());
+    }
+
+    #[test]
+    fn macro_review_requires_a_loaded_existing_macro() {
+        let mut app = app();
+        app.handle_event(config_event());
+        app.macro_editor.load(loaded_macro());
+        app.review_macro();
+        assert_eq!(app.draft_error, Some(DraftError::NoChanges));
+
+        app.macro_editor.draft.as_mut().unwrap().steps[0].ms_times = 40;
+        app.connection = ConnectionState::Connected;
+        app.review_macro();
+        assert!(
+            matches!(
+                app.pending,
+                Some(PendingWrite {
+                    target: WriteTarget::Macro { .. },
+                    ..
+                })
+            ),
+            "a changed macro opens the macro confirmation"
+        );
+    }
+
+    #[test]
+    fn a_reviewed_macro_command_keeps_the_reviewed_target() {
+        let mut app = app();
+        app.handle_event(config_event());
+        app.macro_editor.load(loaded_macro());
+        app.macro_editor.draft.as_mut().unwrap().steps[0].ms_times = 40;
+        app.connection = ConnectionState::Connected;
+        app.review_macro();
+        let pending = app.pending.take().unwrap();
+
+        // The user can change the selection behind the dialog; the reviewed
+        // target must still be the one that is written.
+        app.macro_editor.select(Slot::S3, MacroIndex::M4);
+        let (command, busy) =
+            pending_command(pending, PathBuf::from("target/test-backups")).unwrap();
+        assert_eq!(busy, Busy::WriteMacro);
+        match command {
+            Command::WriteMacro { slot, index, .. } => {
+                assert_eq!(slot, Slot::S1);
+                assert_eq!(index, MacroIndex::M1);
+            }
+            other => panic!("expected a macro write command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recording_blocks_write_confirmation_and_loading_reports_the_stop() {
+        let mut recording_app = app();
+        recording_app.handle_event(config_event());
+        recording_app.connection = ConnectionState::Connected;
+        recording_app.macro_editor.load(loaded_macro());
+        recording_app.macro_editor.begin_recording();
+        assert!(recording_app.macro_editor.recording);
+        assert!(
+            !recording_app.can_write(),
+            "recording must block the write path"
+        );
+
+        recording_app.settings.as_mut().unwrap().profile_names[0] = "Edited".to_string();
+        recording_app.review_settings();
+        assert_eq!(recording_app.draft_error, Some(DraftError::Recording));
+        assert!(recording_app.pending.is_none());
+
+        // A dialog opened before recording must stay open (not silently send).
+        let mut app = app();
+        app.handle_event(config_event());
+        app.connection = ConnectionState::Connected;
+        app.settings.as_mut().unwrap().profile_names[0] = "Edited".to_string();
+        app.review_settings();
+        let pending = app.pending.take().expect("review opens the dialog");
+        app.macro_editor.load(loaded_macro());
+        app.macro_editor.begin_recording();
+        app.confirm_write(pending);
+        assert!(
+            app.pending.is_some(),
+            "the dialog stays open while recording"
+        );
+        assert!(app.busy.is_none(), "no write may be sent while recording");
+
+        app.handle_event(Event::MacroLoaded {
+            slot: Slot::S1,
+            index: MacroIndex::M1,
+            entry: Box::new(loaded_macro()),
+        });
+        assert!(!app.macro_editor.recording);
+        assert!(app
+            .log
+            .iter()
+            .any(|entry| entry.notice.key == Key::LogRecordingStopped));
+    }
+
+    #[test]
+    fn a_config_refresh_drops_a_stale_macro_baseline_and_logs_it() {
+        let mut app = app();
+        app.handle_event(config_event());
+        app.macro_editor.load(loaded_macro());
+        assert!(app.macro_editor.is_loaded());
+
+        // The refreshed configuration has no steps for M1, so the loaded
+        // baseline no longer matches the displayed header.
+        app.handle_event(config_event());
+        assert!(
+            !app.macro_editor.is_loaded(),
+            "a stale macro baseline must not stay loaded"
+        );
+        assert!(app
+            .log
+            .iter()
+            .any(|entry| entry.notice.key == Key::LogMacroReload));
+
+        // A matching refresh keeps the loaded macro intact.
+        let matching = config_snapshot_with_macro();
+        app.handle_event(config_event_with(matching.clone()));
+        app.macro_editor.load(loaded_macro());
+        app.handle_event(config_event_with(matching));
+        assert!(app.macro_editor.is_loaded());
+    }
+
+    #[test]
     fn headless_draw_covers_onboarding_stale_data_and_every_tab() {
         let ctx = egui::Context::default();
         theme::install(&ctx);
@@ -2794,7 +4764,11 @@ mod tests {
             text: None,
             value: Some(200),
         });
-        app.config = Some(config_view());
+        let snapshot = config_snapshot_with_macro();
+        app.settings = Some(SettingsDraft::from_config(&snapshot.config));
+        app.config = Some(ConfigView::from_snapshot(&snapshot));
+        app.config_snapshot = Some(snapshot);
+        app.macro_editor.load(loaded_macro());
         app.error = Some(Notice::new(Key::ErrScanFailed).with_detail("scan failed"));
         let _ = ctx.run(input.clone(), |ctx| app.draw(ctx));
 
@@ -2805,6 +4779,35 @@ mod tests {
             app.tab = tab;
             let _ = ctx.run(input.clone(), |ctx| app.draw(ctx));
         }
+
+        // A confirmation dialog and the result / failure banners paint on top.
+        app.settings.as_mut().unwrap().profile_names[0] = "Combo".to_string();
+        app.review_settings();
+        let _ = ctx.run(input.clone(), |ctx| app.draw(ctx));
+        app.pending = None;
+        app.write_result = Some(WriteOutcome::Config(Box::new(ConfigWriteReport {
+            backup: backup_report(),
+            snapshot: config_snapshot(),
+            view: config_view(),
+            changed: Vec::new(),
+            packets_sent: 1,
+            crc: eightbitdo_core::config_ops::ConfigCrcStatus {
+                expected: 0,
+                stored: 0,
+                recomputed: 0,
+                recomputed_from_sent: 0,
+            },
+        })));
+        let _ = ctx.run(input.clone(), |ctx| app.draw(ctx));
+        app.write_result = None;
+        app.write_failure = Some(Box::new(WriteFailure {
+            phase: WritePhase::Device,
+            detail: "config write failed during Save (NotSaved): timeout".to_string(),
+            backup: Some(BackupRef::from(&backup_report())),
+            recovery: Some("recovery text".to_string()),
+            disconnected: false,
+        }));
+        let _ = ctx.run(input.clone(), |ctx| app.draw(ctx));
 
         // Log rows use a fixed height and the clear key lives in the tab row.
         app.handle_event(Event::Error(
@@ -2935,7 +4938,7 @@ mod tests {
                 })
                 .map(|(_, rect, _)| *rect)
         };
-        let tabs: Vec<Rect> = ["デバイス", "ライブ入力", "設定値", "ログ"]
+        let tabs: Vec<Rect> = ["デバイス", "ライブ入力", "設定値", "設定", "マクロ", "ログ"]
             .iter()
             .map(|label| find_tab(label).unwrap_or_else(|| panic!("missing tab {label}")))
             .collect();
@@ -2973,7 +4976,7 @@ mod tests {
         assert!(
             texts
                 .iter()
-                .any(|(text, _, _)| text == "読み取り専用 / 設定 2768 バイト / マクロ 4×3"),
+                .any(|(text, _, _)| text == "書き込み対応 / 設定 2768 バイト / マクロ 4×3"),
             "the bottom meta line closes the content column"
         );
         let clear = find("ログを消す").expect("clear key is painted");

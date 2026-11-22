@@ -476,9 +476,11 @@ sequenceDiagram
 > **キーマッピング（mapKey）書込の確定仕様（RE・2026-11-22）**:
 > `MapKeyRecord` = `0x0E0 + slot * 0x5C`（`flag` u32 + `key[22]` の 22 × u32）。22 index 順は `A, B, X, Y, L1, R1, L2, R2, L3, R3, Select, Start, Share, Logo, Up, Down, Left, Right, P1/PL, P2/PR, P3/L4, P4/R4`。
 > 単一エントリ書込は `offset = 0x0E4 + slot * 0x5C + idx * 4`, `len = 4`, `total_len = 0x0AD0` で `0x0001` を送り、完了時に共通 onfinished から **`0x0006/0x0067` Save**（Android。Windows USB は `0x0123`）。公式は書込後の read-back を行わない。
-> 変更するのは対象 4B のみで、`flag`（`0` = 無効）は変更しない。`flag` を 1 にするのは `setMapKey` の全 22 + flag 一括コピー経由。全体 2768B 書込でも同じ領域を更新できる（本実装は全体書込 + Save + read-back 検証を使用）。
+> 変更するのは対象 4B のみで、`flag`（静的解析では `0` = 無効。**実機値は 0/1 ではなく、意味は未確定**）は変更しない。`flag` を 1 にするのは `setMapKey` の全 22 + flag 一括コピー経由。全体 2768B 書込でも同じ領域を更新できる（本実装は全体書込 + Save + read-back 検証を使用）。
 > 無効値は `KeyMap_N = 0`。`KeyMap_My_NUll = 227` は書込・表示経路から参照されず用途未確認のため書かない。1 ボタン = 1 つの 32-bit `KeyMap` 値で、ビット合成は確認されていない。
 > **raw 2768B 書込経路も同じ検証を行う**: `config write --file` は 22 個の `key[]` と `gyro[].key_map` を documented single `KeyMap` ホワイトリストで検証し、227・未知ビット・複合値を拒否する（mapKey のビット合成は未確認のため単一値のみ許可）。全レコードの flag は 0/1、マクロ `max_steps` は 0/0xFFFF/1..=200、`total_cnt <= 4` も検証する。**マクロ `key_map` だけは `macro write --trigger` と同じ任意 KeyMap を受理**する（複合トリガーの dump / 復旧を拒否しないため）。数値範囲（joy/hotwheel/gyro/rumble）は flag==1 のときのみ検証し、key_map / flag は常時検証する。未文書値の復旧用に `--force-raw`（検証を警告に降格、予約領域ガードは維持）がある。
+>
+> **実機の `map_key.flag` は 0/1 ではない（2026-11-23）**: 実機バックアップでは **slot 0/1 = `0x20200911`、slot 2 = `0xFFFFFFFF`**。flag の意味は未確定（opaque）であり、`0` = 無効という解釈も未確認である。現行コードの raw 検証は `flag = 0/1` のみ許可するため、実機 dump の書き戻しには **`--force-raw` が必要**（実機値と不整合。コード側の修正は別 PR 予定）。`config remap` は flag を変更しない。実バイト証跡（`slot_flags` / 全レコードの flag / remap の差分 / `--force-raw` エラー）は [DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) を参照。
 
 - **マクロ詳細ステップ (`MacroDatas`, 1 ステップ = 10 バイト)**:
   - `S_UltimateBT2Advance.setMacroStruct` より、1 ステップは以下の `5 x u16` (Little-Endian, 計 10 バイト) で構成される:
@@ -493,6 +495,8 @@ sequenceDiagram
 > **タイムアウト / 再送の実装差（2026-11-22 RE 追記）**: 公式 Android の BLE Save は **2000 ms・最大 2 回再送**（`getSaveCustomConfigChannel` のチャネル設定 `+0x64 = 2000.0f`、`+0x31 = 2`。静的解析）。Windows USB HID は **3 秒**。本リポジトリの config write / macro write は **3 秒・リトライなし**で実装しており、公式 BLE の 2 秒 / 2 再送とは異なる（未確定・暫定方針）。この差は許容し、実機検証で再送が必要と判明した場合にのみ変更する。
 >
 > **USB HID の設定書込は本リポジトリ未実装**: `config write` / `config set` / `config remap` と full 2768B 書込は **BLE のみ**。USB App Mode の実機証跡と transport が揃うまで、USB config write は提供しない（`Save 0x0123` の実装は macro/Save の既存定数のみ）。
+>
+> **実機確認（2026-11-23、BLE・MTU 200・74B chunk）**: full 2768B `config write` は **38 write + 1 Save（合計 39 packets）** で送信され、Save 後の read-back SHA-256 が送信内容と一致した。device は送信した CRC を `stored` として保持し、`in_place` 再計算値とは一致しない（CLI は `sent` / `stored` / `in_place` の 3 解釈を表示する）。`config remap A B` の read-back 反映（A→B）と B→A への復帰も同一接続で確認した。MTU 200 以外の実機挙動は未確認。
 
 - **BLE (Android `getSaveCustomConfigChannel`)**: `cmd = 0x0006`, **`subcmd = 0x0067`** を使用。BLE の `Save` タイムアウトは仕様書に記載がないため、本実装は暫定 3 秒・リトライなしとする（§6.5）。
 - **Windows USB HID (`8BitDoAdvance.dll::saveUltimateBT2`)**: `cmd = 0x0006`, **`subcmd = 0x0123`** を使用（**USB HID の Save タイムアウトは `3` 秒**）。
@@ -660,6 +664,8 @@ Header または最初の Save が失敗した場合、Erase は送らない。�
 
 ダウンロードした `.dat` ファイルは先頭 **`0x1C` (28 バイト) のイメージヘッダ** + 実データ部で構成される（マルチセクションイメージでは後続セクションに別の 28B ヘッダが続く）。
 
+> **本リポジトリの実装範囲（2026-11-23）**: `crates/eightbitdo-core/src/ota.rs` の `.dat` パーサは **先頭 1 セクションのみ**対応し、`28 + image_len` とファイル長が一致しない trailing data（マルチセクション）を `OtaInvalidFirmware` で拒否する。公式 `.dat` がマルチセクションの場合、この実装ではファームウェア更新を実行できない（公式ファーム対応の **blocker**。§8.5「未検証事項」12 と「CLI / GUI / UniFFI 配線時の必須検証」3 を参照）。
+
 - **先頭 28 バイトイメージヘッダ (`header[0..0x1C]`)**:
   - `+0x00` (`u32`): `firmwareFile_Version`（ファームウェアバージョン値）
   - `+0x04` (`u32`): `load_base_addr`（書き込み先 Flash ベースアドレス）
@@ -770,7 +776,7 @@ payload-less の ready ACK が完了 ACK より先に届く場合、Erase 完了
 
 実機 btsnoop 採取のために、モノリシックな `write_firmware` を変更せずに段階停止できる API を追加した。**既定ビルドには存在しない**。
 
-- feature: `eightbitdo-core/ota-bench`（既定 OFF）。`eightbitdo-uniffi` や通常 CLI は有効化しない。
+- feature: `eightbitdo-core/ota-bench`（既定 OFF）。通常 CLI / GUI / UniFFI は有効化しない。
 - `OtaUpdate::write_firmware_with_checkpoint(ready, image, progress, checkpoint) -> OtaBenchOutcome`
   - `OtaCheckpoint::AfterFirstErase`: 最初の `EraseFlash 0x0004` ACK 直後、WriteFirmware の前に停止（最初の Erase ACK 採取用）
   - `OtaCheckpoint::AfterWrites`: 全 WriteFirmware ACK 後、WriteVersion の前に停止
