@@ -17,9 +17,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use eightbitdo_core::{
-    macro_header_chunk_len, macro_ops::is_skipped_steps, macro_write_chunk_len, scan_devices,
-    BleOptions, BleTransport, ConfigSnapshot, Error, MacroBackup, MacroEntry, MacroWritePlan,
-    Session, Transport, VersionInfo,
+    macro_header_chunk_len, macro_ops::is_skipped_steps, macro_write_chunk_len,
+    macro_write_chunk_len_requested, scan_devices, BleOptions, BleTransport, ConfigSnapshot, Error,
+    MacroBackup, MacroEntry, MacroWritePlan, Session, Transport, VersionInfo,
 };
 use eightbitdo_protocol::commands::SaveTransport;
 use eightbitdo_protocol::config_bt2::{
@@ -173,6 +173,10 @@ enum MacroCommand {
         /// `macro-backup-<unix-seconds>-<pid>`.
         #[arg(long, value_name = "DIR")]
         backup_dir: Option<PathBuf>,
+
+        /// Force 32- or 64-byte write chunks. Omit to select from the MTU.
+        #[arg(long, value_name = "32|64")]
+        chunk_size: Option<u16>,
     },
 
     /// Restore all non-empty macros from a backup directory.
@@ -187,6 +191,10 @@ enum MacroCommand {
         /// A failed pre-restore backup always aborts, even with --force.
         #[arg(long)]
         force: bool,
+
+        /// Force 32- or 64-byte write chunks. Omit to select from the MTU.
+        #[arg(long, value_name = "32|64")]
+        chunk_size: Option<u16>,
     },
 }
 
@@ -229,6 +237,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                 file,
                 trigger,
                 backup_dir,
+                chunk_size,
             } => {
                 macro_write(
                     &options,
@@ -237,11 +246,16 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                     &file,
                     trigger.as_deref(),
                     backup_dir.as_deref(),
+                    chunk_size,
                 )
                 .await?;
             }
-            MacroCommand::Restore { dir, force } => {
-                macro_restore(&options, &dir, force).await?;
+            MacroCommand::Restore {
+                dir,
+                force,
+                chunk_size,
+            } => {
+                macro_restore(&options, &dir, force, chunk_size).await?;
             }
         },
         Command::Backup { raw, json, hold } => {
@@ -1128,6 +1142,7 @@ async fn macro_write(
     file: &Path,
     trigger: Option<&str>,
     backup_dir: Option<&Path>,
+    chunk_size: Option<u16>,
 ) -> Result<(), Error> {
     let slot = parse_slot(slot)?;
     let index = parse_macro_index(index)?;
@@ -1140,7 +1155,16 @@ async fn macro_write(
         || default_backup_dir("macro-backup"),
         std::path::Path::to_path_buf,
     );
-    let result = macro_write_session(&session, slot, index, &file, trigger, &backup_dir).await;
+    let result = macro_write_session(
+        &session,
+        slot,
+        index,
+        &file,
+        trigger,
+        &backup_dir,
+        chunk_size,
+    )
+    .await;
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
 }
@@ -1152,9 +1176,12 @@ async fn macro_write_session<T: Transport>(
     file: &MacroFile,
     trigger: Option<KeyMap>,
     backup_dir: &Path,
+    chunk_size: Option<u16>,
 ) -> Result<(), Error> {
     let created = !backup_dir.exists();
-    let result = macro_write_session_inner(session, slot, index, file, trigger, backup_dir).await;
+    let result =
+        macro_write_session_inner(session, slot, index, file, trigger, backup_dir, chunk_size)
+            .await;
     if result.is_err() && created {
         // Do not leave an empty directory behind on an early failure (empty
         // macro, MTU too small, config read failure).
@@ -1170,12 +1197,17 @@ async fn macro_write_session_inner<T: Transport>(
     file: &MacroFile,
     trigger: Option<KeyMap>,
     backup_dir: &Path,
+    chunk_size: Option<u16>,
 ) -> Result<(), Error> {
     let mtu = session.transport().mtu();
     // Fail before creating a pre-write backup directory if this MTU cannot
     // support the macro write at all.
     macro_header_chunk_len(mtu)?;
-    macro_write_chunk_len(mtu)?;
+    if let Some(requested) = chunk_size {
+        macro_write_chunk_len_requested(mtu, requested)?;
+    } else {
+        macro_write_chunk_len(mtu)?;
+    }
     prepare_output_directory(backup_dir)?;
     println!("reading configuration...");
     let snapshot = session.read_config_snapshot().await?;
@@ -1223,6 +1255,7 @@ async fn macro_write_session_inner<T: Transport>(
     }
 
     let mut plan = build_macro_write_plan(file, trigger, &backup, slot, index)?;
+    plan.chunk_size = chunk_size;
     plan.save_transport = SaveTransport::Ble;
 
     println!(
@@ -1434,10 +1467,15 @@ fn ensure_backup_gamepad_mode(
     Ok(())
 }
 
-async fn macro_restore(options: &BleOptions, dir: &Path, force: bool) -> Result<(), Error> {
+async fn macro_restore(
+    options: &BleOptions,
+    dir: &Path,
+    force: bool,
+    chunk_size: Option<u16>,
+) -> Result<(), Error> {
     let transport = BleTransport::connect(options).await?;
     let session = Session::new(transport);
-    let result = macro_restore_session(&session, dir, force).await;
+    let result = macro_restore_session(&session, dir, force, chunk_size).await;
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
 }
@@ -1447,13 +1485,19 @@ fn macro_header_bytes(config: &Bt2Config, slot: Slot) -> &[u8] {
     &config.as_bytes()[offset..offset + MACRO_SLOT_SIZE]
 }
 
-fn restore_macro_plan(entry: &MacroEntry, header: &MacroSlot) -> MacroWritePlan {
-    MacroWritePlan::new(entry.steps().to_vec())
+fn restore_macro_plan(
+    entry: &MacroEntry,
+    header: &MacroSlot,
+    chunk_size: Option<u16>,
+) -> MacroWritePlan {
+    let mut plan = MacroWritePlan::new(entry.steps().to_vec())
         .with_key_map(entry.record().key_map)
         .with_cycles_num(entry.record().cycles_num)
         .with_interval_ms(entry.record().interval_ms)
         .with_header_state(header.flag, header.total_cnt)
-        .with_save_transport(SaveTransport::Ble)
+        .with_save_transport(SaveTransport::Ble);
+    plan.chunk_size = chunk_size;
+    plan
 }
 
 fn config_snapshot(config: Bt2Config) -> ConfigSnapshot {
@@ -1550,9 +1594,10 @@ async fn macro_restore_session<T: Transport>(
     session: &Session<T>,
     dir: &Path,
     force: bool,
+    chunk_size: Option<u16>,
 ) -> Result<(), Error> {
     let pre_dir = pre_restore_dir(dir);
-    macro_restore_session_with_pre_dir(session, dir, force, pre_dir).await
+    macro_restore_session_with_pre_dir(session, dir, force, pre_dir, chunk_size).await
 }
 
 async fn macro_restore_session_with_pre_dir<T: Transport>(
@@ -1560,9 +1605,10 @@ async fn macro_restore_session_with_pre_dir<T: Transport>(
     dir: &Path,
     force: bool,
     pre_dir: PathBuf,
+    chunk_size: Option<u16>,
 ) -> Result<(), Error> {
     let pre_created = !pre_dir.exists();
-    let result = macro_restore_session_core(session, dir, force, &pre_dir).await;
+    let result = macro_restore_session_core(session, dir, force, &pre_dir, chunk_size).await;
     if result.is_err() && pre_created {
         // Keep a non-empty incomplete backup for recovery; remove only an
         // empty directory created before the failure.
@@ -1603,7 +1649,15 @@ async fn macro_restore_session_core<T: Transport>(
     dir: &Path,
     force: bool,
     pre_dir: &Path,
+    chunk_size: Option<u16>,
 ) -> Result<(), Error> {
+    let mtu = session.transport().mtu();
+    macro_header_chunk_len(mtu)?;
+    if let Some(requested) = chunk_size {
+        macro_write_chunk_len_requested(mtu, requested)?;
+    } else {
+        macro_write_chunk_len(mtu)?;
+    }
     let backup = read_restore_backup(dir)?;
     println!("loaded backup: {}", dir.display());
 
@@ -1699,7 +1753,7 @@ async fn macro_restore_session_core<T: Transport>(
                 continue;
             }
             let header = backup.snapshot().config.macro_slot(slot);
-            let plan = restore_macro_plan(entry, &header);
+            let plan = restore_macro_plan(entry, &header, chunk_size);
             println!(
                 "restoring slot {} macro {} ({} steps)...",
                 slot.index(),
@@ -6573,6 +6627,7 @@ mod tests {
             &test_macro_file(),
             None,
             &backup_dir,
+            None,
         )
         .await;
 
@@ -6601,6 +6656,7 @@ mod tests {
             &test_macro_file(),
             None,
             &backup_dir,
+            None,
         )
         .await;
 
@@ -6629,6 +6685,7 @@ mod tests {
             &test_macro_file(),
             None,
             &backup_dir,
+            None,
         )
         .await;
 
@@ -6651,7 +6708,7 @@ mod tests {
         let mock = MockTransport::new();
         push_config_responses(&mock, &current);
         let session = Session::new(&mock);
-        let result = macro_restore_session(&session, &fixture_dir, false).await;
+        let result = macro_restore_session(&session, &fixture_dir, false, None).await;
 
         assert!(result.is_err());
         assert!(!mock
@@ -6671,7 +6728,7 @@ mod tests {
         push_config_responses(&mock, &snapshot.config);
         push_config_responses(&mock, &snapshot.config);
         let session = Session::new(&mock);
-        macro_restore_session(&session, &fixture_dir, false)
+        macro_restore_session(&session, &fixture_dir, false, None)
             .await
             .unwrap();
 
@@ -6698,7 +6755,7 @@ mod tests {
         push_config_responses(&mock, &snapshot.config);
         push_config_responses(&mock, &changed);
         let session = Session::new(&mock);
-        let result = macro_restore_session(&session, &fixture_dir, false).await;
+        let result = macro_restore_session(&session, &fixture_dir, false, None).await;
 
         assert!(matches!(
             result,
@@ -6771,7 +6828,7 @@ mod tests {
         push_config_responses(&mock, &empty_snapshot.config);
 
         let session = Session::new(&mock);
-        macro_restore_session(&session, &empty_dir, true)
+        macro_restore_session(&session, &empty_dir, true, None)
             .await
             .unwrap();
 
@@ -6800,7 +6857,7 @@ mod tests {
         push_config_responses(&mock, &current_snapshot.config);
         push_macro_read(&mock, &current_snapshot.config, Slot::S1, MacroIndex::M1);
         let session = Session::new(&mock);
-        let result = macro_restore_session(&session, &empty_dir, false).await;
+        let result = macro_restore_session(&session, &empty_dir, false, None).await;
 
         assert!(result.is_err());
         assert!(!mock
@@ -6869,7 +6926,7 @@ mod tests {
         push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M1);
 
         let session = Session::new(&mock);
-        macro_restore_session(&session, &fixture_dir, false)
+        macro_restore_session(&session, &fixture_dir, false, None)
             .await
             .unwrap();
 
@@ -6933,6 +6990,7 @@ mod tests {
             &test_macro_file(),
             None,
             &dir,
+            None,
         )
         .await;
         assert!(matches!(result, Err(Error::MtuTooSmall { mtu: 23, .. })));
@@ -7035,7 +7093,7 @@ mod tests {
         push_macro_raw(&mock, &wrong);
 
         let session = Session::new(&mock);
-        let result = macro_restore_session(&session, &fixture_dir, false).await;
+        let result = macro_restore_session(&session, &fixture_dir, false, None).await;
         assert!(matches!(
             result,
             Err(Error::UnexpectedResponse(message))
@@ -7064,10 +7122,13 @@ mod tests {
         let (_, backup) = backup_fixture(&dir);
         let entry = backup.get(Slot::S1, MacroIndex::M1).unwrap();
         let header = backup.snapshot().config.macro_slot(Slot::S1);
-        let plan = restore_macro_plan(entry, &header);
+        let plan = restore_macro_plan(entry, &header, Some(32));
         assert_eq!(plan.name, None);
+        assert_eq!(plan.chunk_size, Some(32));
         assert_eq!(plan.cycles_num, Some(entry.record().cycles_num));
         assert_eq!(plan.interval_ms, Some(entry.record().interval_ms));
+        let default = restore_macro_plan(entry, &header, None);
+        assert_eq!(default.chunk_size, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7120,7 +7181,8 @@ mod tests {
         push_config_responses(&mock, &target_snapshot.config);
         let session = Session::new(&mock);
         let result =
-            macro_restore_session_with_pre_dir(&session, &target_dir, true, pre_dir.clone()).await;
+            macro_restore_session_with_pre_dir(&session, &target_dir, true, pre_dir.clone(), None)
+                .await;
 
         assert!(matches!(
             result,
@@ -7146,7 +7208,7 @@ mod tests {
         push_config_responses(&transport.inner, &current.config);
         let session = Session::new(&transport);
         let result =
-            macro_restore_session_with_pre_dir(&session, &target_dir, false, pre_dir).await;
+            macro_restore_session_with_pre_dir(&session, &target_dir, false, pre_dir, None).await;
 
         assert!(result.is_err());
         assert!(!transport
@@ -7182,7 +7244,8 @@ mod tests {
         push_config_responses(&transport.inner, &target_snapshot.config);
 
         let session = Session::new(&transport);
-        let result = macro_restore_session_with_pre_dir(&session, &target_dir, true, pre_dir).await;
+        let result =
+            macro_restore_session_with_pre_dir(&session, &target_dir, true, pre_dir, None).await;
         assert!(
             result.is_ok(),
             "force must continue after skipped: {result:?}"
@@ -7227,6 +7290,7 @@ mod tests {
             &test_macro_file(),
             None,
             &backup_dir,
+            None,
         )
         .await;
 
@@ -7294,6 +7358,7 @@ mod tests {
             &test_macro_file(),
             None,
             &backup_dir,
+            None,
         )
         .await
         .expect("full backup -> write -> verify must succeed");
@@ -7397,6 +7462,7 @@ mod tests {
             &test_macro_file(),
             None,
             &backup_dir,
+            None,
         )
         .await;
 
