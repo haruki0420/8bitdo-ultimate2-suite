@@ -1177,11 +1177,20 @@ fn offset_mode_error(
     chunk_offset: usize,
     mode: Option<OffsetMode>,
 ) -> Error {
+    let detail = match mode {
+        None => {
+            "the first response offset must be 0, the requested absolute offset, or the \
+                 sector-relative chunk offset"
+        }
+        Some(OffsetMode::AmbiguousZero) => {
+            "a leading 0 is neither absolute nor relative, so the next non-zero offset must be \
+             the requested absolute offset or the sector-relative chunk offset"
+        }
+        Some(_) => "absolute and relative echoes must not be mixed within one macro",
+    };
     Error::UnexpectedResponse(format!(
         "macro chunk response offset 0x{reported:X} does not match requested 0x{requested:X} \
-         (chunk offset 0x{chunk_offset:X}, mode {mode:?}); a leading 0 is neither absolute nor \
-         relative, so the next non-zero offset must be the requested absolute offset or the \
-         sector-relative chunk offset, and modes must not be mixed"
+         (chunk offset 0x{chunk_offset:X}, mode {mode:?}); {detail}"
     ))
 }
 
