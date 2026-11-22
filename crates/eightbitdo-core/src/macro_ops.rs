@@ -298,7 +298,8 @@ pub struct MacroWriteOutcome {
     pub flag: u32,
     /// Registered macro count after the update.
     pub total_cnt: u8,
-    /// Total packets sent, including Erase, every Write chunk, Header and Save.
+    /// Total packets sent: Header chunks, header Save, Erase, every Write
+    /// chunk, and final Save.
     pub packets_sent: usize,
     /// Read-back entry that matched the requested steps.
     pub readback: MacroEntry,
@@ -720,7 +721,8 @@ impl<T: Transport> Session<T> {
         Ok((buffer.into_vec(), response_offsets))
     }
 
-    /// Write one macro with the mandatory Erase → Write → Header → Save flow.
+    /// Write one macro with the official Header → Save → Erase → Write → Save
+    /// flow.
     ///
     /// `backup` must contain all 12 entries (see [`MacroBackup::new`]); this is
     /// the "backup first" precondition. Writing into an empty macro
@@ -728,10 +730,11 @@ impl<T: Transport> Session<T> {
     /// [`Error::EmptyMacroWrite`] because step-data clear support is not
     /// implemented.
     /// `SaveTransport::Usb` is rejected with [`Error::Unsupported`].
-    /// If Erase, any Write chunk or the 216-byte header update fails,
-    /// **Save is not sent** and [`Error::MacroWrite`] is returned with
-    /// `saved = false`. After Save, the 216-byte config header and the
-    /// `0x0102` raw steps are read back and compared.
+    /// The header is written with `total_len = 0xD8` and saved first. If the
+    /// header or first Save fails, Erase is not sent. If Erase or Write fails,
+    /// the header has already been saved, so the error says restore is needed.
+    /// After the final Save, the 216-byte config header and the `0x0102` raw
+    /// steps are read back and compared.
     ///
     /// The header values `flag`, `total_cnt`, `key_map`, `cycles_num` and
     /// `interval_ms` are preserved from the backup unless the plan overrides
@@ -825,16 +828,59 @@ impl<T: Transport> Session<T> {
         let header_bytes =
             updated.as_bytes()[header_offset..header_offset + MACRO_SLOT_SIZE].to_vec();
 
-        // Build every request before erasing so a local encoding error cannot
-        // leave the sector erased without new data.
+        // Official order: header → Save → Erase → Write → Save.
+        // Build every request first so local encoding errors cannot touch flash.
+        let header_request = commands::write_macro_header_packets(
+            header_offset as u32,
+            &header_bytes,
+            header_chunk_size,
+        )?;
         let erase = commands::erase_macro(mode, slot, index);
         let write_packets =
             commands::write_macro_steps(mode, slot, index, &plan.steps, write_chunk_size)?;
-        let header_request =
-            commands::write_config_packets(header_offset as u32, &header_bytes, header_chunk_size)?;
         let save = commands::save(plan.save_transport);
 
         let mut packets_sent = 0usize;
+        for request in &header_request {
+            self.send_and_await_ack(
+                request,
+                false,
+                cmd::WRITE_CONFIG,
+                0,
+                plan.timeouts.header,
+                "WriteMacroHeader",
+            )
+            .await
+            .map_err(|error| {
+                macro_write_failure_with_note(
+                    MacroWriteStage::Header,
+                    error,
+                    false,
+                    "macro header write failed before Save; Erase was not sent",
+                )
+            })?;
+            packets_sent += 1;
+        }
+
+        self.send_and_await_ack(
+            &save,
+            false,
+            cmd::SAVE,
+            plan.save_transport.subcmd(),
+            plan.timeouts.save,
+            "Save",
+        )
+        .await
+        .map_err(|error| {
+            macro_write_failure_with_note(
+                MacroWriteStage::Save,
+                error,
+                true,
+                "macro header Save failed; Erase/Write were not sent and the header may or may not be committed",
+            )
+        })?;
+        packets_sent += 1;
+
         self.send_and_await_ack(
             &erase,
             true,
@@ -844,7 +890,14 @@ impl<T: Transport> Session<T> {
             "EraseBT2Macro",
         )
         .await
-        .map_err(|error| macro_write_failure(MacroWriteStage::Erase, error, false))?;
+        .map_err(|error| {
+            macro_write_failure_with_note(
+                MacroWriteStage::Erase,
+                error,
+                true,
+                "macro header was already saved; Erase failed; restore from backup",
+            )
+        })?;
         packets_sent += 1;
 
         tokio::time::sleep(MACRO_ERASE_SETTLE_DELAY).await;
@@ -859,25 +912,18 @@ impl<T: Transport> Session<T> {
                 "WriteBT2Macro",
             )
             .await
-            .map_err(|error| macro_write_failure(MacroWriteStage::Write, error, false))?;
+            .map_err(|error| {
+                macro_write_failure_with_note(
+                    MacroWriteStage::Write,
+                    error,
+                    true,
+                    "macro header was already saved; Write failed; restore from backup",
+                )
+            })?;
             packets_sent += 1;
         }
 
         tokio::time::sleep(MACRO_WRITE_SETTLE_DELAY).await;
-
-        for request in &header_request {
-            self.send_and_await_ack(
-                request,
-                false,
-                cmd::WRITE_CONFIG,
-                0,
-                plan.timeouts.header,
-                "WriteMacroHeader",
-            )
-            .await
-            .map_err(|error| macro_write_failure(MacroWriteStage::Header, error, false))?;
-            packets_sent += 1;
-        }
 
         self.send_and_await_ack(
             &save,
@@ -888,7 +934,14 @@ impl<T: Transport> Session<T> {
             "Save",
         )
         .await
-        .map_err(|error| macro_write_failure(MacroWriteStage::Save, error, true))?;
+        .map_err(|error| {
+            macro_write_failure_with_note(
+                MacroWriteStage::Save,
+                error,
+                true,
+                "macro header and data were sent; final Save failed",
+            )
+        })?;
         packets_sent += 1;
 
         tokio::time::sleep(MACRO_VERIFY_DELAY).await;
@@ -978,8 +1031,11 @@ impl<T: Transport> Session<T> {
         let header_offset = macro_slot_offset(slot);
         let header_bytes =
             updated.as_bytes()[header_offset..header_offset + MACRO_SLOT_SIZE].to_vec();
-        let requests =
-            commands::write_config_packets(header_offset as u32, &header_bytes, header_chunk_size)?;
+        let requests = commands::write_macro_header_packets(
+            header_offset as u32,
+            &header_bytes,
+            header_chunk_size,
+        )?;
         let save = commands::save(SaveTransport::Ble);
 
         let mut packets_sent = 0usize;
@@ -1192,6 +1248,24 @@ fn macro_write_failure(stage: MacroWriteStage, error: Error, saved: bool) -> Err
     Error::MacroWrite {
         stage,
         reason: error.to_string(),
+        saved,
+        recovery: if saved {
+            MACRO_SAVED_RECOVERY
+        } else {
+            MACRO_NOT_SAVED_RECOVERY
+        },
+    }
+}
+
+fn macro_write_failure_with_note(
+    stage: MacroWriteStage,
+    error: Error,
+    saved: bool,
+    note: &'static str,
+) -> Error {
+    Error::MacroWrite {
+        stage,
+        reason: format!("{note}: {error}"),
         saved,
         recovery: if saved {
             MACRO_SAVED_RECOVERY
@@ -1821,6 +1895,19 @@ mod write_tests {
         mock.push_response(&header, &[]);
     }
 
+    /// Queue the official ACK order: header × N → Save → Erase → Write × N → Save.
+    fn push_official_acks(mock: &MockTransport, header_chunks: usize, write_chunks: usize) {
+        for _ in 0..header_chunks {
+            push_ack(mock, cmd::WRITE_CONFIG, true);
+        }
+        push_ack(mock, cmd::SAVE, true);
+        push_ack(mock, cmd::ERASE_MACRO, true);
+        for _ in 0..write_chunks {
+            push_ack(mock, cmd::WRITE_MACRO, true);
+        }
+        push_ack(mock, cmd::SAVE, true);
+    }
+
     fn push_readback(mock: &MockTransport, steps: &[MacroStep]) {
         let raw = raw_steps(steps);
         let mut offset = 0u32;
@@ -1877,6 +1964,14 @@ mod write_tests {
         let plan = MacroWritePlan::new(steps.clone());
 
         let mock = MockTransport::with_mtu(200);
+        // Header ACKs declare 142 bytes but have no payload; total_len is
+        // 0xD8 for the official macro-header write.
+        let header_ack =
+            CustomHeader::new(cmd::RESPONSE, cmd::WRITE_CONFIG, 0xD8, 0x68C).with_chunk_len(142);
+        mock.push_response(&header_ack, &[]);
+        mock.push_response(&header_ack, &[]);
+        // First Save after the header.
+        mock.push_response(&CustomHeader::new(cmd::RESPONSE, cmd::SAVE, 0, 0), &[]);
         // Observed Erase ACK: cmd=0x0004, subcmd=0x0104, chunk_len=0x1000,
         // total_len=0x1000, no payload.
         let mut erase_ack = CustomHeader::new(cmd::RESPONSE, cmd::ERASE_MACRO, 0x1000, 0);
@@ -1890,11 +1985,7 @@ mod write_tests {
         let mut write_frame = write_ack.to_bytes().to_vec();
         write_frame.insert(0, 0x04);
         mock.push_incoming(&write_frame);
-        // Header ACKs declare 142 bytes but have no payload.
-        let header_ack =
-            CustomHeader::new(cmd::RESPONSE, cmd::WRITE_CONFIG, 0x0AD0, 0x68C).with_chunk_len(142);
-        mock.push_response(&header_ack, &[]);
-        mock.push_response(&header_ack, &[]);
+        // Final Save after the data chunks.
         mock.push_response(&CustomHeader::new(cmd::RESPONSE, cmd::SAVE, 0, 0), &[]);
         let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
         push_config(&mock, &expected);
@@ -1909,7 +2000,7 @@ mod write_tests {
     }
 
     #[tokio::test]
-    async fn write_macro_sends_erase_write_chunks_header_save_and_verifies() {
+    async fn write_macro_writes_header_save_then_erase_write_and_save() {
         let backup = backup_from(config_with_existing_macro());
         let steps = sample_steps(20);
         let mut plan = MacroWritePlan::new(steps.clone())
@@ -1920,15 +2011,15 @@ mod write_tests {
         plan.interval_ms = Some(30);
 
         let mock = MockTransport::with_mtu(200);
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        // Real BLE saves may echo the platform sub-command (0x0067).
+        let save_ack = CustomHeader::new(cmd::RESPONSE, SaveTransport::Ble.subcmd(), 0, 0);
+        mock.push_response(&save_ack, &[]);
         push_ack(&mock, cmd::ERASE_MACRO, true);
         for _ in 0..4 {
-            push_ack(&mock, cmd::WRITE_MACRO, false);
+            push_ack(&mock, cmd::WRITE_MACRO, true);
         }
-        push_ack(&mock, cmd::WRITE_CONFIG, true);
-        push_ack(&mock, cmd::WRITE_CONFIG, true);
-        // Real BLE saves may echo the platform sub-command (0x0067) instead
-        // of 0x0006 in an envelope.
-        let save_ack = CustomHeader::new(cmd::RESPONSE, SaveTransport::Ble.subcmd(), 0, 0);
         mock.push_response(&save_ack, &[]);
         let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
         push_config(&mock, &expected);
@@ -1949,64 +2040,39 @@ mod write_tests {
         assert_eq!(
             commands,
             vec![
+                cmd::WRITE_CONFIG,
+                cmd::WRITE_CONFIG,
+                cmd::SAVE,
                 cmd::ERASE_MACRO,
                 cmd::WRITE_MACRO,
                 cmd::WRITE_MACRO,
                 cmd::WRITE_MACRO,
                 cmd::WRITE_MACRO,
-                cmd::WRITE_CONFIG,
-                cmd::WRITE_CONFIG,
                 cmd::SAVE,
                 cmd::READ_MACRO,
                 cmd::READ_MACRO,
             ]
         );
 
-        // Erase: payload-less, 4 KB declared length, crc16 = 0xFFFF.
-        assert_eq!(
-            sent[0],
-            vec![
-                0x04, 0x04, 0x01, 0x00, 0x00, 0x00, 0x10, 0xFF, 0xFF, 0x00, 0x10, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00,
-            ]
-        );
-
-        // 200 steps = 200 bytes, 32-byte aligned to 224: 64/64/64/32.
-        let aligned = macro_data::encode_macro_steps(&steps).unwrap();
-        assert_eq!(aligned.len(), 224);
-        for (i, chunk) in aligned.chunks(64).enumerate() {
-            let request = &sent[1 + i];
-            let header = CustomHeader::parse(&request[1..]).unwrap();
-            assert_eq!(header.cmd, cmd::WRITE_MACRO);
-            assert_eq!(header.subcmd, 0);
-            assert_eq!(header.total_len, 224);
-            assert_eq!(header.offset, (i * 64) as u32);
-            assert_eq!(header.chunk_len as usize, chunk.len());
-            assert_eq!(header.crc16, packet_crc16(chunk));
-            assert_eq!(&request[17..], chunk);
-        }
-
-        // Header: 216 bytes split into 142 + 74 at 0x68C / 0x71A.
-        // `total_len` stays 0x0AD0 on both packets.
-        let first_header = CustomHeader::parse(&sent[5][1..]).unwrap();
+        // Header is sent first, before Erase. total_len is 0xD8, not 0x0AD0.
+        let first_header = CustomHeader::parse(&sent[0][1..]).unwrap();
         assert_eq!(first_header.cmd, cmd::WRITE_CONFIG);
         assert_eq!(first_header.subcmd, 0);
-        assert_eq!(first_header.total_len, 0x0AD0);
+        assert_eq!(first_header.total_len, 0xD8);
         assert_eq!(first_header.offset, 0x68C);
         assert_eq!(first_header.chunk_len, 142);
-        assert_eq!(first_header.crc16, packet_crc16(&sent[5][17..]));
-        assert_eq!(sent[5].len(), 17 + 142);
-        let second_header = CustomHeader::parse(&sent[6][1..]).unwrap();
+        assert_eq!(first_header.crc16, packet_crc16(&sent[0][17..]));
+        assert_eq!(sent[0].len(), 17 + 142);
+        let second_header = CustomHeader::parse(&sent[1][1..]).unwrap();
         assert_eq!(second_header.cmd, cmd::WRITE_CONFIG);
-        assert_eq!(second_header.subcmd, 0);
-        assert_eq!(second_header.total_len, 0x0AD0);
+        assert_eq!(second_header.total_len, 0xD8);
         assert_eq!(second_header.offset, 0x68C + 142);
         assert_eq!(second_header.chunk_len, 74);
-        assert_eq!(second_header.crc16, packet_crc16(&sent[6][17..]));
-        assert_eq!(sent[6].len(), 17 + 74);
-        let header_payload: Vec<u8> = sent[5][17..]
+        assert_eq!(second_header.crc16, packet_crc16(&sent[1][17..]));
+        assert_eq!(sent[1].len(), 17 + 74);
+        let header_payload: Vec<u8> = sent[0][17..]
             .iter()
-            .chain(&sent[6][17..])
+            .chain(&sent[1][17..])
             .copied()
             .collect();
         assert_eq!(header_payload.len(), MACRO_SLOT_SIZE);
@@ -2025,18 +2091,41 @@ mod write_tests {
             u32::from_le_bytes([record[0x30], record[0x31], record[0x32], record[0x33]]),
             30
         );
-        assert_eq!(record[0x20], 0);
 
-        // Save: BLE subcmd 0x0067, no payload.
+        // Erase after the header Save.
         assert_eq!(
-            sent[7],
+            sent[3],
+            vec![
+                0x04, 0x04, 0x01, 0x00, 0x00, 0x00, 0x10, 0xFF, 0xFF, 0x00, 0x10, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00,
+            ]
+        );
+
+        // 200 steps = 200 bytes, 32-byte aligned to 224: 64/64/64/32.
+        let aligned = macro_data::encode_macro_steps(&steps).unwrap();
+        assert_eq!(aligned.len(), 224);
+        for (i, chunk) in aligned.chunks(64).enumerate() {
+            let request = &sent[4 + i];
+            let header = CustomHeader::parse(&request[1..]).unwrap();
+            assert_eq!(header.cmd, cmd::WRITE_MACRO);
+            assert_eq!(header.subcmd, 0);
+            assert_eq!(header.total_len, 224);
+            assert_eq!(header.offset, (i * 64) as u32);
+            assert_eq!(header.chunk_len as usize, chunk.len());
+            assert_eq!(header.crc16, packet_crc16(chunk));
+            assert_eq!(&request[17..], chunk);
+        }
+
+        // Final Save after all data chunks.
+        assert_eq!(
+            sent[8],
             vec![
                 0x04, 0x06, 0x00, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00,
             ]
         );
 
-        assert_eq!(outcome.packets_sent, 8);
+        assert_eq!(outcome.packets_sent, 9);
         assert_eq!(outcome.record.max_steps, 20);
         assert_eq!(outcome.record.key_map, KeyMap::M3);
         assert_eq!(outcome.record.name(), "Edited");
@@ -2046,6 +2135,63 @@ mod write_tests {
         assert_eq!(outcome.readback.read_offsets(), &[0, 142]);
         assert_eq!(outcome.flag, 0);
         assert_eq!(outcome.total_cnt, 0);
+    }
+
+    #[tokio::test]
+    async fn write_macro_macro1_uses_sector_0x1000_order() {
+        let mut config = Bt2Config::zeroed();
+        config.set_gamepad_mode(GamepadMode::Switch);
+        let record = MacroRecord {
+            max_steps: 4,
+            ..MacroRecord::default()
+        };
+        config.set_macro_record(Slot::S1, MacroIndex::M2, &record);
+        config.recompute_crc();
+        let backup = backup_from(config);
+
+        let steps = sample_steps(4);
+        let plan = MacroWritePlan::new(steps.clone());
+        let mock = MockTransport::with_mtu(200);
+        push_official_acks(&mock, 2, 1);
+        let expected = expected_config(&backup, Slot::S1, MacroIndex::M2, &plan);
+        push_config(&mock, &expected);
+        push_readback(&mock, &steps);
+
+        let session = Session::new(&mock);
+        session
+            .write_macro(&backup, Slot::S1, MacroIndex::M2, &plan)
+            .await
+            .unwrap();
+
+        let sent = mock.sent_frames();
+        let commands: Vec<u16> = sent
+            .iter()
+            .map(|frame| frame_cmd(frame))
+            .filter(|command| *command != cmd::READ_CONFIG)
+            .collect();
+        assert_eq!(
+            commands,
+            vec![
+                cmd::WRITE_CONFIG,
+                cmd::WRITE_CONFIG,
+                cmd::SAVE,
+                cmd::ERASE_MACRO,
+                cmd::WRITE_MACRO,
+                cmd::SAVE,
+                cmd::READ_MACRO,
+            ]
+        );
+        for frame in sent
+            .iter()
+            .filter(|frame| frame_cmd(frame) == cmd::WRITE_CONFIG)
+        {
+            assert_eq!(CustomHeader::parse(&frame[1..]).unwrap().total_len, 0xD8);
+        }
+        assert_eq!(CustomHeader::parse(&sent[3][1..]).unwrap().offset, 0x1000);
+        let write = CustomHeader::parse(&sent[4][1..]).unwrap();
+        assert_eq!(write.offset, 0x1000);
+        assert_eq!(write.total_len, 64);
+        assert_eq!(count_cmd(&sent, cmd::SAVE), 2);
     }
 
     #[tokio::test]
@@ -2084,13 +2230,7 @@ mod write_tests {
         let plan = MacroWritePlan::new(steps.clone()).with_chunk_size(32);
 
         let mock = MockTransport::with_mtu(200);
-        push_ack(&mock, cmd::ERASE_MACRO, true);
-        for _ in 0..15 {
-            push_ack(&mock, cmd::WRITE_MACRO, true);
-        }
-        push_ack(&mock, cmd::WRITE_CONFIG, true);
-        push_ack(&mock, cmd::WRITE_CONFIG, true);
-        push_ack(&mock, cmd::SAVE, true);
+        push_official_acks(&mock, 2, 15);
         let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
         push_config(&mock, &expected);
         push_readback(&mock, &steps);
@@ -2126,15 +2266,8 @@ mod write_tests {
         let plan = MacroWritePlan::new(steps.clone());
 
         let mock = MockTransport::with_mtu(64);
-        push_ack(&mock, cmd::ERASE_MACRO, false);
-        for _ in 0..4 {
-            push_ack(&mock, cmd::WRITE_MACRO, false);
-        }
-        // 216 bytes at 44 bytes per header chunk: 44*4 + 40.
-        for _ in 0..5 {
-            push_ack(&mock, cmd::WRITE_CONFIG, false);
-        }
-        push_ack(&mock, cmd::SAVE, false);
+        // Official order: header × 5 → Save → Erase → Write × 4 → Save.
+        push_official_acks(&mock, 5, 4);
         let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
         push_config(&mock, &expected);
         push_readback(&mock, &steps);
@@ -2151,7 +2284,12 @@ mod write_tests {
             "every frame must fit mtu - 3 = 61 bytes"
         );
         // 100 bytes -> 128 aligned -> 4 x 32.
-        for (i, request) in sent[1..5].iter().enumerate() {
+        let write_frames: Vec<_> = sent
+            .iter()
+            .filter(|frame| frame_cmd(frame) == cmd::WRITE_MACRO)
+            .collect();
+        assert_eq!(write_frames.len(), 4);
+        for (i, request) in write_frames.iter().enumerate() {
             let header = CustomHeader::parse(&request[1..]).unwrap();
             assert_eq!(header.total_len, 128);
             assert_eq!(header.chunk_len, 32);
@@ -2170,7 +2308,7 @@ mod write_tests {
             .zip(expected_offsets)
         {
             let header = CustomHeader::parse(&frame[1..]).unwrap();
-            assert_eq!(header.total_len, 0x0AD0);
+            assert_eq!(header.total_len, 0xD8);
             assert_eq!(header.chunk_len, length);
             assert_eq!(header.offset, offset);
             assert_eq!(frame.len(), 17 + usize::from(length));
@@ -2208,13 +2346,7 @@ mod write_tests {
             .with_header_state(1, 2);
 
         let mock = MockTransport::with_mtu(200);
-        push_ack(&mock, cmd::ERASE_MACRO, true);
-        for _ in 0..4 {
-            push_ack(&mock, cmd::WRITE_MACRO, true);
-        }
-        push_ack(&mock, cmd::WRITE_CONFIG, true);
-        push_ack(&mock, cmd::WRITE_CONFIG, true);
-        push_ack(&mock, cmd::SAVE, true);
+        push_official_acks(&mock, 2, 4);
         let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
         push_config(&mock, &expected);
         push_readback(&mock, &steps);
@@ -2225,8 +2357,8 @@ mod write_tests {
             .await
             .unwrap();
 
-        let header = CustomHeader::parse(&mock.sent_frames()[5][1..]).unwrap();
-        let payload = &mock.sent_frames()[5][17..];
+        let header = CustomHeader::parse(&mock.sent_frames()[0][1..]).unwrap();
+        let payload = &mock.sent_frames()[0][17..];
         assert_eq!(header.offset, 0x68C);
         assert_eq!(u32::from_le_bytes(payload[0..4].try_into().unwrap()), 1);
         assert_eq!(payload[4], 2);
@@ -2324,90 +2456,90 @@ mod write_tests {
         (result, sent)
     }
 
-    fn assert_no_save(sent: &[Vec<u8>]) {
-        assert!(
-            sent.iter().all(|frame| frame_cmd(frame) != cmd::SAVE),
-            "Save must not be sent after a pre-Save failure"
-        );
+    fn count_cmd(sent: &[Vec<u8>], command: u16) -> usize {
+        sent.iter()
+            .filter(|frame| frame_cmd(frame) == command)
+            .count()
     }
 
     #[tokio::test]
-    async fn erase_timeout_does_not_send_save() {
+    async fn erase_timeout_does_not_send_final_save() {
         let steps = sample_steps(10);
-        let (result, sent) = write_with_script(Vec::new(), true, &steps).await;
+        let script = vec![
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::SAVE, true),
+        ];
+        let (result, sent) = write_with_script(script, true, &steps).await;
         assert!(matches!(
             result,
             Err(Error::MacroWrite {
                 stage: MacroWriteStage::Erase,
-                saved: false,
+                saved: true,
                 ..
             })
         ));
-        assert_eq!(sent.len(), 1);
-        assert_no_save(&sent);
+        assert_eq!(sent.len(), 4);
+        assert_eq!(count_cmd(&sent, cmd::SAVE), 1);
+        assert_eq!(frame_cmd(sent.last().unwrap()), cmd::ERASE_MACRO);
     }
 
     #[tokio::test]
-    async fn write_timeout_does_not_send_header_or_save() {
+    async fn write_timeout_does_not_send_final_save() {
         let steps = sample_steps(10);
-        let script = vec![ack_frame(cmd::ERASE_MACRO, true)];
+        let script = vec![
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::SAVE, true),
+            ack_frame(cmd::ERASE_MACRO, true),
+        ];
         let (result, sent) = write_with_script(script, true, &steps).await;
         assert!(matches!(
             result,
             Err(Error::MacroWrite {
                 stage: MacroWriteStage::Write,
+                saved: true,
+                ..
+            })
+        ));
+        assert_eq!(sent.len(), 5);
+        assert_eq!(count_cmd(&sent, cmd::SAVE), 1);
+        assert_eq!(frame_cmd(sent.last().unwrap()), cmd::WRITE_MACRO);
+    }
+
+    #[tokio::test]
+    async fn header_timeout_does_not_save_or_erase() {
+        let steps = sample_steps(20);
+        let (result, sent) = write_with_script(Vec::new(), true, &steps).await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Header,
+                saved: false,
+                ..
+            })
+        ));
+        assert_eq!(sent.len(), 1);
+        assert_eq!(count_cmd(&sent, cmd::SAVE), 0);
+        assert_eq!(count_cmd(&sent, cmd::ERASE_MACRO), 0);
+    }
+
+    #[tokio::test]
+    async fn second_header_chunk_timeout_does_not_save_or_erase() {
+        let steps = sample_steps(20);
+        let script = vec![ack_frame(cmd::WRITE_CONFIG, true)];
+        let (result, sent) = write_with_script(script, true, &steps).await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Header,
                 saved: false,
                 ..
             })
         ));
         assert_eq!(sent.len(), 2);
-        assert_no_save(&sent);
-        assert!(sent
-            .iter()
-            .all(|frame| frame_cmd(frame) != cmd::WRITE_CONFIG));
-    }
-
-    #[tokio::test]
-    async fn header_timeout_does_not_send_save() {
-        let steps = sample_steps(20);
-        let mut script = vec![ack_frame(cmd::ERASE_MACRO, false)];
-        for _ in 0..4 {
-            script.push(ack_frame(cmd::WRITE_MACRO, false));
-        }
-        let (result, sent) = write_with_script(script, true, &steps).await;
-        assert!(matches!(
-            result,
-            Err(Error::MacroWrite {
-                stage: MacroWriteStage::Header,
-                saved: false,
-                ..
-            })
-        ));
-        assert_eq!(sent.len(), 6);
-        assert_no_save(&sent);
-    }
-
-    #[tokio::test]
-    async fn second_header_chunk_timeout_does_not_send_save() {
-        let steps = sample_steps(20);
-        let mut script = vec![ack_frame(cmd::ERASE_MACRO, true)];
-        for _ in 0..4 {
-            script.push(ack_frame(cmd::WRITE_MACRO, true));
-        }
-        // ACK only the first 142-byte header chunk; the 74-byte second chunk
-        // is sent but never acknowledged.
-        script.push(ack_frame(cmd::WRITE_CONFIG, true));
-        let (result, sent) = write_with_script(script, true, &steps).await;
-        assert!(matches!(
-            result,
-            Err(Error::MacroWrite {
-                stage: MacroWriteStage::Header,
-                saved: false,
-                ..
-            })
-        ));
-        assert_eq!(sent.len(), 7);
-        assert_no_save(&sent);
+        assert_eq!(count_cmd(&sent, cmd::SAVE), 0);
+        assert_eq!(count_cmd(&sent, cmd::ERASE_MACRO), 0);
         let header_frames: Vec<_> = sent
             .iter()
             .filter(|frame| frame_cmd(frame) == cmd::WRITE_CONFIG)
@@ -2418,14 +2550,12 @@ mod write_tests {
     }
 
     #[tokio::test]
-    async fn save_timeout_is_reported_as_saved() {
+    async fn header_save_timeout_does_not_erase() {
         let steps = sample_steps(20);
-        let mut script = vec![ack_frame(cmd::ERASE_MACRO, true)];
-        for _ in 0..4 {
-            script.push(ack_frame(cmd::WRITE_MACRO, true));
-        }
-        script.push(ack_frame(cmd::WRITE_CONFIG, true));
-        script.push(ack_frame(cmd::WRITE_CONFIG, true));
+        let script = vec![
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::WRITE_CONFIG, true),
+        ];
         let (result, sent) = write_with_script(script, true, &steps).await;
         assert!(matches!(
             result,
@@ -2435,32 +2565,67 @@ mod write_tests {
                 ..
             })
         ));
+        assert_eq!(sent.len(), 3);
+        assert_eq!(frame_cmd(sent.last().unwrap()), cmd::SAVE);
+        assert_eq!(count_cmd(&sent, cmd::ERASE_MACRO), 0);
+    }
+
+    #[tokio::test]
+    async fn final_save_timeout_is_reported_as_saved() {
+        let steps = sample_steps(20);
+        let mut script = vec![
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::SAVE, true),
+            ack_frame(cmd::ERASE_MACRO, true),
+        ];
+        for _ in 0..4 {
+            script.push(ack_frame(cmd::WRITE_MACRO, true));
+        }
+        let (result, sent) = write_with_script(script, true, &steps).await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Save,
+                saved: true,
+                ..
+            })
+        ));
+        assert_eq!(count_cmd(&sent, cmd::SAVE), 2);
         assert_eq!(frame_cmd(sent.last().unwrap()), cmd::SAVE);
     }
 
     #[tokio::test]
-    async fn disconnect_mid_write_does_not_send_save() {
+    async fn disconnect_mid_write_does_not_send_final_save() {
         let steps = sample_steps(10);
-        let script = vec![ack_frame(cmd::ERASE_MACRO, true)];
+        let script = vec![
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::SAVE, true),
+            ack_frame(cmd::ERASE_MACRO, true),
+        ];
         let (result, sent) = write_with_script(script, false, &steps).await;
         assert!(matches!(
             result,
             Err(Error::MacroWrite {
                 stage: MacroWriteStage::Write,
-                saved: false,
+                saved: true,
                 ..
             })
         ));
-        assert_no_save(&sent);
+        assert_eq!(count_cmd(&sent, cmd::SAVE), 1);
     }
 
     fn full_success_script(steps: &[MacroStep], config: &Bt2Config) -> Vec<Vec<u8>> {
-        let mut script = vec![ack_frame(cmd::ERASE_MACRO, true)];
+        let mut script = vec![
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::SAVE, true),
+            ack_frame(cmd::ERASE_MACRO, true),
+        ];
         for _ in 0..4 {
             script.push(ack_frame(cmd::WRITE_MACRO, true));
         }
-        script.push(ack_frame(cmd::WRITE_CONFIG, true));
-        script.push(ack_frame(cmd::WRITE_CONFIG, true));
         script.push(ack_frame(cmd::SAVE, true));
         script.extend(config_frames(config));
         let raw = raw_steps(steps);
@@ -2538,7 +2703,7 @@ mod write_tests {
         let sent = transport.sent();
         assert!(!sent.is_empty());
         assert!(sent.iter().all(|frame| frame_cmd(frame) == cmd::READ_MACRO));
-        assert_no_save(&sent);
+        assert_eq!(count_cmd(&sent, cmd::SAVE), 0);
     }
     /// Wraps a scripted transport with a BLE-like frame-size limit.
     struct LimitedTransport {
@@ -2607,11 +2772,11 @@ mod write_tests {
         );
         assert_eq!(
             CustomHeader::parse(&headers[0][1..]).unwrap().total_len,
-            0x0AD0
+            0xD8
         );
         assert_eq!(
             CustomHeader::parse(&headers[1][1..]).unwrap().total_len,
-            0x0AD0
+            0xD8
         );
     }
     #[test]
@@ -2726,6 +2891,15 @@ mod write_tests {
         assert!(!sent
             .iter()
             .any(|frame| matches!(frame_cmd(frame), cmd::ERASE_MACRO | cmd::WRITE_MACRO)));
+        for (index, frame) in sent
+            .iter()
+            .filter(|frame| frame_cmd(frame) == cmd::WRITE_CONFIG)
+            .enumerate()
+        {
+            let header = CustomHeader::parse(&frame[1..]).unwrap();
+            assert_eq!(header.total_len, 0xD8);
+            assert_eq!(header.offset, 0x68C + (index * 142) as u32);
+        }
         assert_eq!(outcome.packets_sent, 3);
         let commands: Vec<u16> = sent
             .iter()
@@ -2831,13 +3005,7 @@ mod write_tests {
         let steps = sample_steps(10);
         let plan = MacroWritePlan::new(steps.clone());
         let mock = MockTransport::with_mtu(200);
-        push_ack(&mock, cmd::ERASE_MACRO, true);
-        for _ in 0..2 {
-            push_ack(&mock, cmd::WRITE_MACRO, true);
-        }
-        push_ack(&mock, cmd::WRITE_CONFIG, true);
-        push_ack(&mock, cmd::WRITE_CONFIG, true);
-        push_ack(&mock, cmd::SAVE, true);
+        push_official_acks(&mock, 2, 2);
         let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
         push_config(&mock, &expected);
         push_readback(&mock, &steps);
@@ -2976,13 +3144,7 @@ mod write_tests {
         let steps = sample_steps(10);
         let plan = MacroWritePlan::new(steps.clone());
         let mock = MockTransport::with_mtu(200);
-        push_ack(&mock, cmd::ERASE_MACRO, true);
-        for _ in 0..2 {
-            push_ack(&mock, cmd::WRITE_MACRO, true);
-        }
-        push_ack(&mock, cmd::WRITE_CONFIG, true);
-        push_ack(&mock, cmd::WRITE_CONFIG, true);
-        push_ack(&mock, cmd::SAVE, true);
+        push_official_acks(&mock, 2, 2);
         let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
         push_config(&mock, &expected);
         push_readback(&mock, &steps);
