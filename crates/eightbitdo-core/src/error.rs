@@ -147,6 +147,21 @@ pub enum Error {
         path: std::path::PathBuf,
     },
 
+    /// The BLE lock path is unsafe to use.
+    ///
+    /// The lock file must be a regular file owned by the effective user and
+    /// must not be a symbolic link: the guard truncates the file and tightens
+    /// its mode, so following an attacker-controlled path in a shared
+    /// directory could damage an arbitrary file.
+    #[cfg(feature = "ble")]
+    #[error("refusing to use BLE lock file {}: {reason}", path.display())]
+    BleLockInvalid {
+        /// Rejected lock path.
+        path: std::path::PathBuf,
+        /// Why the path was rejected.
+        reason: String,
+    },
+
     /// No matching peripheral was found during the scan.
     #[error("device not found: name={name}, address={address:?}")]
     DeviceNotFound {

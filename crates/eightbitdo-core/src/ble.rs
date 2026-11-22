@@ -108,7 +108,9 @@ pub struct BleTransport {
     ///
     /// Wrapped in a mutex so [`Transport::disconnect`] can release it before
     /// the value is dropped; a process exit releases it through the kernel
-    /// regardless.
+    /// regardless. Declared last so it is the last field dropped: the
+    /// peripheral/notification fields go first and another process cannot take
+    /// the lock while this struct is still tearing down.
     ble_lock: std::sync::Mutex<Option<BleLock>>,
 }
 
@@ -307,16 +309,48 @@ impl Transport for BleTransport {
     }
 
     async fn disconnect(&self) -> Result<(), Error> {
-        // Best effort: notify teardown and link teardown are both idempotent
-        // from the caller's point of view.
-        let _ = self.peripheral.unsubscribe(&self.characteristic).await;
-        let _ = self.peripheral.disconnect().await;
-        // Release the single-owner lock only after the link is torn down, so a
-        // reconnect in another process cannot race the old connection.
-        if let Ok(mut lock) = self.ble_lock.lock() {
-            let _ = lock.take();
+        // Notify teardown and link teardown are both attempted so the error
+        // reports every failed step. The single-owner lock is released only
+        // when both succeed: after a partial teardown the old link may still
+        // be alive, and letting another process scan over it is exactly the
+        // contention this lock exists to prevent.
+        let mut failures = Vec::new();
+        if let Err(error) = self.peripheral.unsubscribe(&self.characteristic).await {
+            failures.push(format!("unsubscribe: {error}"));
         }
-        Ok(())
+        if let Err(error) = self.peripheral.disconnect().await {
+            failures.push(format!("disconnect: {error}"));
+        }
+        let teardown = if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Ble(failures.join("; ")))
+        };
+        release_ble_lock_after_teardown(&self.ble_lock, &teardown)
+    }
+}
+
+/// Release the BLE lock only after a fully successful teardown.
+///
+/// A failed or timed-out teardown returns `Err` and keeps the lock in the
+/// transport: the link may still be half-closed, so another process must not
+/// start scanning. The kernel still releases the lock when the transport is
+/// dropped or the process exits; the CLI prints a warning in that case.
+fn release_ble_lock_after_teardown(
+    lock: &std::sync::Mutex<Option<BleLock>>,
+    teardown: &Result<(), Error>,
+) -> Result<(), Error> {
+    match teardown {
+        Ok(()) => {
+            if let Ok(mut lock) = lock.lock() {
+                let _ = lock.take();
+            }
+            Ok(())
+        }
+        Err(error) => Err(Error::Ble(format!(
+            "BLE teardown incomplete ({error}); keeping the single-owner BLE lock while this \
+             transport is alive so another process cannot scan over a half-closed link"
+        ))),
     }
 }
 
@@ -669,6 +703,40 @@ mod tests {
             "expected BleBusy, got {error:?}"
         );
         FileExt::unlock(&file).expect("unlock");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failed_teardown_keeps_the_ble_lock() {
+        let path = temp_lock_path("teardown-failure");
+        let lock = std::sync::Mutex::new(Some(BleLock::acquire_at(&path).expect("hold the lock")));
+        let failed: Result<(), Error> = Err(Error::Ble("disconnect: timed out".to_string()));
+
+        let error = release_ble_lock_after_teardown(&lock, &failed)
+            .expect_err("a failed teardown must not release the lock");
+        assert!(
+            error
+                .to_string()
+                .contains("keeping the single-owner BLE lock"),
+            "the failure must explain that the lock is kept: {error}"
+        );
+        assert!(lock.lock().expect("lock mutex").is_some());
+        let busy = BleLock::acquire_at(&path).expect_err("another process must still be refused");
+        assert!(matches!(busy, Error::BleBusy { .. }), "got {busy:?}");
+
+        // A successful retry releases it.
+        release_ble_lock_after_teardown(&lock, &Ok(())).expect("successful teardown releases");
+        let _reacquired = BleLock::acquire_at(&path).expect("lock must be free after teardown");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn successful_teardown_releases_the_ble_lock() {
+        let path = temp_lock_path("teardown-ok");
+        let lock = std::sync::Mutex::new(Some(BleLock::acquire_at(&path).expect("hold the lock")));
+        release_ble_lock_after_teardown(&lock, &Ok(())).expect("release");
+        assert!(lock.lock().expect("lock mutex").is_none());
+        let _reacquired = BleLock::acquire_at(&path).expect("lock must be free");
         let _ = std::fs::remove_file(&path);
     }
 }

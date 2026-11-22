@@ -455,125 +455,11 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
     };
 
     match cli.command {
+        // `scan` only touches the adapter, not the controller link: SIGINT keeps
+        // its default termination and there is no App Mode to warn about.
         Command::Scan => scan(Duration::from_secs(cli.scan_timeout)).await?,
-        Command::Info => info(&options).await?,
-        Command::Config { command } => match command {
-            ConfigCommand::Dump { raw, json } => {
-                dump_config(&options, raw.as_deref(), json.as_deref()).await?;
-            }
-            ConfigCommand::Write {
-                file,
-                backup_dir,
-                accept_reserved_drift,
-                force_raw,
-                write_chunk,
-                yes,
-            } => {
-                config_write(
-                    &options,
-                    &file,
-                    backup_dir.as_deref(),
-                    accept_reserved_drift,
-                    force_raw,
-                    write_chunk,
-                    yes,
-                )
-                .await?;
-            }
-            ConfigCommand::Set {
-                field,
-                value,
-                slot,
-                backup_dir,
-                write_chunk,
-                yes,
-            } => {
-                let slot = parse_slot(slot)?;
-                let set = parse_config_set(&field, &value, slot)?;
-                config_set(&options, &set, backup_dir.as_deref(), write_chunk, yes).await?;
-            }
-            ConfigCommand::Remap {
-                from,
-                to,
-                slot,
-                backup_dir,
-                write_chunk,
-                yes,
-            } => {
-                let slot = parse_slot(slot)?;
-                let button = parse_physical_button(&from)?;
-                let target = parse_remap_target(&to)?;
-                config_remap(
-                    &options,
-                    slot,
-                    button,
-                    target,
-                    backup_dir.as_deref(),
-                    write_chunk,
-                    yes,
-                )
-                .await?;
-            }
-            ConfigCommand::Map { command } => match command {
-                MapCommand::Show { slot } => {
-                    let slot = parse_slot(slot)?;
-                    config_map_show(&options, slot).await?;
-                }
-            },
-        },
-        Command::Macro { command } => match command {
-            MacroCommand::Backup {
-                dir,
-                poll_interval_ms,
-                report_enable,
-            } => {
-                macro_backup(&options, &dir, poll_interval_ms, report_enable).await?;
-            }
-            MacroCommand::Write {
-                slot,
-                index,
-                file,
-                trigger,
-                backup_dir,
-                chunk_size,
-                write_total_relative,
-                poll_interval_ms,
-                report_enable,
-            } => {
-                macro_write(
-                    &options,
-                    slot,
-                    index,
-                    &file,
-                    trigger.as_deref(),
-                    backup_dir.as_deref(),
-                    chunk_size,
-                    macro_write_layout(write_total_relative),
-                    poll_interval_ms,
-                    report_enable,
-                )
-                .await?;
-            }
-            MacroCommand::Restore {
-                dir,
-                force,
-                chunk_size,
-                write_total_relative,
-                poll_interval_ms,
-                report_enable,
-            } => {
-                macro_restore(
-                    &options,
-                    &dir,
-                    force,
-                    chunk_size,
-                    macro_write_layout(write_total_relative),
-                    poll_interval_ms,
-                    report_enable,
-                )
-                .await?;
-            }
-        },
+        // These commands manage their own Ctrl-C (`hold` / monitor shutdown) and
+        // print the App Mode warning from that shutdown path.
         Command::Backup { raw, json, hold } => {
             backup(
                 &options,
@@ -610,9 +496,174 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
             )
             .await;
         }
+        // Everything else holds the link through `BleTransport::connect` and
+        // would otherwise die on SIGINT before the operator learns that 80ND
+        // is gone. Wrap connect + command as one cancellable unit.
+        command @ (Command::Info | Command::Config { .. } | Command::Macro { .. }) => {
+            match with_sigint(
+                dispatch_connected_command(&options, command),
+                wait_for_sigint(),
+            )
+            .await
+            {
+                SigintOutcome::Finished(result) => result?,
+                SigintOutcome::Interrupted => {
+                    warn_sigint_disconnects();
+                    return Ok(ExitCode::from(EXIT_INTERRUPTED));
+                }
+            }
+        }
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Dispatch the commands whose whole duration owns the BLE link.
+///
+/// Only the variants wrapped by [`with_sigint`] in [`run`] reach here; the
+/// lifecycle-owning commands (`scan`, `backup`, `monitor`, `keepalive`,
+/// `session`) are handled by `run` directly.
+async fn dispatch_connected_command(options: &BleOptions, command: Command) -> Result<(), Error> {
+    match command {
+        Command::Info => info(options).await,
+        Command::Config { command } => dispatch_config_command(options, command).await,
+        Command::Macro { command } => dispatch_macro_command(options, command).await,
+        Command::Scan
+        | Command::Backup { .. }
+        | Command::Monitor { .. }
+        | Command::Keepalive { .. }
+        | Command::Session { .. } => {
+            unreachable!("only SIGINT-wrapped connected commands are dispatched here")
+        }
+    }
+}
+
+async fn dispatch_config_command(
+    options: &BleOptions,
+    command: ConfigCommand,
+) -> Result<(), Error> {
+    match command {
+        ConfigCommand::Dump { raw, json } => {
+            dump_config(options, raw.as_deref(), json.as_deref()).await?;
+        }
+        ConfigCommand::Write {
+            file,
+            backup_dir,
+            accept_reserved_drift,
+            force_raw,
+            write_chunk,
+            yes,
+        } => {
+            config_write(
+                options,
+                &file,
+                backup_dir.as_deref(),
+                accept_reserved_drift,
+                force_raw,
+                write_chunk,
+                yes,
+            )
+            .await?;
+        }
+        ConfigCommand::Set {
+            field,
+            value,
+            slot,
+            backup_dir,
+            write_chunk,
+            yes,
+        } => {
+            let slot = parse_slot(slot)?;
+            let set = parse_config_set(&field, &value, slot)?;
+            config_set(options, &set, backup_dir.as_deref(), write_chunk, yes).await?;
+        }
+        ConfigCommand::Remap {
+            from,
+            to,
+            slot,
+            backup_dir,
+            write_chunk,
+            yes,
+        } => {
+            let slot = parse_slot(slot)?;
+            let button = parse_physical_button(&from)?;
+            let target = parse_remap_target(&to)?;
+            config_remap(
+                options,
+                slot,
+                button,
+                target,
+                backup_dir.as_deref(),
+                write_chunk,
+                yes,
+            )
+            .await?;
+        }
+        ConfigCommand::Map { command } => match command {
+            MapCommand::Show { slot } => {
+                let slot = parse_slot(slot)?;
+                config_map_show(options, slot).await?;
+            }
+        },
+    }
+    Ok(())
+}
+
+async fn dispatch_macro_command(options: &BleOptions, command: MacroCommand) -> Result<(), Error> {
+    match command {
+        MacroCommand::Backup {
+            dir,
+            poll_interval_ms,
+            report_enable,
+        } => {
+            macro_backup(options, &dir, poll_interval_ms, report_enable).await?;
+        }
+        MacroCommand::Write {
+            slot,
+            index,
+            file,
+            trigger,
+            backup_dir,
+            chunk_size,
+            write_total_relative,
+            poll_interval_ms,
+            report_enable,
+        } => {
+            macro_write(
+                options,
+                slot,
+                index,
+                &file,
+                trigger.as_deref(),
+                backup_dir.as_deref(),
+                chunk_size,
+                macro_write_layout(write_total_relative),
+                poll_interval_ms,
+                report_enable,
+            )
+            .await?;
+        }
+        MacroCommand::Restore {
+            dir,
+            force,
+            chunk_size,
+            write_total_relative,
+            poll_interval_ms,
+            report_enable,
+        } => {
+            macro_restore(
+                options,
+                &dir,
+                force,
+                chunk_size,
+                macro_write_layout(write_total_relative),
+                poll_interval_ms,
+                report_enable,
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn scan(timeout: Duration) -> Result<(), Error> {
@@ -650,7 +701,67 @@ async fn best_effort_disable_reports<T: Transport>(session: &Session<T>, timeout
 }
 
 async fn best_effort_disconnect<T: Transport>(transport: &T, timeout: Duration) {
-    let _ = tokio::time::timeout(timeout, transport.disconnect()).await;
+    match tokio::time::timeout(timeout, transport.disconnect()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            // `BleTransport::disconnect` keeps the single-owner lock after a
+            // partial teardown. The link may still be half-closed, so warn
+            // instead of silently starting the next command.
+            eprintln!(
+                "warning: {error}. The BLE link may still be half-closed; do not start \
+                 another BLE operation until this process exits."
+            );
+        }
+        Err(_) => eprintln!(
+            "warning: BLE disconnect did not finish within {timeout:?}; the link may still \
+             be half-closed. Do not start another BLE operation until this process exits."
+        ),
+    }
+}
+
+/// Wait for SIGINT and resolve; the value itself is ignored.
+async fn wait_for_sigint() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Shutdown future for commands that keep a link open for a fixed time
+/// (`backup --hold`, `monitor`, `keepalive`): ends the loop and warns that the
+/// link is about to be dropped.
+async fn shutdown_on_sigint() {
+    wait_for_sigint().await;
+    warn_sigint_disconnects();
+}
+
+/// Result of racing a BLE command against SIGINT.
+#[derive(Debug)]
+enum SigintOutcome<T> {
+    /// The command finished before a signal arrived.
+    Finished(T),
+    /// SIGINT arrived first; the command future was dropped.
+    Interrupted,
+}
+
+/// Race a BLE-owning future against SIGINT.
+///
+/// Every command that opens or holds the BLE link must warn before dropping
+/// it: the controller stops advertising `80ND` the moment the link closes.
+/// Previously this was only true inside the `session` REPL, so a Ctrl-C during
+/// `connect`, the `0x0007` enable, or `info`/`config`/`macro` lost App Mode
+/// without telling the operator.
+///
+/// The signal future is injected so the race and its mapping are testable
+/// without delivering a real process signal.
+async fn with_sigint<T, F, S>(future: F, signal: S) -> SigintOutcome<T>
+where
+    F: Future<Output = T>,
+    S: Future<Output = ()>,
+{
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        _ = signal => SigintOutcome::Interrupted,
+        value = &mut future => SigintOutcome::Finished(value),
+    }
 }
 
 /// Convert `--poll-interval-ms` into the session keepalive interval.
@@ -2999,11 +3110,16 @@ async fn backup(
     hold: Duration,
 ) -> Result<(), Error> {
     validate_output_paths(raw_path, json_path)?;
-    let transport = BleTransport::connect(options).await?;
-    let session = Session::new(transport);
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+    let transport = match with_sigint(BleTransport::connect(options), wait_for_sigint()).await {
+        SigintOutcome::Finished(Ok(transport)) => transport,
+        SigintOutcome::Finished(Err(error)) => return Err(error),
+        SigintOutcome::Interrupted => {
+            warn_sigint_disconnects();
+            return Ok(());
+        }
     };
+    let session = Session::new(transport);
+    let shutdown = shutdown_on_sigint();
     let result = backup_session(&session, raw_path, json_path, hold, shutdown).await;
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
@@ -4526,11 +4642,16 @@ async fn monitor(options: &BleOptions, count: Option<u64>) -> Result<(), Error> 
         return Ok(());
     }
 
-    let transport = BleTransport::connect(options).await?;
-    let session = Session::new(transport);
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+    let transport = match with_sigint(BleTransport::connect(options), wait_for_sigint()).await {
+        SigintOutcome::Finished(Ok(transport)) => transport,
+        SigintOutcome::Finished(Err(error)) => return Err(error),
+        SigintOutcome::Interrupted => {
+            warn_sigint_disconnects();
+            return Ok(());
+        }
     };
+    let session = Session::new(transport);
+    let shutdown = shutdown_on_sigint();
     let result = monitor_connection(&session, Duration::from_millis(20), count, shutdown).await;
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result.map(|_| ())
@@ -4574,18 +4695,20 @@ async fn keepalive(
     }
 
     let started = Instant::now();
-    let transport = match BleTransport::connect(options).await {
-        Ok(transport) => transport,
-        Err(error) => {
+    let transport = match with_sigint(BleTransport::connect(options), wait_for_sigint()).await {
+        SigintOutcome::Finished(Ok(transport)) => transport,
+        SigintOutcome::Finished(Err(error)) => {
             eprintln!("keepalive error after 0.0s: {error}");
             return Ok(ExitCode::FAILURE);
+        }
+        SigintOutcome::Interrupted => {
+            warn_sigint_disconnects();
+            return Ok(ExitCode::from(EXIT_INTERRUPTED));
         }
     };
     let session = Session::new(transport);
 
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
+    let shutdown = shutdown_on_sigint();
     let result = run_keepalive(&session, interval, duration, shutdown).await;
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
 
@@ -5369,10 +5492,11 @@ fn keepalive_degraded_error(state: &SessionKeepaliveState) -> Option<Error> {
         return None;
     }
     Some(Error::Transport(format!(
-        "keepalive degraded (consecutive failures {}): {}. The controller left BLE App \
-         Mode, so `{APP_BLE_NAME}` no longer advertises and this session does not \
-         auto-reconnect. Press Profile on the controller for about 3 seconds to re-enter \
-         App Mode, then start a new `eightbitdo session`",
+        "keepalive degraded (consecutive failures {}): {}. The last few keepalive ticks failed \
+         with I/O errors (a missing input report is normal idle and is not counted as a \
+         failure). The controller left BLE App Mode, so `{APP_BLE_NAME}` no longer advertises \
+         and this session does not auto-reconnect. Press Profile on the controller for about \
+         3 seconds to re-enter App Mode, then start a new `eightbitdo session`",
         state.consecutive_failures.load(Ordering::SeqCst),
         state
             .last_error()
@@ -5391,6 +5515,12 @@ const EXIT_SESSION_DEGRADED: u8 = 3;
 /// Exit code for a session that ended for any reason other than a clean
 /// `quit`.
 const EXIT_SESSION_ERROR: u8 = 1;
+
+/// Exit code for a top-level BLE command interrupted by SIGINT.
+///
+/// `130` is the conventional shell status for a process terminated by
+/// `SIGINT`; the command itself still prints the App Mode press warning first.
+const EXIT_INTERRUPTED: u8 = 130;
 
 /// Map a finished REPL result and the keepalive state to a process exit code.
 ///
@@ -5424,11 +5554,19 @@ fn warn_eof_disconnects() {
 }
 
 fn warn_app_mode_requires_press(reason: &str) {
-    eprintln!(
+    eprintln!("{}", app_mode_press_message(reason));
+}
+
+/// The operator-facing warning shared by SIGINT, EOF and a lost link.
+///
+/// Kept separate from the printing so the required content (`80ND` stops
+/// advertising, Profile ~3 seconds) is testable without capturing stderr.
+fn app_mode_press_message(reason: &str) -> String {
+    format!(
         "note: {reason}. The controller stops advertising `{APP_BLE_NAME}`; to re-enter \
          App Mode, press Profile on the controller for about 3 seconds before starting a \
          new session."
-    );
+    )
 }
 
 async fn shutdown_session<T: Transport>(
@@ -6703,11 +6841,17 @@ async fn session(
         eprintln!("session error: --interval-ms must be greater than zero");
         return Ok(ExitCode::FAILURE);
     }
-    let transport = match BleTransport::connect(options).await {
-        Ok(transport) => transport,
-        Err(error) => {
+    // The connect scan can take seconds and already leaves App Mode when it is
+    // interrupted: warn instead of dying silently under the default SIGINT.
+    let transport = match with_sigint(BleTransport::connect(options), wait_for_sigint()).await {
+        SigintOutcome::Finished(Ok(transport)) => transport,
+        SigintOutcome::Finished(Err(error)) => {
             eprintln!("session error: {error}");
             return Ok(ExitCode::FAILURE);
+        }
+        SigintOutcome::Interrupted => {
+            warn_sigint_disconnects();
+            return Ok(ExitCode::from(EXIT_INTERRUPTED));
         }
     };
     let session = Arc::new(AsyncMutex::new(Session::new(transport)));
@@ -6715,20 +6859,27 @@ async fn session(
         let guard = session.lock().await;
         guard.transport().mtu()
     };
-    let keepalive = match start_session_keepalive_with_config(
+    // The startup `0x0007` enable is also part of the link-owning phase.
+    let keepalive_start = start_session_keepalive_with_config(
         Arc::clone(&session),
         SessionKeepaliveConfig::with_interval(interval),
         report_enable,
-    )
-    .await
-    {
-        Ok(keepalive) => keepalive,
-        Err(error) => {
+    );
+    let keepalive = match with_sigint(keepalive_start, wait_for_sigint()).await {
+        SigintOutcome::Finished(Ok(keepalive)) => keepalive,
+        SigintOutcome::Finished(Err(error)) => {
             if let Ok(guard) = tokio::time::timeout(CLEANUP_TIMEOUT, session.lock()).await {
                 best_effort_disconnect(guard.transport(), CLEANUP_TIMEOUT).await;
             }
             eprintln!("session error: {error}");
             return Ok(ExitCode::FAILURE);
+        }
+        SigintOutcome::Interrupted => {
+            warn_sigint_disconnects();
+            if let Ok(guard) = tokio::time::timeout(CLEANUP_TIMEOUT, session.lock()).await {
+                best_effort_disconnect(guard.transport(), CLEANUP_TIMEOUT).await;
+            }
+            return Ok(ExitCode::from(EXIT_INTERRUPTED));
         }
     };
     // Make the 0x0007 state explicit: a REPL macro write happens while this
@@ -9089,6 +9240,61 @@ mod tests {
         let finalized = finalize_session_result(Ok(()), &state_quit);
         assert!(
             matches!(finalized, Err(Error::Transport(ref msg)) if msg.contains("keepalive degraded"))
+        );
+    }
+
+    #[test]
+    fn app_mode_press_message_names_the_link_the_press_and_the_wait() {
+        for reason in [
+            "SIGINT received; exiting closes the BLE link and exits App Mode",
+            "stdin ended (EOF); exiting closes the BLE link and exits App Mode",
+            "the BLE link was lost",
+        ] {
+            let message = app_mode_press_message(reason);
+            assert!(message.contains(reason), "reason missing: {message}");
+            assert!(message.contains("80ND"), "80ND missing: {message}");
+            assert!(
+                message.contains("Profile"),
+                "press instruction missing: {message}"
+            );
+            assert!(
+                message.contains("3 seconds"),
+                "press duration missing: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_commands_use_the_conventional_sigint_exit_code() {
+        // 128 + SIGINT(2), distinct from the degraded exit code 3 so the
+        // resident loop cannot confuse a user interrupt with a lost link.
+        assert_eq!(EXIT_INTERRUPTED, 130);
+        assert_ne!(EXIT_INTERRUPTED, EXIT_SESSION_DEGRADED);
+    }
+
+    #[tokio::test]
+    async fn with_sigint_prefers_the_signal_and_passes_finished_results() {
+        let interrupted = with_sigint(async { Ok::<u8, Error>(7) }, std::future::ready(())).await;
+        assert!(
+            matches!(interrupted, SigintOutcome::Interrupted),
+            "a ready signal must win over the command"
+        );
+
+        let finished =
+            with_sigint(async { Ok::<u8, Error>(7) }, std::future::pending::<()>()).await;
+        assert!(
+            matches!(finished, SigintOutcome::Finished(Ok(7))),
+            "the command result must pass through"
+        );
+
+        let failed = with_sigint(
+            async { Err::<u8, Error>(Error::Disconnected) },
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(
+            matches!(failed, SigintOutcome::Finished(Err(Error::Disconnected))),
+            "a command error must not be mistaken for an interruption"
         );
     }
 
