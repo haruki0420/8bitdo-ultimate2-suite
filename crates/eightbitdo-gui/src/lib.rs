@@ -8,7 +8,7 @@
 //! with its recovery data on failure.
 //!
 //! The crate is split into a small testable core ([`driver`], [`backup`],
-//! [`model`], [`write`]) and a thin egui layer ([`app`]) that talks to a
+//! [`model`], [`mod@write`]) and a thin egui layer ([`app`]) that talks to a
 //! background tokio worker ([`worker`]) over channels. The UI thread never
 //! awaits device I/O. [`i18n`] holds every user-visible string (Japanese by
 //! default, English fallback) and [`theme`] holds the design tokens and
