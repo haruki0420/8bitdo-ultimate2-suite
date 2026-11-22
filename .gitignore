@@ -48,3 +48,9 @@ Thumbs.db
 
 # Local GUI backups (normally under the XDG data directory)
 8bitdo-backups/
+
+# Local agent scratch (RE / analysis) — keep the repo root clean
+.tmp/
+.re-scratch/
+androguard.db*
+androguard.log

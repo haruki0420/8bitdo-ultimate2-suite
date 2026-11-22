@@ -85,9 +85,9 @@ Tier の判定・パス別トリガー・故障リストの詳細は **[docs/REV
 - [ ] `docs/STRUCT_BT2_2768B.md` のオフセット・サイズ・エンディアンと一致しているか
 - [ ] 予約領域 `0x1F4..0x68B` / `0x914..0x92B` を破壊していないか
 - [ ] 名前が UTF-16**BE**、数値が Little-Endian になっているか
-- [ ] マクロの `align32`、BLE 64B / USB HID 32B チャンク（32B アライン。それ以外は拒否。64B 超は 64B にクランプしてから判定）、4KB セクタ、Erase → Write → Header → Save の順序。`Erase 0x0104` は `total_len = chunk_len = 0x1000`、ペイロードなし
+- [ ] マクロの `align32`、BLE 64B / USB HID 32B チャンク（32B アライン。それ以外は拒否。64B 超は 64B にクランプしてから判定）、4KB セクタ、Header (`total_len=0xD8`) → Save → Erase → Write → Save の順序。`macro restore` は slot 単位で Header+Save 1 回 → 全マクロ Erase/Write → 最終 Save 1 回。`Erase 0x0104` は `total_len = chunk_len = 0x1000`、ペイロードなし
 - [ ] OTA の前提（BLE Boot: `enterBoot` → `"8bt"` → `readPID 0x0008` 5s、USB Boot: **RX** `[0x00,0x05]` → `readPID cmd=0x0000/subcmd=0x0008` 5s、`readVersionInBoot 0x0005`）と書込順序、失敗時の全セクタ消去・再書き込み。`readVersionInBoot` の offset `0x01017040` は type 1 用で、非 type 1 は停止して仕様/Issue を確認する。USB Boot の **TX** フレーミングは未文書化のため、USB OTA 書込は停止し、`PROTOCOL_SPEC` に証跡を追加するか `N/A + 理由（USB Boot TX 未文書化）` を記録する。USB の復旧は再列挙/再接続
-- [ ] 実機書き込み前に 2768B 設定とマクロ 4×3 をバックアップし、SHA-256 と復元結果を記録しているか。`max_steps` は `0x68C + slot * 0xD8 + 0x08 + macro_idx * 0x34 + 0x22`（`u16`）
+- [ ] 実機書き込み前に 2768B 設定とマクロ 3 スロット × 4 マクロ をバックアップし、SHA-256 と復元結果を記録しているか。`max_steps` は `0x68C + slot * 0xD8 + 0x08 + macro_idx * 0x34 + 0x22`（`u16`）
 - [ ] BLE 受信にプレフィックスを要求していないか（`0x600F`）
 - [ ] USB HID の送信 `[0x81, 0x04]` / 受信 `[0x02, 0x04]` を混同していないか
 - [ ] 失敗系（長さ不足、未知の値、予約バイト）のテストがあるか

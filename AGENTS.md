@@ -25,7 +25,7 @@
 2. **[docs/STRUCT_BT2_2768B.md](docs/STRUCT_BT2_2768B.md)**
    - 2768 バイト（`0xAD0`）`record_ultimatebt2` 設定構造体の全オフセット・型・デフォルト値・部分書き込みパラメータ
    - 32-bit `KeyMap` ビットマスク全表と 22 キーインデックス
-   - 10 バイト `MacroDatas` ステップ構造（1ms 単位、8-bit スティック・トリガー）、Flash セクタ配置（`macro_idx << 12`）、Erase → Write → Header → Save のコミット手順
+   - 10 バイト `MacroDatas` ステップ構造（1ms 単位、8-bit スティック・トリガー）、Flash セクタ配置（`macro_idx << 12`）、Header (`total_len=0xD8`) → Save → Erase → Write → Save のコミット手順
 3. **[docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)**
    - 全体アーキテクチャ、ワークスペース構成、Phase 1〜5 の実装ロードマップ、安全原則
 
@@ -60,7 +60,8 @@
 2. **構造体の未知・予約バイト保全**:
    - 2768 バイト構造体を編集する際は必ず元のバイトバッファを保持した上で変更箇所だけ上書きし、`ANSI_CRC_16_sh` を再計算してから書き込むこと。
 3. **マクロ Flash 書き込み順序**:
-   - 必ず `Erase (0x0104, total_len = chunk_len = 0x1000, ペイロードなし)` → `Write (0x0103, BLE 64B / USB HID 32B（32B アライン。それ以外は拒否。64B 超は 64B にクランプしてから判定）, 最終チャンクは 32B アライン長)` → `Macro ヘッダ更新 (0x0001)` → `Save (0x0006)` の順序を守ること。マクロの `Erase` / `Write` / ヘッダは 2 秒、`Save` は 3 秒（USB HID。BLE は `wait_ack` 既定値とリトライ方針を記録）。OTA の 10 秒 / 1 秒 / 64B 固定をマクロに適用しない。
+   - 必ず `Macro ヘッダ更新 (0x0001, total_len=0xD8)` → `Save (0x0006)` → `Erase (0x0104, total_len = chunk_len = 0x1000, ペイロードなし)` → `Write (0x0103, BLE 64B / USB HID 32B（32B アライン。それ以外は拒否。64B 超は 64B にクランプしてから判定）, 最終チャンクは 32B アライン長)` → `Save (0x0006)` の順序を守ること。`macro restore` の slot 単位バッチでは、ヘッダ + 最初の Save を slot に 1 回、最終 Save を全マクロの Erase/Write 後に 1 回だけ送る。マクロの `Erase` / `Write` / ヘッダは 2 秒、`Save` は 3 秒・リトライなし（BLE の正式値は未文書化。USB HID は 3 秒）。OTA の 10 秒 / 1 秒 / 64B 固定をマクロに適用しない。
+   - 216B のマクロヘッダ部分書込は config CRC `+0x00C` を wire に載せない（`docs/PROTOCOL_SPEC.md` §6.5）。
 4. **OTA（ファームウェア更新）の安全性**:
    - `enterBoot 0x000C` → BLE Boot は `"8bt"` へ再接続 → `readPID 0x0008` (5s)、USB Boot は **RX** `[0x00,0x05]` → `readPID cmd=0x0000/subcmd=0x0008` (5s) の前提を確認し、`readPID` の結果から `gamepad_type` を判定すること。`readVersionInBoot 0x0005` の offset `0x01017040` は type 1 用で、非 type 1 は推測せず `docs/PROTOCOL_SPEC.md` / Issue を確認して停止すること。
    - `EraseFlash 0x0004` の ACK を待ってから `WriteFirmware 0x0003` を送り、失敗時は再接続だけで済ませず、全セクタ消去・再書き込みで復旧すること。USB の復旧は再列挙/再接続であり、BLE の `"8bt"` ではない。
@@ -103,5 +104,5 @@
 
 1. `crates/eightbitdo-core` に `Transport` トレイト（BLE / USB HID / Mock）とセッション管理を実装する。
 2. `crates/eightbitdo-cli` に `scan` / `info` / `config dump` / `monitor` を実装する。
-3. 実機では **読み取り専用コマンドから**検証し、最初の書き込み前に必ず 2768B 設定とマクロ 4×3 スロットをバックアップし、ファイル名と SHA-256 を記録する。
-4. 書き込み系の前に、モックトランスポートで `Erase 0x0104 → Write 0x0103 → Header 0x0001 → Save 0x0006` のパケット列と CRC を固定する。
+3. 実機では **読み取り専用コマンドから**検証し、最初の書き込み前に必ず 2768B 設定とマクロ 3 スロット × 4 マクロをバックアップし、ファイル名と SHA-256 を記録する。
+4. 書き込み系の前に、モックトランスポートで `Header 0x0001 (total_len=0xD8) → Save 0x0006 → Erase 0x0104 → Write 0x0103 → Save 0x0006` のパケット列と CRC を固定する。

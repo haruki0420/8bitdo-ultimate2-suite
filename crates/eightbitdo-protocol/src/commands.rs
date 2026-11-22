@@ -6,7 +6,7 @@
 
 use alloc::vec::Vec;
 
-use crate::config_bt2::{MacroIndex, Slot, CONFIG_SIZE};
+use crate::config_bt2::{MacroIndex, Slot, CONFIG_SIZE, MACRO_SLOT_SIZE};
 use crate::error::Error;
 use crate::header::{self, CustomHeader, PacketKind, USB_REPORT_SIZE};
 use crate::macro_data::{self, MacroStep};
@@ -421,6 +421,62 @@ pub fn write_config_packets(
         .collect())
 }
 
+/// Split a **216-byte** macro header write into transport-sized packets.
+///
+/// Official evidence (`getBT2_WriteMacroi`, called from `writeBT2Macro`): the
+/// macro header command uses `cmd = 0x0001`, `offset = 0x68C + slot * 0xD8`,
+/// and **`total_len = 0xD8`** (216), not the full 2768-byte configuration
+/// length. `chunk_len` is split by the MTU (142 + 74 on MTU 200). Every packet
+/// carries the CRC-16/MODBUS of its own payload.
+///
+/// This is deliberately separate from [`write_config_packets`], whose
+/// `total_len` remains `0x0AD0` for other configuration writes.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidLength`] when `data` is not exactly
+/// [`MACRO_SLOT_SIZE`], [`Error::EmptyPayload`] when `data` is empty,
+/// [`Error::InvalidChunkSize`] when `chunk_size` is zero (its `max` is the
+/// 216-byte payload length, the largest meaningful chunk), or
+/// [`Error::RangeOutOfBounds`] when `offset + data.len()` exceeds the
+/// 2768-byte configuration block.
+pub fn write_macro_header_packets(
+    offset: u32,
+    data: &[u8],
+    chunk_size: usize,
+) -> Result<Vec<Request>, Error> {
+    if data.is_empty() {
+        return Err(Error::EmptyPayload);
+    }
+    if data.len() != MACRO_SLOT_SIZE {
+        return Err(Error::InvalidLength {
+            expected: MACRO_SLOT_SIZE,
+            actual: data.len(),
+        });
+    }
+    if chunk_size == 0 {
+        return Err(Error::InvalidChunkSize {
+            max: data.len(),
+            actual: 0,
+        });
+    }
+    check_config_range(offset, data.len() as u64)?;
+    let total_len = data.len() as u32;
+    Ok(data
+        .chunks(chunk_size)
+        .enumerate()
+        .map(|(i, chunk)| {
+            Request::new(
+                cmd::WRITE_CONFIG,
+                0,
+                total_len,
+                offset + (i * chunk_size) as u32,
+            )
+            .with_crc_payload(chunk)
+        })
+        .collect())
+}
+
 /// Commit pending configuration writes to flash.
 #[must_use]
 pub fn save(transport: SaveTransport) -> Request {
@@ -512,6 +568,10 @@ pub const fn macro_subcmd(gamepad_mode: u16, slot: Slot) -> u16 {
 /// `getBT2_ReadMacro` (0x2bd90) sets `+0x40 = +0x44 = +0x48` to that length,
 /// keeps the 4 KB sector base in `+0x38`, and uses `cmd 0x0102`.
 ///
+/// This is the first-chunk form. The device answers with one chunk per
+/// request, so subsequent chunks must use [`read_macro_from`] with an
+/// advancing `chunk_offset`.
+///
 /// # Errors
 ///
 /// Returns [`Error::TooManySteps`] when `steps` exceeds
@@ -522,6 +582,33 @@ pub fn read_macro(
     slot: Slot,
     macro_idx: MacroIndex,
     steps: u16,
+) -> Result<Request, Error> {
+    read_macro_from(gamepad_mode, slot, macro_idx, steps, 0)
+}
+
+/// Read one macro chunk at `chunk_offset` inside the macro's 4 KB sector.
+///
+/// The device returns **one chunk per request** (observed 142 bytes,
+/// `docs/PROTOCOL_SPEC.md` §4.3.2). `total_len` and `chunk_len` stay at the
+/// full macro length (`steps * 10`); only the wire `offset` advances:
+/// `offset = (macro_idx << 12) + chunk_offset`.
+///
+/// `chunk_offset` must be smaller than `steps * 10`. Use the response
+/// payload length to advance it. The zero-step form keeps the historical
+/// zero-length request.
+///
+/// # Errors
+///
+/// Returns [`Error::TooManySteps`] when `steps` exceeds
+/// [`macro_data::MAX_MACRO_STEPS`], [`Error::RangeOutOfBounds`] when the
+/// encoded steps would exceed one 4 KB flash sector, or
+/// [`Error::InvalidFrame`] when `chunk_offset` is not inside the macro.
+pub fn read_macro_from(
+    gamepad_mode: u16,
+    slot: Slot,
+    macro_idx: MacroIndex,
+    steps: u16,
+    chunk_offset: u32,
 ) -> Result<Request, Error> {
     let step_count = usize::from(steps);
     let total_len = u32::from(steps) * macro_data::MACRO_STEP_SIZE as u32;
@@ -538,19 +625,104 @@ pub fn read_macro(
             actual: step_count,
         });
     }
+    if total_len != 0 && chunk_offset >= total_len {
+        return Err(Error::InvalidFrame(
+            "macro chunk offset must be less than the declared length",
+        ));
+    }
+    let offset =
+        macro_idx
+            .sector_offset()
+            .checked_add(chunk_offset)
+            .ok_or(Error::AddressOverflow {
+                base: macro_idx.sector_offset(),
+                offset: u64::from(chunk_offset),
+            })?;
     Ok(Request::new_payloadless(
         cmd::READ_MACRO,
         macro_subcmd(gamepad_mode, slot),
         total_len,
-        macro_idx.sector_offset(),
+        offset,
     ))
+}
+
+/// Framing knob for `WriteBT2Macro` (`0x0103`).
+///
+/// The default is `absolute_total_len = true`:
+/// `total_len = (macro_idx << 12) + aligned payload length` (the absolute end
+/// address). Chunk offsets are always sector-based (`macro_idx << 12 + i *
+/// chunk_size`): a sector-relative write offset is deliberately not supported,
+/// because `Erase` (`0x0104`) always targets `macro_idx << 12`. A 0-based write
+/// offset would therefore write a different sector than the one that was
+/// erased and could destroy unrelated macro data.
+///
+/// On-device evidence (2026-11-22, **BLE only**, slot S1, `macro_idx=0 (M1)`
+/// and `macro_idx=1 (M2)`): `macro_idx=0` persists with either `total_len`
+/// theory because its sector base is 0, but `macro_idx=1` ACKs
+/// `align32(steps * 10)` and does **not** persist; sending the absolute end
+/// address makes the read-back SHA match. Confirmed frames: `macro_idx=1
+/// (M2)` with 2 steps sends `0x1020` (`0x1000 + 0x20`), and 46 steps (460B ->
+/// 0x1E0) sends `0x11E0` (`0x1000 + 0x1E0`). `macro_idx=2 (M3)` / `macro_idx=3
+/// (M4)` and slots S2/S3 are extrapolated from the formula and are **not**
+/// device-verified yet. USB HID write is unimplemented (BLE Save only) and
+/// unverified.
+///
+/// [`Self::relative_total_len`] keeps the pre-2026-11-22 experiment available
+/// for A/B work. A plan carries its layout so one per-slot batch cannot mix
+/// layouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacroWriteLayout {
+    /// When true (default), `total_len = (macro_idx << 12) + aligned payload
+    /// length`.
+    pub absolute_total_len: bool,
+}
+
+impl Default for MacroWriteLayout {
+    fn default() -> Self {
+        Self::default_ble()
+    }
+}
+
+impl MacroWriteLayout {
+    /// The validated BLE framing used by every production caller: absolute
+    /// `total_len` (sector base + aligned payload length).
+    #[must_use]
+    pub const fn default_ble() -> Self {
+        Self {
+            absolute_total_len: true,
+        }
+    }
+
+    /// The pre-2026-11-22 experiment: `total_len = align32(steps * 10)`.
+    ///
+    /// Kept for on-device A/B work only; `macro_idx=1..=3 (M2..=M4)` do not
+    /// persist under this framing (device-confirmed for `macro_idx=1` only).
+    #[must_use]
+    pub const fn relative_total_len() -> Self {
+        Self {
+            absolute_total_len: false,
+        }
+    }
+
+    /// `total_len` for an aligned payload of `payload_len` bytes.
+    #[must_use]
+    pub const fn total_len(self, macro_idx: MacroIndex, payload_len: usize) -> u32 {
+        let aligned = payload_len as u32;
+        if self.absolute_total_len {
+            macro_idx.sector_offset().saturating_add(aligned)
+        } else {
+            aligned
+        }
+    }
 }
 
 /// Write macro steps, splitting into packets of at most `chunk_size` bytes.
 ///
 /// The payload is [`macro_data::encode_macro_steps`] (32-byte aligned) and
-/// every packet's `offset` advances. BLE allows 64-byte chunks; USB HID
-/// allows 32.
+/// every packet's `offset` advances from `macro_idx << 12`. BLE allows 64-byte
+/// chunks; USB HID allows 32. `total_len` is the absolute end address
+/// `(macro_idx << 12) + align32(steps * 10)` (BLE, `macro_idx=0/1` and slot S1
+/// device-confirmed on 2026-11-22; other indices/slots extrapolated).
 pub fn write_macro_steps(
     gamepad_mode: u16,
     slot: Slot,
@@ -558,8 +730,30 @@ pub fn write_macro_steps(
     steps: &[MacroStep],
     chunk_size: usize,
 ) -> Result<Vec<Request>, Error> {
+    write_macro_steps_with_layout(
+        gamepad_mode,
+        slot,
+        macro_idx,
+        steps,
+        chunk_size,
+        MacroWriteLayout::default_ble(),
+    )
+}
+
+/// [`write_macro_steps`] with an explicit [`MacroWriteLayout`] framing.
+///
+/// Production callers should pass [`MacroWriteLayout::default_ble`]; the
+/// relative-total experiment uses [`MacroWriteLayout::relative_total_len`].
+pub fn write_macro_steps_with_layout(
+    gamepad_mode: u16,
+    slot: Slot,
+    macro_idx: MacroIndex,
+    steps: &[MacroStep],
+    chunk_size: usize,
+    layout: MacroWriteLayout,
+) -> Result<Vec<Request>, Error> {
     let payload = macro_data::encode_macro_steps(steps)?;
-    write_macro_payload(gamepad_mode, slot, macro_idx, &payload, chunk_size)
+    write_macro_payload_with_layout(gamepad_mode, slot, macro_idx, &payload, chunk_size, layout)
 }
 
 /// Write a pre-encoded macro payload (already 32-byte aligned).
@@ -584,6 +778,29 @@ pub fn write_macro_payload(
     macro_idx: MacroIndex,
     payload: &[u8],
     chunk_size: usize,
+) -> Result<Vec<Request>, Error> {
+    write_macro_payload_with_layout(
+        gamepad_mode,
+        slot,
+        macro_idx,
+        payload,
+        chunk_size,
+        MacroWriteLayout::default_ble(),
+    )
+}
+
+/// [`write_macro_payload`] with experimental [`MacroWriteLayout`] framing.
+///
+/// The validation is identical to [`write_macro_payload`]; only `total_len`
+/// depends on `layout`. Write offsets are always sector-based
+/// (`macro_idx << 12`).
+pub fn write_macro_payload_with_layout(
+    gamepad_mode: u16,
+    slot: Slot,
+    macro_idx: MacroIndex,
+    payload: &[u8],
+    chunk_size: usize,
+    layout: MacroWriteLayout,
 ) -> Result<Vec<Request>, Error> {
     if payload.is_empty() {
         return Err(Error::EmptyPayload);
@@ -610,7 +827,10 @@ pub fn write_macro_payload(
             alignment: MACRO_PAYLOAD_ALIGNMENT,
         });
     }
-    let total_len = payload.len() as u32;
+    let total_len = layout.total_len(macro_idx, payload.len());
+    // Write offsets always start at the macro's own flash sector. `Erase` uses
+    // the same sector base, so a relative (0-based) write would target a
+    // different sector; that framing is intentionally not exposed.
     let base = macro_idx.sector_offset();
     Ok(payload
         .chunks(chunk_size)
@@ -1039,6 +1259,59 @@ mod tests {
     }
 
     #[test]
+    fn macro_header_packets_use_216_total_len() {
+        let data = [0x5Au8; 216];
+        let packets = write_macro_header_packets(0x68C, &data, 142).unwrap();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].header.cmd, 0x0001);
+        assert_eq!(packets[0].header.subcmd, 0);
+        assert_eq!(packets[0].header.offset, 0x68C);
+        assert_eq!(packets[0].header.total_len, 216);
+        assert_eq!(packets[0].header.chunk_len, 142);
+        assert_eq!(packets[0].payload.len(), 142);
+        assert_eq!(packets[1].header.offset, 0x68C + 142);
+        assert_eq!(packets[1].header.total_len, 216);
+        assert_eq!(packets[1].header.chunk_len, 74);
+        assert_eq!(packets[1].payload.len(), 74);
+        for packet in &packets {
+            assert_eq!(
+                packet.header.crc16,
+                crate::crc::packet_crc16(&packet.payload)
+            );
+        }
+
+        // The existing config writer keeps its 0x0AD0 total_len.
+        let config = write_config_packets(0x68C, &data, 142).unwrap();
+        assert_eq!(config[0].header.total_len, 0x0AD0);
+        assert!(matches!(
+            write_macro_header_packets(0x0AC0, &data, 32),
+            Err(Error::RangeOutOfBounds { .. })
+        ));
+        assert!(matches!(
+            write_macro_header_packets(0x68C, &[], 32),
+            Err(Error::EmptyPayload)
+        ));
+        assert!(matches!(
+            write_macro_header_packets(0x68C, &data, 0),
+            Err(Error::InvalidChunkSize { actual: 0, .. })
+        ));
+        assert!(matches!(
+            write_macro_header_packets(0x68C, &data[..215], 32),
+            Err(Error::InvalidLength {
+                expected: 216,
+                actual: 215
+            })
+        ));
+        assert!(matches!(
+            write_macro_header_packets(0x68C, &[0u8; 217], 32),
+            Err(Error::InvalidLength {
+                expected: 216,
+                actual: 217
+            })
+        ));
+    }
+
+    #[test]
     fn config_ranges_are_bounded() {
         assert!(matches!(
             read_config(0x0AD0, 1),
@@ -1175,6 +1448,33 @@ mod tests {
     }
 
     #[test]
+    fn read_macro_from_advances_only_the_offset() {
+        let request = read_macro_from(3, Slot::S2, MacroIndex::M2, 50, 142).unwrap();
+        assert_eq!(request.header.cmd, 0x0102);
+        assert_eq!(request.header.subcmd, 0x0301);
+        assert_eq!(request.header.chunk_len, 500);
+        assert_eq!(request.header.total_len, 500);
+        assert_eq!(request.header.offset, 0x1000 + 142);
+        assert!(request.payload.is_empty());
+
+        let bytes = request.encode_ble_payloadless(PacketKind::App).unwrap();
+        assert_eq!(bytes.len(), 17);
+        let parsed = CustomHeader::parse(&bytes[1..]).unwrap();
+        assert_eq!(parsed.chunk_len, 500);
+        assert_eq!(parsed.total_len, 500);
+        assert_eq!(parsed.offset, 0x108E);
+
+        assert!(matches!(
+            read_macro_from(3, Slot::S2, MacroIndex::M2, 50, 500),
+            Err(Error::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            read_macro_from(3, Slot::S2, MacroIndex::M2, 50, 501),
+            Err(Error::InvalidFrame(_))
+        ));
+    }
+
+    #[test]
     fn write_macro_aligns_and_chunks() {
         let steps = [MacroStep::neutral(10); 20];
         let packets = write_macro_steps(0, Slot::S1, MacroIndex::M1, &steps, 64).unwrap();
@@ -1193,6 +1493,84 @@ mod tests {
                 crate::crc::packet_crc16(&packet.payload)
             );
         }
+    }
+
+    #[test]
+    fn write_macro_layout_absolute_total_len_adds_the_sector_base() {
+        // 115 steps = 1150 bytes -> 1152 (0x480) after 32-byte alignment.
+        let steps = [MacroStep::neutral(10); 115];
+        // The default is the absolute end address (device-confirmed for
+        // macro_idx=1 (M2) on slot S1, BLE).
+        let default_macro1 = write_macro_steps(0, Slot::S1, MacroIndex::M2, &steps, 64).unwrap();
+        assert_eq!(default_macro1[0].header.total_len, 0x1480);
+        assert_eq!(default_macro1[0].header.offset, 0x1000);
+        let aligned_len = macro_data::encode_macro_steps(&steps).unwrap().len() as u32;
+        assert_eq!(aligned_len, 0x480);
+        assert_eq!(default_macro1[0].header.total_len, 0x1000 + aligned_len);
+
+        // The pre-2026-11-22 experiment drops the sector base.
+        let relative = write_macro_steps_with_layout(
+            0,
+            Slot::S1,
+            MacroIndex::M2,
+            &steps,
+            64,
+            MacroWriteLayout::relative_total_len(),
+        )
+        .unwrap();
+        assert_eq!(relative[0].header.total_len, 0x480);
+        // Only total_len changes; offsets keep the sector base.
+        assert_eq!(relative[0].header.offset, 0x1000);
+
+        // macro_idx=0 (M1) has base 0, so both theories agree.
+        let default_macro0 = write_macro_steps(0, Slot::S1, MacroIndex::M1, &steps, 64).unwrap();
+        assert_eq!(default_macro0[0].header.total_len, 0x480);
+        assert_eq!(default_macro0[0].header.offset, 0);
+        let relative_macro0 = write_macro_steps_with_layout(
+            0,
+            Slot::S1,
+            MacroIndex::M1,
+            &steps,
+            64,
+            MacroWriteLayout::relative_total_len(),
+        )
+        .unwrap();
+        assert_eq!(relative_macro0[0].header.total_len, 0x480);
+    }
+
+    /// `macro_idx=2 (M3)` and `macro_idx=3 (M4)` use their own sector base.
+    ///
+    /// These indices and slots other than S1 are **not** device-verified; the
+    /// expectations are arithmetic extrapolation from the formula confirmed
+    /// for `macro_idx=0/1` on S1 (BLE, 2026-11-22).
+    #[test]
+    fn write_macro_absolute_total_len_uses_the_sector_base_for_m3_and_m4() {
+        let steps = [MacroStep::neutral(10); 2]; // 20 bytes -> 32 aligned.
+        for (macro_idx, base) in [(MacroIndex::M3, 0x2000u32), (MacroIndex::M4, 0x3000)] {
+            let packets = write_macro_steps(0, Slot::S1, macro_idx, &steps, 64).unwrap();
+            assert_eq!(packets.len(), 1);
+            assert_eq!(packets[0].header.total_len, base + 0x20);
+            assert_eq!(packets[0].header.offset, base);
+            assert_eq!(packets[0].header.chunk_len, 32);
+        }
+    }
+
+    /// The frame confirmed on hardware on 2026-11-22 (BLE, slot S1):
+    /// `macro_idx=1 (M2)` (sector 0x1000) with 2 steps sends
+    /// `total_len = 0x1020`, `offset = 0x1000`.
+    ///
+    /// `0x1020` equals `0x1000 + align32(2 * 10)`; the relative experiment
+    /// (`align32(len) = 0x20`) ACKed but was not persisted.
+    #[test]
+    fn write_macro_default_macro1_two_steps_matches_the_device_confirmed_frame() {
+        let steps = [MacroStep::neutral(10); 2];
+        let packets = write_macro_steps(0, Slot::S1, MacroIndex::M2, &steps, 64).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].header.cmd, cmd::WRITE_MACRO);
+        assert_eq!(packets[0].header.total_len, 0x1020);
+        assert_eq!(packets[0].header.offset, 0x1000);
+        assert_eq!(packets[0].header.chunk_len, 32);
+        assert_eq!(packets[0].payload.len(), 32);
     }
 
     #[test]
@@ -1222,6 +1600,27 @@ mod tests {
                 packet.header.crc16,
                 crate::crc::packet_crc16(&packet.payload)
             );
+        }
+    }
+
+    #[test]
+    fn write_macro_32_byte_chunks_are_uniform_for_460_and_500_bytes() {
+        for (steps, chunks) in [(46usize, 15usize), (50, 16)] {
+            let data = alloc::vec![MacroStep::neutral(1); steps];
+            let packets = write_macro_steps(0, Slot::S1, MacroIndex::M1, &data, 32).unwrap();
+            assert_eq!(packets.len(), chunks);
+            let total_len = ((steps * 10 + 31) & !31) as u32;
+            for (index, packet) in packets.iter().enumerate() {
+                assert_eq!(packet.header.total_len, total_len);
+                assert_eq!(packet.header.chunk_len, 32);
+                assert_eq!(packet.header.offset, (index * 32) as u32);
+                assert_eq!(packet.payload.len(), 32);
+                assert_eq!(
+                    packet.header.crc16,
+                    crate::crc::packet_crc16(&packet.payload)
+                );
+            }
+            assert_eq!(packets.last().unwrap().header.chunk_len, 32);
         }
     }
 

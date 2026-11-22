@@ -183,26 +183,35 @@ Track C: モバイル
   - BLE `"80ND"` スキャン、`FF10` + `FF11` 優先 / `FF13` フォールバック、`peripheral.mtu()` の読み取り（MTU ネゴシエーション自体は OS/BlueZ 任せ）
   - `Session`: operation lock（keepalive とコマンドの直列化）、ReadVersion（4B ダミーペイロード + `cmd=0x0004` エンベロープ）、ReadConfig（`chunk_len = total_len = 0x0AD0`、1 要求 = 1 チャンク、142B、最終チャンク切り詰め）、入力レポート
   - CLI: `scan` / `info` / `config dump` / `backup` / `monitor` / `keepalive` / **`session`**
-  - `session`: 1 接続、`0x0007` enable + 20ms `0x0003` keepalive + 受信ドレイン、operation lock でコマンド中は keepalive を停止、`info` / `config dump` / `backup` / `monitor` / `monitor stop` / `status` / `help` / `quit`。`monitor` 自身も 20ms `0x0003` を送り、その間は keepalive が止まる（monitor が keepalive を兼ねる）。`monitor stop` 後は keepalive が自動再開。トップレベルの `monitor` も同じ 20ms `0x0003` ポーリングを共有し、終了時に `0x0007` disable → 切断する。なお `monitor --count N` は公式 `ReadKeysAndJoy` と同様に投げっぱなしで、応答が 1 件も来ない場合も 20ms 周期で `0x0003` を送り続け、`--count` に達するまで Ctrl-C まで回り続ける。`status` は `monitor sent` / `monitor received` を表示し、終了時のロック待ち・切断はタイムアウト付きで有界にする。連続失敗 3 回または `Disconnected` で degraded 停止し、自動再接続しない（`keepalive degraded ...` のメッセージで、設定モードが切れた可能性と Profile 長押しでの再入を案内する）。1 tick の受信ドレインは最大 4 レポート（`try_next_input` 自体も 1 回最大 16 フレーム + 1ms）に固定し、通知が途切れなくても operation lock を保持し続けない。設定の `--raw` / `--json` は同一ディレクトリの一時ファイルへ書いてから rename するアトミック書込で、同一ファイルを指す 2 つの出力パス（`.` / `..`、symlink、Unix の hard link）は端末にアクセスする前に拒否する。hard link の同一性検出は Unix のみ（device/inode）で、Windows は file identity 未実装のため hard link alias を事前拒否しない。ただし出力は一時ファイル + `rename` なので、JSON の `rename` が raw の内容を直接書き換えることはない。case-insensitive alias は raw 書き込み後の再検証で拾う。この再検証は偶発的な alias 用であり、出力ディレクトリに write 権限を持つ攻撃者による TOCTOU / 並行 rename は非保証である。REPL の 1 行は最大 4096 バイトで、超過分は読み捨てて次の行を正常に読む。`session` の Ctrl-C はコマンド実行中でも future を drop して REPL を抜け、セッションを終了する。行リーダーのキャンセル耐性は `monitor` / keepalive の終了通知による中断で読みかけの行を壊さないためのもので、Ctrl-C 後の継続を意味しない。
-  - `session` は将来のデーモン化（常駐プロセス）への布石。1 回の Profile 長押しで複数操作を完結させる
+  - `session`: 1 接続、`0x0007` enable（既定。`--no-report-enable` 時は起動時の enable(1) を送らず `0x0003` keepalive のみ。終了時の disable(0) は best-effort）+ 20ms `0x0003` keepalive + 受信ドレイン、operation lock でコマンド中は keepalive を停止、`info` / `config dump` / `backup` / `monitor` / `monitor stop` / `status` / `help` / `quit`。`monitor` 自身も 20ms `0x0003` を送り、その間は keepalive が止まる（monitor が keepalive を兼ねる）。`monitor stop` 後は keepalive が自動再開。トップレベルの `monitor` も同じ 20ms `0x0003` ポーリングを共有し、終了時に `0x0007` disable → 切断する。なお `monitor --count N` は公式 `ReadKeysAndJoy` と同様に投げっぱなしで、応答が 1 件も来ない場合も 20ms 周期で `0x0003` を送り続け、`--count` に達するまで Ctrl-C まで回り続ける。`status` は `monitor sent` / `monitor received` を表示し、終了時のロック待ち・切断はタイムアウト付きで有界にする。連続失敗 3 回または `Disconnected` で degraded 停止し、自動再接続しない（`keepalive degraded ...` のメッセージで、設定モードが切れた可能性と Profile 長押しでの再入を案内する）。1 tick の受信ドレインは最大 4 レポート（`try_next_input` 自体も 1 回最大 16 フレーム + 1ms）に固定し、通知が途切れなくても operation lock を保持し続けない。設定の `--raw` / `--json` は同一ディレクトリの一時ファイルへ書いてから rename するアトミック書込で、同一ファイルを指す 2 つの出力パス（`.` / `..`、symlink、Unix の hard link）は端末にアクセスする前に拒否する。hard link の同一性検出は Unix のみ（device/inode）で、Windows は file identity 未実装のため hard link alias を事前拒否しない。ただし出力は一時ファイル + `rename` なので、JSON の `rename` が raw の内容を直接書き換えることはない。case-insensitive alias は raw 書き込み後の再検証で拾う。この再検証は偶発的な alias 用であり、出力ディレクトリに write 権限を持つ攻撃者による TOCTOU / 並行 rename は非保証である。REPL の 1 行は最大 4096 バイトで、超過分は読み捨てて次の行を正常に読む。`session` の Ctrl-C はコマンド実行中でも future を drop して REPL を抜け、セッションを終了する（`--allow-macro-write` 有効時の macro write / restore は、準備（ファイル読込・pre-write / pre-restore backup）を含むコマンド全体が完了するまで Ctrl-C を遅延してから終了する。次項参照）。行リーダーのキャンセル耐性は `monitor` / keepalive の終了通知による中断で読みかけの行を壊さないためのもので、Ctrl-C 後の継続を意味しない。
+  - `session` の macro 操作（2026-11-22 追加。REPL 経由の macro 書込は実機未検証）: REPL から `macro backup <DIR>`（読み取りのみ、常に利用可）/ `macro write <SLOT> <INDEX> <FILE> [--trigger <KEY>] [--chunk-size <32|64>]` / `macro restore <DIR> [--force]` を実行できる。`macro write` / `macro restore` は **`--allow-macro-write`（既定 OFF）** が必要で、無い場合は `restart with --allow-macro-write` を案内して拒否する。`session` は**既定で起動時に `0x0007 enable(1)` を送る（公式相当）**ため、**REPL の `macro write` は enable 状態で実行される**。`--no-report-enable` を指定すると起動時の enable(1) を送らずに `0x0003` keepalive を継続し（終了時の disable(0) は best-effort）、トップレベル `macro write` の既定（enable なし）と同じ書込条件で A/B できる。macro 操作中は operation lock により 20ms `0x0003` ポーリングが止まり、操作後に再開する（公式は書込中 `0x0003` なし）。**`--allow-macro-write` 有効時の `macro write` / `macro restore` は、準備（ファイル読込・pre-write / pre-restore backup）を含むコマンド全体が完了するまで Ctrl-C を遅延してから終了する**。非通常ファイル（FIFO / socket / directory）は読み取り前に拒否するためブロックせず、デバイス I/O は timeout で有界（SIGKILL・電源断は防げない）。REPL の `macro write` は `--backup-dir` 非対応（cwd の `macro-backup-<unix-nanos>-<pid>-<sequence>` を使う）、`macro restore` は `--chunk-size` 非対応（pre-restore backup は `<backup dir 名>-pre-restore-<unix-nanos>-<pid>-<sequence>`）。
+  - `session` の config 書込（2026-11-23 追加）: `--allow-config-write` 付きで REPL から `config set <field> <value>` / `config remap <physical> <target>` / `config map show` / `config write --file <path>` を実行できる。各書込はトップレベルと同じ共通関数（`ConfigWritePlan` / `PreparedConfigWrite` / `raw` 検証 / pre-write backup / 前後 SHA-256 / read-back / `--accept-reserved-drift` / `--force-raw` / `--write-chunk`）を使い、`--yes`（対話確認なし）または REPL 上の `yes` 入力で確認する。REPL は二段階で実行する: (1) snapshot 読込・plan・pre-write backup・確認プロンプトはキャンセル可能フェーズ（operation lock は prepare 中のみ保持し、プロンプト待機中は解放して 20ms keepalive を継続。Ctrl-C で中止でき、backup は残る）、(2) `finish_config_prepared`（TOCTOU 再読込 → `0x0001` 連続 → Save → read-back）は operation lock 下の非キャンセルフェーズ（Ctrl-C は遅延 + notice）。終了後に keepalive を再開する。失敗時は backup path と復旧コマンド（top-level / REPL 双方）を表示する。REPL の引数は空白区切りのため、スペース入りプロファイル名は top-level `config set` を使う。`config map show` / `config dump` は `--allow-config-write` 不要。`session` は将来のデーモン化（常駐プロセス）への布石。1 回の Profile 長押しで複数操作を完結させる
   - docs: `FF13` 実機観測、`cmd=0x0004` エンベロープ、ReadConfig の `chunk_len`、keepalive 設計
 - **完了条件**: 1 回の Profile で `session` 内の `info` → `backup` → `monitor` が通り、Tier 3 レビューと CI 4/4 を満たすこと。
 - **状態**: 進行中。
 
 ### Phase 2b: BLE マクロ読み書き（本命）
-- **ゴール**: 3 スロット（`slot 0..2`）× 4 マクロ（`macro_idx 0..3`）のバックアップと、Erase → Write → Header → Save の実機書き込み。
+- **ゴール**: 3 スロット（`slot 0..2`）× 4 マクロ（`macro_idx 0..3`）のバックアップと、Header (`total_len=0xD8`) → Save → Erase → Write → Save の実機書き込み。slot 単位バッチ restore ではヘッダ + 最初の Save を 1 回、最終 Save を全マクロの後に 1 回送る。
 - **実装項目**:
-  - `0x0102` ReadBT2Macro（`offset = macro_idx << 12`, `total_len = chunk_len = steps * 10`）
-  - `0x0104` Erase（`total_len = chunk_len = 0x1000`, `crc16 = 0xFFFF`, ペイロードなし）
-  - `0x0103` Write（BLE 64B / USB 32B、32B アライン、チャンクごと CRC）
-  - `0x0001` Header（マクロステップ数更新）
-  - `0x0006` Save（BLE `subcmd = 0x0067`）
-  - 3×4 バックアップ（raw + JSON/TOML + SHA-256）
-  - Mock でパケット列・CRC・チャンク境界・タイムアウト（Erase / Write / Header 2 秒、Save は transport 方針）を固定
-  - fail-closed（失敗時に Save しない）、読み戻し検証
+  - `0x0102` ReadBT2Macro（1 要求 = 1 チャンク 142B、`offset = (macro_idx << 12) + chunk_offset`, `total_len = chunk_len = steps * 10`。実機で `macro_idx=0 (M1)` / 500B と `macro_idx=1 (M2)` / 460B の応答 offset を確認）
+  - 公式順序: **Header `0x0001` (`total_len = 0xD8`) → Save → Erase `0x0104` → Write `0x0103` → Save**
+  - `0x0001` Header（`offset = 0x68C + slot * 0xD8`, `len = 0xD8`, `total_len = 0xD8`、216B を `min(142, max_payload)` で分割、2 秒/チャンク）
+  - `0x0104` Erase（`total_len = chunk_len = 0x1000`, `crc16 = 0xFFFF`, ペイロードなし、2 秒）
+  - `0x0103` Write（`max_payload = mtu - 3 - 17` に応じて 64B / 32B、`--chunk-size 32|64` で明示指定可能、32B アライン、チャンクごと CRC、2 秒、**`total_len = (macro_idx << 12) + align32(steps * 10)`（絶対終端、2026-11-22 実機確認。相対値では ACK のみで永続化されない）**）
+  - `0x0006` Save（BLE `subcmd = 0x0067`、slot バッチごとにヘッダ後 1 回 + 全マクロ後 1 回、3 秒・リトライなし）
+  - 3 スロット × 4 マクロのバックアップ（raw `.bin` + JSON/TOML + SHA-256 + config snapshot）
+  - Mock でパケット列・CRC・チャンク境界・タイムアウト・fail-closed・読み戻し不一致を固定
+  - CLI: `macro backup --dir <DIR>` / `macro write --slot N --index N --file <JSON/TOML> [--trigger M1..M4]` / `macro restore --dir <DIR> [--force]`。実験用フラグ `--poll-interval-ms <MS>`（既定 **0**。書込中に `0x0003` を送る間隔。公式はマクロ書込中に送らない）と `--report-enable`（既定 false。`0x0007` を送る）を `macro backup` / `macro write` / `macro restore` で受け付ける。`macro write` / `macro restore`（トップレベル CLI）と REPL の `macro write` は `--write-total-relative`（既定は絶対終端 `total_len`。旧 `align32` framing に戻す A/B 用）を持つ（REPL の `macro restore` は `--force` のみ）。Write offset の相対モードは提供しない（Erase は `macro_idx << 12` の sector を消すため、0 起点の Write は別 sector を破壊する。unit test で混在拒否を固定）
+  - fail-closed（`MacroWriteState::{NotSaved, HeaderSaved, DataSaved}`: Header 失敗は Save/Erase 未送信、最初の Save 失敗は Erase/Write 未送信、Erase/Write 失敗はヘッダ Save 済みとして復元を案内、空 slot のヘッダのみ restore で Verify が失敗した場合は `HeaderSaved` として復元を案内）、`0x0002` の 216B ヘッダ検証 + `0x0102` の raw 検証、`--trigger` のヘッダ反映
+  - 実機の旧順序 macro1 verify 失敗（部分書込）を受け、Erase ACK 後 100ms、全 Write 後 50ms、最終 Save 後 verify 300ms の暫定 delay を追加（Header Save → Erase は 0ms）
+  - 空きマクロ（`max_steps == 0` / `0xFFFF`）への write を拒否（step data clear 未実装）
+  - `macro write` は 12 マクロ完全バックアップ必須。対象 slot に読めないマクロがあれば `unreadable macro in target slot` で拒否
+  - backup dir は空 path / symlink（末尾 `/` 含む）/ 既存の非空ディレクトリ / `.` を拒否（pre-write / pre-restore 含む）。失敗した `macro backup` / `macro write` の早期失敗は作成した空ディレクトリを削除
+  - restore は「backup で空、現在は非空」を `--force` なしで拒否。`--force` は読めない現在マクロの skipped のみ許可し、pre-restore backup の書込み失敗は `--force` でも中止。全空 slot は 216B ヘッダのみ書込
+  - `MacroFile.cycles_num` / `interval_ms` は省略可能（未指定は既存値保持）。`gamepad_mode` は無視
 - **完了条件**: 実機で 1 マクロ書き込み → 読み戻し一致 → Switch 側で発動 → 元のマクロへ復元。
 - **Tier**: **3**（write-path / Flash / CRC / マクロ）。
-- **状態**: 未着手（Phase 2a 後）。
+- **状態**: 読み取り・バックアップは実機確認済み（142B チャンク、offset エコー）。書き込み・restore は Mock 実装と CLI まで完了。**2026-11-22 実機（BLE・slot S1・`macro_idx=0/1 (M1/M2)` のみ）: Write `0x0103` の `total_len` を絶対終端 `(macro_idx << 12) + align32(steps * 10)` にすることで `macro_idx=1` の永続化を確認**（相対値 `align32(steps * 10)` では ACK のみで未永続。`macro_idx=0` は base 0 のため両者一致）。`macro_idx=2/3 (M3/M4)` と slot S2/S3 は式からの外挿で未確認。これが既定。CLI `--write-total-relative` は旧 framing に戻す A/B 用。USB HID の Write は未実装・未検証（BLE のみ実装）。残る未確定点は `PROTOCOL_SPEC.md` §6.5（ACK 形状 / total_len 照合、Save タイムアウト、config CRC 再計算、MTU 200 以外での実機挙動）。
 
 ### Phase 2c: Linux BLE OTA
 - **ゴール**: Linux から BLE Bootloader 経由でファームウェア更新・復旧を行う。
@@ -218,15 +227,20 @@ Track C: モバイル
 - **状態**: 未着手（Phase 2b 後）。
 
 ### Phase 2d: 設定書き込み（config apply）
-- **ゴール**: 2768B の部分書き込みと Save を CLI から安全に実行する。
-- **実装項目**:
-  - プロファイル名、リマップ、スティック / トリガー、振動、6 軸、RGB の部分書き込み
-  - `ANSI_CRC_16_sh` 再計算、`total_len = 0x0AD0` を維持したチャンク分割
-  - `0x0006` Save（BLE `0x0067`）
-  - 書き込み前の 2768B バックアップと SHA-256 記録、読み戻し検証
-- **完了条件**: 各セクションの書き込み → 読み戻し一致。
+- **ゴール**: 2768B 全体の書込み + Save を CLI から安全に実行する。
+- **実装状況（2026-11-22、BLE のみ。実機書込は未検証）**:
+  - core `config_ops`: デバイス snapshot に型付き編集を適用し、予約バイト（`0x1F4..0x68C` / `0x914..0x92C`）を保持、`ANSI_CRC_16_sh` を再計算して **2768B 全体を `0x0001` 分割送信 → `0x0006/0x0067` Save → `0x0002` read-back 検証**。CRC 不一致・ACK 失敗は `ConfigWriteStage`（Write/Save/Verify）+ `ConfigWriteState`（NotSaved/Saved）で fail-closed。失敗時は段階別の復旧文を返す。
+  - 書込 chunk の既定は **`min(MTU ペイロード, 74)`**（RE: 公式書込上限 74B、`MAX_ATT_MTU 92 - 0x12`。静的解析・実機未確認）。`--write-chunk <BYTES>` は接続前に **1..=180**（観測 MTU 200 のペイロード上限）で検証し、任意サイズ（例: 180B、旧 MTU 連動の A/B）を指定可能。接続後は交渉 MTU の上限も検証する。
+  - CLI: `config dump` / **`config write --file <2768B>`** / **`config set <field> <value>`** / **`config remap <physical> <target>`** / **`config map show`**。`config write` はファイル読込・既知フィールド検証を **BLE 接続前** に行う。
+  - 安全策: **pre-write backup 必須**（`config.bin` + `config.json`、`REVIEW_TIERS` §6 の例外としてマクロ step sector は対象外）、`--yes` なしの対話確認、**前後 SHA-256 表示**、確認後の **TOCTOU 再読込**（変化時は中止）、read-back 検証、ゲームパッドモード / cur_slot 変更とマクロヘッダ（`0x68C..0x914`）変更の警告。
+  - 復旧: `config write --file <backup>/config.bin --yes`。device が予約バイトを正規化した場合は `--accept-reserved-drift` で現在の device 予約バイトに合わせる。
+  - 検証: `config set` は joy start `0..=127` / end `0..=128`、gyro sensitivity `1..=15`、hotwheel speed `0..=15`、rumble level `0..=5`、flag 類 `0/1`、`gyro.key` は `config remap` と同じ documented single-`KeyMap` ホワイトリスト（227・未知ビット・複合拒否）。
+  - raw `config write --file` も同じ検証を行う: 22 `key[]` と `gyro[].key_map` は documented single `KeyMap`、全レコード（joy/trigger/rumble/gyro/special/mapKey/LED/macro）の flag は 0/1、マクロ `max_steps` は 0/0xFFFF/1..=200・`total_cnt <= 4`。**マクロ `key_map` は `macro write --trigger` と同じ任意 KeyMap を受理**する（複合トリガーの復旧経路を塞がないため）。数値範囲（joy/hotwheel/gyro/rumble）は **flag==1 のときのみ**検証し、key_map / flag は常時検証する（disabled レコードは保持）。不明な `cur_slot`（実機観測 6 など）は警告して保持する。
+  - 未文書値の復旧用に `config write --force-raw`（whitelist/range/enum を警告に降格。予約領域ガードは維持）を提供する。
+  - **未実装 / 未確認**: USB HID config write（BLE のみ）、実機での full config write 検証、`config set` の joy/trigger flag=1・LED color flag=1 の副作用（help に明記）、公式 BLE Save の 2000ms / 2 再送との差（本実装は 3 秒 / リトライなし。`PROTOCOL_SPEC` §6.4 に記録）。
+- **完了条件**: 各セクションの書き込み → 読み戻し一致（Mock で固定済み。実機は未検証）。
 - **Tier**: **3**。
-- **状態**: 未着手（Phase 2c 後）。
+- **状態**: 実装済み（Mock テスト）。実機書込検証待ち。
 
 ### Phase 2e: USB HID / 2.4G トランスポート（保留）
 - **ゴール**: USB 有線 / 2.4G レシーバ経由の App Mode。
@@ -267,7 +281,7 @@ Track C: モバイル
 
 ## 6. 開発・検証上の安全原則
 
-1. **実機書き込み前の必須バックアップ**: 最初の書き込み実験前に必ず 2768 バイトの原本バイナリと既存マクロ 4×3 スロットをダンプ保存する。
+1. **実機書き込み前の必須バックアップ**: 最初の書き込み実験前に必ず 2768 バイトの原本バイナリと既存マクロ 3 スロット × 4 マクロをダンプ保存する。
 2. **未知フィールドの保全**: 2768 バイト構造体内の予約領域・未編集領域は `read -> modify -> recalculate CRC -> write` の流れで元のバイト列をそのまま保持する。
 3. **OTA 開発時の注意**: Bootloader コマンド（特に `EraseFlash` / `WriteFirmware`）は、まずモックトランスポートとパケットダンプで公式アプリの通信ログと完全一致を検証してから実機に適用する。
 4. **プロプライエタリ資産の非公開**: 解析に用いた公式 `.apk` / `.exe` / `.dll` や公式ファームウェアバイナリ自体は絶対にリポジトリへコミットしない。

@@ -58,7 +58,7 @@
 | トリガー書込 | `getBT2_WriteTrigger(slot)` | `0x0001` | `0x0000` | `0x00B0 + slot * 0x08` | `0x0008` (8B) | `0x0AD0` |
 | 特殊機能書込 | `getBT2_WriteSpecial(slot)` | `0x0001` | `0x0000` | `0x00C8 + slot * 0x08` | `0x0008` (8B) | `0x0AD0` |
 | 単一ボタンリマップ | `getBT2_WriteMapKey(slot, idx)` | `0x0001` | `0x0000` | `0x00E4 + slot * 0x5C + idx * 4` | `0x0004` (4B) | `0x0AD0` |
-| マクロヘッダ書込 | `getBT2_WriteMacro(slot)` | `0x0001` | `0x0000` | `0x068C + slot * 0xD8` | `0x00D8` (216B) | `0x0AD0` |
+| マクロヘッダ書込 | `getBT2_WriteMacroi(slot)` / `writeBT2Macro` | `0x0001` | `0x0000` | `0x068C + slot * 0xD8` | `0x00D8` (216B) | `0x00D8` |
 | マクロ名単体書込 | `writeUltimateBT2MacroName(slot, m)` | `0x0001` | `0x0000` | `0x0694 + slot * 0xD8 + m * 0x34` | `0x0020` (32B) | `0x0AD0` |
 | ジャイロ書込 | `writeUltimateBT2sixaxis(slot)` *(DLL正)* | `0x0001` | `0x0000` | `0x092C + slot * 0x0C` *(※注1)* | `0x000C` (12B) | `0x0AD0` *(※注1)* |
 | RGB Dynamic書込 | `getBT2_WriteDyNamic(slot)` | `0x0001` | `0x0000` | `0x0950 + slot * 0x0C` | `0x000C` (12B) | `0x0AD0` |
@@ -69,6 +69,11 @@
 
 > **※注1 (`getBT2_WriteSixAxis` における Android `.so` のバグと Windows DLL の正しい値)**:
 > Android 版 `libadvancelib.so` の `getBT2_WriteSixAxis` は `.rodata 0x1d6a0` (`{0x0, 0xC, 0xC, 0xC}`) を読み込む実装ミスによりヘッダに `offset = 0, total_len = 0x0C, len = 0x0C` を入れている（ペイロードポインタ自体は `base + slot * 0x0C + 0x92C` を指す）。一方 Windows 版 `8BitDoAdvance.dll` の `_writeUltimateBT2sixaxis@2772` では正しく **`offset = 0x92C + slot * 0x0C`, `total_len = 0x0AD0`, `len = 0x0C`** を送信している。独自実装では Windows DLL 準拠（`offset = 0x92C + slot * 0x0C, total_len = 0x0AD0`）を用いること。
+
+> **書込時の BLE 分割長（RE 再確認・2026-11-22）**:
+> 公式 Android の `Generate_CustomDataCmd` は書込系で `min(残り, MAX_ATT_MTU - 0x12)` を使い、`MAX_ATT_MTU` は初期値 **`0x5C` (92)** のまま `0x600F` 用に変更されない。したがって **公式書込のペイロード上限は 74B**（静的解析。実機書込キャプチャは未確認）。既存の「MTU 200 → 142B」は**読み出し応答側の実機観測値**であり、書込側の分割長ではない。本リポジトリの full config write は既定で **`min(MTU ペイロード, 74)`**（MTU 200 でも 74B）を使い、`--write-chunk <BYTES>` は接続前上限 **180**（観測 MTU 200 のペイロード上限）まで明示指定できる（公式 74B との A/B 用。実機未確認）。
+>
+> **部分書込と Save（RE 確定・2026-11-22）**: `getBT2_Write*` の部分書込も、完了時に共通 onfinished から **`0x0006/0x0067` Save が必ず 1 回**送られる（部分書込専用の Save 関数は無い）。
 
 ### 1.3 `+0x1F4..+0x68B` (3 × 392B) および `+0x914..+0x92B` (3 × 8B) の解析結果
 
@@ -157,7 +162,7 @@ struct Bt2Header {
 | `3` | `CONFIG_SLOT_SWIFT_MAX` | スロット数上限マーカー |
 | `4` | `CONFIG_SLOT_SWIFT_NONE` | スロット未選択 / 削除状態（オフ状態） |
 
-> **実機観測・未確定（2026-11-21）**: Ultimate 2 Bluetooth で `cur_slot = 6` を観測した。enum の `0..=2` / `4` の範囲外であり、意味は未確定である。CLI は `0..=2` を `profile N`、`4` を `none`、それ以外を `unknown (6)` のように表示する。`deleteCurslot` が `cur_slot = 4` を書くことは解析済みだが、実機で 6 が観測される理由（別状態・未初期化・ファームウェア固有値など）は断定できない。
+> **実機観測・未確定（2026-11-21）**: Ultimate 2 Bluetooth で `cur_slot = 6` を観測した。enum の `0..=2` / `4` の範囲外であり、意味は未確定である。CLI は `0..=2` を `profile N`、`4` を `none`、それ以外を `unknown (6)` のように表示する。`deleteCurslot` が `cur_slot = 4` を書くことは解析済みだが、実機で 6 が観測される理由（別状態・未初期化・ファームウェア固有値など）は断定できない。**raw `config write` は不明な `cur_slot`（6 等）を拒否せず、警告して保持する。**
 
 ---
 
@@ -203,12 +208,14 @@ struct Bt2Header {
 | 相対オフセット | サイズ | 型 | フィールド名 | 説明・デフォルト値 |
 | :---: | :---: | --- | --- | --- |
 | `+0x00` | 4B | `u32` | `flag` | 有効フラグ (`1` = カスタム有効, `0` = 無効) |
-| `+0x04` | 1B | `u8` | `left_start_value` | 左スティック 内側デッドゾーン (`0..=127`, デフォルト `0`) |
+| `+0x04` | 1B | `u8` | `left_start_value` | 左スティック 内側デッドゾーン (`0..=127`, `createFile`/`deleteFile` 既定 **17** = `0x11`) |
 | `+0x05` | 1B | `u8` | `left_end_value` | 左スティック 外側有効境界 (`0..=128`, デフォルト `128` = `0x80`) |
-| `+0x06` | 1B | `u8` | `right_start_value` | 右スティック 内側デッドゾーン (`0..=127`, デフォルト `0`) |
+| `+0x06` | 1B | `u8` | `right_start_value` | 右スティック 内側デッドゾーン (`0..=127`, `createFile`/`deleteFile` 既定 **17** = `0x11`) |
 | `+0x07` | 1B | `u8` | `right_end_value` | 右スティック 外側有効境界 (`0..=128`, デフォルト `128` = `0x80`) |
 
 > `flag != 1` の場合、`BasicAdvanceUI.getS_Sticks` は `[0, 128, 0, 128]`（デッドゾーンなし・フルレンジ）として扱う。
+>
+> **既定値の訂正（RE・Android v2.01 `createFile`/`deleteFile` bytecode、2026-11-22）**: プロファイル新規作成/削除直後の既定値は start **17 (`0x11`)** / end **128**。旧記述の「start 既定 0」は誤り。17 の意図（Anti-Jitter 等）は未確認。
 
 ### 4.3 トリガー設定 `TriggerRecord` (`+0x0B0..+0x0C7`, 3 × 8B)
 
@@ -217,10 +224,12 @@ struct Bt2Header {
 | 相対オフセット | サイズ | 型 | フィールド名 | 説明・デフォルト値 |
 | :---: | :---: | --- | --- | --- |
 | `+0x00` | 4B | `u32` | `flag` | 有効フラグ (`1` = カスタム有効, `0` = 無効) |
-| `+0x04` | 1B | `u8` | `left_start_value` | LT (L2) 開始デッドゾーン (`0..=255`, デフォルト `0`, ヘアトリガーモード時 `77` = `0x4D`) |
+| `+0x04` | 1B | `u8` | `left_start_value` | LT (L2) 開始デッドゾーン (`0..=255`, `gamepad_mode == 0` (Switch) 時のみ既定 `77` = `0x4D`、それ以外 `0`) |
 | `+0x05` | 1B | `u8` | `left_end_value` | LT (L2) 終了/最大点 (`0..=255`, デフォルト `255` = `0xFF`) |
-| `+0x06` | 1B | `u8` | `right_start_value` | RT (R2) 開始デッドゾーン (`0..=255`, デフォルト `0`, ヘアトリガーモード時 `77` = `0x4D`) |
+| `+0x06` | 1B | `u8` | `right_start_value` | RT (R2) 開始デッドゾーン (`0..=255`, `gamepad_mode == 0` (Switch) 時のみ既定 `77` = `0x4D`、それ以外 `0`) |
 | `+0x07` | 1B | `u8` | `right_end_value` | RT (R2) 終了/最大点 (`0..=255`, デフォルト `255` = `0xFF`) |
+
+> **既定値の条件訂正（RE・Android v2.01 bytecode、2026-11-22）**: 既定 `77` は「ヘアトリガーモード」ではなく **`gamepad_mode == 0`（Switch モード）のときのみ**。それ以外のモードでは `0`。
 
 ### 4.4 特殊機能フラグ `JoyTriggerSpecialRecord` (`+0x0C8..+0x0DF`, 3 × 8B)
 
@@ -267,6 +276,7 @@ struct Bt2Header {
 | `+0x04..+0x5B` | `0x0E4 + s * 0x5C` | 88B | `[u32; 22]` | `key[22]` | 22 個の物理ボタンに対応するマッピング先 `KeyMap` 値 |
 
 - 部分書込 `getBT2_WriteMapKey(slot, key_idx)` は `flag` を除く **`key[key_idx]` 単体（4B）** を `offset = 0x0E4 + slot * 0x5C + key_idx * 4`, `len = 4`, `total_len = 0x0AD0` で書き込む。
+- **書込経路（RE 確定・2026-11-22）**: Android `HIDChannel.writeBT2MAPkEY` は `ANSI_CRC_16_sh(record, 0xAD0)` → `getBT2_WriteMapKey` → 共通 onfinished から **`0x0006/0x0067` Save**。Windows は `_writeUltimateBT2MapKey@2776`（VA `0x10438ED0`）が `offset = 0xE4 + slot*0x5C + idx*4`, `len = 4`, `total_len = 0xAD0` を送り、Save `0x0006/0x0123`（3 秒）。**変更するのは 4B の 1 エントリのみで `flag` は変更しない**。`flag`（`+0xE0 + slot*0x5C`、`0`=無効）を 1 にするのは `setMapKey` の全 22 要素 + flag 一括コピー経由。全体 2768B 書込で同じ領域を更新する経路も有効（本実装はこちらを使用）。`0 = KeyMap_N`（未割当）が実値。`KeyMap_My_NUll = 227` はマッピング書込経路から参照されず、用途未確認のため書かない。
 
 ### 5.2 `key[22]` 配列インデックス対応表（Ultimate 2 / Non-3E レイアウト）
 
@@ -299,6 +309,8 @@ struct Bt2Header {
 
 > **※3E系（8BitDo Ultimate 3-mode / `is3E() == true`）との配列順の違いに注意**:
 > `getMappings()` の Non-3E（Ultimate 2 Bluetooth を含む）分岐は上記の 22 要素順 `[A, B, X, Y, L1, R1, L2, R2, L3, R3, Select, Start, Share, Logo, Up, Down, Left, Right, P1, P2, P3, P4]` である（3E 系は `[L3, R3, P3, P4, Up..]` の 20 要素）。
+>
+> **背面ボタンの物理名（RE 確定・2026-11-22）**: index 18 = P1 = **PL**、19 = P2 = **PR**、20 = P3 = **L4**、21 = P4 = **R4**（DEX `MappingImageEngineer.getMotionKeyString`）。前面マッピング UI の割当先一覧には PL/PR/L4/R4 を出さない設計（`getMapKeyString` は P1/P2 に `null` を返す）。
 
 ### 5.3 32-bit `KeyMap` 定数・ビットマスク完全表
 
@@ -350,6 +362,8 @@ struct Bt2Header {
 | `227` | `0x0000_00E3` | `KeyMap_My_NUll` | 無効化/未定義プレースホルダ（UI内部表現） |
 
 > **マクロとの関連**: マクロをボタンに割り当てる場合、実際の設定ではボタン側のリマップエントリを無効 (`KeyMap_N`) にするか、`MacroFunPro3Record.key_map` に起動トリガーキー（例: `KeyMap_P1`, `KeyMap_L2` 等の 32-bit `KeyMap` 値）を書き込む仕様となっている（UI では最大 4 つのマクロに対し `M1..M4` を割り当て管理する）。
+>
+> **マッピング値の型（RE 確定）**: `MapKeyRecord.key[]` は 1 ボタン = 1 つの 32-bit `KeyMap` 値であり、複数ボタンのビット合成ではない。無効化は `0`。`KeyMap_My_NUll = 227` は定数として存在するが、Android/Windows のリマップ書込・表示経路から参照されず用途は未確認（書かない）。単一エントリ書込は `flag` を変えない。
 
 ---
 
@@ -476,7 +490,7 @@ struct Bt2Header {
 ### 9.2 `total_len` 32B アライメント計算と Flash セクタ配置
 
 > **重要（`PROTOCOL_SPEC.md` 突合・補正結果）**:
-> `PROTOCOL_SPEC.md` に記載されていた `align32(steps * 2)` は誤記であり、実コード（`libadvancelib.so` `getBT2_WriteMacro` 1058行目〜）では **`max_steps * 10` を 32 バイト境界に切り上げる**。
+> `PROTOCOL_SPEC.md` に記載されていた `align32(steps * 2)` は誤記であり、実コード（`libadvancelib.so` `getBT2_WriteMacro` 1058行目〜）では **`max_steps * 10` を 32 バイト境界に切り上げる**。さらに BLE の wire `total_len` は **sector base を足した絶対終端** でなければ永続化されない（2026-11-22、BLE・slot S1・`macro_idx=0/1 (M1/M2)` で実機確認。`macro_idx=2/3` と他 slot は式からの外挿、USB HID は未実装・未検証。§9.2）。
 
 - **Flash セクタアドレス (`offset`)**:
   `offset = (macro_idx as u32) << 12`
@@ -491,16 +505,22 @@ struct Bt2Header {
   - ※注意: Flash セクタ番号は `macro_idx << 12` であり、スロット番号は `offset` ではなく `subcmd` の下位バイトに載る（コントローラ側がセクタまたは `mode|slot` に応じてバンク管理する）。
 - **バイト長 (`total_len`) 計算式**:
   - **Raw バイト長**: `raw_bytes = (max_steps as u32) * 10`
-  - **Write (`cmd 0x0103`) の `total_len`**: **32 バイト切り上げ**
+  - **Write (`cmd 0x0103`) の `total_len`**: **絶対終端 = sector base + 32 バイト切り上げ**（BLE・slot S1・`macro_idx=0/1` で実機確認。他は外挿）
     ```rust
     let raw_bytes = (max_steps as u32) * 10;
     let aligned_len = (raw_bytes + 31) & !31;
-    // libadvancelib.so の実装:
+    let total_len = ((macro_idx as u32) << 12) + aligned_len; // 絶対終端
+    // libadvancelib.so のアライン計算:
     // if (raw_bytes & 0x1e) == 0 { raw_bytes } else { (raw_bytes & !0x1f) + 0x20 }
     // (raw_bytes は 10 の倍数＝常に偶数なので bit0 は 0、& 0x1e == 0 は 32 の倍数判定と等価)
     ```
-    - 例: `max_steps = 4` → `raw_bytes = 40` → `aligned_len = 64`（不足分 24 バイトはホスト側バッファ上のゼロ詰め領域が送られる）
-    - 例: `max_steps = 16` → `raw_bytes = 160` → `aligned_len = 160`
+    - **`total_len` が `aligned_len` だけ（sector base なし）だと ACK は返るが Flash に永続化されない**。`macro_idx=0 (M1)` は base 0 のため両者が一致し、成功して見える（2026-11-22、BLE・slot S1 で実機確認）。
+    - 例: `macro_idx=1 (M2)`・`max_steps = 2` → `0x1000 + 0x20 = 0x1020`
+    - 例: `macro_idx=1 (M2)`・`max_steps = 46`（460B → 480B = 0x1E0）→ `0x1000 + 0x1E0 = 0x11E0`（実機で read-back SHA 一致）
+    - 例: `macro_idx=1 (M2)`・`max_steps = 115`（1150B → 1152B = 0x480）→ `0x1000 + 0x480 = 0x1480`（式からの算術例、実機未確認）
+    - 例: `max_steps = 16` → `raw_bytes = 160` → `aligned_len = 160`（`macro_idx=0 (M1)` なら `0xA0`）
+    - 外挿: `macro_idx=2 (M3)` は `0x2000 + aligned_len`、`macro_idx=3 (M4)` は `0x3000 + aligned_len`（未確認）。slot S2/S3 も未確認で、式に slot 依存はない。
+    - 例外: 旧 framing（`aligned_len` のみ）は CLI `--write-total-relative` で再現できる（実験用）。
   - **Read (`cmd 0x0102`) の `total_len`**: アライメントなしの `max_steps * 10` をそのまま指定。
   - **Erase (`cmd 0x0104`) の `total_len` / `chunk_len` / `crc16`**: `total_len` は `0x1000` (4096 バイト = 1 セクタ分)。ペイロードを持たないが、公式実装は `chunk_len` も `0x1000` に設定する（wire header `+0x04` はその値。実ペイロードは `len = 0`）。`gamepad_type == 1` の CRC 計算は空ペイロードに対して行われ、`crc16` は長さ `<= 0` で `0xFFFF` を返すため、wire header `+0x06` は `0xFFFF` となる。
 
@@ -508,28 +528,51 @@ struct Bt2Header {
 
 #### マクロ書き込み手順（必ずこの順序を守ること）
 
-1. **Step 1: Flash セクタ消去 (`Erase`)**
+1. **Step 1: マクロ管理ヘッダ更新 (`Header`)**
+   - `cmd = 0x0001`
+   - `subcmd = 0x0000`
+   - `offset = 0x68C + slot * 0xD8`
+   - **`total_len = 0xD8` (216)**（公式 `getBT2_WriteMacroi` / `writeBT2Macro`。`0x0AD0` ではない）
+   - 216B を `chunk_len = min(142, mtu - 3 - 17)` で分割（MTU 200 なら 142 + 74）。`offset` は実チャンク長だけ進む。
+   - `ANSI_CRC_16_sh` は 2768B 全体で再計算するが、216B の wire には `+0x00C` を含めない。
+2. **Step 2: ヘッダ Save (`Save`)**
+   - **BLE**: `cmd = 0x0006, subcmd = 0x0067, offset = 0, len = 0, total_len = 0`
+   - 公式 `writeBT2Macro_onfinished` はヘッダ書込完了時に Save を送る。
+   - Header またはこの Save が失敗した場合、Erase は送らない。
+3. **Step 3: Flash セクタ消去 (`Erase`)**
    - `cmd = 0x0104`
    - `subcmd = (gamepad_mode << 8) | slot`
    - `offset = macro_idx << 12`
    - `total_len = 0x1000`（消去サイズ。ペイロード長ではない）
-   - `chunk_len = 0x1000`（公式実装のチャネル設定値。wire header `+0x04` に書かれる。ペイロードなし、`len = 0`）
-   - `crc16 = 0xFFFF`（空ペイロードに対する CRC-16/MODBUS。公式 `crc16` は長さ `<= 0` で `0xFFFF`）
-2. **Step 2: マクロステップデータ書込 (`Write`)**
+   - `chunk_len = 0x1000`（wire header `+0x04`。ペイロードなし、`len = 0`）
+   - `crc16 = 0xFFFF`
+   - ACK 後 **100ms** 待ってから Write を送る（`MACRO_ERASE_SETTLE_DELAY`、暫定値）。
+4. **Step 4: マクロステップデータ書込 (`Write`)**
    - `cmd = 0x0103`
    - `subcmd = (gamepad_mode << 8) | slot`
-   - `offset = (macro_idx << 12) + chunk_index * chunk_size`（`chunk_index` はパケットごとに進む）
-   - `total_len = align32(max_steps * 10)`
-   - `chunk_size` は BLE 64B / USB HID 32B（32B アライン。それ以外は拒否。64B 超は 64B にクランプしてから判定）。最終チャンクは 32B アライン長。46B などの交渉済みサイズは将来拡張で、現在の API は `UnsupportedChunkSize` を返す
-   - ペイロード: `max_steps * 10` バイト＋32B アライメント用ゼロパディング（BLE 64B / USB HID 32B で分割送信・`Send_CustomCmdPacket` 準拠で各チャンクヘッダ `CRC-16/MODBUS (0xA001)` 付与）
-3. **Step 3: 2768B コンフィグ内のマクロ管理ヘッダ更新**
-   - `max_steps`, `key_map`, `cycles_num`, `interval_ms`, `filename`, `total_cnt`, `flag` 等を `0x68C + slot * 0xD8` に反映し、`ANSI_CRC_16_sh` を再計算する。
-   - 部分書込 (`cmd = 0x0001, subcmd = 0x0000, offset = 0x68C + slot * 0xD8, len = 0xD8, total_len = 0x0AD0`) または全体書込を送信する。
-4. **Step 4: 不揮発メモリへのコミット (`Save`)**
+   - `offset = (macro_idx << 12) + chunk_index * chunk_size`
+   - **`total_len = (macro_idx << 12) + align32(max_steps * 10)`（絶対終端）**。`align32(max_steps * 10)` だけ（相対値）だと ACK は返るが永続化されない（`macro_idx=0 (M1)` は base 0 のため差が出ない）。実機確認は BLE・slot S1・`macro_idx=0/1 (M1/M2)` のみで、`macro_idx=2/3 (M3/M4)` と slot S2/S3 は外挿、USB HID は未実装・未検証。
+   - `chunk_size` は MTU 連動（64 / 32）、`--chunk-size 32` で **32B 均一**（460B → 480B = 15 × 32B、500B → 512B = 16 × 32B）。`--chunk-size 64` は 64B 基本で最終チャンクが 32B になり得る（均一は 32B 指定のみ）。32/64 以外は `UnsupportedChunkSize`。
+   - ペイロード: `max_steps * 10` バイト＋32B アライメント用ゼロパディング。各チャンクに CRC-16/MODBUS。
+   - slot バッチ restore では、Step 3–4 をバッチ内の各マクロについて繰り返す。**全マクロの最終 Write ACK 後 50ms** 待ってから最終 Save を送る（`MACRO_WRITE_SETTLE_DELAY`、暫定値）。
+5. **Step 5: 最終 Save (`Save`)**
    - **BLE**: `cmd = 0x0006, subcmd = 0x0067, offset = 0, len = 0, total_len = 0`
-   - **USB**: `cmd = 0x0006, subcmd = 0x0123, offset = 0, len = 0, total_len = 0`
+   - slot バッチにつき **1 回だけ**送る。公式 `EraseMacroDataDone` / `WriteMacroDataDone` の連鎖後に Save を送る。
+6. **Step 6: 読み戻し検証 (`Read`)**
+   - 最終 Save ACK 後 **300ms** 待ってから `cmd = 0x0002` で 2768B config を読み、対象 slot の **216B ヘッダ**が送信した `header_bytes` と一致することを確認する（`MACRO_VERIFY_DELAY`、暫定値）。
+   - 続けて `cmd = 0x0102` でバッチ内の各 `(slot, macro_idx)` を読み、`max_steps * 10` バイトが書き込んだ `MacroDatas` と一致することを確認する。
+   - full config の `stored_crc` / `computed_crc` も取得し、`config_crc_valid` を返す。invalid でも書き込みは失敗させず、CLI が「config CRC is invalid; a full 2768B config write may be required」と警告する。
 
-> ACK は各コマンド送信後の transport `wait_ack` で待つ。マクロの `Erase` / `Write` / ヘッダは 2 秒（実装定数 `0x44fa0000`）。マクロ `Save` は 3 秒（USB HID の仕様記載。BLE は transport の `wait_ack` 既定値とリトライ方針を記録する）。OTA の 10 秒 erase / 1 秒 chunk / 64B 固定はマクロに適用しない。
+> ACK は各コマンド送信後の transport `wait_ack` で待つ。マクロの `Erase` / `Write` / ヘッダは 2 秒（実装定数 `0x44fa0000`）。マクロ `Save` は本実装では 3 秒で **リトライしない**（USB HID の値。公式 BLE 実装は 2 秒・最大 2 回再送のため相違〔一次根拠: 静的解析ノート（2026-11-22）〕。暫定値）。OTA の 10 秒 erase / 1 秒 chunk / 64B 固定はマクロに適用しない。
+
+> **実装ノート（Mock 検証済み・新順序 + 絶対終端 `total_len` は BLE・slot S1・`macro_idx=0/1` で 2026-11-22 に実機永続化確認。他は外挿）**:
+> - **実機観測（2026-11-22、BLE・slot S1）**: 旧順序（Erase → Write → Header(total_len=0x0AD0) → Save）で `macro_idx=0 (M1)`（500B）は成功し、`macro_idx=1 (M2)`（460B）だけが全 ACK 後に `0x0102` zeros で Verify 失敗した。216B ヘッダは一致していた。新順序でもデータ未永続だった原因は **Write `0x0103` の `total_len`** と特定し、`total_len = (macro_idx << 12) + align32(max_steps * 10)`（絶対終端）に変更したところ **read-back SHA が期待値と一致**した（`macro_idx=1 (M2)`・46 steps → `0x11E0`。`macro_idx=0 (M1)` は base 0 のため従来値と一致）。`macro_idx=2/3` と slot S2/S3 は未検証の外挿、USB HID は未実装・未検証。CLI `--write-total-relative` は旧 framing に戻す実験用フラグ。書込中は `0x0003` を送らない（公式同等。CLI `--poll-interval-ms` 既定 0）。最終 32B チャンク仮説に対しては `--chunk-size 32` も利用できる。Header Save → Erase の settle は 0ms。RE 根拠: `getBT2_WriteMacroi` / `writeCustomConfig_onfinished` / `writeBT2Macro_onfinished` / `EraseMacroDataDone` / `WriteMacroDataDone`。
+> - **Fail-closed / 状態**: `Error::MacroWrite` は `MacroWriteState::{NotSaved, HeaderSaved, DataSaved}` で区別する。Header 失敗は Save/Erase 未送信で sector 未変更（`NotSaved`）。最初の Save 失敗は Erase/Write 未送信で sector 未変更、Erase/Write 失敗はヘッダ Save 済みで sector が消去/部分書込の可能性（`HeaderSaved`）。step data を送った書き込みでは、最終 Save / Verify の失敗はヘッダ + データ送信済み（`DataSaved`）。ヘッダのみを書く空 slot の restore では step data を送らないため、Verify 失敗は `HeaderSaved` になる。`HeaderSaved` / `DataSaved` は再書き込みせず、12 マクロ backup から復元する。
+> - **空きマクロ拒否**: `max_steps == 0` / `0xFFFF` への `macro write` は `Error::EmptyMacroWrite` で拒否する。step data の clear が未実装で、`macro write` では新規作成できない。`macro restore` はバックアップが非空なら現在のマクロが空でも書ける（pre-restore backup と 216B ヘッダ更新を使う）。
+> - **ヘッダ値**: `max_steps` は新しいステップ数。`key_map` / `cycles_num` / `interval_ms` / `flag` / `total_cnt` は指定がなければ既存値を保持する。既存の予約バイト（slot `+0x05..+0x07`、record `+0x26..+0x27`）も保持する。
+> - **CRC**: 216B の Header 部分書込には config CRC (`+0x00C`) を含めない（公式の部分書込と同じ）。Save 時に device が CRC を再計算するかは実機未確認。
+> - Header / Write のチャンク長は **MTU 連動**。`max_payload = mtu - 3 - 17` とし、Header は `min(142, max_payload)`、Write は `max_payload >= 64` → 64B、`>= 32` → 32B、それ未満は書き込み開始前に `Error::MtuTooSmall`。MTU 200 は 142 + 74 / 64B、MTU 64 は 44×4 + 40 / 32B、MTU 23 は Header 3×72 で header-only restore は実行可、非空マクロの Write は不可。Mock で全フレームが `mtu - 3` 以下であることを固定済み。実機は MTU 200 のみを想定検証する。
+> - **USB**: USB 32B 書き込みは未実装。`SaveTransport::Usb` は `Error::Unsupported` で拒否し、CLI は BLE のみを使う。
 
 #### マクロ読み出し手順
 
@@ -537,9 +580,10 @@ struct Bt2Header {
 2. `max_steps > 0` の場合、Flash 読み出しを発行する：
    - `cmd = 0x0102`
    - `subcmd = (gamepad_mode << 8) | slot`
-   - `offset = macro_idx << 12`
-   - `total_len = max_steps * 10`
-   - 応答ペイロードを 10 バイト単位で `max_steps` 個の `MacroDatas` としてデコードする。
+   - `offset = (macro_idx << 12) + chunk_offset`
+   - `total_len = chunk_len = max_steps * 10`（全長のまま）
+   - 応答ペイロードを 10 バイト単位で `MacroDatas` としてデコードする。
+3. **1 要求 = 1 チャンク**（実機 2026-11-22 観測: 142B）。`chunk_offset += payload.len()` で `offset` を進めて再要求する。実機では応答 `offset` が要求した絶対 offset をエコーした（`macro_idx=0 (M1)` / 500B: `[0, 142, 284, 426]`、`macro_idx=1 (M2)` / 460B: `[4096, 4238, 4380, 4522]`）。`macro backup` は互換のため 0（逐次）とセクタ相対 offset も受け入れるが、`response_offsets` に実際の値を記録する。最終チャンクは残り長に切り詰める。
 
 ---
 
