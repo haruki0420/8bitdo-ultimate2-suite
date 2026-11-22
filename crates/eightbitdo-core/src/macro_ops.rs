@@ -2476,8 +2476,9 @@ mod write_tests {
             Err(Error::MacroWrite {
                 stage: MacroWriteStage::Erase,
                 saved: true,
+                reason,
                 ..
-            })
+            }) if reason.contains("header was already saved")
         ));
         assert_eq!(sent.len(), 4);
         assert_eq!(count_cmd(&sent, cmd::SAVE), 1);
@@ -2499,8 +2500,9 @@ mod write_tests {
             Err(Error::MacroWrite {
                 stage: MacroWriteStage::Write,
                 saved: true,
+                reason,
                 ..
-            })
+            }) if reason.contains("header was already saved")
         ));
         assert_eq!(sent.len(), 5);
         assert_eq!(count_cmd(&sent, cmd::SAVE), 1);
