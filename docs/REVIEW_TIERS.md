@@ -292,7 +292,7 @@ EraseFlash 0x0004
 ```
 
 - `macro restore` は slot 単位のバッチで、**ヘッダ × N → Save 1 回 → 各マクロの Erase/Write → 最終 Save 1 回** の順に送る。マクロごとにヘッダ + Save を繰り返さない。
-- ACK は `cmd` / `subcmd` で判定し、`chunk_len` / `total_len` のエコーを許容する。`0x04` prefix 付き frame は、まず prefix + 16B header として解析し、既知の別 App Mode コマンドの ACK なら読み飛ばす。未知コマンドや解析失敗の場合は、prefix なしヘッダとして読み直す。この順序で `04 01 00 ...`（prefix + direct Header ACK）を Erase ACK と誤認しないことを確認する。
+- ACK は `cmd` / `subcmd` で判定し、`chunk_len` / `total_len` のエコーを許容する。`0x600F` の BLE App チャネルでは受信フレームに prefix は付かないため、prefix なしで解析する。先頭 2 バイトが `04 01` の frame は `cmd=0x0104`（Erase の直接 ACK）として扱う。payload 付き envelope ACK が Header / Erase / Write / Save の各 stage で受理されることを確認する。
 - `Erase 0x0104` はペイロードを持たない。公式実装（`getBT2_EraseMacro`）は `total_len` と `chunk_len` をともに `0x1000` に設定し、`Generate_CustomDataCmd` が wire header `+0x04` にその値を書く。実ペイロードは `len = 0`。`total_len = 0x1000` は消去サイズであり、ペイロード長ではない。`chunk_len = 0` と混同しない。Rust 実装の修正は本 PR に含まれる。
 - `Write 0x0103` の `offset` は `(macro_idx << 12) + chunk_index * chunk_size`。`chunk_size` は BLE 64B / USB HID 32B（32B アライン。それ以外は拒否）。各チャンク送信ごとに `chunk_index` を進める。
 - マクロのチャンクは BLE 最大 64B / USB HID 最大 32B（32B アライン。それ以外は拒否。64B 超は 64B にクランプしてから判定）。**最終チャンクは 32B アライン長まで** とし、OTA の「最終チャンク 64B 固定」とは混同しない。46B などの交渉済みサイズは将来拡張で、現在の API は `UnsupportedChunkSize` を返す。
