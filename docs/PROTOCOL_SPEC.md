@@ -490,6 +490,7 @@ sequenceDiagram
 `eightbitdo-core` の `write_macro` は次の順序を固定する。実機への書き込みはまだ行っていない。
 
 1. **Erase (`0x0104`)**: `total_len = chunk_len = 0x1000`, `offset = macro_idx << 12`, `crc16 = 0xFFFF`, ペイロードなし。ACK は 2 秒。
+   - 実機 Erase ACK（2026-11-22）は **16B ヘッダのみ**で、`04 00 04 01 00 10 01 01 00 10 00 00 00 00 00 00`（`cmd=0x0004`, `subcmd=0x0104`, `chunk_len=0x1000`, `crc16=0x0101`, `total_len=0x1000`, `offset=0`）。`chunk_len` をエコーしていてもペイロードはない。ACK 判定はヘッダ先行で行い、`chunk_len` / `total_len` のエコーを許容する（`decode_app_response` のペイロード長検査を ACK に適用しない）。
 2. **Write (`0x0103`)**: `total_len = align32(steps * 10)`、`offset = (macro_idx << 12) + chunk_index * chunk_size`、各チャンクの CRC-16/MODBUS。ACK は 2 秒。チャンクは MTU 連動で、`max_payload = mtu - 3 - 17`（ATT 3B + 1B prefix + 16B header）が `64` 以上なら 64B、`32` 以上なら 32B、それ未満は `Error::MtuTooSmall` で書き込みを開始しない（32B アライン不能）。
 3. **Header (`0x0001`)**: `offset = 0x68C + slot * 0xD8`, `len = 0xD8`, `total_len = 0x0AD0`。`ANSI_CRC_16_sh` を 2768B 全体で再計算した後に 216B を切り出す。216B は `chunk_len = min(142, max_payload)` で分割し、`total_len = 0x0AD0` を維持したまま `offset` を実チャンク長だけ進める。各チャンクの ACK は 2 秒。
    - MTU 200: `max_payload = 180` → **142 + 74**（159B / 91B フレーム）
