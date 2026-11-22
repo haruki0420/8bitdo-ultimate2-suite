@@ -769,6 +769,7 @@ mod tests {
         assert_eq!(options.scan_timeout, Duration::from_secs(10));
         assert_eq!(options.connect_timeout, Duration::from_secs(20));
         assert!(!options.verbose);
+        assert_eq!(options.lock_path, None);
     }
 
     #[test]

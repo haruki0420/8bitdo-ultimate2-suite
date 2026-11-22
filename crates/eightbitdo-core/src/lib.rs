@@ -51,7 +51,7 @@ pub use macro_ops::{
 };
 pub use mock::MockTransport;
 pub use ota::{
-    gamepad_type_from_pid, BootReady, FirmwareImage, GamepadType, JumpOutcome, OtaConfig,
+    gamepad_type_from_pid, BootReady, FirmwareImage, GamepadType, JumpOutcome, OtaConfig, OtaLink,
     OtaOutcome, OtaPhase, OtaProgress, OtaTimeouts, OtaTransport, OtaUpdate, OTA_CHUNK_SIZE,
     OTA_ENTER_BOOT_TIMEOUT, OTA_ERASE_TIMEOUT, OTA_IMAGE_HEADER_LEN, OTA_JUMP_TIMEOUT,
     OTA_MAX_FRAME_LEN, OTA_MIN_MTU, OTA_PID_TIMEOUT, OTA_SECTOR_SIZE, OTA_VERSION_HEADER_LEN,

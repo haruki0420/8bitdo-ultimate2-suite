@@ -738,7 +738,8 @@ Bootloader Mode (`"8bt"`, Service `0000FF20-...`, Char `0000FF21-...`) では先
 #### 実装済み API
 
 - `OtaUpdate` の段階: `Idle` → `EnteringBoot`（`0x000C`）→ `AwaitingBootReconnect`（`"8bt"` への再接続はフロントエンドの責務）→ `PreparingBoot`（`readPID 0x0008` → `gamepad_type` 判定 → 任意で `readVersionInBoot 0x0005`）→ `Ready` → `Erasing` / `Writing` / `Finalizing` → `Complete`（失敗時は `Failed`）。
-- `prepare_boot` は **`BootReady<'a, T>` ガード**を返し、`write_firmware` はそのガードのみを受け付ける。ガードは PID 読みに使った boot transport を借用し、生成元 `OtaUpdate` の ID も保持するため、「PID 確認後のリンク」と「書込リンク」を別にできない（型 + 実行時 ID 照合）。`OtaTransport` マーカーは **sealed**（外部 crate 実装不可）で、crate 内の Mock と **boot 専用 `BleBootTransport`**（`"8bt"` / service `FF20` / characteristic `FF21`・`FF23`）にのみ実装する。App Mode `BleTransport`（`"80ND"` / `FF10`）は接続先が異なり `"8bt"` に到達できないため、`OtaTransport` ではない。USB transport は型で拒否される。
+- `prepare_boot` は **`BootReady<'a, T>` ガード**を返し、`write_firmware` はそのガードのみを受け付ける。ガードは PID 読みに使った boot transport を借用し、生成元 `OtaUpdate` の ID も保持するため、「PID 確認後のリンク」と「書込リンク」を別にできない（型 + 実行時 ID 照合）。`OtaTransport` マーカーは **sealed**（外部 crate 実装不可）で、crate 内の Mock と **boot 専用 `BleBootTransport`**（`"8bt"` / service `FF20` / characteristic `FF21`・`FF23`）にのみ実装する。App Mode `BleTransport`（`"80ND"` / `FF10`）は接続先が異なり `"8bt"` に到達できないため、`OtaTransport` ではない。USB transport は型で拒否される。UniFFI / モバイルのネイティブ boot transport は、公開アダプタ **`OtaLink<T: Transport>`**（crate 内で `sealed::Sealed` を実装）で包んで渡す。`OtaLink` はフレーミング変換をせず、`"8bt"` / FF20 / FF21 への接続、TX への追加 prefix なし、RX の 16B ヘッダ先頭、MTU、リンクの単一所有を呼び出し側の契約とする。
+  - デスクトップの `BleBootTransport` は PR #10 の単一所有者 BLE ロックを共有し、`BleBootOptions::lock_path`（`None` は既定パス）で App Mode と排他する。`OtaLink` はネイティブ側のロック契約を呼び出し側に委ねる。
 - 期待 app base の組み込み検証: `OtaConfig::new(expected_load_base)` と `OtaUpdate::with_config` は、base が **type 1 の暫定 application ウィンドウ `0x0101_0000..0x0102_0000`**（`UT2_TYPE1_APP_BASE_MIN..UT2_TYPE1_APP_FLASH_END`）内で 4KB アラインであることを要求する。さらに `write_firmware` は `.dat +0x04` の `load_base_addr` が `expected_load_base` と厳密一致し、`expected_load_base + image_len <= UT2_TYPE1_APP_FLASH_END` であることを **最初の Erase 前**に検査し、外れたら `OtaInvalidFirmware` で停止する。`load_base = 0` / bootloader 領域 / type 0 の `0x0801_xxxx` は拒否される。
   - このウィンドウは、文書化された type 1 のアドレス（`readVersionInBoot`/`WriteFirmwareVersion` = `0x01017040`、`JumpApp` = `0x01018000`）を含み、0 番地・bootloader・type 0 領域を除外する **暫定の 64 KiB アライン範囲**である。公式 `.dat` の `load_base_addr` と実フラッシュサイズは未測定のため、実機と公式 `.dat` で確定するまで暫定値として扱い、CLI 配線は保留する。
 - MTU 事前検証: 最初の Erase 前に `mtu - 3 >= 81`（`OTA_MIN_MTU = 84`）を検証し、不足なら `MtuTooSmall` で停止する。最大フレームは 64B WriteFirmware の **81B**（1B prefix + 16B header + 64B payload）。Erase 17B / WriteVersion 41B / WriteFirmwareVersion 21B / JumpApp 17B はこれに収まる。App Mode の観測 MTU は 92 だが、**Bootloader の実 MTU は未確認**。
@@ -792,9 +793,9 @@ payload-less の ready ACK が完了 ACK より先に届く場合、Erase 完了
 3. マルチセクション `.dat` をサポートするか、公式 `.dat` 非対応を明示する（blocker 解消）。
 4. `require_completion_ack` の既定値を実 wire に合わせて確定し、`allow_unverified_wire` を削除または明示的なベンチ専用に限定する。
 5. バッテリー残量、バージョン / ダウングレード判定、ダウンロード整合性（SHA-256 / 署名）を追加する。
-6. `OtaTransport` は boot 専用 `BleBootTransport` のみを使い、App Mode `BleTransport` や USB transport を渡さない（型で強制）。
+6. デスクトップは boot 専用 `BleBootTransport` のみを使い、App Mode `BleTransport` や USB transport を渡さない（型で強制）。モバイルは `OtaLink` でネイティブ boot transport（`"8bt"`/FF20/FF21）を包み、フレーミング・単一所有・ロックの契約を満たすことを確認する。
 7. 成功判定は ACK だけでなく、`"80ND"` への再接続と App Mode のバージョン読み出しで確認する。
 
 #### テスト
 
-MockTransport による **46 テスト**: 正常系の全パケット列・CRC・チャンク境界・セクタ境界・複数セクタ進捗・部分セクタ、Erase/Write/WriteVersion/WriteFirmwareVersion/Jump の失敗、送信失敗、ACK タイムアウト（リトライなし）、PID 不一致、ready/completion ACK ガード（スキップ成功・単独 ACK タイムアウト）、MTU 不足、type 1 ウィンドウ外・`base + image_len` 上限超過・境界ちょうど、transport 不一致（ガード）、未確認 wire ゲート、`0x000E` 応答、キャンセル、マルチセクション拒否メッセージ、`load_base + image_len` の 2^32 境界、WriteVersion の ready ACK 単独タイムアウト。
+MockTransport による **48 テスト**: 正常系の全パケット列・CRC・チャンク境界・セクタ境界・複数セクタ進捗・部分セクタ、Erase/Write/WriteVersion/WriteFirmwareVersion/Jump の失敗、送信失敗、ACK タイムアウト（リトライなし）、PID 不一致、ready/completion ACK ガード（スキップ成功・単独 ACK タイムアウト）、MTU 不足、type 1 ウィンドウ外・`base + image_len` 上限超過・境界ちょうど、transport 不一致（ガード）、未確認 wire ゲート、`0x000E` 応答、キャンセル、マルチセクション拒否メッセージ、`load_base + image_len` の 2^32 境界、WriteVersion の ready ACK 単独タイムアウト、`OtaLink` アダプタ経由の Mock transport。
