@@ -31,6 +31,7 @@ pub use config_ops::{
     button_mapping, button_mappings, config_write_chunk_len, map_key_flag, ConfigCrcStatus,
     ConfigEdit, ConfigRegion, ConfigWriteOutcome, ConfigWritePlan, ConfigWriteTimeouts,
     PreparedConfigWrite, CONFIG_SAVE_TIMEOUT, CONFIG_VERIFY_DELAY, CONFIG_WRITE_TIMEOUT,
+    OFFICIAL_WRITE_CHUNK,
 };
 pub use error::Error;
 pub use error::{ConfigWriteStage, ConfigWriteState, MacroWriteStage, MacroWriteState};

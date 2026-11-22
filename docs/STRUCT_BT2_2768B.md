@@ -71,7 +71,7 @@
 > Android 版 `libadvancelib.so` の `getBT2_WriteSixAxis` は `.rodata 0x1d6a0` (`{0x0, 0xC, 0xC, 0xC}`) を読み込む実装ミスによりヘッダに `offset = 0, total_len = 0x0C, len = 0x0C` を入れている（ペイロードポインタ自体は `base + slot * 0x0C + 0x92C` を指す）。一方 Windows 版 `8BitDoAdvance.dll` の `_writeUltimateBT2sixaxis@2772` では正しく **`offset = 0x92C + slot * 0x0C`, `total_len = 0x0AD0`, `len = 0x0C`** を送信している。独自実装では Windows DLL 準拠（`offset = 0x92C + slot * 0x0C, total_len = 0x0AD0`）を用いること。
 
 > **書込時の BLE 分割長（RE 再確認・2026-11-22）**:
-> 公式 Android の `Generate_CustomDataCmd` は書込系で `min(残り, MAX_ATT_MTU - 0x12)` を使い、`MAX_ATT_MTU` は初期値 **`0x5C` (92)** のまま `0x600F` 用に変更されない。したがって **公式書込のペイロード上限は 74B**（静的解析。実機書込キャプチャは未確認）。既存の「MTU 200 → 142B」は**読み出し応答側の実機観測値**であり、書込側の分割長ではない。本リポジトリの full config write は交渉 MTU 連動（`mtu - 3 - 17`）で送る（ATT 的には妥当だが公式の 74B 固定とは異なる。実機未確認）。
+> 公式 Android の `Generate_CustomDataCmd` は書込系で `min(残り, MAX_ATT_MTU - 0x12)` を使い、`MAX_ATT_MTU` は初期値 **`0x5C` (92)** のまま `0x600F` 用に変更されない。したがって **公式書込のペイロード上限は 74B**（静的解析。実機書込キャプチャは未確認）。既存の「MTU 200 → 142B」は**読み出し応答側の実機観測値**であり、書込側の分割長ではない。本リポジトリの full config write は既定で **`min(MTU ペイロード, 74)`**（MTU 200 でも 74B）を使い、`--write-chunk <BYTES>` で交渉 MTU までの任意サイズ（例: 180）を明示指定できる（公式 74B との A/B 用。実機未確認）。
 >
 > **部分書込と Save（RE 確定・2026-11-22）**: `getBT2_Write*` の部分書込も、完了時に共通 onfinished から **`0x0006/0x0067` Save が必ず 1 回**送られる（部分書込専用の Save 関数は無い）。
 

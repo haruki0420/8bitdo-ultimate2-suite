@@ -143,6 +143,7 @@ Windows の `FindHid` / `enum_hid` は `HidD_GetPreparsedData` + `HidP_GetCaps` 
    - **`cmd == 0x0007`（`SetReportEnable`）実行時**:
      - `getSetReportEnableChannel()` 実行時に `MAX_ATT_MTU` を **`0x3F`（63 バイト）** へ変更する。これはリアルタイム入力ストリーム（12 バイト通知）中の MTU / パケットサイズを固定するためである。
    - 例外 PID (`0x202F`): `MAX_ATT_MTU = 0x3E` (62)、チャンク上限 `MAX_ATT_MTU - 0x13`。
+   - **書込側の分割長（RE・2026-11-22）**: 公式 Android の `Generate_CustomDataCmd` は書込系でも `min(残り, MAX_ATT_MTU - 0x12)` を使い、`MAX_ATT_MTU` は初期値 **`0x5C` (92)** のまま `0x600F` 用に変更されない。したがって **公式書込のペイロード上限は 74B**（静的解析。実機書込キャプチャは未確認）。**142B は読み出し応答側の実機観測値**であり、書込側の分割長ではない。本実装の full config write は既定で `min(MTU ペイロード, 74)` を使い、`--write-chunk <BYTES>` で交渉 MTU までの任意サイズ（例: 180B）を明示指定できる（A/B 用）。
 
 ---
 
@@ -487,6 +488,10 @@ sequenceDiagram
     - `+0x08` (`u16`): `rightJoy`（右スティック座標パック値）
 
 ### 6.4 USB HID と BLE での Save サブコマンド差異
+
+> **タイムアウト / 再送の実装差（2026-11-22 RE 追記）**: 公式 Android の BLE Save は **2000 ms・最大 2 回再送**（`getSaveCustomConfigChannel` のチャネル設定 `+0x64 = 2000.0f`、`+0x31 = 2`。静的解析）。Windows USB HID は **3 秒**。本リポジトリの config write / macro write は **3 秒・リトライなし**で実装しており、公式 BLE の 2 秒 / 2 再送とは異なる（未確定・暫定方針）。この差は許容し、実機検証で再送が必要と判明した場合にのみ変更する。
+>
+> **USB HID の設定書込は本リポジトリ未実装**: `config write` / `config set` / `config remap` と full 2768B 書込は **BLE のみ**。USB App Mode の実機証跡と transport が揃うまで、USB config write は提供しない（`Save 0x0123` の実装は macro/Save の既存定数のみ）。
 
 - **BLE (Android `getSaveCustomConfigChannel`)**: `cmd = 0x0006`, **`subcmd = 0x0067`** を使用。BLE の `Save` タイムアウトは仕様書に記載がないため、本実装は暫定 3 秒・リトライなしとする（§6.5）。
 - **Windows USB HID (`8BitDoAdvance.dll::saveUltimateBT2`)**: `cmd = 0x0006`, **`subcmd = 0x0123`** を使用（**USB HID の Save タイムアウトは `3` 秒**）。

@@ -18,17 +18,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use eightbitdo_core::{
-    button_mapping, button_mappings, macro_header_chunk_len, macro_ops::is_skipped_steps,
-    macro_write_chunk_len, macro_write_chunk_len_requested, map_key_flag, scan_devices,
-    validate_macro_chunk_size, BleOptions, BleTransport, ConfigCrcStatus, ConfigEdit, ConfigRegion,
-    ConfigSnapshot, ConfigWritePlan, ConfigWriteTimeouts, Error, MacroBackup, MacroEntry,
-    MacroWritePlan, PreparedConfigWrite, Session, Transport, VersionInfo,
+    button_mapping, button_mappings, config_write_chunk_len, macro_header_chunk_len,
+    macro_ops::is_skipped_steps, macro_write_chunk_len, macro_write_chunk_len_requested,
+    map_key_flag, max_protocol_payload, scan_devices, validate_macro_chunk_size, BleOptions,
+    BleTransport, ConfigCrcStatus, ConfigEdit, ConfigRegion, ConfigSnapshot, ConfigWritePlan,
+    ConfigWriteTimeouts, Error, MacroBackup, MacroEntry, MacroWritePlan, PreparedConfigWrite,
+    Session, Transport, VersionInfo,
 };
 use eightbitdo_protocol::commands::{MacroWriteLayout, SaveTransport};
 use eightbitdo_protocol::config_bt2::{
     macro_record_offset, macro_slot_offset, Argb, Bt2Config, GamepadMode, JoyRecord, MacroIndex,
     MacroSlot, RumbleRecord, SixAxisRecord, Slot, TriggerRecord, CONFIG_SIZE, MACROS_PER_SLOT,
-    MACRO_SLOT_SIZE, SLOT_COUNT,
+    MACRO_SLOT_SIZE, OFF_LEGACY_A, OFF_LEGACY_B, OFF_MACROS, OFF_SIX_AXIS, SLOT_COUNT,
 };
 use eightbitdo_protocol::input_report::InputReport;
 use eightbitdo_protocol::keymap::ButtonIndex;
@@ -79,6 +80,10 @@ enum Command {
     Info,
 
     /// Configuration operations: dump, write, set, remap and map show.
+    ///
+    /// Configuration writes use BLE only; USB HID config write is not
+    /// implemented (the USB Save sub-command 0x0123 exists but no USB
+    /// transport is wired for config writes).
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -170,6 +175,12 @@ enum ConfigCommand {
     /// Read the current block with `config dump --raw FILE`, edit the bytes
     /// offline, then write the result. A pre-write backup is mandatory and the
     /// result is verified by reading the block back.
+    ///
+    /// Known fields are validated before connecting (gamepad_mode, cur_slot,
+    /// joy ranges, enabled gyro ranges, hotwheel speed). Changes to the macro
+    /// header region (0x68C..0x914) and to gamepad_mode/cur_slot are warned
+    /// about because step data is not part of this write and the BLE link may
+    /// restart.
     Write {
         /// 2768-byte configuration file (`config dump --raw` output, edited).
         #[arg(long, value_name = "FILE")]
@@ -179,6 +190,22 @@ enum ConfigCommand {
         /// config.json). Defaults to `config-backup-<unix-nanos>-<pid>-<seq>`.
         #[arg(long, value_name = "DIR")]
         backup_dir: Option<PathBuf>,
+
+        /// Copy the device's current reserved bytes (0x1F4..0x68C and
+        /// 0x914..0x92C) into the file before writing.
+        ///
+        /// Use this to restore a backup after the device normalized reserved
+        /// bytes; without it a reserved-byte difference is refused.
+        #[arg(long)]
+        accept_reserved_drift: bool,
+
+        /// Override the 0x0001 write payload size in bytes.
+        ///
+        /// Defaults to min(MTU payload, 74): 74 reproduces the official
+        /// writer (MAX_ATT_MTU 92 - 0x12, static analysis). Larger values up
+        /// to the negotiated MTU payload are experimental A/B.
+        #[arg(long, value_name = "BYTES")]
+        write_chunk: Option<u16>,
 
         /// Skip the interactive confirmation prompt.
         #[arg(long)]
@@ -194,6 +221,10 @@ enum ConfigCommand {
     /// key, led.dynamic.color / bg_color / flag, led.hotwheel.color / bg_color
     /// / speed / flag, led.single.color / flag, map_key.flag (0 = disabled,
     /// 1 = enabled; the single-entry `config remap` does not change it).
+    ///
+    /// Side effects: joy.* and trigger.* set that record's `flag` to 1
+    /// (custom settings enabled), and led.*.color sets that theme's `flag` to
+    /// 1. Flag fields only accept 0 or 1.
     Set {
         /// Field path (see the command description).
         field: String,
@@ -208,6 +239,11 @@ enum ConfigCommand {
         /// Directory for the mandatory pre-write backup.
         #[arg(long, value_name = "DIR")]
         backup_dir: Option<PathBuf>,
+
+        /// Override the 0x0001 write payload size in bytes (default
+        /// min(MTU payload, 74), the official 74-byte split).
+        #[arg(long, value_name = "BYTES")]
+        write_chunk: Option<u16>,
 
         /// Skip the interactive confirmation prompt.
         #[arg(long)]
@@ -235,6 +271,11 @@ enum ConfigCommand {
         /// Directory for the mandatory pre-write backup.
         #[arg(long, value_name = "DIR")]
         backup_dir: Option<PathBuf>,
+
+        /// Override the 0x0001 write payload size in bytes (default
+        /// min(MTU payload, 74), the official 74-byte split).
+        #[arg(long, value_name = "BYTES")]
+        write_chunk: Option<u16>,
 
         /// Skip the interactive confirmation prompt.
         #[arg(long)]
@@ -402,32 +443,53 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
             ConfigCommand::Write {
                 file,
                 backup_dir,
+                accept_reserved_drift,
+                write_chunk,
                 yes,
             } => {
-                config_write(&options, &file, backup_dir.as_deref(), yes).await?;
+                config_write(
+                    &options,
+                    &file,
+                    backup_dir.as_deref(),
+                    accept_reserved_drift,
+                    write_chunk,
+                    yes,
+                )
+                .await?;
             }
             ConfigCommand::Set {
                 field,
                 value,
                 slot,
                 backup_dir,
+                write_chunk,
                 yes,
             } => {
                 let slot = parse_slot(slot)?;
                 let set = parse_config_set(&field, &value, slot)?;
-                config_set(&options, &set, backup_dir.as_deref(), yes).await?;
+                config_set(&options, &set, backup_dir.as_deref(), write_chunk, yes).await?;
             }
             ConfigCommand::Remap {
                 from,
                 to,
                 slot,
                 backup_dir,
+                write_chunk,
                 yes,
             } => {
                 let slot = parse_slot(slot)?;
                 let button = parse_physical_button(&from)?;
                 let target = parse_remap_target(&to)?;
-                config_remap(&options, slot, button, target, backup_dir.as_deref(), yes).await?;
+                config_remap(
+                    &options,
+                    slot,
+                    button,
+                    target,
+                    backup_dir.as_deref(),
+                    write_chunk,
+                    yes,
+                )
+                .await?;
             }
             ConfigCommand::Map { command } => match command {
                 MapCommand::Show { slot } => {
@@ -1279,34 +1341,29 @@ fn parse_config_set(field: &str, value: &str, slot: Slot) -> Result<ConfigSet, E
             slot,
             name: value.to_string(),
         },
-        "rumble.level" => {
-            let level = parse_u8(value, &name)?;
-            if level > 5 {
-                return Err(invalid_input(format!(
-                    "rumble.level must be 0..=5, got {level}"
-                )));
-            }
-            ConfigSet::RumbleLevel { slot, level }
-        }
+        "rumble.level" => ConfigSet::RumbleLevel {
+            slot,
+            level: parse_range_u8(value, &name, 0, 5)?,
+        },
         "joy.left_start" => ConfigSet::Joy {
             slot,
             field: JoyField::LeftStart,
-            value: parse_u8(value, &name)?,
+            value: parse_range_u8(value, &name, 0, 127)?,
         },
         "joy.left_end" => ConfigSet::Joy {
             slot,
             field: JoyField::LeftEnd,
-            value: parse_u8(value, &name)?,
+            value: parse_range_u8(value, &name, 0, 128)?,
         },
         "joy.right_start" => ConfigSet::Joy {
             slot,
             field: JoyField::RightStart,
-            value: parse_u8(value, &name)?,
+            value: parse_range_u8(value, &name, 0, 127)?,
         },
         "joy.right_end" => ConfigSet::Joy {
             slot,
             field: JoyField::RightEnd,
-            value: parse_u8(value, &name)?,
+            value: parse_range_u8(value, &name, 0, 128)?,
         },
         "trigger.left_start" => ConfigSet::Trigger {
             slot,
@@ -1341,7 +1398,7 @@ fn parse_config_set(field: &str, value: &str, slot: Slot) -> Result<ConfigSet, E
         "gyro.sensitivity" => ConfigSet::Gyro {
             slot,
             field: GyroField::Sensitivity,
-            value: parse_u8(value, &name)?,
+            value: parse_range_u8(value, &name, 1, 15)?,
         },
         "gyro.dead_compensate" => ConfigSet::Gyro {
             slot,
@@ -1353,9 +1410,11 @@ fn parse_config_set(field: &str, value: &str, slot: Slot) -> Result<ConfigSet, E
             field: GyroField::Mapping,
             value: parse_gyro_mapping(value)?,
         },
+        // gyro.key uses the same documented single-KeyMap whitelist as remap:
+        // KeyMap_My_NUll (227), unknown bits and combinations are rejected.
         "gyro.key" => ConfigSet::GyroKeyMap {
             slot,
-            key: parse_trigger(value)?,
+            key: parse_key_map_value(value)?,
         },
         "led.dynamic.color" => ConfigSet::Led {
             slot,
@@ -1367,7 +1426,7 @@ fn parse_config_set(field: &str, value: &str, slot: Slot) -> Result<ConfigSet, E
         },
         "led.dynamic.flag" => ConfigSet::Led {
             slot,
-            change: LedChange::DynamicFlag(parse_u32(value, &name)?),
+            change: LedChange::DynamicFlag(parse_flag(value, &name)?),
         },
         "led.hotwheel.color" => ConfigSet::Led {
             slot,
@@ -1379,11 +1438,11 @@ fn parse_config_set(field: &str, value: &str, slot: Slot) -> Result<ConfigSet, E
         },
         "led.hotwheel.speed" => ConfigSet::Led {
             slot,
-            change: LedChange::HotWheelSpeed(parse_u8(value, &name)?),
+            change: LedChange::HotWheelSpeed(parse_range_u8(value, &name, 0, 15)?),
         },
         "led.hotwheel.flag" => ConfigSet::Led {
             slot,
-            change: LedChange::HotWheelFlag(parse_u32(value, &name)?),
+            change: LedChange::HotWheelFlag(parse_flag(value, &name)?),
         },
         "led.single.color" => ConfigSet::Led {
             slot,
@@ -1391,11 +1450,11 @@ fn parse_config_set(field: &str, value: &str, slot: Slot) -> Result<ConfigSet, E
         },
         "led.single.flag" => ConfigSet::Led {
             slot,
-            change: LedChange::SingleFlag(parse_u32(value, &name)?),
+            change: LedChange::SingleFlag(parse_flag(value, &name)?),
         },
         "map_key.flag" | "mapkey.flag" => ConfigSet::MapKeyFlag {
             slot,
-            flag: parse_u32(value, &name)?,
+            flag: parse_flag(value, &name)?,
         },
         other => {
             return Err(invalid_input(format!(
@@ -1491,6 +1550,28 @@ fn parse_u8(value: &str, field: &str) -> Result<u8, Error> {
         .map_err(|_| invalid_input(format!("{field} must fit in 0..=255, got {value:?}")))
 }
 
+/// Parse a decimal/0x integer and enforce an inclusive range.
+fn parse_range_u8(value: &str, field: &str, min: u8, max: u8) -> Result<u8, Error> {
+    let parsed = parse_u8(value, field)?;
+    if !(min..=max).contains(&parsed) {
+        return Err(invalid_input(format!(
+            "{field} must be {min}..={max}, got {parsed}"
+        )));
+    }
+    Ok(parsed)
+}
+
+/// Parse a 0/1 flag value (led.*.flag, map_key.flag).
+fn parse_flag(value: &str, field: &str) -> Result<u32, Error> {
+    let parsed = parse_u32(value, field)?;
+    if parsed > 1 {
+        return Err(invalid_input(format!(
+            "{field} must be 0 or 1, got {parsed}"
+        )));
+    }
+    Ok(parsed)
+}
+
 fn parse_u32(value: &str, field: &str) -> Result<u32, Error> {
     let text = value.trim();
     let parsed = if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
@@ -1575,53 +1656,14 @@ fn parse_physical_button(value: &str) -> Result<ButtonIndex, Error> {
     Ok(button)
 }
 
-/// True for the RE-confirmed single `KeyMap` constants a remap may target.
+/// Parse and validate a documented single `KeyMap` value.
 ///
-/// `0` disables an entry. `KeyMap_My_NUll` (227) and unknown bit combinations
-/// are rejected: the official remap path only writes single constants and the
-/// meaning of 227 is unconfirmed.
-fn is_documented_key_map(key: KeyMap) -> bool {
-    matches!(
-        key.bits(),
-        0 | 1
-            | 2
-            | 4
-            | 8
-            | 0x10
-            | 0x20
-            | 0x40
-            | 0x80
-            | 0x100
-            | 0x200
-            | 0x400
-            | 0x800
-            | 0x1000
-            | 0x2000
-            | 0x4000
-            | 0x8000
-            | 0x0001_0000
-            | 0x0002_0000
-            | 0x0004_0000
-            | 0x0020_0000
-            | 0x0040_0000
-            | 0x0080_0000
-            | 0x0100_0000
-            | 0x0200_0000
-            | 0x0400_0000
-            | 0x0800_0000
-            | 0x4000_0000
-            | 119
-            | 120
-            | 121
-            | 122
-            | 123
-            | 124
-    )
-}
-
-/// Parse a remap target (`null`/`disable`, a KeyMap name, M1..M4, 0xHEX or
-/// decimal) and reject values the official remap path never writes.
-fn parse_remap_target(value: &str) -> Result<KeyMap, Error> {
+/// Accepts `null`/`disable`, a KeyMap name, M1..M4, `0xHEX` or decimal. The
+/// whitelist lives in the protocol crate ([`KeyMap::is_single_documented`],
+/// derived from the same table as [`KeyMap::name`]); `KeyMap_My_NUll` (227),
+/// unknown bits and combinations are rejected. Used by both `config remap`
+/// and `config set gyro.key`.
+fn parse_key_map_value(value: &str) -> Result<KeyMap, Error> {
     let text = value.trim();
     let lower = text.to_ascii_lowercase();
     let key = if matches!(
@@ -1632,20 +1674,25 @@ fn parse_remap_target(value: &str) -> Result<KeyMap, Error> {
     } else {
         parse_trigger(text).map_err(|_| {
             invalid_input(format!(
-                "unknown remap target {value:?}; use a KeyMap name, M1..M4, null/disable, \
+                "unknown KeyMap value {value:?}; use a KeyMap name, M1..M4, null/disable, \
                  0xHEX or decimal"
             ))
         })?
     };
-    if !is_documented_key_map(key) {
+    if !key.is_single_documented() {
         return Err(invalid_input(format!(
-            "target {value:?} (0x{:08X}) is not a documented single KeyMap value; remap accepts \
-             one KeyMap constant (0 = unassigned) and rejects KeyMap_My_NUll (227), unknown bits \
-             and combinations",
+            "KeyMap value {value:?} (0x{:08X}) is not a documented single value; use one KeyMap \
+             constant (0 = unassigned). KeyMap_My_NUll (227), unknown bits and combinations are \
+             rejected.",
             key.bits()
         )));
     }
     Ok(key)
+}
+
+/// Parse a `config remap` target.
+fn parse_remap_target(value: &str) -> Result<KeyMap, Error> {
+    parse_key_map_value(value)
 }
 
 fn key_label(key: KeyMap) -> String {
@@ -1698,7 +1745,8 @@ async fn config_remap_session<T: Transport>(
     button: ButtonIndex,
     target: KeyMap,
     backup_dir: Option<&Path>,
-    assume_yes: bool,
+    confirmation: ConfigConfirmation<'_>,
+    write_chunk: Option<u16>,
 ) -> Result<(), Error> {
     let snapshot = session.read_config_snapshot().await?;
     let before = button_mapping(&snapshot.config, slot, button);
@@ -1725,7 +1773,15 @@ async fn config_remap_session<T: Transport>(
          use `config set map_key.flag 1` to enable the record)",
         map_key_flag(&snapshot.config, slot)
     );
-    apply_config_prepared(session, &snapshot, &prepared, backup_dir, assume_yes).await
+    apply_config_prepared(
+        session,
+        &snapshot,
+        &prepared,
+        backup_dir,
+        confirmation,
+        write_chunk,
+    )
+    .await
 }
 
 async fn config_remap(
@@ -1734,11 +1790,28 @@ async fn config_remap(
     button: ButtonIndex,
     target: KeyMap,
     backup_dir: Option<&Path>,
+    write_chunk: Option<u16>,
     assume_yes: bool,
 ) -> Result<(), Error> {
     let transport = BleTransport::connect(options).await?;
     let session = Session::new(transport);
-    let result = config_remap_session(&session, slot, button, target, backup_dir, assume_yes).await;
+    let stdin = std::io::stdin();
+    let mut stdin_lock = stdin.lock();
+    let confirmation = if assume_yes {
+        ConfigConfirmation::AssumeYes
+    } else {
+        ConfigConfirmation::Reader(&mut stdin_lock)
+    };
+    let result = config_remap_session(
+        &session,
+        slot,
+        button,
+        target,
+        backup_dir,
+        confirmation,
+        write_chunk,
+    )
+    .await;
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
 }
@@ -1795,6 +1868,24 @@ fn config_readback_crc_label(crc: ConfigCrcStatus) -> &'static str {
     }
 }
 
+/// How a configuration write gets its confirmation.
+enum ConfigConfirmation<'a> {
+    /// `--yes` was passed: write without prompting.
+    AssumeYes,
+    /// Prompt on stderr and read one line from this reader (stdin in
+    /// production, a cursor in tests).
+    Reader(&'a mut dyn std::io::BufRead),
+}
+
+impl ConfigConfirmation<'_> {
+    fn confirm(&mut self) -> Result<bool, Error> {
+        match self {
+            Self::AssumeYes => Ok(true),
+            Self::Reader(reader) => confirm_config_write(reader),
+        }
+    }
+}
+
 /// Ask for confirmation unless `--yes` was passed.
 fn confirm_config_write(reader: &mut impl std::io::BufRead) -> Result<bool, Error> {
     eprint!("Type 'yes' to write the 2768-byte configuration: ");
@@ -1804,16 +1895,159 @@ fn confirm_config_write(reader: &mut impl std::io::BufRead) -> Result<bool, Erro
     Ok(answer.trim().eq_ignore_ascii_case("yes"))
 }
 
-/// Apply a prepared configuration write with the mandatory pre-write backup,
-/// confirmation, Save and read-back verification.
+/// Reserved regions the official host does not interpret.
+const RESERVED_RANGES: [(usize, usize); 2] =
+    [(OFF_LEGACY_A, OFF_MACROS), (OFF_LEGACY_B, OFF_SIX_AXIS)];
+
+/// The 216-byte-per-slot macro header region inside the 2768-byte block.
+const MACRO_HEADER_RANGE: std::ops::Range<usize> = OFF_MACROS..OFF_LEGACY_B;
+
+/// Copy the device's current reserved bytes over an edited buffer.
 ///
-/// The backup is written before the prompt and before any frame is sent.
+/// Used by `config write --accept-reserved-drift` after the device normalized
+/// reserved bytes between the backup and the restore.
+fn copy_device_reserved(current: &Bt2Config, edited: &mut Bt2Config) {
+    for (start, end) in RESERVED_RANGES {
+        edited.as_mut_bytes()[start..end].copy_from_slice(&current.as_bytes()[start..end]);
+    }
+}
+
+/// Validate the known fields of a complete raw configuration file.
+///
+/// Only fields with documented ranges/enums are checked; unknown and reserved
+/// bytes are preserved as-is. A zeroed/disabled record is not rejected for a
+/// value that only applies while its feature flag is enabled.
+fn validate_raw_config(config: &Bt2Config) -> Result<(), Error> {
+    let mut problems: Vec<String> = Vec::new();
+    if config.gamepad_mode().is_none() {
+        problems.push(format!(
+            "gamepad_mode {} is not a known 0..=5 value",
+            config.gamepad_mode_raw()
+        ));
+    }
+    let cur_slot = config.cur_slot_raw();
+    if !matches!(cur_slot, 0 | 1 | 2 | 4 | 6) {
+        problems.push(format!(
+            "cur_slot {cur_slot} is not 0..=2, 4 (none) or 6 (observed on hardware)"
+        ));
+    }
+    for slot in Slot::ALL {
+        let joy = config.joy(slot);
+        for (name, value, max) in [
+            ("left_start_value", joy.left_start_value, 127u8),
+            ("left_end_value", joy.left_end_value, 128),
+            ("right_start_value", joy.right_start_value, 127),
+            ("right_end_value", joy.right_end_value, 128),
+        ] {
+            if value > max {
+                problems.push(format!(
+                    "joy[{}].{name} {value} exceeds {max}",
+                    slot.index()
+                ));
+            }
+        }
+        let gyro = config.six_axis(slot);
+        if gyro.flag == 1 {
+            if !(1..=15).contains(&gyro.sensitivity) {
+                problems.push(format!(
+                    "gyro[{}].sensitivity {} is outside 1..=15",
+                    slot.index(),
+                    gyro.sensitivity
+                ));
+            }
+            if gyro.trigger_mode > 1 {
+                problems.push(format!(
+                    "gyro[{}].trigger_mode {} is outside 0..=1",
+                    slot.index(),
+                    gyro.trigger_mode
+                ));
+            }
+            if gyro.mapping_type > 2 {
+                problems.push(format!(
+                    "gyro[{}].mapping_type {} is outside 0..=2",
+                    slot.index(),
+                    gyro.mapping_type
+                ));
+            }
+        }
+        let hotwheel = config.hotwheel_theme(slot);
+        if hotwheel.speed > 15 {
+            problems.push(format!(
+                "hotwheel[{}].speed {} is outside 0..=15",
+                slot.index(),
+                hotwheel.speed
+            ));
+        }
+        let rumble = config.rumble(slot);
+        if rumble.flag == 1 {
+            for (name, value) in [("left", rumble.left), ("right", rumble.right)] {
+                if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                    problems.push(format!(
+                        "rumble[{}].{name} {value} is not a finite 0.0..=1.0 multiplier",
+                        slot.index()
+                    ));
+                }
+            }
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid_data(format!(
+            "configuration file has invalid known fields; refusing to write:\n  - {}",
+            problems.join("\n  - ")
+        )))
+    }
+}
+
+/// Warn when a write changes the macro header region.
+fn warn_if_macro_header_changes(changed: &[ConfigRegion]) {
+    let touches_macro_header = changed.iter().any(|region| {
+        region.offset() < MACRO_HEADER_RANGE.end && region.end() > MACRO_HEADER_RANGE.start
+    });
+    if touches_macro_header {
+        eprintln!(
+            "warning: this write changes macro header bytes 0x{:03X}..0x{:03X}. Macro step data \
+             (the 4 KB flash sectors) is not part of the 2768-byte configuration and is not backed \
+             up or rewritten here; non-empty macros may change behavior.",
+            MACRO_HEADER_RANGE.start, MACRO_HEADER_RANGE.end
+        );
+    }
+}
+
+/// Warn when a write changes the connection mode or the active slot.
+fn warn_if_mode_or_slot_changes(snapshot: &ConfigSnapshot, expected: &Bt2Config) {
+    if snapshot.config.gamepad_mode_raw() != expected.gamepad_mode_raw() {
+        eprintln!(
+            "warning: gamepad_mode changes from {} to {}; the BLE configuration link may restart. \
+             If the write fails, reconnect and re-run.",
+            snapshot.config.gamepad_mode_raw(),
+            expected.gamepad_mode_raw()
+        );
+    }
+    if snapshot.config.cur_slot_raw() != expected.cur_slot_raw() {
+        eprintln!(
+            "warning: cur_slot changes from {} to {}; the controller may switch profiles or \
+             restart the BLE configuration link.",
+            snapshot.config.cur_slot_raw(),
+            expected.cur_slot_raw()
+        );
+    }
+}
+
+/// Apply a prepared configuration write with the mandatory pre-write backup,
+/// confirmation, TOCTOU re-read, Save and read-back verification.
+///
+/// The backup is written before the prompt and before any frame is sent. After
+/// the prompt the configuration is read again; if it changed while the operator
+/// was deciding, the write is aborted without sending `0x0001`/`0x0006`.
 async fn apply_config_prepared<T: Transport>(
     session: &Session<T>,
     snapshot: &ConfigSnapshot,
     prepared: &PreparedConfigWrite,
     backup_dir: Option<&Path>,
-    assume_yes: bool,
+    mut confirmation: ConfigConfirmation<'_>,
+    write_chunk: Option<u16>,
 ) -> Result<(), Error> {
     let before_sha = sha256_hex(snapshot.config.as_bytes());
     println!("config size: {CONFIG_SIZE} bytes");
@@ -1827,6 +2061,19 @@ async fn apply_config_prepared<T: Transport>(
         sha256_hex(prepared.expected_bytes())
     );
     print_changed_regions(prepared.changed());
+    // Validate an explicit chunk before the backup and prompt so a bad value
+    // cannot leave a backup directory behind or bother the operator.
+    if let Some(chunk) = write_chunk {
+        let limit = max_protocol_payload(session.transport().mtu());
+        if chunk == 0 || usize::from(chunk) > limit {
+            return Err(Error::InvalidRequest(format!(
+                "--write-chunk {chunk} must be 1..={limit} for MTU {}",
+                session.transport().mtu()
+            )));
+        }
+    }
+    warn_if_macro_header_changes(prepared.changed());
+    warn_if_mode_or_slot_changes(snapshot, prepared.expected());
 
     let backup = backup_dir.map_or_else(|| default_backup_dir("config-backup"), Path::to_path_buf);
     prepare_output_directory(&backup)?;
@@ -1843,23 +2090,46 @@ async fn apply_config_prepared<T: Transport>(
         "pre-write backup: {} (config.bin sha256 {backup_sha})",
         backup.display()
     );
-    eprintln!("recover with: {recover}");
+    eprintln!(
+        "note: config writes do not touch macro step sectors (0x0103/0x0104); the backup covers \
+         the 2768-byte configuration only"
+    );
+    eprintln!(
+        "recover with: {recover} (add --accept-reserved-drift if the device normalized reserved \
+         bytes)"
+    );
 
-    if !assume_yes {
-        let stdin = std::io::stdin();
-        let mut handle = stdin.lock();
-        if !confirm_config_write(&mut handle)? {
-            println!("aborted; no configuration was written");
-            return Ok(());
-        }
+    if !confirmation.confirm()? {
+        println!("aborted; no configuration was written");
+        return Ok(());
     }
 
+    // TOCTOU: the operator may have changed the profile (or another host may
+    // have written) while the prompt was open. Re-read and refuse rather than
+    // overwriting a state the prepared buffer was not based on.
+    let current = session.read_config_snapshot().await?;
+    if current.config != snapshot.config {
+        return Err(Error::InvalidRequest(format!(
+            "configuration changed while waiting for confirmation (before sha256 {before_sha}, \
+             now {}); aborted without sending a write. Re-run the command.",
+            sha256_hex(current.config.as_bytes())
+        )));
+    }
+
+    let default_chunk = config_write_chunk_len(session.transport().mtu())?;
+    let effective_chunk = write_chunk.map_or(default_chunk, usize::from);
+    eprintln!("write chunk: {effective_chunk} bytes (official 74; override with --write-chunk)");
     eprintln!(
         "writing 2768 bytes + Save; do not interrupt (Ctrl-C or power loss can leave the commit \
          unconfirmed)"
     );
     let outcome = match session
-        .write_full_config(snapshot, prepared, ConfigWriteTimeouts::default())
+        .write_full_config_with_chunk(
+            snapshot,
+            prepared,
+            write_chunk.map(usize::from),
+            ConfigWriteTimeouts::default(),
+        )
         .await
     {
         Ok(outcome) => outcome,
@@ -1868,7 +2138,10 @@ async fn apply_config_prepared<T: Transport>(
                 "config write failed; pre-write backup: {}",
                 backup.display()
             );
-            eprintln!("recover with: {recover}");
+            eprintln!(
+                "recover with: {recover} (add --accept-reserved-drift if the device normalized \
+                 reserved bytes)"
+            );
             return Err(error);
         }
     };
@@ -1896,37 +2169,81 @@ async fn apply_config_prepared<T: Transport>(
 
 async fn config_write_session<T: Transport>(
     session: &Session<T>,
-    file: &Path,
+    edited: &Bt2Config,
     backup_dir: Option<&Path>,
-    assume_yes: bool,
+    accept_reserved_drift: bool,
+    confirmation: ConfigConfirmation<'_>,
+    write_chunk: Option<u16>,
 ) -> Result<(), Error> {
-    let edited = read_config_file(file)?;
     let snapshot = session.read_config_snapshot().await?;
+    let mut edited = edited.clone();
+    if accept_reserved_drift {
+        copy_device_reserved(&snapshot.config, &mut edited);
+        eprintln!("--accept-reserved-drift: using the device's current reserved bytes");
+    }
     let prepared = PreparedConfigWrite::from_buffer(&snapshot, edited)?;
-    apply_config_prepared(session, &snapshot, &prepared, backup_dir, assume_yes).await
+    apply_config_prepared(
+        session,
+        &snapshot,
+        &prepared,
+        backup_dir,
+        confirmation,
+        write_chunk,
+    )
+    .await
 }
 
 async fn config_set_session<T: Transport>(
     session: &Session<T>,
     set: &ConfigSet,
     backup_dir: Option<&Path>,
-    assume_yes: bool,
+    confirmation: ConfigConfirmation<'_>,
+    write_chunk: Option<u16>,
 ) -> Result<(), Error> {
     let snapshot = session.read_config_snapshot().await?;
     let plan = set.plan(&snapshot)?;
     let prepared = plan.prepare(&snapshot)?;
-    apply_config_prepared(session, &snapshot, &prepared, backup_dir, assume_yes).await
+    apply_config_prepared(
+        session,
+        &snapshot,
+        &prepared,
+        backup_dir,
+        confirmation,
+        write_chunk,
+    )
+    .await
 }
 
 async fn config_write(
     options: &BleOptions,
     file: &Path,
     backup_dir: Option<&Path>,
+    accept_reserved_drift: bool,
+    write_chunk: Option<u16>,
     assume_yes: bool,
 ) -> Result<(), Error> {
+    // Read and validate the file before opening the BLE connection: an invalid
+    // path or length must not enter configuration mode at all.
+    let edited = read_config_file(file)?;
+    validate_raw_config(&edited)?;
     let transport = BleTransport::connect(options).await?;
     let session = Session::new(transport);
-    let result = config_write_session(&session, file, backup_dir, assume_yes).await;
+    let stdin = std::io::stdin();
+    let mut stdin_lock = stdin.lock();
+    let confirmation = if assume_yes {
+        ConfigConfirmation::AssumeYes
+    } else {
+        ConfigConfirmation::Reader(&mut stdin_lock)
+    };
+    let result = config_write_session(
+        &session,
+        &edited,
+        backup_dir,
+        accept_reserved_drift,
+        confirmation,
+        write_chunk,
+    )
+    .await;
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
 }
@@ -1935,11 +2252,19 @@ async fn config_set(
     options: &BleOptions,
     set: &ConfigSet,
     backup_dir: Option<&Path>,
+    write_chunk: Option<u16>,
     assume_yes: bool,
 ) -> Result<(), Error> {
     let transport = BleTransport::connect(options).await?;
     let session = Session::new(transport);
-    let result = config_set_session(&session, set, backup_dir, assume_yes).await;
+    let stdin = std::io::stdin();
+    let mut stdin_lock = stdin.lock();
+    let confirmation = if assume_yes {
+        ConfigConfirmation::AssumeYes
+    } else {
+        ConfigConfirmation::Reader(&mut stdin_lock)
+    };
+    let result = config_set_session(&session, set, backup_dir, confirmation, write_chunk).await;
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
 }
@@ -8174,7 +8499,8 @@ mod tests {
             ButtonIndex::P4,
             KeyMap::L2,
             Some(&dir.join("backup")),
-            true,
+            ConfigConfirmation::AssumeYes,
+            None,
         )
         .await
         .unwrap();
@@ -8231,9 +8557,16 @@ mod tests {
         let transport = ConfigDeviceTransport::new(initial.clone());
         let session = Session::new(&transport);
         let backup = dir.join("backup");
-        config_write_session(&session, &file, Some(&backup), true)
-            .await
-            .unwrap();
+        config_write_session(
+            &session,
+            &edited,
+            Some(&backup),
+            false,
+            ConfigConfirmation::AssumeYes,
+            None,
+        )
+        .await
+        .unwrap();
 
         let device = transport.config();
         assert_eq!(device.profile_name(Slot::S2), "Edited");
@@ -8283,9 +8616,15 @@ mod tests {
         let transport = ConfigDeviceTransport::new(initial.clone());
         let session = Session::new(&transport);
         let set = parse_config_set("joy.left_start", "42", Slot::S2).unwrap();
-        config_set_session(&session, &set, Some(&dir.join("backup")), true)
-            .await
-            .unwrap();
+        config_set_session(
+            &session,
+            &set,
+            Some(&dir.join("backup")),
+            ConfigConfirmation::AssumeYes,
+            None,
+        )
+        .await
+        .unwrap();
 
         let device = transport.config();
         let joy = device.joy(Slot::S2);
@@ -8323,9 +8662,16 @@ mod tests {
         let transport = ConfigDeviceTransport::new(initial.clone());
         let session = Session::new(&transport);
         let backup = dir.join("backup");
-        let error = config_write_session(&session, &file, Some(&backup), true)
-            .await
-            .unwrap_err();
+        let error = config_write_session(
+            &session,
+            &edited,
+            Some(&backup),
+            false,
+            ConfigConfirmation::AssumeYes,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(error, Error::InvalidRequest(_)), "{error:?}");
         assert!(!backup.exists(), "no backup should be created");
         assert_eq!(transport.config().as_bytes(), initial.as_bytes());
@@ -8334,6 +8680,292 @@ mod tests {
             cmd == commands::cmd::WRITE_CONFIG || cmd == commands::cmd::SAVE
         });
         assert!(!wrote, "no write or Save frame should be sent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_set_ranges_and_flags_are_validated_before_io() {
+        let slot = Slot::S1;
+        for (field, value) in [
+            ("rumble.level", "6"),
+            ("joy.left_start", "128"),
+            ("joy.left_end", "129"),
+            ("joy.right_start", "128"),
+            ("joy.right_end", "129"),
+            ("gyro.sensitivity", "0"),
+            ("gyro.sensitivity", "16"),
+            ("led.hotwheel.speed", "16"),
+            ("led.dynamic.flag", "2"),
+            ("led.hotwheel.flag", "0x10"),
+            ("led.single.flag", "2"),
+            ("map_key.flag", "2"),
+            ("gyro.key", "227"),
+            ("gyro.key", "0x3000"),
+        ] {
+            let error = parse_config_set(field, value, slot).unwrap_err();
+            assert!(is_invalid_input(&error), "{field}={value}: {error:?}");
+        }
+        // Inclusive boundaries and documented single KeyMaps are accepted.
+        for (field, value) in [
+            ("rumble.level", "0"),
+            ("rumble.level", "5"),
+            ("joy.left_start", "127"),
+            ("joy.left_end", "128"),
+            ("gyro.sensitivity", "1"),
+            ("gyro.sensitivity", "15"),
+            ("led.hotwheel.speed", "15"),
+            ("led.dynamic.flag", "1"),
+            ("map_key.flag", "0"),
+            ("gyro.key", "L2"),
+            ("gyro.key", "null"),
+        ] {
+            assert!(
+                parse_config_set(field, value, slot).is_ok(),
+                "{field}={value} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_config_validation_checks_known_fields() {
+        let mut config = config_write_fixture();
+        assert!(
+            validate_raw_config(&config).is_ok(),
+            "{:?}",
+            validate_raw_config(&config)
+        );
+
+        config.set_gamepad_mode_raw(9);
+        assert!(validate_raw_config(&config).is_err());
+        config.set_gamepad_mode(GamepadMode::Switch);
+
+        config.set_cur_slot_raw(3);
+        assert!(validate_raw_config(&config).is_err());
+        // 6 has been observed on hardware; zeroed/unknown values are preserved
+        // with a warning elsewhere.
+        config.set_cur_slot_raw(6);
+        assert!(validate_raw_config(&config).is_ok());
+        config.set_cur_slot_raw(4);
+        assert!(validate_raw_config(&config).is_ok());
+
+        let mut joy = config.joy(Slot::S2);
+        joy.left_start_value = 128;
+        config.set_joy(Slot::S2, &joy);
+        assert!(validate_raw_config(&config).is_err());
+        joy.left_start_value = 127;
+        joy.right_end_value = 129;
+        config.set_joy(Slot::S2, &joy);
+        assert!(validate_raw_config(&config).is_err());
+        joy.right_end_value = 128;
+        config.set_joy(Slot::S2, &joy);
+        assert!(validate_raw_config(&config).is_ok());
+
+        let mut gyro = config.six_axis(Slot::S1);
+        gyro.flag = 1;
+        gyro.sensitivity = 0;
+        config.set_six_axis(Slot::S1, &gyro);
+        assert!(validate_raw_config(&config).is_err());
+        gyro.sensitivity = 5;
+        gyro.mapping_type = 3;
+        config.set_six_axis(Slot::S1, &gyro);
+        assert!(validate_raw_config(&config).is_err());
+        gyro.mapping_type = 2;
+        gyro.trigger_mode = 1;
+        config.set_six_axis(Slot::S1, &gyro);
+        assert!(validate_raw_config(&config).is_ok());
+        // A disabled record may still hold zeroed defaults.
+        gyro.flag = 0;
+        gyro.sensitivity = 0;
+        gyro.mapping_type = 3;
+        config.set_six_axis(Slot::S1, &gyro);
+        assert!(validate_raw_config(&config).is_ok());
+
+        let mut hotwheel = config.hotwheel_theme(Slot::S3);
+        hotwheel.speed = 16;
+        config.set_hotwheel_theme(Slot::S3, &hotwheel);
+        assert!(validate_raw_config(&config).is_err());
+        hotwheel.speed = 15;
+        config.set_hotwheel_theme(Slot::S3, &hotwheel);
+        assert!(validate_raw_config(&config).is_ok());
+    }
+
+    #[tokio::test]
+    async fn config_write_accept_reserved_drift_uses_device_reserved_bytes() {
+        let dir = scratch_dir("config-drift");
+        let initial = config_write_fixture();
+        let mut edited = initial.clone();
+        // The file carries different reserved bytes (e.g. after the device
+        // normalized them) plus one intended change.
+        edited.as_mut_bytes()[eightbitdo_protocol::config_bt2::OFF_LEGACY_A] ^= 0xFF;
+        edited.set_profile_name(Slot::S2, "Drift").unwrap();
+
+        // Without the flag the reserved difference is refused.
+        let transport = ConfigDeviceTransport::new(initial.clone());
+        let session = Session::new(&transport);
+        let error = config_write_session(
+            &session,
+            &edited,
+            Some(&dir.join("rejected")),
+            false,
+            ConfigConfirmation::AssumeYes,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidRequest(_)), "{error:?}");
+
+        // With the flag the device's reserved bytes win and the intended
+        // change is written.
+        let transport = ConfigDeviceTransport::new(initial.clone());
+        let session = Session::new(&transport);
+        config_write_session(
+            &session,
+            &edited,
+            Some(&dir.join("accepted")),
+            true,
+            ConfigConfirmation::AssumeYes,
+            None,
+        )
+        .await
+        .unwrap();
+        let device = transport.config();
+        assert_eq!(device.profile_name(Slot::S2), "Drift");
+        for (start, end) in RESERVED_RANGES {
+            assert_eq!(
+                &device.as_bytes()[start..end],
+                &initial.as_bytes()[start..end]
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn config_confirm_abort_keeps_backup_and_sends_no_write_frames() {
+        let dir = scratch_dir("config-abort");
+        let initial = config_write_fixture();
+        let mut edited = initial.clone();
+        edited.set_profile_name(Slot::S2, "Aborted").unwrap();
+        let transport = ConfigDeviceTransport::new(initial.clone());
+        let session = Session::new(&transport);
+        let backup = dir.join("backup");
+        let mut reader = std::io::Cursor::new(b"no\n".to_vec());
+        config_write_session(
+            &session,
+            &edited,
+            Some(&backup),
+            false,
+            ConfigConfirmation::Reader(&mut reader),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(transport.config().as_bytes(), initial.as_bytes());
+        assert!(
+            backup.join("config.bin").is_file(),
+            "the pre-write backup must remain after an aborted confirmation"
+        );
+        let wrote = transport.sent().iter().any(|frame| {
+            let cmd = CustomHeader::parse(&frame[1..]).unwrap().cmd;
+            cmd == commands::cmd::WRITE_CONFIG || cmd == commands::cmd::SAVE
+        });
+        assert!(!wrote, "confirmation abort must not send write/Save frames");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn config_write_aborts_when_the_device_changed_after_the_snapshot() {
+        let dir = scratch_dir("config-toctou");
+        let initial = config_write_fixture();
+        let stale = config_snapshot(initial.clone());
+        let mut edited = initial.clone();
+        edited.set_profile_name(Slot::S2, "Planned").unwrap();
+        let prepared = PreparedConfigWrite::from_buffer(&stale, edited).unwrap();
+
+        // Another host changed the profile after the snapshot was taken.
+        let mut changed = initial.clone();
+        changed.set_profile_name(Slot::S1, "Changed").unwrap();
+        changed.recompute_crc();
+        let transport = ConfigDeviceTransport::new(changed.clone());
+        let session = Session::new(&transport);
+        let backup = dir.join("backup");
+        let error = apply_config_prepared(
+            &session,
+            &stale,
+            &prepared,
+            Some(&backup),
+            ConfigConfirmation::AssumeYes,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidRequest(_)), "{error:?}");
+        assert!(error.to_string().contains("changed"), "{error}");
+        assert_eq!(transport.config().as_bytes(), changed.as_bytes());
+        let wrote = transport.sent().iter().any(|frame| {
+            let cmd = CustomHeader::parse(&frame[1..]).unwrap().cmd;
+            cmd == commands::cmd::WRITE_CONFIG || cmd == commands::cmd::SAVE
+        });
+        assert!(!wrote, "TOCTOU abort must not send write/Save frames");
+        assert!(backup.join("config.bin").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn config_write_honours_the_write_chunk_override() {
+        let dir = scratch_dir("config-chunk");
+        let initial = config_write_fixture();
+        let mut edited = initial.clone();
+        edited.set_profile_name(Slot::S2, "Chunk").unwrap();
+        let transport = ConfigDeviceTransport::new(initial.clone());
+        let session = Session::new(&transport);
+        config_write_session(
+            &session,
+            &edited,
+            Some(&dir.join("backup")),
+            false,
+            ConfigConfirmation::AssumeYes,
+            Some(180),
+        )
+        .await
+        .unwrap();
+        let sent = transport.sent();
+        let chunk_lens: Vec<u16> = sent
+            .iter()
+            .filter_map(|frame| {
+                let header = CustomHeader::parse(&frame[1..]).unwrap();
+                (header.cmd == commands::cmd::WRITE_CONFIG).then_some(header.chunk_len)
+            })
+            .collect();
+        assert!(!chunk_lens.is_empty());
+        assert!(chunk_lens.iter().all(|len| *len <= 180), "{chunk_lens:?}");
+        assert_eq!(chunk_lens[0], 180);
+
+        // An override above the negotiated payload is rejected before the
+        // backup is created and before any frame is sent.
+        let transport = ConfigDeviceTransport::new(initial.clone());
+        let session = Session::new(&transport);
+        let rejected = dir.join("rejected-chunk");
+        let error = config_write_session(
+            &session,
+            &edited,
+            Some(&rejected),
+            false,
+            ConfigConfirmation::AssumeYes,
+            Some(181),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidRequest(_)), "{error:?}");
+        assert!(
+            !rejected.exists(),
+            "chunk validation must run before backup"
+        );
+        let wrote = transport.sent().iter().any(|frame| {
+            let cmd = CustomHeader::parse(&frame[1..]).unwrap().cmd;
+            cmd == commands::cmd::WRITE_CONFIG || cmd == commands::cmd::SAVE
+        });
+        assert!(!wrote);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

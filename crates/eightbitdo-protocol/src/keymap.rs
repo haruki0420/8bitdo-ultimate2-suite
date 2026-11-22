@@ -162,6 +162,20 @@ impl KeyMap {
     }
 }
 
+impl KeyMap {
+    /// True when this is one documented single `KeyMap` constant.
+    ///
+    /// This is the whitelist for button remapping and `gyro.key`: the value
+    /// must have a name in [`KeyMap::name`] and must not be the unconfirmed
+    /// `KeyMap::MY_NULL` (227). Unknown bits, combinations and 227 return
+    /// false. Deriving the answer from `name()` keeps a single source of
+    /// truth for the documented constants.
+    #[must_use]
+    pub const fn is_single_documented(self) -> bool {
+        self.0 != 227 && self.name().is_some()
+    }
+}
+
 impl From<u32> for KeyMap {
     fn from(bits: u32) -> Self {
         Self(bits)
@@ -434,6 +448,64 @@ mod tests {
         assert_eq!((KeyMap::A | KeyMap::B).name(), None);
         assert_eq!(KeyMap::A.to_string(), "A");
         assert_eq!((KeyMap::A | KeyMap::B).to_string(), "KeyMap(0x00003000)");
+    }
+
+    #[test]
+    fn single_documented_whitelist_matches_the_documented_constants() {
+        for key in [
+            KeyMap::NONE,
+            KeyMap::START,
+            KeyMap::L3,
+            KeyMap::R3,
+            KeyMap::SELECT,
+            KeyMap::X,
+            KeyMap::Y,
+            KeyMap::RIGHT,
+            KeyMap::LEFT,
+            KeyMap::DOWN,
+            KeyMap::UP,
+            KeyMap::L1,
+            KeyMap::R1,
+            KeyMap::B,
+            KeyMap::A,
+            KeyMap::L2,
+            KeyMap::R2,
+            KeyMap::TURBO,
+            KeyMap::HOME,
+            KeyMap::BT_CON,
+            KeyMap::P3,
+            KeyMap::SCREENSHOT,
+            KeyMap::TURBO_3,
+            KeyMap::TURBO_AUTO,
+            KeyMap::P1,
+            KeyMap::P2,
+            KeyMap::SWAP,
+            KeyMap::P4,
+            KeyMap::M1,
+            KeyMap::M2,
+            KeyMap::M3,
+            KeyMap::M4,
+            KeyMap::SHARE,
+            KeyMap::LOGO,
+        ] {
+            assert!(
+                key.is_single_documented(),
+                "0x{:08X} should be documented",
+                key.bits()
+            );
+        }
+        assert!(!KeyMap::MY_NULL.is_single_documented());
+        assert!(!KeyMap::from_bits(227).is_single_documented());
+        assert!(!(KeyMap::A | KeyMap::B).is_single_documented());
+        assert!(!KeyMap::from_bits(0x0000_0018).is_single_documented());
+        assert!(!KeyMap::from_bits(0x8000_0000).is_single_documented());
+        // The whitelist and the name table agree for every accepted value.
+        for bits in 0u32..=0xFFFF {
+            let key = KeyMap::from_bits(bits);
+            if key.is_single_documented() {
+                assert!(key.name().is_some());
+            }
+        }
     }
 
     #[test]

@@ -227,15 +227,18 @@ Track C: モバイル
 - **状態**: 未着手（Phase 2b 後）。
 
 ### Phase 2d: 設定書き込み（config apply）
-- **ゴール**: 2768B の部分書き込みと Save を CLI から安全に実行する。
-- **実装項目**:
-  - プロファイル名、リマップ、スティック / トリガー、振動、6 軸、RGB の部分書き込み
-  - `ANSI_CRC_16_sh` 再計算、`total_len = 0x0AD0` を維持したチャンク分割（マクロヘッダ `0xD8` を除く）
-  - `0x0006` Save（BLE `0x0067`）
-  - 書き込み前の 2768B バックアップと SHA-256 記録、読み戻し検証
-- **完了条件**: 各セクションの書き込み → 読み戻し一致。
+- **ゴール**: 2768B 全体の書込み + Save を CLI から安全に実行する。
+- **実装状況（2026-11-22、BLE のみ。実機書込は未検証）**:
+  - core `config_ops`: デバイス snapshot に型付き編集を適用し、予約バイト（`0x1F4..0x68C` / `0x914..0x92C`）を保持、`ANSI_CRC_16_sh` を再計算して **2768B 全体を `0x0001` 分割送信 → `0x0006/0x0067` Save → `0x0002` read-back 検証**。CRC 不一致・ACK 失敗は `ConfigWriteStage`（Write/Save/Verify）+ `ConfigWriteState`（NotSaved/Saved）で fail-closed。失敗時は段階別の復旧文を返す。
+  - 書込 chunk の既定は **`min(MTU ペイロード, 74)`**（RE: 公式書込上限 74B、`MAX_ATT_MTU 92 - 0x12`。静的解析・実機未確認）。`--write-chunk <BYTES>` で交渉 MTU までの任意サイズ（例: 180B、旧 MTU 連動の A/B）を指定可能。
+  - CLI: `config dump` / **`config write --file <2768B>`** / **`config set <field> <value>`** / **`config remap <physical> <target>`** / **`config map show`**。`config write` はファイル読込・既知フィールド検証を **BLE 接続前** に行う。
+  - 安全策: **pre-write backup 必須**（`config.bin` + `config.json`、`REVIEW_TIERS` §6 の例外としてマクロ step sector は対象外）、`--yes` なしの対話確認、**前後 SHA-256 表示**、確認後の **TOCTOU 再読込**（変化時は中止）、read-back 検証、ゲームパッドモード / cur_slot 変更とマクロヘッダ（`0x68C..0x914`）変更の警告。
+  - 復旧: `config write --file <backup>/config.bin --yes`。device が予約バイトを正規化した場合は `--accept-reserved-drift` で現在の device 予約バイトに合わせる。
+  - `config set` の検証: joy start `0..=127` / end `0..=128`、gyro sensitivity `1..=15`、hotwheel speed `0..=15`、rumble level `0..=5`、flag 類 `0/1`、`gyro.key` は `config remap` と同じ documented single-`KeyMap` ホワイトリスト（227・未知ビット・複合拒否）。
+  - **未実装 / 未確認**: USB HID config write（BLE のみ）、実機での full config write 検証、`config set` の joy/trigger flag=1・LED color flag=1 の副作用（help に明記）、公式 BLE Save の 2000ms / 2 再送との差（本実装は 3 秒 / リトライなし。`PROTOCOL_SPEC` §6.4 に記録）。
+- **完了条件**: 各セクションの書き込み → 読み戻し一致（Mock で固定済み。実機は未検証）。
 - **Tier**: **3**。
-- **状態**: 未着手（Phase 2c 後）。
+- **状態**: 実装済み（Mock テスト）。実機書込検証待ち。
 
 ### Phase 2e: USB HID / 2.4G トランスポート（保留）
 - **ゴール**: USB 有線 / 2.4G レシーバ経由の App Mode。

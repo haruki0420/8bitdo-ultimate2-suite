@@ -27,7 +27,8 @@
 //! entry at `+0x0E4 + slot * 0x5C + button * 4`, matching the official
 //! `getBT2_WriteMapKey` / `_writeUltimateBT2MapKey` single-entry write
 //! (re-derived from the official Android and Windows binaries; see
-//! `.tmp/features/re/CONFIG_WRITE_RE.md` §3). The 22-entry order is the
+//! `docs/PROTOCOL_SPEC.md` §6.3 and `docs/STRUCT_BT2_2768B.md` §5.1). The
+//! 22-entry order is the
 //! non-3E layout of [`ButtonIndex`]: `A, B, X, Y, L1, R1, L2, R2, L3, R3,
 //! Select, Start, Share, Logo, Up, Down, Left, Right, P1/PL, P2/PR, P3/L4,
 //! P4/R4`. [`KeyMap::NONE`] (`0`) disables an entry; the official remap path
@@ -79,10 +80,20 @@ const CRC_RANGE: std::ops::Range<usize> = OFF_CRC16..OFF_CRC16 + 4;
 const RESERVED_REGIONS: [(usize, usize); 2] =
     [(OFF_LEGACY_A, OFF_MACROS), (OFF_LEGACY_B, OFF_SIX_AXIS)];
 
-/// Payload bytes one `0x0001` frame may carry at this MTU.
+/// Official configuration-write payload cap from static analysis.
 ///
-/// Uses the same budget as the macro path: `mtu - 3` (ATT overhead) minus the
-/// 1-byte BLE prefix and the 16-byte custom header.
+/// `min(残り, MAX_ATT_MTU - 0x12)` with the Android `MAX_ATT_MTU = 0x5C` (92)
+/// yields 74 bytes. The official app never raises `MAX_ATT_MTU` for
+/// configuration writes; this value is a static-analysis result and has not
+/// been captured on hardware.
+pub const OFFICIAL_WRITE_CHUNK: usize = 74;
+
+/// Default payload bytes one `0x0001` frame carries at this MTU.
+///
+/// This is `min(mtu payload budget, 74)`: the RE-confirmed official write cap
+/// is 74 bytes, so a larger negotiated MTU does not enlarge the default. Pass
+/// an explicit larger value to [`Session::write_full_config_with_chunk`] for
+/// the MTU-only experiment.
 ///
 /// # Errors
 ///
@@ -95,7 +106,7 @@ pub fn config_write_chunk_len(mtu: u16) -> Result<usize, Error> {
             reason: "no room for the 1-byte prefix and 16-byte header".to_string(),
         });
     }
-    Ok(max_payload.min(CONFIG_SIZE))
+    Ok(max_payload.min(OFFICIAL_WRITE_CHUNK).min(CONFIG_SIZE))
 }
 
 /// One typed change to the configuration.
@@ -534,8 +545,8 @@ impl<T: Transport> Session<T> {
     /// [`PreparedConfigWrite::from_buffer`], which validates the buffer and
     /// recomputes the CRC. The call:
     ///
-    /// 1. splits the 2768 bytes into MTU-sized `0x0001` packets (every packet
-    ///    carries the CRC-16/MODBUS of its own payload),
+    /// 1. splits the 2768 bytes into `min(MTU payload, 74)`-byte `0x0001`
+    ///    packets (every packet carries the CRC-16/MODBUS of its own payload),
     /// 2. waits for each ACK (`2 s`, [`CONFIG_WRITE_TIMEOUT`]),
     /// 3. sends the BLE Save (`0x0006`, `subcmd 0x0067`, `3 s`,
     ///    [`CONFIG_SAVE_TIMEOUT`]),
@@ -545,6 +556,11 @@ impl<T: Transport> Session<T> {
     ///
     /// The caller is responsible for the mandatory pre-write backup; nothing
     /// here touches the local filesystem.
+    ///
+    /// The default chunk is `min(MTU payload, 74)`: the official Android writer
+    /// caps the payload at 74 bytes ([`OFFICIAL_WRITE_CHUNK`]). Use
+    /// [`Session::write_full_config_with_chunk`] to request a larger
+    /// negotiated-MTU chunk for the A/B experiment.
     ///
     /// # Errors
     ///
@@ -558,6 +574,29 @@ impl<T: Transport> Session<T> {
         prepared: &PreparedConfigWrite,
         timeouts: ConfigWriteTimeouts,
     ) -> Result<ConfigWriteOutcome, Error> {
+        self.write_full_config_with_chunk(snapshot, prepared, None, timeouts)
+            .await
+    }
+
+    /// Like [`Session::write_full_config`], with an explicit chunk size.
+    ///
+    /// `None` selects the negotiated-MTU chunk ([`config_write_chunk_len`]).
+    /// `Some(74)` ([`OFFICIAL_WRITE_CHUNK`]) reproduces the official writer's
+    /// fixed 74-byte split; any other value must be `1..=mtu_payload`. The
+    /// override cannot exceed the negotiated ATT payload budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] for a zero chunk, a chunk larger than
+    /// the negotiated MTU allows, or a no-op plan, and otherwise the same
+    /// errors as [`Session::write_full_config`].
+    pub async fn write_full_config_with_chunk(
+        &self,
+        snapshot: &ConfigSnapshot,
+        prepared: &PreparedConfigWrite,
+        chunk_size: Option<usize>,
+        timeouts: ConfigWriteTimeouts,
+    ) -> Result<ConfigWriteOutcome, Error> {
         if prepared.is_noop() {
             return Err(Error::InvalidRequest(
                 "configuration write plan changes nothing; refusing a no-op write".to_string(),
@@ -565,7 +604,28 @@ impl<T: Transport> Session<T> {
         }
 
         let mtu = self.transport().mtu();
-        let chunk_size = config_write_chunk_len(mtu)?;
+        let mtu_payload = max_protocol_payload(mtu);
+        if mtu_payload == 0 {
+            return Err(Error::MtuTooSmall {
+                mtu,
+                reason: "no room for the 1-byte prefix and 16-byte header".to_string(),
+            });
+        }
+        let chunk_size = match chunk_size {
+            None => config_write_chunk_len(mtu)?,
+            Some(0) => {
+                return Err(Error::InvalidRequest(
+                    "write chunk must be at least 1 byte".to_string(),
+                ))
+            }
+            Some(requested) if requested > mtu_payload => {
+                return Err(Error::InvalidRequest(format!(
+                    "write chunk {requested} exceeds the {mtu_payload}-byte payload the MTU {mtu} \
+                     allows"
+                )))
+            }
+            Some(requested) => requested,
+        };
         // Build every frame before the first one is sent: a local framing error
         // must not leave a partially written block.
         let requests =
@@ -1101,7 +1161,9 @@ mod tests {
 
     #[test]
     fn config_write_chunk_len_tracks_the_mtu_and_rejects_a_tiny_one() {
-        assert_eq!(config_write_chunk_len(200).unwrap(), 180);
+        // The RE-confirmed official write cap (74) bounds the default even
+        // when the negotiated MTU allows more.
+        assert_eq!(config_write_chunk_len(200).unwrap(), OFFICIAL_WRITE_CHUNK);
         assert_eq!(config_write_chunk_len(64).unwrap(), 44);
         assert_eq!(config_write_chunk_len(23).unwrap(), 3);
         let error = config_write_chunk_len(20).unwrap_err();
@@ -1311,7 +1373,7 @@ mod tests {
         let outcome = result.expect("write should succeed");
 
         let chunk_len = config_write_chunk_len(200).unwrap();
-        assert_eq!(chunk_len, 180);
+        assert_eq!(chunk_len, OFFICIAL_WRITE_CHUNK);
         let write_frames: Vec<&Vec<u8>> = sent
             .iter()
             .filter(|frame| request_cmd(frame) == cmd::WRITE_CONFIG)
@@ -1537,6 +1599,99 @@ mod tests {
                 assert!(reason.contains("CRC"), "{reason}");
             }
             other => panic!("expected ConfigWrite, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_write_chunk_can_use_the_mtu_payload_and_rejects_oversize() {
+        let snapshot = sample_snapshot();
+        let prepared = name_plan("Slot2").prepare(&snapshot).unwrap();
+
+        // The MTU payload budget is 180 at MTU 200; requesting it must be
+        // accepted even though the official default is 74.
+        let chunk = 180usize;
+        let mut script = vec![ack(cmd::WRITE_CONFIG); CONFIG_SIZE.div_ceil(chunk)];
+        script.push(save_ack());
+        script.extend(read_responses(prepared.expected(), 142));
+        let transport = ScriptedTransport::new(script, 200);
+        let session = Session::new(&transport);
+        let outcome = session
+            .write_full_config_with_chunk(&snapshot, &prepared, Some(chunk), short_timeouts())
+            .await
+            .expect("the MTU payload chunk must be accepted");
+        let frames = transport.sent();
+        let writes: Vec<&Vec<u8>> = frames
+            .iter()
+            .filter(|frame| request_cmd(frame) == cmd::WRITE_CONFIG)
+            .collect();
+        assert_eq!(writes.len(), CONFIG_SIZE.div_ceil(chunk));
+        for (index, frame) in writes.iter().enumerate() {
+            let header = CustomHeader::parse(&frame[1..]).unwrap();
+            assert_eq!(header.offset as usize, index * chunk);
+            let remaining = CONFIG_SIZE - index * chunk;
+            assert_eq!(header.chunk_len as usize, remaining.min(chunk));
+        }
+        assert_eq!(outcome.read_back, *prepared.expected());
+
+        // A chunk above the negotiated payload must be refused before sending.
+        let transport = ScriptedTransport::new(Vec::new(), 200);
+        let session = Session::new(&transport);
+        let error = session
+            .write_full_config_with_chunk(&snapshot, &prepared, Some(181), short_timeouts())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidRequest(_)), "{error}");
+        assert!(transport.sent().is_empty());
+
+        // A zero chunk is refused too.
+        let transport = ScriptedTransport::new(Vec::new(), 200);
+        let session = Session::new(&transport);
+        let error = session
+            .write_full_config_with_chunk(&snapshot, &prepared, Some(0), short_timeouts())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidRequest(_)), "{error}");
+        assert!(transport.sent().is_empty());
+    }
+
+    #[test]
+    fn button_index_table_matches_the_re_transcription() {
+        // Independently transcribed from the RE document: the non-3E
+        // MapKeyRecord order and the default KeyMap of each physical button.
+        let expected: [(usize, &str, KeyMap); BUTTON_COUNT] = [
+            (0, "A", KeyMap::A),
+            (1, "B", KeyMap::B),
+            (2, "X", KeyMap::X),
+            (3, "Y", KeyMap::Y),
+            (4, "L1", KeyMap::L1),
+            (5, "R1", KeyMap::R1),
+            (6, "L2", KeyMap::L2),
+            (7, "R2", KeyMap::R2),
+            (8, "L3", KeyMap::L3),
+            (9, "R3", KeyMap::R3),
+            (10, "Select", KeyMap::SELECT),
+            (11, "Start", KeyMap::START),
+            (12, "Share", KeyMap::SHARE),
+            (13, "Logo", KeyMap::LOGO),
+            (14, "Up", KeyMap::UP),
+            (15, "Down", KeyMap::DOWN),
+            (16, "Left", KeyMap::LEFT),
+            (17, "Right", KeyMap::RIGHT),
+            (18, "P1", KeyMap::P1),
+            (19, "P2", KeyMap::P2),
+            (20, "P3", KeyMap::P3),
+            (21, "P4", KeyMap::P4),
+        ];
+        for (position, (index, label, default_key)) in expected.into_iter().enumerate() {
+            let button = ButtonIndex::ALL[position];
+            assert_eq!(button.index(), index, "index of {label}");
+            assert_eq!(button.label(), label, "label at wire index {index}");
+            assert_eq!(
+                button.default_key(),
+                default_key,
+                "default KeyMap of {label}"
+            );
+            assert_eq!(ButtonIndex::from_index(index), Some(button));
         }
     }
 
