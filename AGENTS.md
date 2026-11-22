@@ -7,7 +7,7 @@
 ## 1. プロジェクト概要
 
 - **目的**: **8BitDo Ultimate 2 Bluetooth Controller**（内部 PID `0x600F` / 2.4G レシーバー `0x6011`）を、Nintendo Switch と接続したまま **Linux / macOS / Windows / Android / iOS** から BLE GATT（および USB/2.4G HID）でフル設定・マクロ編集・ファームウェアアップデートできるクロスプラットフォーム OSS ツール群を構築する。
-- **現在のフェーズ**: Phase 1（protocol）完了。Phase 2a〜2d の core / CLI（読み取り・マクロ書込・BLE OTA core・設定書込）は実装済みだが Mock 検証中心で**実機未検証**。GUI は Phase 3a（読み取り）に加え、Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）の書き込み UI を実装済み（PR #16、**実機未検証・Tier 3**）。Phase 3c（OTA 画面）と GUI からのリストア / JSON・TOML 入出力は未着手。
+- **現在のフェーズ**: Phase 1（protocol）完了。Phase 2a/2b/2d の core / CLI は **BLE 実機で確認済み**（2a: 読み取り・2768B dump・20ms keepalive、2b: マクロ slot S1 M1/M2 の書込、2d: full 2768B write・remap・read-back SHA 一致）。Phase 2c の BLE OTA は core 実装済みだが CLI / GUI 未配線・実機未検証。GUI は Phase 3a（読み取り）に加え、Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）の書き込み UI を実装済み（PR #16、**実機未検証・Tier 3**）。Phase 3c（OTA 画面）と GUI からのリストア / JSON・TOML 入出力は未着手。
 - **ライセンス／公開方針**: パブリックリポジトリ。公式バイナリ（`.apk`, `.exe`, `.dll`, `.so` 等）や公式ファームウェアファイル自体は `.gitignore` で除外しており、**絶対にコミットしないこと**。
 
 ---
@@ -92,7 +92,7 @@
 
 ## 6. 現在の状態と次に着手すべき作業
 
-**Phase 1（protocol）は完了済み**、Phase 2a〜2d の core / CLI は Mock 検証まで実装済みです（**実機未検証**）。
+**Phase 1（protocol）は完了済み**。Phase 2a/2b/2d の core / CLI は **BLE 実機で確認済み**（2a: 読み取り・2768B dump・20ms keepalive、2b: マクロ slot S1 M1/M2 の書込、2d: full 2768B write・remap・read-back SHA 一致）。Phase 2c の BLE OTA は core 実装済みですが、CLI / GUI 未配線・実機未検証です。
 
 - **Phase 3 GUI（PR #16）**: Phase 3a の読み取り専用 UI に加えて、以下を実装。
   - Phase 3b: マクロエディタ（20ms ライブ録音、ステップ編集、既存非空マクロへの Header → Save → Erase → Write → Save、read-back 検証）

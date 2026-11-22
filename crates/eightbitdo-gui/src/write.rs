@@ -184,6 +184,8 @@ pub enum DraftError {
     InvalidPlan(String),
     /// The configuration snapshot needed to identify the write is missing.
     NoSnapshot,
+    /// A macro recording is running, so a write must not start.
+    Recording,
 }
 
 impl std::fmt::Display for DraftError {
@@ -234,6 +236,9 @@ impl std::fmt::Display for DraftError {
             }
             Self::InvalidPlan(detail) => write!(formatter, "{detail}"),
             Self::NoSnapshot => formatter.write_str("no configuration snapshot is loaded"),
+            Self::Recording => {
+                formatter.write_str("a macro recording is running; stop recording before writing")
+            }
         }
     }
 }
@@ -959,7 +964,15 @@ impl MacroEditor {
     }
 
     /// Replace the loaded macro with a freshly read entry.
-    pub fn load(&mut self, entry: MacroEntry) {
+    ///
+    /// If a recording is running, it is stopped first. Returns `true` when that
+    /// happened so the application shell can tell the user that the take was
+    /// not written by the load.
+    pub fn load(&mut self, entry: MacroEntry) -> bool {
+        let was_recording = self.recording;
+        if was_recording {
+            self.stop_recording();
+        }
         self.slot = entry.slot();
         self.index = entry.index();
         self.draft = Some(MacroDraft::from_entry(&entry));
@@ -967,6 +980,27 @@ impl MacroEditor {
         self.selected_step = None;
         self.recording = false;
         self.recorder.clear();
+        was_recording
+    }
+
+    /// Drop the loaded draft and its baseline, keeping the current selection.
+    pub fn unload(&mut self) {
+        self.draft = None;
+        self.original = None;
+        self.recording = false;
+        self.recorder.clear();
+        self.selected_step = None;
+    }
+
+    /// True when a loaded baseline still matches the configuration snapshot.
+    ///
+    /// The macro header lives in the 2768-byte block, so a newer configuration
+    /// read can make a loaded entry stale. An unloaded editor always matches.
+    #[must_use]
+    pub fn record_matches_config(&self, config: &Bt2Config) -> bool {
+        self.original
+            .as_ref()
+            .is_none_or(|entry| entry.record() == &config.macro_record(self.slot, self.index))
     }
 
     /// True when a draft and its device baseline are both present.
@@ -1510,6 +1544,58 @@ mod tests {
         assert!(editor.delete_selected(), "one of two steps can be deleted");
         assert_eq!(editor.draft.as_ref().unwrap().steps.len(), 1);
         assert!(!editor.delete_selected(), "the last step is kept");
+    }
+
+    #[test]
+    fn loading_a_macro_stops_an_active_recording_and_reports_it() {
+        let mut header = MacroSlot::default();
+        header.records[0].max_steps = 1;
+        let mut config = Bt2Config::default();
+        config.set_macro_slot(Slot::S1, &header);
+        let entry = entry(
+            &config,
+            Slot::S1,
+            MacroIndex::M1,
+            vec![MacroStep::neutral(20)],
+        );
+
+        let mut editor = MacroEditor::default();
+        assert!(!editor.load(entry.clone()));
+        editor.begin_recording();
+        editor.record(&InputView {
+            keys: KeyMap::A,
+            ..InputView::default()
+        });
+        assert!(editor.recording);
+        assert!(
+            editor.load(entry),
+            "loading while recording must report the stopped take"
+        );
+        assert!(!editor.recording);
+        assert!(editor.draft.is_some());
+    }
+
+    #[test]
+    fn record_matches_config_detects_a_stale_header() {
+        let mut header = MacroSlot::default();
+        header.records[0].max_steps = 1;
+        let mut config = Bt2Config::default();
+        config.set_macro_slot(Slot::S1, &header);
+        let entry = entry(
+            &config,
+            Slot::S1,
+            MacroIndex::M1,
+            vec![MacroStep::neutral(20)],
+        );
+        let mut editor = MacroEditor::default();
+        editor.load(entry);
+        assert!(editor.record_matches_config(&config));
+
+        let mut changed = config.clone();
+        let mut header = changed.macro_slot(Slot::S1);
+        header.records[0].max_steps = 2;
+        changed.set_macro_slot(Slot::S1, &header);
+        assert!(!editor.record_matches_config(&changed));
     }
 
     #[test]

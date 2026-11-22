@@ -345,12 +345,24 @@ impl App {
                         .with_arg(view.size.to_string())
                         .with_arg(view.sha256.clone()),
                 );
+                if self.macro_editor.is_loaded()
+                    && !self.macro_editor.record_matches_config(&snapshot.config)
+                {
+                    let was_recording = self.macro_editor.recording;
+                    self.macro_editor.unload();
+                    if was_recording {
+                        self.push_notice(LogLevel::Info, Notice::new(Key::LogRecordingStopped));
+                    }
+                    self.push_notice(LogLevel::Info, Notice::new(Key::LogMacroReload));
+                }
                 self.settings = Some(SettingsDraft::from_config(&snapshot.config));
                 self.config_snapshot = Some(*snapshot);
                 self.config = Some(*view);
             }
             Event::MacroLoaded { slot, index, entry } => {
-                self.macro_editor.load(*entry);
+                if self.macro_editor.load(*entry) {
+                    self.push_notice(LogLevel::Info, Notice::new(Key::LogRecordingStopped));
+                }
                 self.push_notice(
                     LogLevel::Info,
                     Notice::new(Key::LogMacroRead)
@@ -422,7 +434,9 @@ impl App {
                 self.write_failure = None;
                 self.draft_error = None;
                 self.error = None;
-                self.macro_editor.load(report.readback.clone());
+                if self.macro_editor.load(report.readback.clone()) {
+                    self.push_notice(LogLevel::Info, Notice::new(Key::LogRecordingStopped));
+                }
                 self.write_result = Some(WriteOutcome::Macro(report.clone()));
                 self.push_notice(
                     LogLevel::Info,
@@ -509,17 +523,31 @@ impl App {
         self.connection.is_connected() && self.busy.is_none()
     }
 
-    /// True when the write path is available: connected, idle, and the
-    /// configuration has been read at least once.
-    fn can_write(&self) -> bool {
+    /// True when the settings controls can be edited.
+    fn can_edit_settings(&self) -> bool {
         self.connection.is_connected()
             && self.busy.is_none()
             && self.config_snapshot.is_some()
             && self.settings.is_some()
     }
 
+    /// True when a write may be confirmed: connected, idle, configuration read,
+    /// and no macro recording is running.
+    ///
+    /// Recording is excluded on purpose: the confirmation dialog is
+    /// non-modal, so the user can start a recording behind it, and a write
+    /// pauses the 20 ms keepalive (missing reports) or replaces the take in
+    /// `MacroEditor::load`. The user must stop recording first.
+    fn can_write(&self) -> bool {
+        self.can_edit_settings() && !self.macro_editor.recording
+    }
+
     /// Open the confirmation dialog for the current settings draft.
     fn review_settings(&mut self) {
+        if self.macro_editor.recording {
+            self.draft_error = Some(DraftError::Recording);
+            return;
+        }
         let (Some(snapshot), Some(settings)) =
             (self.config_snapshot.clone(), self.settings.clone())
         else {
@@ -539,6 +567,10 @@ impl App {
 
     /// Open the confirmation dialog for the loaded macro.
     fn review_macro(&mut self) {
+        if self.macro_editor.recording {
+            self.draft_error = Some(DraftError::Recording);
+            return;
+        }
         let Some(snapshot) = self.config_snapshot.clone() else {
             self.draft_error = Some(DraftError::NoSnapshot);
             return;
@@ -556,6 +588,13 @@ impl App {
 
     /// Send the confirmed write. The confirmation dialog is the only caller.
     fn confirm_write(&mut self, pending: PendingWrite) {
+        if self.macro_editor.recording {
+            // Keep the dialog open; the confirm key is disabled until the
+            // recording is stopped.
+            self.draft_error = Some(DraftError::Recording);
+            self.pending = Some(pending);
+            return;
+        }
         if !self.can_write() {
             self.pending = None;
             return;
@@ -1996,16 +2035,19 @@ impl App {
 
         let config = snapshot.config.clone();
         let lang = self.lang;
+        let edit_enabled = self.can_edit_settings();
         let enabled = self.can_write();
         let mut slot = self.settings_slot;
-        ui.add_enabled_ui(enabled, |ui| {
+        ui.add_enabled_ui(edit_enabled, |ui| {
             settings_editor(ui, lang, &config, &mut settings, &mut slot);
         });
         self.settings = Some(settings);
         self.settings_slot = slot;
 
         if !self.can_write() {
-            let reason = if self.connection.is_connected() {
+            let reason = if self.macro_editor.recording {
+                Key::RecordingBlocksWrite
+            } else if self.connection.is_connected() {
                 Key::BusyHint
             } else {
                 Key::ConnectFirstHint
@@ -2381,6 +2423,12 @@ impl App {
     // Confirmation dialog
     // -----------------------------------------------------------------------
 
+    /// Non-modal confirmation dialog.
+    ///
+    /// Background controls stay interactive, so the actual write is re-guarded
+    /// at confirm time: `can_write` (connection, busy, recording), the reviewed
+    /// target (not the current editor selection), and the expected configuration
+    /// SHA-256 in the worker. The dialog itself is only the review surface.
     fn write_dialog(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.pending.clone() else {
             return;
@@ -2413,6 +2461,15 @@ impl App {
                     ))
                     .wrap(),
                 );
+                if self.macro_editor.recording {
+                    ui.add(
+                        egui::Label::new(theme::job_meta_color(
+                            i18n::t(lang, Key::RecordingBlocksWrite),
+                            theme::AMBER,
+                        ))
+                        .wrap(),
+                    );
+                }
                 ui.add_space(theme::SPACE_3);
                 ui.horizontal(|ui| {
                     let confirm_label = i18n::t(lang, Key::WriteConfirm).to_owned();
@@ -4197,7 +4254,10 @@ mod tests {
     }
 
     fn config_event() -> Event {
-        let snapshot = config_snapshot();
+        config_event_with(config_snapshot())
+    }
+
+    fn config_event_with(snapshot: ConfigSnapshot) -> Event {
         Event::Config {
             snapshot: Box::new(snapshot.clone()),
             view: Box::new(ConfigView::from_snapshot(&snapshot)),
@@ -4590,6 +4650,79 @@ mod tests {
             }
             other => panic!("expected a macro write command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn recording_blocks_write_confirmation_and_loading_reports_the_stop() {
+        let mut recording_app = app();
+        recording_app.handle_event(config_event());
+        recording_app.connection = ConnectionState::Connected;
+        recording_app.macro_editor.load(loaded_macro());
+        recording_app.macro_editor.begin_recording();
+        assert!(recording_app.macro_editor.recording);
+        assert!(
+            !recording_app.can_write(),
+            "recording must block the write path"
+        );
+
+        recording_app.settings.as_mut().unwrap().profile_names[0] = "Edited".to_string();
+        recording_app.review_settings();
+        assert_eq!(recording_app.draft_error, Some(DraftError::Recording));
+        assert!(recording_app.pending.is_none());
+
+        // A dialog opened before recording must stay open (not silently send).
+        let mut app = app();
+        app.handle_event(config_event());
+        app.connection = ConnectionState::Connected;
+        app.settings.as_mut().unwrap().profile_names[0] = "Edited".to_string();
+        app.review_settings();
+        let pending = app.pending.take().expect("review opens the dialog");
+        app.macro_editor.load(loaded_macro());
+        app.macro_editor.begin_recording();
+        app.confirm_write(pending);
+        assert!(
+            app.pending.is_some(),
+            "the dialog stays open while recording"
+        );
+        assert!(app.busy.is_none(), "no write may be sent while recording");
+
+        app.handle_event(Event::MacroLoaded {
+            slot: Slot::S1,
+            index: MacroIndex::M1,
+            entry: Box::new(loaded_macro()),
+        });
+        assert!(!app.macro_editor.recording);
+        assert!(app
+            .log
+            .iter()
+            .any(|entry| entry.notice.key == Key::LogRecordingStopped));
+    }
+
+    #[test]
+    fn a_config_refresh_drops_a_stale_macro_baseline_and_logs_it() {
+        let mut app = app();
+        app.handle_event(config_event());
+        app.macro_editor.load(loaded_macro());
+        assert!(app.macro_editor.is_loaded());
+
+        // The refreshed configuration has no steps for M1, so the loaded
+        // baseline no longer matches the displayed header.
+        app.handle_event(config_event());
+        assert!(
+            !app.macro_editor.is_loaded(),
+            "a stale macro baseline must not stay loaded"
+        );
+        assert!(app
+            .log
+            .iter()
+            .any(|entry| entry.notice.key == Key::LogMacroReload));
+
+        // A matching refresh keeps the loaded macro intact.
+        let matching = config_snapshot_with_macro();
+        app.handle_event(config_event_with(matching.clone()));
+        app.macro_editor.load(loaded_macro());
+        app.handle_event(config_event_with(matching));
+        assert!(app.macro_editor.is_loaded());
     }
 
     #[test]

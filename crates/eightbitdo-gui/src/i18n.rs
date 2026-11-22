@@ -314,6 +314,7 @@ define_keys! {
     SettingsNeedsConfig => "接続して設定値を読み取ると編集できます。" | "Connect and read the configuration to edit it.",
     SettingsStale => "前回読み取った設定を編集しています。書き込み直前に再読み取りして検証します。" | "Editing the last read configuration; it is re-read and re-validated immediately before writing.",
     SettingsDirtyHint => "変更は「変更を確認」から確認ダイアログを開いた後だけ書き込まれます。" | "Changes are written only after opening the confirmation dialog with Review changes.",
+    RecordingBlocksWrite => "録音中は書き込めません。録音を停止してから確認してください。" | "Stop recording before writing.",
     ApplySettings => "変更を確認" | "Review changes",
     DiscardChanges => "変更を破棄" | "Discard changes",
     WriteConfirm => "書き込む" | "Write",
@@ -428,6 +429,8 @@ define_keys! {
     LogConfigWritten => "設定値を書き込みました。" | "Configuration written.",
     LogMacroWritten => "プロファイル {} のマクロ {} を書き込みました。" | "Wrote macro {} in profile {}.",
     LogMacroRead => "プロファイル {} のマクロ {} を読み取りました。" | "Read macro {} in profile {}.",
+    LogRecordingStopped => "録音を停止しました。" | "Recording stopped.",
+    LogMacroReload => "設定値が更新されたため、マクロを読み直してください。" | "The configuration changed; read the macro again.",
     LogDisconnected => "切断しました。" | "Disconnected.",
     LogWorkerStopped => "バックグラウンド処理が停止しました。アプリを再起動してください。" | "The background worker stopped. Restart the application.",
     LogAppNotRunning => "バックグラウンド処理が動作していません。アプリを再起動してください。" | "The background worker is not running. Restart the application.",
@@ -709,6 +712,7 @@ pub fn draft_error_text(lang: Lang, error: &DraftError) -> String {
         DraftError::InvalidTrigger { .. } => t(lang, Key::InvalidTriggerError).to_string(),
         DraftError::InvalidPlan(_) => t(lang, Key::InvalidPlanError).to_string(),
         DraftError::NoSnapshot => t(lang, Key::NoSnapshotError).to_string(),
+        DraftError::Recording => t(lang, Key::RecordingBlocksWrite).to_string(),
     }
 }
 

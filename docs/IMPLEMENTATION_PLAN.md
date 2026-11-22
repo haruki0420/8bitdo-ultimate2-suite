@@ -142,10 +142,10 @@ graph TD
 ```text
 Track A: コア / CLI（Linux・デスクトップ）
   Phase 1  protocol                 完了
-  Phase 2a read-only + session      完了
-  Phase 2b macro write              完了（Mock、実機未検証）
-  Phase 2c BLE OTA (Linux)          core 実装済み（CLI / GUI 未配線、実機保留）
-  Phase 2d config apply             完了（Mock、実機未検証）
+  Phase 2a read-only + session      完了（実機確認済み）
+  Phase 2b macro write              完了（BLE S1 M1/M2 実機確認。他は外挿）
+  Phase 2c BLE OTA (Linux)          core 実装済み（CLI / GUI 未配線、実機未検証）
+  Phase 2d config apply             完了（BLE full 2768B write / remap / read-back SHA 一致）
   Phase 2e USB / 2.4G transport     保留
 
 Track B: GUI（egui / Pure Rust）
@@ -163,8 +163,11 @@ Track C: モバイル
 | 項目 | 状態 |
 | --- | --- |
 | Phase 1 | 完了。ただし実機で ReadVersion の 4B ペイロード、ReadConfig の `chunk_len = 0x0AD0`、1 要求 = 1 チャンク、最終 142B パディングを補正した |
-| Phase 2a | 進行中。実機で ReadVersion **200 (0xC8)**、2768B dump（SHA-256 `1dca47fa...59c600`）、20ms keepalive **128.9 秒**を確認 |
-| レビュー | Phase 2a は **Tier 3**（3 セッション）。`crates/eightbitdo-core/**` の session/backup と mock transport を含むため。Phase 2b 以降の書き込みも **Tier 3**（3 セッション） |
+| Phase 2a | 完了（実機確認済み）。ReadVersion **200 (0xC8)**、2768B dump（SHA-256 `1dca47fa...59c600`）、20ms keepalive **128.9 秒**を確認 |
+| Phase 2b | 完了（BLE・slot S1・`macro_idx=0/1 (M1/M2)` で実機確認）。`macro_idx=2/3` と他 slot は外挿、restore と REPL 経由の実機書込は未検証 |
+| Phase 2c | core 実装済み。CLI / GUI 未配線、実機未検証 |
+| Phase 2d | 完了（BLE 実機で full 2768B write・remap・read-back SHA 一致）。USB config write は未実装 |
+| レビュー | Phase 2a/2b/2d は **Tier 3**（3 セッション）。`crates/eightbitdo-core/**` の session/backup と mock transport を含むため。Phase 3 GUI の書込も **Tier 3** |
 
 ### Phase 1: `eightbitdo-protocol`（純粋プロトコル＆バイナリ層）
 - **ゴール**: 実機なしで全パケット・CRC・2768B 構造体・10B マクロのエンコード／デコードを単体テストで検証する。
@@ -242,7 +245,7 @@ Track C: モバイル
 
 ### Phase 2d: 設定書き込み（config apply）
 - **ゴール**: 2768B 全体の書込み + Save を CLI から安全に実行する。
-- **実装状況（2026-11-22、BLE のみ。実機書込は未検証）**:
+- **実装状況（BLE のみ。実機で full 2768B write・remap・read-back SHA 一致を確認）**:
   - core `config_ops`: デバイス snapshot に型付き編集を適用し、予約バイト（`0x1F4..0x68C` / `0x914..0x92C`）を保持、`ANSI_CRC_16_sh` を再計算して **2768B 全体を `0x0001` 分割送信 → `0x0006/0x0067` Save → `0x0002` read-back 検証**。CRC 不一致・ACK 失敗は `ConfigWriteStage`（Write/Save/Verify）+ `ConfigWriteState`（NotSaved/Saved）で fail-closed。失敗時は段階別の復旧文を返す。
   - 書込 chunk の既定は **`min(MTU ペイロード, 74)`**（RE: 公式書込上限 74B、`MAX_ATT_MTU 92 - 0x12`。静的解析・実機未確認）。`--write-chunk <BYTES>` は接続前に **1..=180**（観測 MTU 200 のペイロード上限）で検証し、任意サイズ（例: 180B、旧 MTU 連動の A/B）を指定可能。接続後は交渉 MTU の上限も検証する。
   - CLI: `config dump` / **`config write --file <2768B>`** / **`config set <field> <value>`** / **`config remap <physical> <target>`** / **`config map show`**。`config write` はファイル読込・既知フィールド検証を **BLE 接続前** に行う。
@@ -251,10 +254,10 @@ Track C: モバイル
   - 検証: `config set` は joy start `0..=127` / end `0..=128`、gyro sensitivity `1..=15`、hotwheel speed `0..=15`、rumble level `0..=5`、flag 類 `0/1`、`gyro.key` は `config remap` と同じ documented single-`KeyMap` ホワイトリスト（227・未知ビット・複合拒否）。
   - raw `config write --file` も同じ検証を行う: 22 `key[]` と `gyro[].key_map` は documented single `KeyMap`、全レコード（joy/trigger/rumble/gyro/special/mapKey/LED/macro）の flag は 0/1、マクロ `max_steps` は 0/0xFFFF/1..=200・`total_cnt <= 4`。**マクロ `key_map` は `macro write --trigger` と同じ任意 KeyMap を受理**する（複合トリガーの復旧経路を塞がないため）。数値範囲（joy/hotwheel/gyro/rumble）は **flag==1 のときのみ**検証し、key_map / flag は常時検証する（disabled レコードは保持）。不明な `cur_slot`（実機観測 6 など）は警告して保持する。
   - 未文書値の復旧用に `config write --force-raw`（whitelist/range/enum を警告に降格。予約領域ガードは維持）を提供する。
-  - **未実装 / 未確認**: USB HID config write（BLE のみ）、実機での full config write 検証、`config set` の joy/trigger flag=1・LED color flag=1 の副作用（help に明記）、公式 BLE Save の 2000ms / 2 再送との差（本実装は 3 秒 / リトライなし。`PROTOCOL_SPEC` §6.4 に記録）。
-- **完了条件**: 各セクションの書き込み → 読み戻し一致（Mock で固定済み。実機は未検証）。
+  - **未実装 / 未確認**: USB HID config write（BLE のみ）、`config set` の joy/trigger flag=1・LED color flag=1 の副作用（help に明記）、公式 BLE Save の 2000ms / 2 再送との差（本実装は 3 秒 / リトライなし。`PROTOCOL_SPEC` §6.4 に記録）。
+- **完了条件**: 各セクションの書き込み → 読み戻し一致（Mock で固定済み。BLE 実機で full 2768B write・remap・read-back SHA 一致を確認済み）。
 - **Tier**: **3**。
-- **状態**: 実装済み（Mock テスト）。実機書込検証待ち。
+- **状態**: 実装済み。BLE 実機で full 2768B write・remap・read-back SHA 一致を確認済み。USB config write は未実装。
 
 ### Phase 2e: USB HID / 2.4G トランスポート（保留）
 - **ゴール**: USB 有線 / 2.4G レシーバ経由の App Mode。
@@ -265,7 +268,7 @@ Track C: モバイル
 - **Phase 3a（read-only GUI、Phase 2a 後）**: 接続パネル、デバイス情報、ライブ入力、設定ビューア、バックアップ。既定は **Tier 2**、ただし `crates/eightbitdo-core/**`（`session` / transport / mock を含む）の変更を伴う場合は **Tier 3**。GUI 側だけで完結する場合も、`session` の読み取り契約（ドレインの fail-closed、応答 `total_len` / `crc16` 照合、`Instant` 上限）を検証するテストを変えるなら Tier 3。
   - **状態**: 実装済み（PR #16 以前）。Mock / ヘッドレステストのみで**実機未検証**。
 - **Phase 3b（マクロエディタ、Phase 2b 後）**: タイムライン / テーブル、リアルタイム録音、1ms、8bit スティック、トリガー、JSON/TOML。Tier 3。
-  - **状態**: 実装済み（PR #16、**実機未検証**）。20ms ライブ録音、ステップ編集（削除・待ち時間挿入・値変更）、既存非空マクロへの Header → Save → Erase → Write → Save、read-back 検証。空マクロ作成は拒否。JSON/TOML 入出力は未実装。
+  - **状態**: 実装済み（PR #16、**実機未検証**）。20ms ライブ録音、ステップ編集（削除・待ち時間挿入・値変更）、既存非空マクロへの Header → Save → Erase → Write → Save、read-back 検証。空マクロ作成は拒否。録音中は書込不可（確認ダイアログは非モーダルだが確定時に再検証し、録音中に読み込んだ場合は停止通知）。JSON/TOML 入出力は未実装。
 - **Phase 3c（OTA 画面、Phase 2c 後）**: バージョン確認、進捗、復旧モード。Tier 3。
   - **状態**: 未着手（core の BLE OTA も CLI / GUI 未配線・実機保留）。
 - **Phase 3d（設定タブ、Phase 2d 後）**: プロファイル、リマップ、デッドゾーン、振動、6 軸、RGB。Tier 3。
