@@ -493,6 +493,8 @@ sequenceDiagram
 > **タイムアウト / 再送の実装差（2026-11-22 RE 追記）**: 公式 Android の BLE Save は **2000 ms・最大 2 回再送**（`getSaveCustomConfigChannel` のチャネル設定 `+0x64 = 2000.0f`、`+0x31 = 2`。静的解析）。Windows USB HID は **3 秒**。本リポジトリの config write / macro write は **3 秒・リトライなし**で実装しており、公式 BLE の 2 秒 / 2 再送とは異なる（未確定・暫定方針）。この差は許容し、実機検証で再送が必要と判明した場合にのみ変更する。
 >
 > **USB HID の設定書込は本リポジトリ未実装**: `config write` / `config set` / `config remap` と full 2768B 書込は **BLE のみ**。USB App Mode の実機証跡と transport が揃うまで、USB config write は提供しない（`Save 0x0123` の実装は macro/Save の既存定数のみ）。
+>
+> **実機確認（2026-11-23、BLE・MTU 200・74B chunk）**: full 2768B `config write` は **39 packets** で送信され、Save 後の read-back SHA-256 が送信内容と一致した。device は送信した CRC を `stored` として保持し、`in_place` 再計算値とは一致しない（CLI は `sent` / `stored` / `in_place` の 3 解釈を表示する）。`config remap A B` の read-back 反映（A→B）と B→A への復帰も同一接続で確認した。MTU 200 以外の実機挙動は未確認。
 
 - **BLE (Android `getSaveCustomConfigChannel`)**: `cmd = 0x0006`, **`subcmd = 0x0067`** を使用。BLE の `Save` タイムアウトは仕様書に記載がないため、本実装は暫定 3 秒・リトライなしとする（§6.5）。
 - **Windows USB HID (`8BitDoAdvance.dll::saveUltimateBT2`)**: `cmd = 0x0006`, **`subcmd = 0x0123`** を使用（**USB HID の Save タイムアウトは `3` 秒**）。
@@ -659,6 +661,8 @@ Header または最初の Save が失敗した場合、Erase は送らない。�
 ### 8.2 ファームウェアバイナリ (`.dat`) 構造と OTA シーケンス
 
 ダウンロードした `.dat` ファイルは先頭 **`0x1C` (28 バイト) のイメージヘッダ** + 実データ部で構成される（マルチセクションイメージでは後続セクションに別の 28B ヘッダが続く）。
+
+> **本リポジトリの実装範囲（2026-11-23）**: `crates/eightbitdo-core/src/ota.rs` の `.dat` パーサは **先頭 1 セクションのみ**対応し、`28 + image_len` とファイル長が一致しない trailing data（マルチセクション）を `OtaInvalidFirmware` で拒否する。公式 `.dat` がマルチセクションの場合、この実装ではファームウェア更新を実行できない（公式ファーム対応の **blocker**。§8.5「未検証事項」12 と「CLI / GUI / UniFFI 配線時の必須検証」3 を参照）。
 
 - **先頭 28 バイトイメージヘッダ (`header[0..0x1C]`)**:
   - `+0x00` (`u32`): `firmwareFile_Version`（ファームウェアバージョン値）
