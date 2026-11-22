@@ -794,6 +794,8 @@ payload-less の ready ACK が完了 ACK より先に届く場合、Erase 完了
 #### 未検証事項（実機 btsnoop 待ち）
 
 証跡と関数アドレスは [docs/OTA_BLE_EVIDENCE.md](OTA_BLE_EVIDENCE.md) を参照。
+実機 btsnoop の採取手順・確認項目・判定と追記の手順・安全手順は
+**[docs/OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md)** を参照（下記 1〜13 を確定させる）。
 
 1. **Bootloader RX フレーミング**: 応答は App Mode 同様「16B ヘッダ + payload、先頭 prefix なし」を仮定。`0x05` が TX のみかは未確認。
 2. **`readPID` / `readVersionInBoot` の応答形状**: `cmd=0x0004` envelope（要求 `cmd` を `subcmd` にエコー）または `cmd` 直エコーを受理。payload 長は 2B / 4B を要求。
