@@ -706,8 +706,11 @@ Phase B は **未確定 wire に対する最初のフラッシュ書込**であ�
      （**全消去ではない**）。
    - 人間が次を確認し、**続行可否を判断**する。初回 Phase B では「確定済み wire との一致」は
      成立しないため、次の**初回合格条件**で判定する:
-     1. 応答の `cmd` / `subcmd` が期待どおり（`cmd=0x0004` envelope の `subcmd=0x0104`、
-        または `cmd=0x0104` 直エコー。実機の Erase ACK 形状）
+     1. 応答の `cmd` / `subcmd` が期待どおり。EraseFlash（要求 `cmd=0x0004`,
+        `subcmd=0`）に対して受理される ACK は **`cmd=0x0004` envelope で
+        `subcmd=0x0004`**、または **`cmd=0x0004` direct で `subcmd=0`**
+        （`boot_ack_matches` の判定。`0x0104` は EraseMacro のコマンドであり
+        EraseFlash の ACK ではない）
      2. `0x000E` などのエラー通知がない
      3. **要求**の `offset` が `.dat +0x04` の `load_base` + `0*0x1000` と一致し、
         `total_len = 0x1000` である
@@ -877,9 +880,10 @@ Write / WriteVersion / WriteFirmwareVersion / Jump の**全 wire が記録済み
 - [ ] Phase B の場合: セッション 1 は App Mode `"80ND"` → enterBoot → `"8bt"` 再接続 →
       `prepare_boot` の順で入り、`AfterFirstErase` で**最初の 1 セクタ Erase のみ**
       （全消去ではない）を行った
-- [ ] Phase B の場合: セッション 1 の**初回合格条件**（ACK が `cmd=0x0004`/`subcmd=0x0104`
-      または `cmd=0x0104` 直エコー、エラーなし、要求 `offset`/`total_len`、追加フレームなし、
-      リンク維持）を確認し、人間が**続行可否**を判断して 13.6 に記録した
+- [ ] Phase B の場合: セッション 1 の**初回合格条件**（ACK が `cmd=0x0004` envelope の
+      `subcmd=0x0004`、または `cmd=0x0004` direct の `subcmd=0`、エラーなし、要求
+      `offset`/`total_len`、追加フレームなし、リンク維持）を確認し、人間が**続行可否**を
+      判断して 13.6 に記録した
 - [ ] Phase B の場合: セッション 1 の btmon を停止し、capture は**形状確認専用**として
       SHA-256 / フレーム番号だけを記録した（完全性検証の対象にしない）
 - [ ] Phase B の場合: セッション 1 終了時に `OtaBenchOutcome` を記録し、**boot transport を

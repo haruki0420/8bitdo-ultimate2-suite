@@ -385,9 +385,10 @@ own stop point (use a separate output directory or file per run):
 
   RUN 1 - Session 1 (AfterFirstErase): connect App Mode ("80ND") ->
   EnterBoot (0x000C) -> "8bt" reconnect -> readPID -> checkpoint. STOP right
-  after the FIRST Erase ACK (the response is cmd=0x0004/subcmd=0x0104 or a
-  direct cmd=0x0104 echo), then verify offset / total_len / ACK shape before
-  deciding whether to continue (plan §8.3).
+  after the FIRST Erase ACK (accepted shapes: cmd=0x0004 envelope with
+  subcmd=0x0004, or a direct cmd=0x0004 echo with subcmd=0), then verify
+  offset / total_len / ACK shape before deciding whether to continue (plan
+  §8.3).
 
   RUN 2 - Session 2 (full run): scan for "8bt" (do NOT use `scan --check`; it
   is for "80ND"; do NOT send EnterBoot) -> new OtaUpdate -> prepare_boot ->
