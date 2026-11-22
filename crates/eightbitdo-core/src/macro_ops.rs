@@ -40,6 +40,14 @@ pub const MACRO_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// ACK wait after the `0x0001` header update (official 2 s).
 pub const MACRO_HEADER_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Header payload chunk size used for `0x0001`.
+///
+/// A 216-byte header does not fit one BLE frame at MTU 200: `1 + 16 + 216 =
+/// 233` exceeds the usable `mtu - 3 = 197` bytes. The implementation sends
+/// 142 + 74 bytes (`1 + 16 + 142 = 159`). `total_len` stays `0x0AD0` and each
+/// packet's `offset` advances by the actual chunk length.
+pub const MACRO_HEADER_CHUNK_SIZE: usize = 142;
+
 /// ACK wait after `Save` (`0x0006`).
 ///
 /// 3 s is the documented Windows USB HID value. The BLE timeout is not
@@ -663,7 +671,11 @@ impl<T: Transport> Session<T> {
         let erase = commands::erase_macro(mode, slot, index);
         let write_packets =
             commands::write_macro_steps(mode, slot, index, &plan.steps, plan.chunk_size)?;
-        let header_request = commands::write_config(header_offset as u32, &header_bytes)?;
+        let header_request = commands::write_config_packets(
+            header_offset as u32,
+            &header_bytes,
+            MACRO_HEADER_CHUNK_SIZE,
+        )?;
         let save = commands::save(plan.save_transport);
 
         let mut packets_sent = 0usize;
@@ -693,17 +705,19 @@ impl<T: Transport> Session<T> {
             packets_sent += 1;
         }
 
-        self.send_and_await_ack(
-            &header_request,
-            false,
-            cmd::WRITE_CONFIG,
-            0,
-            plan.timeouts.header,
-            "WriteMacroHeader",
-        )
-        .await
-        .map_err(|error| macro_write_failure(MacroWriteStage::Header, error, false))?;
-        packets_sent += 1;
+        for request in &header_request {
+            self.send_and_await_ack(
+                request,
+                false,
+                cmd::WRITE_CONFIG,
+                0,
+                plan.timeouts.header,
+                "WriteMacroHeader",
+            )
+            .await
+            .map_err(|error| macro_write_failure(MacroWriteStage::Header, error, false))?;
+            packets_sent += 1;
+        }
 
         self.send_and_await_ack(
             &save,
@@ -1289,6 +1303,7 @@ mod write_tests {
             push_ack(&mock, cmd::WRITE_MACRO, false);
         }
         push_ack(&mock, cmd::WRITE_CONFIG, true);
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
         // Real BLE saves may echo the platform sub-command (0x0067) instead
         // of 0x0006 in an envelope.
         let save_ack = CustomHeader::new(cmd::RESPONSE, SaveTransport::Ble.subcmd(), 0, 0);
@@ -1311,6 +1326,7 @@ mod write_tests {
                 cmd::WRITE_MACRO,
                 cmd::WRITE_MACRO,
                 cmd::WRITE_MACRO,
+                cmd::WRITE_CONFIG,
                 cmd::WRITE_CONFIG,
                 cmd::SAVE,
                 cmd::READ_MACRO,
@@ -1342,15 +1358,29 @@ mod write_tests {
             assert_eq!(&request[17..], chunk);
         }
 
-        // Header: 216 bytes at 0x68C, total_len 0x0AD0.
-        let header = CustomHeader::parse(&sent[5][1..]).unwrap();
-        assert_eq!(header.cmd, cmd::WRITE_CONFIG);
-        assert_eq!(header.subcmd, 0);
-        assert_eq!(header.total_len, 0x0AD0);
-        assert_eq!(header.offset, 0x68C);
-        assert_eq!(header.chunk_len, MACRO_SLOT_SIZE as u16);
-        assert_eq!(header.crc16, packet_crc16(&sent[5][17..]));
-        let header_payload = &sent[5][17..];
+        // Header: 216 bytes split into 142 + 74 at 0x68C / 0x71A.
+        // `total_len` stays 0x0AD0 on both packets.
+        let first_header = CustomHeader::parse(&sent[5][1..]).unwrap();
+        assert_eq!(first_header.cmd, cmd::WRITE_CONFIG);
+        assert_eq!(first_header.subcmd, 0);
+        assert_eq!(first_header.total_len, 0x0AD0);
+        assert_eq!(first_header.offset, 0x68C);
+        assert_eq!(first_header.chunk_len, 142);
+        assert_eq!(first_header.crc16, packet_crc16(&sent[5][17..]));
+        assert_eq!(sent[5].len(), 17 + 142);
+        let second_header = CustomHeader::parse(&sent[6][1..]).unwrap();
+        assert_eq!(second_header.cmd, cmd::WRITE_CONFIG);
+        assert_eq!(second_header.subcmd, 0);
+        assert_eq!(second_header.total_len, 0x0AD0);
+        assert_eq!(second_header.offset, 0x68C + 142);
+        assert_eq!(second_header.chunk_len, 74);
+        assert_eq!(second_header.crc16, packet_crc16(&sent[6][17..]));
+        assert_eq!(sent[6].len(), 17 + 74);
+        let header_payload: Vec<u8> = sent[5][17..]
+            .iter()
+            .chain(&sent[6][17..])
+            .copied()
+            .collect();
         assert_eq!(header_payload.len(), MACRO_SLOT_SIZE);
         let record = &header_payload[8..8 + MACRO_RECORD_SIZE];
         assert_eq!(&record[0..4], &[0x00, 0x45, 0x00, 0x64]); // "Ed" UTF-16BE
@@ -1371,14 +1401,14 @@ mod write_tests {
 
         // Save: BLE subcmd 0x0067, no payload.
         assert_eq!(
-            sent[6],
+            sent[7],
             vec![
                 0x04, 0x06, 0x00, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00,
             ]
         );
 
-        assert_eq!(outcome.packets_sent, 7);
+        assert_eq!(outcome.packets_sent, 8);
         assert_eq!(outcome.record.max_steps, 20);
         assert_eq!(outcome.record.key_map, KeyMap::M3);
         assert_eq!(outcome.record.name(), "Edited");
@@ -1401,6 +1431,7 @@ mod write_tests {
         for _ in 0..4 {
             push_ack(&mock, cmd::WRITE_MACRO, false);
         }
+        push_ack(&mock, cmd::WRITE_CONFIG, false);
         push_ack(&mock, cmd::WRITE_CONFIG, false);
         push_ack(&mock, cmd::SAVE, false);
         push_readback(&mock, &steps);
@@ -1438,6 +1469,7 @@ mod write_tests {
         for _ in 0..4 {
             push_ack(&mock, cmd::WRITE_MACRO, true);
         }
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
         push_ack(&mock, cmd::WRITE_CONFIG, true);
         push_ack(&mock, cmd::SAVE, true);
         push_readback(&mock, &steps);
@@ -1609,12 +1641,43 @@ mod write_tests {
     }
 
     #[tokio::test]
+    async fn second_header_chunk_timeout_does_not_send_save() {
+        let steps = sample_steps(20);
+        let mut script = vec![ack_frame(cmd::ERASE_MACRO, true)];
+        for _ in 0..4 {
+            script.push(ack_frame(cmd::WRITE_MACRO, true));
+        }
+        // ACK only the first 142-byte header chunk; the 74-byte second chunk
+        // is sent but never acknowledged.
+        script.push(ack_frame(cmd::WRITE_CONFIG, true));
+        let (result, sent) = write_with_script(script, true, &steps).await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Header,
+                saved: false,
+                ..
+            })
+        ));
+        assert_eq!(sent.len(), 7);
+        assert_no_save(&sent);
+        let header_frames: Vec<_> = sent
+            .iter()
+            .filter(|frame| frame_cmd(frame) == cmd::WRITE_CONFIG)
+            .collect();
+        assert_eq!(header_frames.len(), 2);
+        assert_eq!(header_frames[0].len(), 17 + 142);
+        assert_eq!(header_frames[1].len(), 17 + 74);
+    }
+
+    #[tokio::test]
     async fn save_timeout_is_reported_as_saved() {
         let steps = sample_steps(20);
         let mut script = vec![ack_frame(cmd::ERASE_MACRO, true)];
         for _ in 0..4 {
             script.push(ack_frame(cmd::WRITE_MACRO, true));
         }
+        script.push(ack_frame(cmd::WRITE_CONFIG, true));
         script.push(ack_frame(cmd::WRITE_CONFIG, true));
         let (result, sent) = write_with_script(script, true, &steps).await;
         assert!(matches!(
@@ -1649,6 +1712,7 @@ mod write_tests {
         for _ in 0..4 {
             script.push(ack_frame(cmd::WRITE_MACRO, true));
         }
+        script.push(ack_frame(cmd::WRITE_CONFIG, true));
         script.push(ack_frame(cmd::WRITE_CONFIG, true));
         script.push(ack_frame(cmd::SAVE, true));
         let raw = raw_steps(steps);
@@ -1721,5 +1785,78 @@ mod write_tests {
         assert!(!sent.is_empty());
         assert!(sent.iter().all(|frame| frame_cmd(frame) == cmd::READ_MACRO));
         assert_no_save(&sent);
+    }
+    /// Wraps a scripted transport with a BLE-like frame-size limit.
+    struct LimitedTransport {
+        inner: ScriptedTransport,
+        limit: usize,
+    }
+
+    #[async_trait]
+    impl Transport for LimitedTransport {
+        async fn send(&self, data: &[u8]) -> Result<(), Error> {
+            if data.len() > self.limit {
+                return Err(Error::Transport(format!(
+                    "frame of {} bytes exceeds the BLE limit {}",
+                    data.len(),
+                    self.limit
+                )));
+            }
+            self.inner.send(data).await
+        }
+
+        async fn recv(&self) -> Result<Vec<u8>, Error> {
+            self.inner.recv().await
+        }
+
+        fn mtu(&self) -> u16 {
+            200
+        }
+
+        async fn disconnect(&self) -> Result<(), Error> {
+            self.inner.disconnect().await
+        }
+    }
+
+    #[tokio::test]
+    async fn header_split_fits_mtu_200_frame_limit() {
+        let steps = sample_steps(20);
+        let backup = backup_from(config_with_existing_macro());
+        let plan = MacroWritePlan::new(steps.clone());
+        let transport = LimitedTransport {
+            inner: ScriptedTransport::new(full_success_script(&steps), true),
+            limit: 200 - 3,
+        };
+        let session = Session::new(&transport);
+        session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await
+            .unwrap();
+
+        let sent = transport.inner.sent();
+        assert!(
+            sent.iter().all(|frame| frame.len() <= 197),
+            "every BLE frame must fit mtu - 3 = 197 bytes"
+        );
+        let headers: Vec<_> = sent
+            .iter()
+            .filter(|frame| frame_cmd(frame) == cmd::WRITE_CONFIG)
+            .collect();
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].len(), 17 + 142);
+        assert_eq!(headers[1].len(), 17 + 74);
+        assert_eq!(CustomHeader::parse(&headers[0][1..]).unwrap().offset, 0x68C);
+        assert_eq!(
+            CustomHeader::parse(&headers[1][1..]).unwrap().offset,
+            0x68C + 142
+        );
+        assert_eq!(
+            CustomHeader::parse(&headers[0][1..]).unwrap().total_len,
+            0x0AD0
+        );
+        assert_eq!(
+            CustomHeader::parse(&headers[1][1..]).unwrap().total_len,
+            0x0AD0
+        );
     }
 }

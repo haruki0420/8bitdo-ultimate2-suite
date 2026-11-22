@@ -195,7 +195,7 @@ Track C: モバイル
   - `0x0102` ReadBT2Macro（1 要求 = 1 チャンク 142B、`offset = (macro_idx << 12) + chunk_offset`, `total_len = chunk_len = steps * 10`。実機で macro 0 / 500B と macro 1 / 460B の応答 offset を確認）
   - `0x0104` Erase（`total_len = chunk_len = 0x1000`, `crc16 = 0xFFFF`, ペイロードなし、2 秒）
   - `0x0103` Write（BLE 64B / USB 32B、32B アライン、チャンクごと CRC、2 秒）
-  - `0x0001` Header（`offset = 0x68C + slot * 0xD8`, `len = 0xD8`, `total_len = 0xAD0`、2 秒）
+  - `0x0001` Header（`offset = 0x68C + slot * 0xD8`, `len = 0xD8`, `total_len = 0xAD0`、216B を 142B + 74B に分割、2 秒/チャンク）
   - `0x0006` Save（BLE `subcmd = 0x0067`、3 秒 / transport 方針）
   - 3 スロット × 4 マクロのバックアップ（raw `.bin` + JSON/TOML + SHA-256 + config snapshot）
   - Mock でパケット列・CRC・チャンク境界・タイムアウト・fail-closed・読み戻し不一致を固定
@@ -203,7 +203,7 @@ Track C: モバイル
   - fail-closed（Erase / Write / Header 失敗時に Save しない）、読み戻し検証、`--trigger` のヘッダ反映
 - **完了条件**: 実機で 1 マクロ書き込み → 読み戻し一致 → Switch 側で発動 → 元のマクロへ復元。
 - **Tier**: **3**（write-path / Flash / CRC / マクロ）。
-- **状態**: 読み取り・バックアップは実機確認済み（142B チャンク、offset エコー）。書き込み・restore は Mock 実装と CLI まで完了し、**実機書き込みは未実施**。実機前に残る未確定点は `PROTOCOL_SPEC.md` §6.5（216B Header の MTU、BLE Save の ACK 形状 / タイムアウト、未使用マクロの `flag` / `total_cnt` / `key_map`）。
+- **状態**: 読み取り・バックアップは実機確認済み（142B チャンク、offset エコー）。書き込み・restore は Mock 実装と CLI まで完了し、**実機書き込みは未実施**。実機前に残る未確定点は `PROTOCOL_SPEC.md` §6.5（BLE Save の ACK 形状 / タイムアウト、未使用マクロの `flag` / `total_cnt` / `key_map`、MTU 200 未満での Header 分割）。
 
 ### Phase 2c: Linux BLE OTA
 - **ゴール**: Linux から BLE Bootloader 経由でファームウェア更新・復旧を行う。

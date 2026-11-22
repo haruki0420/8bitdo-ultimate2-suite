@@ -524,7 +524,7 @@ struct Bt2Header {
    - ペイロード: `max_steps * 10` バイト＋32B アライメント用ゼロパディング（BLE 64B / USB HID 32B で分割送信・`Send_CustomCmdPacket` 準拠で各チャンクヘッダ `CRC-16/MODBUS (0xA001)` 付与）
 3. **Step 3: 2768B コンフィグ内のマクロ管理ヘッダ更新**
    - `max_steps`, `key_map`, `cycles_num`, `interval_ms`, `filename`, `total_cnt`, `flag` 等を `0x68C + slot * 0xD8` に反映し、`ANSI_CRC_16_sh` を再計算する。
-   - 部分書込 (`cmd = 0x0001, subcmd = 0x0000, offset = 0x68C + slot * 0xD8, len = 0xD8, total_len = 0x0AD0`) または全体書込を送信する。
+   - 部分書込 (`cmd = 0x0001, subcmd = 0x0000, offset = 0x68C + slot * 0xD8, len = 0xD8, total_len = 0x0AD0`) または全体書込を送信する。216B は MTU 200 を前提に **142B + 74B** に分割する（`total_len` は各パケットで `0x0AD0` のまま、`chunk_len = 142 / 74`、2 パケット目の `offset = 先頭 + 142`）。
 4. **Step 4: 不揮発メモリへのコミット (`Save`)**
    - **BLE**: `cmd = 0x0006, subcmd = 0x0067, offset = 0, len = 0, total_len = 0`
    - **USB**: `cmd = 0x0006, subcmd = 0x0123, offset = 0, len = 0, total_len = 0`
@@ -536,7 +536,7 @@ struct Bt2Header {
 > **実装ノート（Mock 検証済み・実機書き込み未検証）**:
 > - **Fail-closed**: Erase / Write / Header のいずれかが失敗したら Save を送らない。ただし Erase 済み・Write 途中のセクタは変更されている可能性がある。Save 後の ACK または読み戻しが失敗した場合だけ `saved = true` として報告する。どちらも 3 スロット × 4 マクロの完全バックアップから復元する。
 > - **ヘッダ値**: `max_steps` は新しいステップ数。`key_map` / `cycles_num` / `interval_ms` / `flag` / `total_cnt` は指定がなければ既存値を保持する。未使用マクロ（`max_steps == 0` または `0xFFFF`）へ書く場合、CLI は `flag = 1` と `total_cnt = max(existing, macro_idx + 1)` を設定し、`--trigger` がなければ `key_map` を `0` のままにする。**この未使用マクロの有効化ポリシーは実機未確認**。
-> - 216B の Header は現実装では 1 パケットで送る。MTU 200 でも `1 + 16 + 216 = 233B` になるため、MTU 次第では分割が必要になる（実機未確認）。
+> - 216B の Header は **142B + 74B** に分割して送る。`total_len = 0x0AD0` は各パケットで維持し、`chunk_len = 142 / 74`、2 パケット目の `offset = 先頭 + 142`。MTU 200 の `mtu - 3 = 197B` 上限に収まる（`1 + 16 + 142 = 159B` / `1 + 16 + 74 = 91B`）。
 
 #### マクロ読み出し手順
 
