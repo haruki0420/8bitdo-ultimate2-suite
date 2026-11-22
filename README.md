@@ -36,8 +36,9 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 - `config remap <physical> <target>` — 1 ボタンのみ（4B）変更。`config map show` で 22 index を表示。
 - 安全策: **pre-write backup 必須**（`config.bin` + `config.json`）、`--yes` なしの確認、前後 SHA-256、確認後の TOCTOU 再読込、read-back 検証、マクロヘッダ変更警告。書込 chunk は既定 `min(MTU, 74)`（RE: 公式 74B）で、`--write-chunk` は接続前上限 **180**（観測 MTU 200 のペイロード上限）まで指定可能。
 - raw `config write` の検証: 22 個の `button_mappings`、`gyro.key_map`、全レコードの flag 0/1、マクロ `max_steps`（0/0xFFFF/1..=200）・`total_cnt`、マクロ `key_map`（`macro write --trigger` と同じ任意 KeyMap）を確認。不明な `cur_slot`（実機観測 6 など）は警告して保持。`--force-raw` は未文書値の復旧用（予約領域ガードは維持）。
-- `session --allow-config-write` の REPL からも同じ `config set` / `config remap` / `config map show` / `config write --file` を実行できる（`--yes` または `yes` 入力の確認、pre-write backup、前後 SHA-256、read-back 検証。書込中は operation lock で 20ms keepalive を停止し、終了後に再開）。
+- `session --allow-config-write` の REPL からも `config set` / `config remap` / `config write --file` を実行できる（`config map show` と `config dump` はフラグ不要の read-only）。書込は `--yes` で対話確認なし、無い場合は `yes` 入力の確認、pre-write backup、前後 SHA-256、read-back 検証付き。確認待ちの間は operation lock を解放して 20ms keepalive を継続し、実書込（最初の `0x0001` 以降）は operation lock 下で Ctrl-C 非キャンセル。書込後は keepalive が再開する。
 - 既知の差: 公式 BLE Save は 2000ms / 最大 2 再送（静的解析）だが、本実装は 3 秒 / リトライなし。USB config write は未実装。
+- REPL の引数は空白区切り。スペースを含むプロファイル名は top-level `config set profile_name "..."`（シェル引用）を使う。
 
 ---
 
