@@ -133,10 +133,21 @@ impl BleLock {
         Self::acquire_with_policy(path.into(), ParentPolicy::Override)
     }
 
+    /// Acquire at an explicit path with the default (enforcing) parent policy.
+    ///
+    /// Exposed to the crate so the production lock path can be tested with a
+    /// temporary directory; production itself reaches this through
+    /// [`BleLock::acquire`].
+    #[cfg(test)]
+    pub(crate) fn acquire_enforcing(path: impl Into<PathBuf>) -> Result<Self, Error> {
+        Self::acquire_with_policy(path.into(), ParentPolicy::Enforce)
+    }
+
     fn acquire_with_policy(path: PathBuf, policy: ParentPolicy) -> Result<Self, Error> {
         precheck_lock_path(&path)?;
+        precheck_lock_parent(&path)?;
         prepare_lock_directory(&path, policy)?;
-        let file = open_lock_file(&path)?;
+        let file = open_lock_file(&path, policy)?;
         validate_lock_file(&path, &file)?;
 
         // `try_lock_exclusive` rather than blocking: the caller must tell the
@@ -223,51 +234,24 @@ fn current_euid() -> u32 {
 
 #[cfg(unix)]
 fn current_user_home() -> Option<PathBuf> {
-    // Prefer the passwd home for the effective uid: `$HOME` can point at `/`
-    // or a service-specific directory under cron/systemd and would split the
-    // lock for the same user.
-    passwd_home_for(current_euid()).or_else(env_home)
+    // NSS-aware lookup (`getpwuid_r`) so LDAP/SSSD users get their real home
+    // too. `$HOME` is deliberately not used on Unix: it changes between a
+    // desktop session, SSH, cron and systemd for the same user, which would
+    // split the lock. When no passwd entry exists the caller falls back to the
+    // per-uid temp directory.
+    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(current_euid()))
+        .ok()
+        .flatten()
+        .map(|user| user.dir)
+        .filter(|directory| !directory.as_os_str().is_empty())
 }
 
 #[cfg(not(unix))]
 fn current_user_home() -> Option<PathBuf> {
-    env_home()
-}
-
-fn env_home() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-}
-
-#[cfg(unix)]
-fn passwd_home_for(uid: u32) -> Option<PathBuf> {
-    let contents = std::fs::read_to_string("/etc/passwd").ok()?;
-    parse_passwd_home(&contents, uid)
-}
-
-/// Parse the home directory for `uid` out of `/etc/passwd` contents.
-///
-/// Kept separate from the file read so the field parsing is testable. NSS
-/// (LDAP etc.) is not consulted; when the entry is absent the caller falls
-/// back to `$HOME`.
-#[cfg(unix)]
-fn parse_passwd_home(contents: &str, uid: u32) -> Option<PathBuf> {
-    contents.lines().find_map(|line| {
-        let mut fields = line.split(':');
-        let _name = fields.next()?;
-        let _password = fields.next()?;
-        let uid_field = fields.next()?;
-        let _gid = fields.next()?;
-        let _gecos = fields.next()?;
-        let home = fields.next()?;
-        if uid_field.parse::<u32>().ok()? == uid && !home.is_empty() {
-            Some(PathBuf::from(home))
-        } else {
-            None
-        }
-    })
 }
 
 /// Reject an existing symlink or non-regular file before opening it.
@@ -293,6 +277,34 @@ fn precheck_lock_path(path: &Path) -> Result<(), Error> {
         Err(error) => return Err(Error::Io(error)),
     }
     Ok(())
+}
+
+/// Reject a symlinked parent directory before creating/opening anything.
+///
+/// `metadata` follows symlinks, so validating a parent through it would let an
+/// attacker point `<temp>/8bitdo-ble-<euid>` at a victim directory and pass the
+/// owner/mode check. The enforcing open closes the remaining TOCTOU window with
+/// `openat(..., O_NOFOLLOW|O_DIRECTORY)`.
+fn precheck_lock_parent(path: &Path) -> Result<(), Error> {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    match std::fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::BleLockInvalid {
+            path: parent.to_path_buf(),
+            reason: "lock parent is a symbolic link; refusing to follow it".to_string(),
+        }),
+        Ok(metadata) if !metadata.is_dir() => Err(Error::BleLockInvalid {
+            path: parent.to_path_buf(),
+            reason: "lock parent is not a directory".to_string(),
+        }),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::Io(error)),
+    }
 }
 
 /// Create the lock's parent directory with mode `0700` when missing.
@@ -328,7 +340,26 @@ fn prepare_lock_directory(path: &Path, policy: ParentPolicy) -> Result<(), Error
 }
 
 fn validate_lock_directory(path: &Path) -> Result<(), Error> {
-    let metadata = std::fs::metadata(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(Error::BleLockInvalid {
+            path: path.to_path_buf(),
+            reason: "lock parent is a symbolic link; refusing to follow it".to_string(),
+        });
+    }
+    if !metadata.is_dir() {
+        return Err(Error::BleLockInvalid {
+            path: path.to_path_buf(),
+            reason: "lock parent is not a directory".to_string(),
+        });
+    }
+    validate_lock_directory_metadata(path, &metadata)
+}
+
+fn validate_lock_directory_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), Error> {
     if !metadata.is_dir() {
         return Err(Error::BleLockInvalid {
             path: path.to_path_buf(),
@@ -373,7 +404,17 @@ fn validate_lock_directory_permissions(
     Ok(())
 }
 
-fn open_lock_file(path: &Path) -> Result<File, Error> {
+fn open_lock_file(path: &Path, policy: ParentPolicy) -> Result<File, Error> {
+    // On Unix the default path is opened relative to a verified directory
+    // descriptor, closing the parent-symlink/rename TOCTOU window. The
+    // trusted override keeps the path-based open (its parent is the caller's
+    // responsibility) but still uses O_NOFOLLOW for the file itself.
+    #[cfg(unix)]
+    if policy == ParentPolicy::Enforce {
+        return open_lock_file_via_dirfd(path);
+    }
+    #[cfg(not(unix))]
+    let _ = policy;
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -389,6 +430,53 @@ fn open_lock_file(path: &Path) -> Result<File, Error> {
     options
         .open(path)
         .map_err(|error| lock_open_error(path, &error))
+}
+
+/// Open the lock file relative to a verified parent directory descriptor.
+#[cfg(unix)]
+fn open_lock_file_via_dirfd(path: &Path) -> Result<File, Error> {
+    use rustix::fs::{openat, Mode, OFlags, CWD};
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| Error::BleLockInvalid {
+            path: path.to_path_buf(),
+            reason: "lock path has no parent directory".to_string(),
+        })?;
+    let name = path.file_name().ok_or_else(|| Error::BleLockInvalid {
+        path: path.to_path_buf(),
+        reason: "lock path has no file name".to_string(),
+    })?;
+
+    let directory = openat(
+        CWD,
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        lock_open_error(
+            parent,
+            &std::io::Error::from_raw_os_error(error.raw_os_error()),
+        )
+    })?;
+    let directory = File::from(directory);
+    validate_lock_directory_metadata(parent, &directory.metadata()?)?;
+
+    let file = openat(
+        &directory,
+        name,
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(|error| {
+        lock_open_error(
+            path,
+            &std::io::Error::from_raw_os_error(error.raw_os_error()),
+        )
+    })?;
+    Ok(File::from(file))
 }
 
 /// Turn the two security-relevant open failures into actionable errors.
@@ -566,17 +654,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn passwd_home_parsing_uses_the_uid_field() {
-        let contents = "\
-root:x:0:0:root:/root:/bin/bash
-alice:x:1000:1000:Alice:/home/alice:/bin/bash
-";
-        assert_eq!(
-            parse_passwd_home(contents, 1000),
-            Some(PathBuf::from("/home/alice"))
+    fn symlinked_parent_directory_is_rejected() {
+        let real = temp_parent_dir("parent-real", 0o700);
+        let link = temp_parent_dir("parent-link-holder", 0o700).join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("create parent symlink");
+        let path = link.join(BLE_LOCK_FILE_NAME);
+
+        // The enforcing (production) policy must not follow the directory
+        // symlink; otherwise an attacker could point the per-uid temp
+        // directory at a victim directory and bypass the owner/mode checks.
+        let error = BleLock::acquire_with_policy(path.clone(), ParentPolicy::Enforce)
+            .expect_err("symlinked parent must be refused");
+        assert!(
+            matches!(error, Error::BleLockInvalid { ref reason, .. }
+                if reason.contains("parent is a symbolic link")),
+            "expected a parent-symlink rejection, got {error:?}"
         );
-        assert_eq!(parse_passwd_home(contents, 0), Some(PathBuf::from("/root")));
-        assert_eq!(parse_passwd_home(contents, 4242), None);
+        // Even the trusted override rejects a symlinked parent.
+        let error = BleLock::acquire_at(&path).expect_err("override must reject it too");
+        assert!(
+            matches!(error, Error::BleLockInvalid { ref reason, .. }
+                if reason.contains("parent is a symbolic link")),
+            "expected a parent-symlink rejection, got {error:?}"
+        );
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
     }
 
     #[cfg(unix)]

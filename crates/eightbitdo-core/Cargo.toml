@@ -10,7 +10,7 @@ authors.workspace = true
 
 [features]
 default = ["ble"]
-ble = ["dep:btleplug", "dep:futures-util", "dep:fs2", "dep:rustix"]
+ble = ["dep:btleplug", "dep:futures-util", "dep:fs2", "dep:rustix", "dep:nix"]
 
 [dependencies]
 eightbitdo-protocol = { path = "../eightbitdo-protocol" }
@@ -27,6 +27,8 @@ fs2 = { version = "0.4.3", optional = true }
 # the lock-file hardening. Windows uses `symlink_metadata` prechecks only (see
 # `ble_lock`); keeping this Unix-only avoids a POSIX-only build dependency.
 rustix = { version = "1.1.6", optional = true, default-features = false, features = ["fs", "process", "std"] }
+# NSS-aware passwd lookup (`getpwuid_r`) for the per-user lock directory.
+nix = { version = "0.29", optional = true, default-features = false, features = ["user"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "time"] }

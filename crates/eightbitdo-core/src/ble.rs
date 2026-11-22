@@ -9,7 +9,7 @@
 //! live in later phases.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::ble_lock::{default_ble_lock_path, BleLock};
+use crate::ble_lock::BleLock;
 use crate::transport::Transport;
 use crate::{
     Error, APP_BLE_NAME, APP_CHARACTERISTIC_UUID, APP_CHARACTERISTIC_UUID_ALT, APP_SERVICE_UUID,
@@ -75,6 +75,32 @@ impl Default for BleOptions {
             verbose: false,
             lock_path: None,
         }
+    }
+}
+
+/// Acquire the single-owner BLE lock for an operation.
+///
+/// `None` is the production default path and therefore uses the **enforcing**
+/// parent-directory policy ([`BleLock::acquire`]); `Some` is an explicit test
+/// or tool override ([`BleLock::acquire_at`]). Keeping the choice here makes
+/// sure the default path is never opened with the override policy.
+fn acquire_ble_lock(lock_path: Option<&Path>) -> Result<BleLock, Error> {
+    match lock_path {
+        Some(path) => BleLock::acquire_at(path),
+        None => BleLock::acquire(),
+    }
+}
+
+/// Test seam for [`acquire_ble_lock`] that substitutes the default path while
+/// keeping the production policy (enforcing) for `None`.
+#[cfg(test)]
+fn acquire_ble_lock_with_default(
+    lock_path: Option<&Path>,
+    default_path: PathBuf,
+) -> Result<BleLock, Error> {
+    match lock_path {
+        Some(path) => BleLock::acquire_at(path),
+        None => BleLock::acquire_enforcing(default_path),
     }
 }
 
@@ -133,12 +159,7 @@ impl BleTransport {
     /// lifetime of the returned transport: a resident `session`, a GUI and a
     /// one-shot `scan` cannot scan or reconnect over each other.
     pub async fn connect(options: &BleOptions) -> Result<Self, Error> {
-        let lock = BleLock::acquire_at(
-            options
-                .lock_path
-                .clone()
-                .unwrap_or_else(default_ble_lock_path),
-        )?;
+        let lock = acquire_ble_lock(options.lock_path.as_deref())?;
         let manager = Manager::new().await.map_err(ble_error)?;
         let adapters = manager.adapters().await.map_err(ble_error)?;
         let adapter = adapters
@@ -381,7 +402,7 @@ pub async fn scan_devices_with_lock_path(
 ) -> Result<Vec<BleDevice>, Error> {
     // Hold the lock for the whole scan: two scans at once are what makes the
     // controller report `In Progress` on the next connect.
-    let _lock = BleLock::acquire_at(lock_path.unwrap_or_else(default_ble_lock_path))?;
+    let _lock = acquire_ble_lock(lock_path.as_deref())?;
     let manager = Manager::new().await.map_err(ble_error)?;
     let adapters = manager.adapters().await.map_err(ble_error)?;
     let adapter = adapters
@@ -654,6 +675,52 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_nanos())
         ))
+    }
+
+    #[cfg(unix)]
+    fn temp_lock_dir(label: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = std::env::temp_dir().join(format!(
+            "eightbitdo-ble-dir-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir(&directory).expect("create lock parent");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(mode))
+            .expect("set lock parent mode");
+        directory
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_lock_path_enforces_the_parent_policy() {
+        // `lock_path: None` (production) must use the enforcing policy: a
+        // 0777 parent is refused, even though an explicit override accepts it.
+        let public_parent = temp_lock_dir("production-public", 0o777);
+        let public_path = public_parent.join(crate::BLE_LOCK_FILE_NAME);
+        let error = acquire_ble_lock_with_default(None, public_path.clone())
+            .expect_err("the production default must reject a 0777 parent");
+        assert!(
+            matches!(error, Error::BleLockInvalid { ref reason, .. }
+                if reason.contains("group/other-writable")),
+            "expected a parent-mode rejection, got {error:?}"
+        );
+
+        let guard = acquire_ble_lock_with_default(Some(&public_path), public_path.clone())
+            .expect("an explicit override skips the parent policy");
+        drop(guard);
+
+        let private_parent = temp_lock_dir("production-private", 0o700);
+        let private_path = private_parent.join(crate::BLE_LOCK_FILE_NAME);
+        let guard = acquire_ble_lock_with_default(None, private_path)
+            .expect("the production default accepts a private parent");
+        drop(guard);
+
+        let _ = std::fs::remove_file(&public_path);
+        let _ = std::fs::remove_dir_all(&public_parent);
+        let _ = std::fs::remove_dir_all(&private_parent);
     }
 
     #[test]

@@ -42,6 +42,8 @@
      ```
    - **`80ND` が見える**: まだ App Mode です。**押下を依頼せず**、接続（新しい `session` /
      ループの再起動）を試みます。ループはこの scan 確認を自動で行います。
+     `scan --check` の判定（`BleDevice::is_app`）は「広告名が `80ND`」または
+     「`FF10` service を広告」のいずれかです。
    - **`80ND` が見えない**（`scan --check` が exit 3）: App Mode を抜けています。この場合だけ
      「Profile を約 3 秒押してください」と案内します。
    - scan 自体が失敗した場合（`scan --check` が exit 0/3 以外。ロック競合など）はまだ別プロセスが
@@ -60,35 +62,42 @@
 
 `scan` / `connect` / `session` に加え、`BleTransport::connect` を使う **すべての CLI コマンド**
 （`info` / `config *` / `macro *` / `backup` / `monitor` / `keepalive`）が、BLE アダプタを
-触る前に排他ロック（`flock`）を取得します。
+触る前に排他ロック（`flock`）を取得します。`BleOptions::lock_path: None`（本番の既定）は
+**Enforce** ポリシー（parent 所有者/mode/symlink 検証 + fd 検証）を通り、`Some` はテスト/ツール用の
+**Override** ポリシー（parent の所有者/mode 検証のみ省略）です。
 
 | 項目 | 内容 |
 | --- | --- |
-| パス（優先順） | 1. `EIGHTBITDO_BLE_LOCK`（テスト/ラッパー用の信頼された上書き）<br>2. Unix: **passwd の euid エントリのホーム**由来の `$HOME/.cache/8bitdo/8bitdo-ble.lock`（passwd に無い場合のみ `$HOME` にフォールバック）<br>3. ホームが決まらない場合のみ `<temp dir>/8bitdo-ble-<euid>/8bitdo-ble.lock`（`TMPDIR` 尊重） |
+| パス（優先順） | 1. `EIGHTBITDO_BLE_LOCK`（テスト/ラッパー用の信頼された上書き）<br>2. Unix: **NSS（`getpwuid_r`）で引いた euid のホーム**由来の `~/.cache/8bitdo/8bitdo-ble.lock`（LDAP/SSSD も可。`$HOME` は使わない）<br>3. ホームが決まらない場合のみ `<temp dir>/8bitdo-ble-<euid>/8bitdo-ble.lock`（`TMPDIR` 尊重。parent は同じく検証） |
 | 環境非依存 | `XDG_RUNTIME_DIR` / `XDG_CACHE_HOME` は **参照しません**。デスクトップ・SSH・cron・systemd で XDG が違っても、同一ユーザーは同じロックファイルを使います |
-| ディレクトリ | 自動作成する場合は mode `0700`。既定パスでは既存 parent も「euid 所有 + group/other write なし（`mode & 0o022 == 0`）」を検証し、満たさなければ拒否 |
+| ディレクトリ | 自動作成する場合は mode `0700`。既定パスでは既存 parent も「euid 所有 + group/other write なし（`mode & 0o022 == 0`）」を検証し、**parent が symlink なら拒否**。Unix は `openat(O_NOFOLLOW\|O_DIRECTORY)` で parent を開いてから lock を開き、検証と open の間の TOCTOU も閉じる |
 | 保持期間 | `scan`: scan 中のみ / `connect`・`session`・各コマンド: 接続保持中ずっと（切断またはプロセス終了で解放） |
 | 競合時 | 待たずに失敗し、`another process is using the BLE adapter (lock file <path>)` を表示する |
 | 解放 | プロセス終了（`SIGKILL` 含む）でカーネルが解放する。ロックファイルは削除しない（別 inode での二重取得を防ぐため） |
 
 **ロックは per-user スコープです。** 別ユーザーの `eightbitdo` とは排他しません
 （ロックは各ユーザーのホーム配下に分かれるため）。同一ユーザー内の CLI / 将来の GUI /
-手動 `flock` の間だけを排他します。同一ユーザーで `HOME` が異なる特殊な環境
-（`sudo -E` などで euid が変わる場合を除く）では、passwd のホームが使われるため
-`HOME` の値にも依存しません。
+手動 `flock` の間だけを排他します。ホームは euid から NSS で引くため、同一ユーザーで
+`HOME` や XDG が異なるデスクトップ・SSH・cron・systemd でも同じロックになります。
+NSS でユーザーが見つからない場合（passwd エントリの無いコンテナ等）は temp の
+`8bitdo-ble-<euid>` ディレクトリを使い、parent の所有者/mode 検証は同じく行います。
 
 ### 安全性
 
 - Unix では `O_NOFOLLOW` で開き、**symlink を追従しません**。
 - 開いたファイル記述子が **通常ファイル** かつ **実効ユーザー所有** であることを検証します
-  （所有者検証は Unix のみ。Windows は `symlink_metadata` による「symlink でない通常ファイル」の
-  事前検証のみで、fd の所有者検証は行いません）。
+  （所有者/mode 検証は Unix のみ。Windows は parent と lock の `symlink_metadata` による
+  「symlink でない」種別検証のみで、fd の所有者検証と dirfd 検証は行いません）。
+- 同一ユーザーが lock ファイルを別ファイルへ hardlink する攻撃は防御しません（advisory lock
+  であり、`fs.protected_hardlinks=1` を前提）。`nlink` は検証していません。
 - 事前チェック（`symlink_metadata`）に加えて fd 側でも検証するため、共有ディレクトリで
   symlink / FIFO / ディレクトリ / 他ユーザー所有ファイルを仕込まれても拒否されます
   （`refusing to use BLE lock file ...`）。
 - ロックファイルは mode `0600` にします。
 - 既定パスの **既存 parent ディレクトリ**は euid 所有かつ group/other write なしを検証します。
   共有 temp ディレクトリ内の予測可能な `0777` ディレクトリを先取りされても拒否されます。
+  さらに parent が symlink の場合は拒否し、Unix では検証済み parent の dirfd から
+  `openat(O_NOFOLLOW)` で lock を開くため、検証後の差し替え（TOCTOU）も防ぎます。
   自動作成するディレクトリは `0700` です。
 - `EIGHTBITDO_BLE_LOCK` は **テスト/ラッパー用の信頼された例外**として、parent ディレクトリの
   ポリシーをスキップします（ロックファイル自体の symlink / 通常ファイル / 所有者検証は行います）。
@@ -127,12 +136,19 @@ flock "$HOME/.cache/8bitdo/8bitdo-ble.lock" -c 'eightbitdo scan --scan-timeout 2
     警告を出して exit **130**。
   - `backup` / `monitor` / `keepalive`: connect・初回 `0x0007`・読み取り/ポーリングを含む
     **全体**を SIGINT とレースさせ、警告を出して exit **130**（取りこぼしなし）。
-  - flash 書込（`macro write` / `macro restore` / `config write` / `config set` / `config remap`）:
-    **非キャンセル（遅延）**。書込の完了を待ち、App Mode 警告と復旧案内
-    （部分適用の可能性・pre-write backup からの `macro restore` / `config write`・read-back 確認）
-    を出して exit **130**（書込自体が失敗した場合は exit 1）。
+  - flash 書込（`macro write` / `macro restore` / `config write` / `config set` / `config remap`）は
+    **二段階**:
+    - prepare 段階（connect、ファイル読込、pre-write backup、プラン作成、確認プロンプト）は
+      **キャンセル可**。SIGINT で future を drop し、**flash フレームを 1 つも送らずに** exit **130**。
+      確認プロンプトは async stdin を使うため、入力待ち中でも SIGINT が届きます。
+    - 最初の flash フレーム以降（`mark_flash_write_active` 後）は**非キャンセル（遅延）**。
+      書込の完了を待ち、App Mode 警告と復旧案内（部分適用の可能性・pre-write backup からの
+      `macro restore` / `config write`・read-back 確認）を出して exit **130**
+      （書込自体が失敗した場合は exit 1）。
   - 同時に完了と SIGINT が起きる場合は **コマンド完了を優先**します（成功直後の誤中断を避ける）。
-  - `scan`: リンクを持たないため警告なし（従来の SIGINT 終了。`scan --check` は exit code 契約）。
+  - `scan`: リンクを持たないため警告なし（従来の SIGINT 終了）。
+    `scan --check` は exit 0 = App Mode あり / 3 = なし（この 3 は **degraded の exit 3 とは別の文脈**）/
+    その他 = scan エラー、という独立した契約です。
 - 警告文は「BLE が切れて `80ND` が消える。再開には Profile 約 3 秒押しが必要」を明示します。
 - 切断処理（unsubscribe / disconnect）が失敗した場合、`BleTransport` は
   **単一所有者ロックを保持したまま** `Err` を返し、CLI は警告を表示します。
@@ -207,11 +223,13 @@ scan 失敗時の停止 / backoff の増加とリセット / backoff 中のコ�
   外部で構造体リテラルを構築しているコードは `lock_path: None` を追加する必要があります
   （または `..BleOptions::default()` を使用してください）。pre-1.0 のためマイナー変更として扱います。
 - 既定のロックパスは **`/tmp` 直下から per-user ディレクトリに変更**されました。
-  さらに `XDG_RUNTIME_DIR` / `XDG_CACHE_HOME` を参照せず、passwd の euid ホーム
-  （無ければ `$HOME`）由来の `~/.cache/8bitdo/8bitdo-ble.lock` に固定されました。
+  さらに `XDG_RUNTIME_DIR` / `XDG_CACHE_HOME` を参照せず、NSS（`getpwuid_r`）の euid ホーム
+  （無ければ temp の per-uid ディレクトリ）由来の `~/.cache/8bitdo/8bitdo-ble.lock` に固定されました。
   旧 `/tmp/8bitdo-ble.lock` や XDG 配下のパスを使う外部スクリプトは新しいパスに合わせてください。
-- 既定パスでは親ディレクトリの所有者/mode が検証されます。`EIGHTBITDO_BLE_LOCK` は
-  テスト/ラッパー用の例外で、親ディレクトリ検証をスキップします。
+- 既定パスでは親ディレクトリの所有者/mode **と symlink でないこと**が検証され、Unix では dirfd
+  （`openat`）で TOCTOU も閉じます。`EIGHTBITDO_BLE_LOCK` はテスト/ラッパー用の例外で、
+  **親ディレクトリの所有者/mode 検証のみ**スキップします（symlink parent の拒否と lock ファイル
+  自体の検証は維持）。
 - `scan --check` を追加しました（exit 0 = App Mode あり / 3 = なし）。人間向け出力の
   grep は不要です。
 - ロックは per-user であり、別ユーザー同士は排他しません。

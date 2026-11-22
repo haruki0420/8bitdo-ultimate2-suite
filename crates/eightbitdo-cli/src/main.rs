@@ -509,19 +509,21 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
         // Everything else holds the link through `BleTransport::connect` and
         // would otherwise die on SIGINT before the operator learns that 80ND
         // is gone. Wrap connect + command as one cancellable unit; flash
-        // writes are deferred instead (see `with_sigint_deferred`).
+        // commands use the two-phase `with_sigint_flash` instead.
         command @ (Command::Info | Command::Config { .. } | Command::Macro { .. }) => {
             if is_flash_command(&command) {
-                // Flash writes are non-cancellable: finish the write, then
-                // print recovery guidance and exit for the signal.
-                match with_sigint_deferred(
+                // Two phases: the prepare/prompt/backup part is cancellable,
+                // the write part is not (see `with_sigint_flash`).
+                reset_flash_write_active();
+                let outcome = with_sigint_flash(
                     dispatch_connected_command(&options, command),
                     wait_for_sigint(),
                 )
-                .await
-                {
-                    DeferredSigintOutcome::Finished(result) => result?,
-                    DeferredSigintOutcome::FinishedAfterInterrupt(result) => {
+                .await;
+                reset_flash_write_active();
+                match outcome {
+                    FlashSigintOutcome::Finished(result) => result?,
+                    FlashSigintOutcome::FinishedAfterInterrupt(result) => {
                         if let Err(error) = &result {
                             eprintln!("error: {error}");
                         }
@@ -531,6 +533,11 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                         } else {
                             EXIT_SESSION_ERROR
                         }));
+                    }
+                    FlashSigintOutcome::Cancelled => {
+                        // Dropped during prepare; no flash frame was sent.
+                        warn_sigint_disconnects();
+                        return Ok(ExitCode::from(EXIT_INTERRUPTED));
                     }
                 }
             } else {
@@ -719,7 +726,21 @@ async fn dispatch_macro_command(options: &BleOptions, command: MacroCommand) -> 
 async fn scan(timeout: Duration, check: bool) -> Result<ExitCode, Error> {
     let mut devices = scan_devices(timeout).await?;
     if check {
-        return Ok(ExitCode::from(scan_check_exit_code(&devices)));
+        let code = scan_check_exit_code(&devices);
+        if code == 0 {
+            if let Some(device) = devices.iter().find(|device| device.is_app) {
+                println!(
+                    "App Mode device found: {}",
+                    device.name.as_deref().unwrap_or("<unnamed>")
+                );
+            }
+        } else {
+            eprintln!(
+                "no App Mode (`{APP_BLE_NAME}`) device found within {} seconds",
+                timeout.as_secs_f64()
+            );
+        }
+        return Ok(ExitCode::from(code));
     }
     if devices.is_empty() {
         println!(
@@ -801,29 +822,10 @@ enum SigintOutcome<T> {
     Interrupted,
 }
 
-/// Result of racing a non-cancellable flash write against SIGINT.
-#[derive(Debug)]
-enum DeferredSigintOutcome<T> {
-    /// The flash write finished before any signal arrived.
-    Finished(T),
-    /// SIGINT arrived during the write; the write was allowed to finish.
-    FinishedAfterInterrupt(T),
-}
-
 /// Race a cancellable BLE-owning future against SIGINT.
 ///
 /// Completion is preferred when both are ready: a command that finished at the
-/// same moment as the signal keeps its result, so the caller does not report a
-/// spurious interrupt after a successful read.
-///
-/// Every command that opens or holds the BLE link must warn before dropping
-/// it: the controller stops advertising `80ND` the moment the link closes.
-/// Previously this was only true inside the `session` REPL, so a Ctrl-C during
-/// `connect`, the `0x0007` enable, or `info`/`config`/`macro` lost App Mode
-/// without telling the operator.
-///
-/// The signal future is injected so the race and its mapping are testable
-/// without delivering a real process signal.
+/// same moment as the signal keeps its result.
 async fn with_sigint<T, F, S>(future: F, signal: S) -> SigintOutcome<T>
 where
     F: Future<Output = T>,
@@ -837,14 +839,57 @@ where
     }
 }
 
-/// Race a non-cancellable flash write against SIGINT.
+/// Set when the first flash frame is about to be sent.
 ///
-/// A dropped flash future can leave a sector or the configuration partially
-/// written, so the write is allowed to finish. The signal is handled once (the
-/// App Mode warning is printed immediately) and reported as
-/// [`DeferredSigintOutcome::FinishedAfterInterrupt`] so the caller can also print the
-/// recovery guidance before exiting.
-async fn with_sigint_deferred<T, F, S>(future: F, signal: S) -> DeferredSigintOutcome<T>
+/// The top-level SIGINT wrapper uses this to split a flash command into a
+/// cancellable prepare phase (connect, reads, pre-write backup, confirmation
+/// prompt, plan) and a non-cancellable write phase. A single CLI command runs
+/// per process; tests exercise the wrapper with an explicit reset.
+static FLASH_WRITE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn mark_flash_write_active() {
+    FLASH_WRITE_ACTIVE.store(true, Ordering::SeqCst);
+}
+
+fn reset_flash_write_active() {
+    FLASH_WRITE_ACTIVE.store(false, Ordering::SeqCst);
+}
+
+/// Result of racing a two-phase flash command against SIGINT.
+#[derive(Debug)]
+enum FlashSigintOutcome<T> {
+    /// The command finished before any signal arrived.
+    Finished(T),
+    /// SIGINT arrived after the write started; the write was allowed to
+    /// finish and its result is reported here.
+    FinishedAfterInterrupt(T),
+    /// SIGINT arrived during the cancellable prepare phase; the future was
+    /// dropped before any flash frame was sent.
+    Cancelled,
+}
+
+/// Race a two-phase flash command against SIGINT.
+///
+/// Before [`mark_flash_write_active`] the future is dropped on SIGINT (prompt,
+/// pre-write backup and file reads are all cancellable). Once the first flash
+/// frame is about to be sent the signal is handled once (the App Mode warning
+/// is printed immediately) and the future is allowed to complete, so a
+/// partially written sector/configuration is not abandoned.
+async fn with_sigint_flash<T, F, S>(future: F, signal: S) -> FlashSigintOutcome<T>
+where
+    F: Future<Output = T>,
+    S: Future<Output = ()>,
+{
+    with_sigint_flash_gate(future, signal, &FLASH_WRITE_ACTIVE).await
+}
+
+/// Inner form of [`with_sigint_flash`] with the write-active gate injected so
+/// tests do not race the process-wide flag.
+async fn with_sigint_flash_gate<T, F, S>(
+    future: F,
+    signal: S,
+    write_active: &AtomicBool,
+) -> FlashSigintOutcome<T>
 where
     F: Future<Output = T>,
     S: Future<Output = ()>,
@@ -857,17 +902,21 @@ where
             biased;
             value = &mut future => {
                 return if signalled {
-                    DeferredSigintOutcome::FinishedAfterInterrupt(value)
+                    FlashSigintOutcome::FinishedAfterInterrupt(value)
                 } else {
-                    DeferredSigintOutcome::Finished(value)
+                    FlashSigintOutcome::Finished(value)
                 };
             }
             _ = &mut signal, if !signalled => {
-                signalled = true;
-                warn_app_mode_requires_press(
-                    "SIGINT received; the flash write in progress is not cancellable and will \
-                     finish before the process exits",
-                );
+                if write_active.load(Ordering::SeqCst) {
+                    signalled = true;
+                    warn_app_mode_requires_press(
+                        "SIGINT received; the flash write has started and is not cancellable, \
+                         so it will finish before the process exits",
+                    );
+                } else {
+                    return FlashSigintOutcome::Cancelled;
+                }
             }
         }
     }
@@ -2041,12 +2090,8 @@ async fn config_remap(
     validate_write_chunk_preconnect(write_chunk)?;
     let transport = BleTransport::connect(options).await?;
     let session = Session::new(transport);
-    let mut prompt = || confirm_config_write(&mut std::io::stdin().lock());
-    let confirmation = if assume_yes {
-        ConfigConfirmation::AssumeYes
-    } else {
-        ConfigConfirmation::Reader(&mut prompt)
-    };
+    let mut confirmation_io = TopLevelConfirmation::new(assume_yes);
+    let confirmation = confirmation_io.confirmation();
     let result = config_remap_session(
         &session,
         slot,
@@ -2117,9 +2162,10 @@ fn config_readback_crc_label(crc: ConfigCrcStatus) -> &'static str {
 enum ConfigConfirmation<'a> {
     /// `--yes` was passed: write without prompting.
     AssumeYes,
-    /// Prompt on stderr and read one line through this synchronous callback
-    /// (top-level stdin, or a cursor in tests). A `FnMut` keeps the whole
-    /// confirmation enum `Send` even when the REPL loop is spawned.
+    /// Prompt on stderr and read one line through this synchronous callback.
+    /// Kept for the existing unit tests; production top-level commands use
+    /// [`ConfigConfirmation::AsyncReader`] so SIGINT can cancel the prompt.
+    #[cfg_attr(not(test), allow(dead_code))]
     Reader(&'a mut (dyn FnMut() -> Result<bool, Error> + Send)),
     /// Prompt and read one line from the session REPL's async reader so the
     /// operator answers on the same input stream. `LineState` keeps the REPL's
@@ -2147,7 +2193,41 @@ impl ConfigConfirmation<'_> {
 /// The confirmation prompt shared by the sync and async readers.
 const CONFIG_CONFIRM_PROMPT: &str = "Type 'yes' to write the 2768-byte configuration: ";
 
-/// Ask for confirmation unless `--yes` was passed.
+/// Top-level `yes/no` confirmation that is assembled lazily.
+///
+/// The async stdin reader must outlive the `ConfigConfirmation` borrow, so it
+/// lives in this struct and [`TopLevelConfirmation::confirmation`] borrows it.
+/// Confirming through async I/O (instead of a blocking `std::io::stdin` read)
+/// lets SIGINT cancel the top-level prompt before any flash frame is sent.
+struct TopLevelConfirmation {
+    assume_yes: bool,
+    stdin: tokio::io::BufReader<tokio::io::Stdin>,
+    line_state: LineState,
+}
+
+impl TopLevelConfirmation {
+    fn new(assume_yes: bool) -> Self {
+        Self {
+            assume_yes,
+            stdin: tokio::io::BufReader::new(tokio::io::stdin()),
+            line_state: LineState::default(),
+        }
+    }
+
+    fn confirmation(&mut self) -> ConfigConfirmation<'_> {
+        if self.assume_yes {
+            ConfigConfirmation::AssumeYes
+        } else {
+            ConfigConfirmation::AsyncReader {
+                reader: &mut self.stdin,
+                line_state: &mut self.line_state,
+            }
+        }
+    }
+}
+
+/// Ask for confirmation unless `--yes` was passed (synchronous test helper).
+#[cfg_attr(not(test), allow(dead_code))]
 fn confirm_config_write(reader: &mut impl std::io::BufRead) -> Result<bool, Error> {
     eprint!("{CONFIG_CONFIRM_PROMPT}");
     std::io::stderr().flush()?;
@@ -2636,6 +2716,7 @@ async fn finish_config_prepared<T: Transport>(
         "writing 2768 bytes + Save; do not interrupt (Ctrl-C or power loss can leave the commit \
          unconfirmed)"
     );
+    mark_flash_write_active();
     let outcome = match session
         .write_full_config_with_chunk(
             &state.snapshot,
@@ -3028,12 +3109,8 @@ async fn config_write(
     let edited = read_and_validate_config_file(file, force_raw)?;
     let transport = BleTransport::connect(options).await?;
     let session = Session::new(transport);
-    let mut prompt = || confirm_config_write(&mut std::io::stdin().lock());
-    let confirmation = if assume_yes {
-        ConfigConfirmation::AssumeYes
-    } else {
-        ConfigConfirmation::Reader(&mut prompt)
-    };
+    let mut confirmation_io = TopLevelConfirmation::new(assume_yes);
+    let confirmation = confirmation_io.confirmation();
     let result = config_write_session(
         &session,
         &edited,
@@ -3057,12 +3134,8 @@ async fn config_set(
     validate_write_chunk_preconnect(write_chunk)?;
     let transport = BleTransport::connect(options).await?;
     let session = Session::new(transport);
-    let mut prompt = || confirm_config_write(&mut std::io::stdin().lock());
-    let confirmation = if assume_yes {
-        ConfigConfirmation::AssumeYes
-    } else {
-        ConfigConfirmation::Reader(&mut prompt)
-    };
+    let mut confirmation_io = TopLevelConfirmation::new(assume_yes);
+    let confirmation = confirmation_io.confirmation();
     let result = config_set_session(&session, set, backup_dir, confirmation, write_chunk).await;
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
@@ -3794,6 +3867,7 @@ async fn macro_write_session_inner<T: Transport>(
         macro_id(index),
         plan.steps.len(),
     );
+    mark_flash_write_active();
     let outcome = session.write_macro(&backup, slot, index, &plan).await?;
     warn_if_config_crc_invalid(outcome.config_crc_valid);
 
@@ -4393,6 +4467,7 @@ async fn macro_restore_session_core<T: Transport>(
             slot.index(),
             plans.len()
         );
+        mark_flash_write_active();
         match session.write_macro_slot(&backup, slot, &plans).await {
             Ok(outcome) => {
                 println!(
@@ -9498,26 +9573,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_sigint_deferred_lets_a_flash_write_finish_after_the_signal() {
+    async fn with_sigint_flash_cancels_only_before_the_write_starts() {
+        let write_active = AtomicBool::new(false);
+
+        // Prepare phase: the pending future is dropped at once, i.e. no flash
+        // frame is sent.
+        let outcome = with_sigint_flash_gate(
+            std::future::pending::<Result<u8, Error>>(),
+            std::future::ready(()),
+            &write_active,
+        )
+        .await;
+        assert!(
+            matches!(outcome, FlashSigintOutcome::Cancelled),
+            "a signal during prepare must cancel before any flash frame"
+        );
+
+        // Write phase: the future is allowed to finish.
+        write_active.store(true, Ordering::SeqCst);
         let future = async {
             tokio::task::yield_now().await;
             Ok::<u8, Error>(9)
         };
-        let outcome = with_sigint_deferred(future, std::future::ready(())).await;
+        let outcome = with_sigint_flash_gate(future, std::future::ready(()), &write_active).await;
         assert!(
-            matches!(
-                outcome,
-                DeferredSigintOutcome::FinishedAfterInterrupt(Ok(9))
-            ),
-            "the flash result must be preserved after a deferred signal"
+            matches!(outcome, FlashSigintOutcome::FinishedAfterInterrupt(Ok(9))),
+            "a signal after the write started must not abandon the write"
         );
 
-        let outcome =
-            with_sigint_deferred(async { Ok::<u8, Error>(9) }, std::future::pending::<()>()).await;
+        let outcome = with_sigint_flash_gate(
+            async { Ok::<u8, Error>(9) },
+            std::future::pending::<()>(),
+            &write_active,
+        )
+        .await;
         assert!(
-            matches!(outcome, DeferredSigintOutcome::Finished(Ok(9))),
+            matches!(outcome, FlashSigintOutcome::Finished(Ok(9))),
             "without a signal the result is a plain finished outcome"
         );
+    }
+
+    #[tokio::test]
+    async fn config_prompt_sigint_cancels_before_any_flash_frame() {
+        // Real top-level flow: read + pre-write backup + async prompt. SIGINT
+        // while the prompt is pending must drop the future before the first
+        // 0x0001/Save frame is sent.
+        let dir = scratch_dir("flash-prompt-cancel");
+        let initial = config_write_fixture();
+        let mut edited = initial.clone();
+        edited.set_profile_name(Slot::S2, "Edited").unwrap();
+        let transport = ConfigDeviceTransport::new(initial.clone());
+        let session = Session::new(&transport);
+        let (_writer, reader) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line_state = LineState::default();
+        let confirmation = ConfigConfirmation::AsyncReader {
+            reader: &mut reader,
+            line_state: &mut line_state,
+        };
+        let backup = dir.join("backup");
+        let write_active = AtomicBool::new(false);
+
+        let outcome = with_sigint_flash_gate(
+            async {
+                config_write_session(&session, &edited, Some(&backup), false, confirmation, None)
+                    .await
+            },
+            std::future::ready(()),
+            &write_active,
+        )
+        .await;
+        assert!(
+            matches!(outcome, FlashSigintOutcome::Cancelled),
+            "a prompt SIGINT must cancel before the flash phase"
+        );
+
+        let sent = transport.sent();
+        let flash_frame = sent.iter().any(|frame| {
+            let cmd = CustomHeader::parse(&frame[1..]).unwrap().cmd;
+            cmd == commands::cmd::WRITE_CONFIG || cmd == commands::cmd::SAVE
+        });
+        assert!(
+            !flash_frame,
+            "the cancelled prompt must not send any 0x0001/Save frame"
+        );
+        assert!(
+            backup.join("config.bin").is_file(),
+            "the pre-write backup (prepare phase) still exists"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
