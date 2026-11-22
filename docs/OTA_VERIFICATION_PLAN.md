@@ -104,15 +104,23 @@ btsnoop を取るには、実際に wire を流す駆動側が必要になる。
   - 各ステップで `OtaWriteState` / `OtaPhase` / `packets_sent` / `sectors_erased` /
     `chunks_written` を**標準エラーまたはログに記録**する（失敗時にどの段階で止まったかを
     capture と突き合わせる）。
-  - **Erase チェックポイント（`ota-bench` の段階実行 API が必要）**: 最初の Erase ACK を
+  - **Erase チェックポイント（`ota-bench` feature の段階実行 API）**: 最初の Erase ACK を
     受けた時点で Write へ進まず**停止**し、人間が btmon で `offset` / `total_len` / ACK 形状を
-    確認してから続行する（timeout では誤受理 ACK / 誤アドレスを検知できないため）。
-    **現行 API では実装できない**: `OtaUpdate::write_firmware` は Erase → Write → Finalize を
-    1 呼び出しで完走するため、Erase ACK で止める段階実行ができない。`impl-ble-ota` に依頼中の
-    `ota-bench` feature の**段階実行 API（Erase のみ / Write から / Finalize）**が提供されたら、
-    それを使って実装する（API 名・シグネチャは実装側で確定）。**未実装のまま「Erase 後に
-    停止する」と書かない。提供までは Phase B を実施しない。** 「Erase 1 回だけで終了する」
-    二段構えも同じ段階実行 API が必要。
+    確認してから次へ進む（timeout では誤受理 ACK / 誤アドレスを検知できないため）。
+    実 API は `impl-ble-ota`（head `8077287`、main 統合中）で実装済み:
+    - feature: **`eightbitdo-core/ota-bench`**（**既定 OFF**。無効時は型・メソッドが存在しない。
+      ハーネスは `#[cfg(feature = "ota-bench")]` で使う）
+    - `OtaUpdate::write_firmware_with_checkpoint(ready, image, progress, checkpoint)`
+    - `OtaCheckpoint::{AfterFirstErase, AfterWrites, AfterWriteVersion}`
+    - 戻り値 `OtaBenchOutcome { checkpoint, sectors_erased, chunks_written, bytes_written,
+      packets_sent, jump }`（停止時 `checkpoint: Some(..)` / `jump: None`、完走時
+      `checkpoint: None` / `jump: Some(..)`）
+    - 停止時の phase は **`OtaPhase::BenchStopped`**。端末は bootloader に残り、**同じ
+      `OtaUpdate` で再開できない**（続行・復旧は新しい `OtaUpdate` + 先頭からの全消去・再書込）
+    - 安全ゲートは通常と同一: **`allow_unverified_wire = true` 必須**、PID → `gamepad_type 1`、
+      expected base 一致、MTU 81B フレーム。feature 無効ビルドでは未定義
+    - **この API はまだ main に統合されていない**（`impl-ble-ota`）。統合までは Phase B を
+      実施しない。
   - **端末切断対策**: `tmux` / `setsid` などで端末から切り離して実行し、SIGINT / SIGHUP /
     端末クローズで書込途中にプロセスが落ちないようにする。
   - **完走するまで「wire 確定」と呼ばない**: Erase / Write / WriteVersion /
@@ -143,8 +151,10 @@ btsnoop を取るには、実際に wire を流す駆動側が必要になる。
   - 復旧可能な専用個体・検証専用ホストで行うこと
   - **最初の Erase ACK でいったん停止し、人間が `offset` / `total_len` / ACK 形状を
     確認してから Write へ進む**こと（timeout では誤受理 ACK・誤アドレスを検知できない）。
-    ただし**現行 API では段階実行できず、`ota-bench` の段階実行 API の提供待ち**（§2.2）。
-    提供までは Phase B を実施しない。
+    停止は
+    **`OtaUpdate::write_firmware_with_checkpoint(.., OtaCheckpoint::AfterFirstErase)`**
+    で行う（§2.2）。**Phase B の解禁条件は「`ota-bench` の bench API + `allow_unverified_wire =
+    true` + 人間チェックポイント」の 3 点**。
   - **最初の Erase で ACK 不明 / タイムアウト / アドレス疑いが出たら、その場で中止**する
     （再試行しない。§8.4 (i)）
   - ユーザーの承認があること
@@ -234,7 +244,7 @@ btsnoop を取るには、実際に wire を流す駆動側が必要になる。
 | 4 | `"8bt"` 広告 → 再接続 | 広告名、MTU 交換、FF20 / FF21・FF23 のどれか | **characteristic の index が `gamepad_type` の手掛かり**（EVIDENCE §6） |
 | 5 | `readPID` `0x0008`（5 s） | 応答形状と PID 値（`0x600F` 期待） | Phase A |
 | 6 | `readVersionInBoot` `0x0005`（5 s、offset `0x01017040`） | 応答形状と version 値 | Phase A。応答後 1〜2 秒で停止 |
-| 7 | （Phase B のみ）Erase / Write / WriteVersion / WriteFirmwareVersion / Jump | 各要求と ACK、payload、`offset` / `total_len` | **Phase A はここを送らない**。Erase ACK のチェックポイントは `ota-bench` 段階実行 API 提供後（§2.2） |
+| 7 | （Phase B のみ）Erase / Write / WriteVersion / WriteFirmwareVersion / Jump | 各要求と ACK、payload、`offset` / `total_len` | **Phase A はここを送らない**。`OtaCheckpoint::AfterFirstErase` で Erase ACK 後に停止（§8.3） |
 | 8 | （Phase B のみ）Jump 後の link close → `"80ND"` 再広告 → 再接続 → `ReadVersion` | 復帰とバージョン | Phase B の成功確認。Phase A は復帰しない |
 | 9 | **btmon 停止** | — | **Phase A: 手順 6 の後 1〜2 秒 / Phase B: 手順 8 の後 5〜10 秒** |
 
@@ -585,9 +595,10 @@ tshark -r excerpt.pcapng -Y 'btatt.handle == <target handle>' \
    ACK・アドレス・`chunk_len`・フレーム長は Phase B でしか観測できないため、「ACK / アドレスが
    確定してから書込む」という前提は**循環する**。したがって Phase B は
    (d) 公式アプリ capture を先に試して不可の理由を記録し、復旧可能な専用個体で行い、
-   **Erase チェックポイント（`ota-bench` の段階実行 API）を置き、初回 Erase の異常で
-   即中止する**という条件でのみ実施する（§8.3）。**段階実行 API が提供されるまでは
-   Phase B を実施しない。**
+   **Erase チェックポイント（`write_firmware_with_checkpoint` +
+   `OtaCheckpoint::AfterFirstErase`）を置き、初回 Erase の異常で即中止する**という条件でのみ
+   実施する（§8.3）。**Phase B の解禁条件は bench API + `allow_unverified_wire = true` +
+   人間チェックポイントの 3 点。**
 3. **公式ファームウェアのみ**を使う。配信元から取得し、ファイルサイズと SHA-256 を記録する。
    マルチセクション `.dat` は現実装では拒否される（blocker）。書込前に
    `28 + header[8] == file_size` を確認する。
@@ -634,14 +645,21 @@ Phase B は **未確定 wire に対する最初のフラッシュ書込**であ�
    進め、ACK 形状を採取結果から確定する（§7.3）。
 7. 書込前に `expected_load_base` が `.dat +0x04` と一致することを確認する（不一致なら
    Erase 前に `OtaInvalidFirmware` で停止する）。
-8. **Erase チェックポイント（`ota-bench` 段階実行 API が前提）**。最初の Erase ACK を
-   受けた時点でいったん停止し、人間が btmon で `offset` / `total_len` / ACK 形状
-   （payload-less か、envelope か）を確認してから Write へ進む。timeout では誤受理 ACK・
-   誤アドレスを検知できないため、この停止を省略しない。**現行 API は Erase → Write →
-   Finalize を 1 呼び出しで完走するため段階実行できず、`impl-ble-ota` の `ota-bench`
-   feature（Erase のみ / Write から / Finalize）の提供後に、その API を使って実装する。
-   提供までは Phase B を実施しない。** 「Erase 1 回だけで終了する」二段構えも同じ API が必要
-   （再開はせず毎回先頭から消去する）。
+8. **Erase チェックポイントは `ota-bench` の段階実行 API で行う**。
+   `OtaUpdate::write_firmware_with_checkpoint(ready, image, progress,
+   OtaCheckpoint::AfterFirstErase)` は**最初の Erase ACK 後に `OtaPhase::BenchStopped` で
+   停止**する（Write は送らない）。停止後は同じ `OtaUpdate` で再開できないため、採取は次の
+   **3 セッション**に分ける（各セッションは新しい `OtaUpdate` で先頭から全消去・再書込。
+   レジュームしない）:
+   1. `AfterFirstErase`: Erase 要求 / ACK を採取 → 人間が `offset` / `total_len` / ACK 形状を
+      確認し、問題なければ次へ
+   2. 新しい `OtaUpdate` で `AfterWriteVersion`: 全 Write チャンク + `WriteVersion` を採取して
+      停止 → 人間が Write ACK / アドレス / フレーム長 / MTU / `WriteVersion` payload を確認
+      （Write 層だけ切り分けたい場合は `AfterWrites` を挟む）
+   3. 新しい `OtaUpdate` で通常の `write_firmware`: `WriteFirmwareVersion` + `JumpApp` まで
+      完走 → `"80ND"` 復帰と version を確認（これで全 wire が記録できたことになる）
+   各セッションの `OtaBenchOutcome`（`checkpoint` / `sectors_erased` / `chunks_written` /
+   `bytes_written` / `packets_sent` / `jump`）をログに残す。
 9. **「wire 確定」の定義**: (d) 公式 capture またはこの Phase B が**最後まで完走**し、
    Erase / Write / WriteVersion / WriteFirmwareVersion / Jump の**全 wire が記録済み**に
    なって初めて確定。Erase だけ成功して Write で失敗した部分記録は確定ではない（§8.4）。
@@ -705,9 +723,11 @@ Phase B は **未確定 wire に対する最初のフラッシュ書込**であ�
 - [ ] Phase B の場合: `allow_unverified_wire=true` は一時ハーネスのみで、コミットしない
 - [ ] Phase B の場合: ハーネスが非キャンセル / no retry / `OtaWriteState` ログを満たす
 - [ ] Phase B の場合: ハーネスを `tmux` / `setsid` 等で端末から切り離して実行する
-- [ ] Phase B の場合: `ota-bench` の段階実行 API（Erase のみ / Write から / Finalize）が
-      提供され、最初の Erase ACK で停止できることを確認した（**提供前は Phase B を
-      実施しない**）
+- [ ] Phase B の場合: `ota-bench` feature を有効にしたハーネスで
+      `OtaUpdate::write_firmware_with_checkpoint` と `OtaCheckpoint::AfterFirstErase` が
+      使えることを確認した（既定ビルドにこれらの型・メソッドが**無い**ことも確認）
+- [ ] Phase B の場合: `AfterFirstErase` で停止し、人間が `offset` / `total_len` / ACK 形状を
+      確認してから次セッションへ進んだ（timeout では誤受理 ACK を検知できない）
 - [ ] Phase B の場合: 最初の Erase の異常（ACK 不明 / タイムアウト / アドレス疑い）で
       即中止する手順を確認した（再試行しない）
 
@@ -748,11 +768,11 @@ Phase B は **未確定 wire に対する最初のフラッシュ書込**であ�
 1. **(d) 公式アプリ capture の可否判定（未試行）**: 公式アプリで OTA を完遂できるか、HCI
    スヌープログに boot 遷移から Jump まで残るかを最初に確認する。不可なら「どの段階で止まったか」
    を EVIDENCE に記録する（§2.2）。
-2. **`ota-bench` 段階実行 API の提供待ち（Phase B の blocker）**: Erase チェックポイントは
-   現行の `OtaUpdate::write_firmware`（Erase → Write → Finalize を 1 呼び出し）では実装できない。
-   `impl-ble-ota` の `ota-bench` feature（Erase のみ / Write から / Finalize）が提供されたら、
-   plan §2.2 / §8.3 / §8.5 を**実際の API 名**で更新し、Phase B を解禁する。**提供までは
-   Phase B を実施しない。**
+2. **`ota-bench` 段階実行 API（実装済み・main 統合待ち）**: `impl-ble-ota`（head `8077287`）で
+   `eightbitdo-core/ota-bench` feature、`OtaUpdate::write_firmware_with_checkpoint`、
+   `OtaCheckpoint`、`OtaBenchOutcome`、`OtaPhase::BenchStopped` が実装された。plan は実 API 名に
+   更新済み。**main へ統合されたら**、Phase B を「bench API + `allow_unverified_wire=true` +
+   人間チェックポイント」の条件で解禁する。**main 未統合の間は Phase B を実施しない。**
 3. **駆動手段が無い**: CLI / GUI / UniFFI に OTA が未配線。Phase A から一時ハーネスか
    配線済みフロントエンドが必要（§2.2）。ハーネスはコミットしない。
 4. **公式 `.dat` の入手・検証**: 配信 API のレスポンス（`md5` のクセを含む）と、
