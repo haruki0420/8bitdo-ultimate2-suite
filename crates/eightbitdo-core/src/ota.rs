@@ -141,6 +141,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+#[cfg(feature = "mobile-boot")]
 use async_trait::async_trait;
 use eightbitdo_protocol::commands::{self, boot, cmd};
 use eightbitdo_protocol::header::{decode_app_response, CustomHeader, HEADER_SIZE};
@@ -236,10 +237,12 @@ pub const UT2_TYPE1_APP_FLASH_END: u32 = 0x0102_0000;
 /// [`BleBootTransport`](crate::ble::BleBootTransport).
 ///
 /// For native mobile transports the sealed marker cannot be implemented by
-/// `eightbitdo-uniffi`; use the hidden [`MobileBootLink::from_native`] adapter
-/// instead. That adapter accepts any [`Transport`], so the boot framing /
-/// ownership / lock contract becomes the caller's responsibility; **USB and
-/// App Mode links are not excluded by the type system** on that path.
+/// `eightbitdo-uniffi`. That crate enables the `mobile-boot` feature and uses
+/// the hidden [`MobileBootLink::from_native`] adapter, which exists only in
+/// that feature build. The adapter accepts any [`Transport`], so the boot
+/// framing / ownership / lock contract becomes the caller's responsibility;
+/// **USB and App Mode links are not excluded by the type system** on that path.
+/// The desktop default build does not contain `MobileBootLink` at all.
 pub trait OtaTransport: Transport + sealed::Sealed {}
 
 mod sealed {
@@ -261,9 +264,11 @@ impl OtaTransport for crate::ble::BleBootTransport {}
 /// [`OtaTransport`] is sealed, so downstream crates cannot implement it.
 /// `MobileBootLink` is the **documented escape hatch for native mobile
 /// transports**: the crate implements the marker for this wrapper, and the
-/// caller injects its own [`Transport`]. It is `#[doc(hidden)]` because desktop
-/// front ends must use [`BleBootTransport`](crate::ble::BleBootTransport),
-/// which resolves `"8bt"` / `FF20` / `FF21` and takes the single-owner BLE lock.
+/// caller injects its own [`Transport`]. It exists only when the
+/// `mobile-boot` feature is enabled (desktop builds do not contain the type)
+/// and is `#[doc(hidden)]`. Desktop front ends must use
+/// [`BleBootTransport`](crate::ble::BleBootTransport), which resolves `"8bt"` /
+/// `FF20` / `FF21` and takes the single-owner BLE lock.
 ///
 /// # Trust contract (caller-owned)
 ///
@@ -282,9 +287,11 @@ impl OtaTransport for crate::ble::BleBootTransport {}
 /// * be owned exclusively by this update, and hold its own single-owner lock
 ///   (or equivalent) so no App Mode session / other process races it. The
 ///   adapter does **not** acquire the BLE lock and does not close the App link.
+#[cfg(feature = "mobile-boot")]
 #[doc(hidden)]
 pub struct MobileBootLink<T: Transport>(T);
 
+#[cfg(feature = "mobile-boot")]
 impl<T: Transport> MobileBootLink<T> {
     /// Wrap a native boot transport for UniFFI / mobile integration.
     ///
@@ -301,10 +308,13 @@ impl<T: Transport> MobileBootLink<T> {
     }
 }
 
+#[cfg(feature = "mobile-boot")]
 impl<T: Transport> sealed::Sealed for MobileBootLink<T> {}
 
+#[cfg(feature = "mobile-boot")]
 impl<T: Transport> OtaTransport for MobileBootLink<T> {}
 
+#[cfg(feature = "mobile-boot")]
 #[async_trait]
 impl<T: Transport> Transport for MobileBootLink<T> {
     async fn send(&self, data: &[u8]) -> Result<(), Error> {
@@ -331,6 +341,16 @@ pub enum GamepadType {
     /// `readVersionInBoot` / `WriteFirmwareVersion` offset `0x01017040` and the
     /// `JumpApp` entry `0x01018000` are documented.
     Type1,
+}
+
+/// How the App Mode EnterBoot transition was observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnterBootOutcome {
+    /// The bootloader acknowledged `0x000C`.
+    Acknowledged,
+    /// The App Mode link closed after `0x000C` (the controller rebooted
+    /// without an ACK, which is the expected real-hardware behavior).
+    LinkClosed,
 }
 
 /// How the `0x0006` JumpApp transition was confirmed.
@@ -963,6 +983,14 @@ impl OtaUpdate {
     /// or [`Error::Ota`] with stage [`OtaFailureStage::EnterBoot`] when the
     /// frame could not be sent or the ACK timed out.
     pub async fn enter_boot<T: Transport>(&mut self, app: &Session<T>) -> Result<(), Error> {
+        self.enter_boot_inner(app).await.map(|_| ())
+    }
+
+    /// Like [`OtaUpdate::enter_boot`], but reports how the reboot was observed.
+    async fn enter_boot_inner<T: Transport>(
+        &mut self,
+        app: &Session<T>,
+    ) -> Result<EnterBootOutcome, Error> {
         if self.phase != OtaPhase::Idle {
             return Err(Error::InvalidRequest(format!(
                 "EnterBoot requires the Idle phase (current phase is {:?})",
@@ -983,14 +1011,14 @@ impl OtaUpdate {
         match result {
             Ok(()) => {
                 self.phase = OtaPhase::AwaitingBootReconnect;
-                Ok(())
+                Ok(EnterBootOutcome::Acknowledged)
             }
             // The controller reboots into "8bt" and may drop the link before
             // (or instead of) an ACK. No flash frame follows without a PID
             // check, so this is safe to accept.
             Err(Error::Disconnected) => {
                 self.phase = OtaPhase::AwaitingBootReconnect;
-                Ok(())
+                Ok(EnterBootOutcome::LinkClosed)
             }
             Err(error) => Err(self.fail(
                 OtaFailureStage::EnterBoot,
@@ -1010,27 +1038,45 @@ impl OtaUpdate {
     /// [`Error::BleBusy`]). The helper calls [`OtaUpdate::enter_boot`], then
     /// [`Session::into_inner`] and [`Transport::disconnect`].
     ///
+    /// The teardown is best-effort:
+    ///
+    /// * when EnterBoot was accepted because the link already closed, teardown
+    ///   errors are ignored (the link is gone and dropping the transport
+    ///   releases the BLE lock);
+    /// * a teardown [`Error::Disconnected`] is accepted after an acknowledged
+    ///   EnterBoot for the same reason;
+    /// * the App link is disconnect-attempted even when EnterBoot itself fails,
+    ///   so a failed attempt does not leave the lock holder behind.
+    ///
     /// # Errors
     ///
     /// Same as [`OtaUpdate::enter_boot`], or [`Error::Ota`] with stage
-    /// [`OtaFailureStage::EnterBoot`] when the App link teardown fails. In that
-    /// case the boot link cannot take the lock; close the App session and
-    /// restart from a new `OtaUpdate`.
+    /// [`OtaFailureStage::EnterBoot`] when the App link teardown fails after an
+    /// acknowledged EnterBoot. Close the App session and restart from a new
+    /// `OtaUpdate`.
     pub async fn enter_boot_and_release<T: Transport>(
         &mut self,
         app: Session<T>,
     ) -> Result<(), Error> {
-        self.enter_boot(&app).await?;
+        let enter = self.enter_boot_inner(&app).await;
+        // Best effort: attempt the teardown even when EnterBoot failed.
         let transport = app.into_inner();
-        if let Err(error) = transport.disconnect().await {
-            return Err(self.fail(
-                OtaFailureStage::EnterBoot,
-                OtaWriteState::Untouched,
-                error,
-                RECOVERY_ENTER_BOOT_RELEASE,
-            ));
+        let teardown = transport.disconnect().await;
+        match enter {
+            Ok(EnterBootOutcome::Acknowledged) => match teardown {
+                Ok(()) | Err(Error::Disconnected) => Ok(()),
+                Err(error) => Err(self.fail(
+                    OtaFailureStage::EnterBoot,
+                    OtaWriteState::Untouched,
+                    error,
+                    RECOVERY_ENTER_BOOT_RELEASE,
+                )),
+            },
+            // The controller rebooted and closed the link; any teardown error
+            // is expected. Dropping the transport releases the BLE lock.
+            Ok(EnterBootOutcome::LinkClosed) => Ok(()),
+            Err(error) => Err(error),
         }
-        Ok(())
     }
 
     /// Read the bootloader PID, verify `gamepad_type`, and optionally read the
@@ -1654,7 +1700,8 @@ fn controller_error(description: &str, payload: &[u8]) -> Error {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::{Arc, Mutex, PoisonError};
 
     use async_trait::async_trait;
     use eightbitdo_protocol::crc::packet_crc16;
@@ -3144,6 +3191,7 @@ mod tests {
         assert_eq!(update.chunks_written(), 64);
     }
 
+    #[cfg(feature = "mobile-boot")]
     #[tokio::test]
     async fn mobile_boot_link_allows_an_external_boot_transport() {
         let image_bytes = one_sector_image();
@@ -3178,6 +3226,7 @@ mod tests {
         assert_eq!(sent_boot(&mock).len(), 70);
     }
 
+    #[cfg(feature = "mobile-boot")]
     #[test]
     fn mobile_boot_link_returns_the_wrapped_transport() {
         let mock = high_mtu_mock();
@@ -3186,6 +3235,7 @@ mod tests {
         assert_eq!(mock.mtu(), 92);
     }
 
+    #[cfg(feature = "mobile-boot")]
     #[tokio::test]
     async fn mobile_boot_link_delegates_receive_errors() {
         let transport = PendingAfter::new(vec![pid_response(UT2_BOOT_PID)]);
@@ -3224,12 +3274,159 @@ mod tests {
         assert!(mock.is_disconnected());
     }
 
+    #[tokio::test]
+    async fn enter_boot_and_release_accepts_a_link_close_with_a_failing_disconnect() {
+        let (link, _called) = ScriptedLink::new(
+            Vec::new(),
+            RecvMode::Disconnected,
+            DisconnectMode::Disconnected,
+        );
+        let session = Session::new(link);
+        let mut update = new_update();
+
+        update.enter_boot_and_release(session).await.unwrap();
+
+        assert_eq!(update.phase(), OtaPhase::AwaitingBootReconnect);
+    }
+
+    #[tokio::test]
+    async fn enter_boot_and_release_reports_a_teardown_failure_after_ack() {
+        let (link, _called) = ScriptedLink::new(
+            vec![frame(cmd::RESPONSE, cmd::ENTER_BOOT, &[])],
+            RecvMode::Disconnected,
+            DisconnectMode::Transport("injected teardown failure".to_string()),
+        );
+        let session = Session::new(link);
+        let mut update = new_update();
+
+        let error = update.enter_boot_and_release(session).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                Error::Ota {
+                    stage: OtaFailureStage::EnterBoot,
+                    state: OtaWriteState::Untouched,
+                    ..
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(update.phase(), OtaPhase::Failed);
+    }
+
+    #[tokio::test]
+    async fn enter_boot_and_release_disconnects_when_enter_boot_fails() {
+        let (link, disconnect_called) =
+            ScriptedLink::new(Vec::new(), RecvMode::Pending, DisconnectMode::Ok);
+        let session = Session::new(link);
+        let mut update = update_with_timeouts(OtaTimeouts {
+            enter_boot: Duration::from_millis(1),
+            ..OtaTimeouts::default()
+        });
+
+        let error = update.enter_boot_and_release(session).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Ota {
+                stage: OtaFailureStage::EnterBoot,
+                ..
+            }
+        ));
+        assert!(
+            disconnect_called.load(AtomicOrdering::SeqCst),
+            "the App link must be disconnect-attempted even when EnterBoot fails"
+        );
+    }
+
     #[test]
     fn phase_terminal_flag() {
         assert!(!OtaPhase::Idle.is_terminal());
         assert!(!OtaPhase::Ready.is_terminal());
         assert!(OtaPhase::Complete.is_terminal());
         assert!(OtaPhase::Failed.is_terminal());
+    }
+
+    /// What the scripted link does when its frame queue is empty.
+    #[derive(Clone, Copy)]
+    enum RecvMode {
+        Pending,
+        Disconnected,
+    }
+
+    /// What the scripted link reports from `disconnect`.
+    #[derive(Clone)]
+    enum DisconnectMode {
+        Ok,
+        Disconnected,
+        Transport(String),
+    }
+
+    /// A small transport used for EnterBoot / teardown edge cases.
+    struct ScriptedLink {
+        incoming: Mutex<VecDeque<Vec<u8>>>,
+        recv_mode: RecvMode,
+        disconnect_mode: DisconnectMode,
+        disconnect_called: Arc<AtomicBool>,
+    }
+
+    impl ScriptedLink {
+        fn new(
+            incoming: Vec<Vec<u8>>,
+            recv_mode: RecvMode,
+            disconnect_mode: DisconnectMode,
+        ) -> (Self, Arc<AtomicBool>) {
+            let called = Arc::new(AtomicBool::new(false));
+            (
+                Self {
+                    incoming: Mutex::new(incoming.into()),
+                    recv_mode,
+                    disconnect_mode,
+                    disconnect_called: Arc::clone(&called),
+                },
+                called,
+            )
+        }
+    }
+
+    impl super::sealed::Sealed for ScriptedLink {}
+
+    impl OtaTransport for ScriptedLink {}
+
+    #[async_trait]
+    impl Transport for ScriptedLink {
+        async fn send(&self, _data: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn recv(&self) -> Result<Vec<u8>, Error> {
+            if let Some(frame) = self
+                .incoming
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()
+            {
+                return Ok(frame);
+            }
+            match self.recv_mode {
+                RecvMode::Pending => std::future::pending().await,
+                RecvMode::Disconnected => Err(Error::Disconnected),
+            }
+        }
+
+        fn mtu(&self) -> u16 {
+            92
+        }
+
+        async fn disconnect(&self) -> Result<(), Error> {
+            self.disconnect_called.store(true, AtomicOrdering::SeqCst);
+            match &self.disconnect_mode {
+                DisconnectMode::Ok => Ok(()),
+                DisconnectMode::Disconnected => Err(Error::Disconnected),
+                DisconnectMode::Transport(message) => Err(Error::Transport(message.clone())),
+            }
+        }
     }
 
     /// A transport that replays queued frames and then never answers again.

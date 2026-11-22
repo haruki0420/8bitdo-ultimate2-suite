@@ -740,8 +740,9 @@ Bootloader Mode (`"8bt"`, Service `0000FF20-...`, Char `0000FF21-...`) では先
 - `OtaUpdate` の段階: `Idle` → `EnteringBoot`（`0x000C`）→ `AwaitingBootReconnect`（`"8bt"` への再接続はフロントエンドの責務）→ `PreparingBoot`（`readPID 0x0008` → `gamepad_type` 判定 → 任意で `readVersionInBoot 0x0005`）→ `Ready` → `Erasing` / `Writing` / `Finalizing` → `Complete`（失敗時は `Failed`）。
 - `prepare_boot` は **`BootReady<'a, T>` ガード**を返し、`write_firmware` はそのガードのみを受け付ける。ガードは PID 読みに使った boot transport を借用し、生成元 `OtaUpdate` の ID も保持するため、「PID 確認後のリンク」と「書込リンク」を別にできない（型 + 実行時 ID 照合）。
   - **デスクトップ**: boot 専用 `BleBootTransport`（`"8bt"` / service `FF20` / characteristic `FF21`・`FF23`）のみを使う。`OtaTransport` マーカーは sealed で、crate 内の Mock とこの型だけに実装される。App Mode `BleTransport`（`"80ND"` / `FF10`）と USB transport はこの経路では型で排除される。
-  - **モバイル / UniFFI**: sealed のため外部 crate は `OtaTransport` を実装できない。代わりに crate 内の **`MobileBootLink<T: Transport>`**（`#[doc(hidden)]`、`from_native`）でネイティブ boot transport を包む。この経路は任意の `Transport` を受け取るため、**App Mode / USB transport を型では排除できない**。`"8bt"`/FF20/FF21 への接続、TX への追加 prefix なし、RX の 16B ヘッダ先頭、MTU、単一所有、ロック取得は **呼び出し側の契約責任**（アダプタはロックを取らない）。
+  - **モバイル / UniFFI**: sealed のため外部 crate は `OtaTransport` を実装できない。代わりに crate 内の **`MobileBootLink<T: Transport>`**（`#[cfg(feature = "mobile-boot")]` + `#[doc(hidden)]`、`from_native`）でネイティブ boot transport を包む。**デスクトップ既定ビルドにはこの型が存在しない**。`eightbitdo-uniffi` だけが `eightbitdo-core/mobile-boot` を有効化する。有効化したビルドでは任意の `Transport` を受け取るため、**App Mode / USB transport を型では排除できない**。`"8bt"`/FF20/FF21 への接続、TX への追加 prefix なし、RX の 16B ヘッダ先頭、MTU、単一所有、ロック取得は **呼び出し側の契約責任**（アダプタはロックを取らない）。
   - **順序**: App Mode の `enter_boot` 後、`"8bt"` に接続する前に App `Session` を drop / disconnect する。両リンクは同じ single-owner BLE ロックを取るため、生きた App Session があると `BleBootTransport::connect` は `BleBusy` を返す。`OtaUpdate::enter_boot_and_release` が EnterBoot + App リンク切断をまとめて行う。`BleBusy` には「App Mode セッションを切断してから再試行」が含まれる。
+  - `enter_boot_and_release` の teardown は best-effort: EnterBoot が **リンククローズ（Disconnected）を受理**した場合は `disconnect()` のエラー（Disconnected 含む）を無視して成功扱いにする（drop でロック解放）。EnterBoot 自体が失敗した場合も App リンクを disconnect 試行する。ACK 受理後の teardown が Disconnected の場合は成功扱い、それ以外の teardown 失敗は `OtaFailureStage::EnterBoot` / `Untouched` で fail-closed。
 - 期待 app base の組み込み検証: `OtaConfig::new(expected_load_base)` と `OtaUpdate::with_config` は、base が **type 1 の暫定 application ウィンドウ `0x0101_0000..0x0102_0000`**（`UT2_TYPE1_APP_BASE_MIN..UT2_TYPE1_APP_FLASH_END`）内で 4KB アラインであることを要求する。さらに `write_firmware` は `.dat +0x04` の `load_base_addr` が `expected_load_base` と厳密一致し、`expected_load_base + image_len <= UT2_TYPE1_APP_FLASH_END` であることを **最初の Erase 前**に検査し、外れたら `OtaInvalidFirmware` で停止する。`load_base = 0` / bootloader 領域 / type 0 の `0x0801_xxxx` は拒否される。
   - このウィンドウは、文書化された type 1 のアドレス（`readVersionInBoot`/`WriteFirmwareVersion` = `0x01017040`、`JumpApp` = `0x01018000`）を含み、0 番地・bootloader・type 0 領域を除外する **暫定の 64 KiB アライン範囲**である。公式 `.dat` の `load_base_addr` と実フラッシュサイズは未測定のため、実機と公式 `.dat` で確定するまで暫定値として扱い、CLI 配線は保留する。
 - MTU 事前検証: 最初の Erase 前に `mtu - 3 >= 81`（`OTA_MIN_MTU = 84`）を検証し、不足なら `MtuTooSmall` で停止する。最大フレームは 64B WriteFirmware の **81B**（1B prefix + 16B header + 64B payload）。Erase 17B / WriteVersion 41B / WriteFirmwareVersion 21B / JumpApp 17B はこれに収まる。App Mode の観測 MTU は 92 だが、**Bootloader の実 MTU は未確認**。
@@ -785,20 +786,20 @@ payload-less の ready ACK が完了 ACK より先に届く場合、Erase 完了
 10. **タイムアウト差**: `readPID` / `readVersionInBoot` は仕様の 5s を実装。証跡 §5 は Android 実装が 2s と報告。
 11. **Bootloader の MTU**: 81B フレームが通るかは未確認。`MTU >= 84` は `mtu - 3` の host 側推論であり、デバイス要件として確認されていない。
 12. **マルチセクション `.dat`（blocker）**: 単一セクションのみ対応。証跡 §8 のとおり公式 `.dat` がマルチセクションである可能性が高く、その場合この実装は更新を拒否する。**公式ファームウェア対応の blocker であり、次 PR の必須項目**。
-13. **遅延 / 重複 ACK の誤帰属**: Bootloader ACK にシーケンス番号はなく、前チャンクの遅延 ACK を次チャンクの ACK として消費し得る。`require_completion_ack` は 2 フレーム消費でリスクを下げるが排除できない。実機 btsnoop で ACK 順序を確認するまでフラッシュ経路を使わない。
+13. **遅延 / 重複 ACK の誤帰属**: Bootloader ACK にシーケンス番号はなく、前チャンクの遅延 ACK を次チャンクの ACK として消費し得る。`require_completion_ack` は 2 フレーム消費でリスクを下げるが排除できない。**CLI 配線前に、ACK の `offset` / `total_len`（可能なら `chunk_len`）を要求コマンドと照合する実装を追加することを必須項目とする**。実機 btsnoop で ACK 順序を確認するまでフラッシュ経路を使わない。
 14. **`load_base_addr` の来歴**: 本実装は `expected_load_base` との厳密一致だけを検証し、`.dat` の署名・ハッシュ・配信元は検証しない。呼び出し元が信頼できる `.dat` と期待 base を渡す trust boundary である。
 15. **バッテリー / ダウングレード / ファームウェア取得・検証**: 本 PR の範囲外。
 
 #### CLI / GUI / UniFFI 配線時の必須検証（配線は保留）
 
-1. 実機 btsnoop で Bootloader RX フレーミング、ready/完了 ACK（WriteVersion 含む）、Erase/Write のアドレス規約、`WriteVersion` payload 長、`WriteFirmware` 実フレーム長、Erase の `chunk_len`、Bootloader MTU を確定する。
+1. 実機 btsnoop で Bootloader RX フレーミング、ready/完了 ACK（WriteVersion 含む）、Erase/Write のアドレス規約、`WriteVersion` payload 長、`WriteFirmware` 実フレーム長、Erase の `chunk_len`、Bootloader MTU を確定する。**そのうえで ACK の `offset` / `total_len` 照合を実装し、遅延 ACK の誤帰属を防ぐ。**
 2. 公式 `.dat` の `load_base_addr` / `image_len` / セクション数を実測し、`UT2_TYPE1_APP_BASE_MIN` / `UT2_TYPE1_APP_FLASH_END` の暫定ウィンドウを確定値に置き換える（外れた画像は Erase 前に拒否する）。
 3. マルチセクション `.dat` をサポートするか、公式 `.dat` 非対応を明示する（blocker 解消）。
 4. `require_completion_ack` の既定値を実 wire に合わせて確定し、`allow_unverified_wire` を削除または明示的なベンチ専用に限定する。
 5. バッテリー残量、バージョン / ダウングレード判定、ダウンロード整合性（SHA-256 / 署名）を追加する。
-6. デスクトップは boot 専用 `BleBootTransport` のみを使う（App Mode / USB は型で排除）。モバイルは `MobileBootLink` でネイティブ boot transport（`"8bt"`/FF20/FF21）を包むが、型では App Mode / USB を排除できないため、フレーミング・単一所有・ロック・App Session 切断の契約をレビューで確認する。
+6. デスクトップは boot 専用 `BleBootTransport` のみを使う（App Mode / USB は型で排除）。モバイルは `mobile-boot` feature を有効化したビルドでのみ `MobileBootLink` を使い、ネイティブ boot transport（`"8bt"`/FF20/FF21）を包む。型では App Mode / USB を排除できないため、フレーミング・単一所有・ロック・App Session 切断の契約をレビューで確認する。既定 feature のビルドに `MobileBootLink` が存在しないことも CI で確認する。
 7. 成功判定は ACK だけでなく、`"80ND"` への再接続と App Mode のバージョン読み出しで確認する。
 
 #### テスト
 
-MockTransport による **50 テスト**: 正常系の全パケット列・CRC・チャンク境界・セクタ境界・複数セクタ進捗・部分セクタ、Erase/Write/WriteVersion/WriteFirmwareVersion/Jump の失敗、送信失敗、ACK タイムアウト（リトライなし）、PID 不一致、ready/completion ACK ガード（スキップ成功・単独 ACK タイムアウト）、MTU 不足、type 1 ウィンドウ外・`base + image_len` 上限超過・境界ちょうど、transport 不一致（ガード）、未確認 wire ゲート、`0x000E` 応答、キャンセル、マルチセクション拒否メッセージ、`load_base + image_len` の 2^32 境界、WriteVersion の ready ACK 単独タイムアウト、`MobileBootLink` アダプタ（成功・受信エラー・into_inner）、`enter_boot_and_release` の App リンク切断。
+MockTransport による **53 テスト**（`mobile-boot` 有効時。既定ビルドは 50）: 正常系の全パケット列・CRC・チャンク境界・セクタ境界・複数セクタ進捗・部分セクタ、Erase/Write/WriteVersion/WriteFirmwareVersion/Jump の失敗、送信失敗、ACK タイムアウト（リトライなし）、PID 不一致、ready/completion ACK ガード（スキップ成功・単独 ACK タイムアウト）、MTU 不足、type 1 ウィンドウ外・`base + image_len` 上限超過・境界ちょうど、transport 不一致（ガード）、未確認 wire ゲート、`0x000E` 応答、キャンセル、マルチセクション拒否メッセージ、`load_base + image_len` の 2^32 境界、WriteVersion の ready ACK 単独タイムアウト、`MobileBootLink` アダプタ（成功・受信エラー・into_inner）、`enter_boot_and_release` の App リンク切断。

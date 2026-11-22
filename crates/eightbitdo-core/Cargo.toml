@@ -11,6 +11,10 @@ authors.workspace = true
 [features]
 default = ["ble"]
 ble = ["dep:btleplug", "dep:futures-util", "dep:fs2", "dep:rustix", "dep:nix"]
+# Mobile (UniFFI) escape hatch for native boot transports. Enabled only by
+# `eightbitdo-uniffi`; the desktop default build does not contain the adapter
+# type at all.
+mobile-boot = []
 
 [dependencies]
 eightbitdo-protocol = { path = "../eightbitdo-protocol" }

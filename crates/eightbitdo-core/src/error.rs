@@ -393,3 +393,24 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
+
+#[cfg(all(test, feature = "ble"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ble_busy_message_mentions_app_mode_disconnect() {
+        let error = Error::BleBusy {
+            path: std::path::PathBuf::from("/tmp/8bitdo-test.lock"),
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("App Mode session"),
+            "BleBusy must explain the App Mode session: {message}"
+        );
+        assert!(
+            message.contains("disconnect/drop"),
+            "BleBusy must tell the caller to disconnect/drop: {message}"
+        );
+    }
+}
