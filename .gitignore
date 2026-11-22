@@ -45,3 +45,6 @@ Thumbs.db
 .vscode/
 .env
 .env.local
+
+# Local GUI backups (normally under the XDG data directory)
+8bitdo-backups/
