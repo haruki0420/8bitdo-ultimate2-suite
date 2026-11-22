@@ -11,11 +11,14 @@ The GUI must not depend on system fonts, so two subset fonts are committed:
   (6879 characters), and every non-ASCII character used by the UI sources.
   Profile and macro names are user data, so the JIS set is included to render
   ordinary Japanese names without escaping.
+* ``NotoSansJP-Medium.otf``: only the ASCII/punctuation basics and the
+  characters the UI itself uses. Section labels and control text use Medium so
+  hierarchy does not depend on Bold everywhere.
 * ``NotoSansJP-Bold.otf``: only the ASCII/punctuation basics and the characters
-  the UI itself uses. It is used for headings and section labels.
+  the UI itself uses. It is used for the page title and emphasized values.
 
-Source font: ``Noto Sans CJK JP`` (regular/bold TTC face 0), SIL Open Font
-License 1.1.  ``OFL.txt`` in this directory is the license text.
+Source font: ``Noto Sans CJK JP`` (regular/medium/bold TTC face 0), SIL Open
+Font License 1.1.  ``OFL.txt`` in this directory is the license text.
 
 Run from anywhere:
 
@@ -101,6 +104,8 @@ def subset_face(weight: str, codes: set[int], destination: Path) -> None:
 
     options = subset.Options()
     options.hinting = False
+    # Keep the source timestamp so regeneration is byte-for-byte reproducible.
+    options.recalc_timestamp = False
     options.name_IDs = ["*"]
     options.name_legacy = True
     options.name_languages = ["en", "ja"]
@@ -111,6 +116,10 @@ def subset_face(weight: str, codes: set[int], destination: Path) -> None:
     subsetter = subset.Subsetter(options=options)
     subsetter.populate(unicodes=codes)
     subsetter.subset(face)
+    # Pin the head timestamp as well: TTFont refreshes it on save by default,
+    # which would make the committed binary change on every regeneration.
+    face["head"].modified = 0
+    face.recalcTimestamp = False
     face.save(str(destination))
 
     size = destination.stat().st_size
@@ -120,9 +129,10 @@ def subset_face(weight: str, codes: set[int], destination: Path) -> None:
 
 def main() -> None:
     regular_codes = ui_codes() | jis_x_0208_codes()
-    bold_codes = ui_codes()
+    ui_only_codes = ui_codes()
     subset_face("Regular", regular_codes, HERE / "NotoSansJP-Regular.otf")
-    subset_face("Bold", bold_codes, HERE / "NotoSansJP-Bold.otf")
+    subset_face("Medium", ui_only_codes, HERE / "NotoSansJP-Medium.otf")
+    subset_face("Bold", ui_only_codes, HERE / "NotoSansJP-Bold.otf")
 
 
 if __name__ == "__main__":

@@ -9,7 +9,9 @@
 //! expect the same number of arguments.
 //!
 //! Japanese is the default language; English is the fallback for users who
-//! switch the language in the top bar.
+//! switch the language in the top bar. Copy follows the design brief's
+//! glossary: labels are noun phrases without a trailing `。`, body copy uses
+//! です・ます, and errors end with the next action.
 
 use eightbitdo_protocol::config_bt2::{GamepadMode, Slot};
 use eightbitdo_protocol::keymap::KeyMap;
@@ -61,9 +63,7 @@ define_keys! {
     // Window and top bar.
     WindowTitle => "8BitDo Ultimate 2 - 読み取り専用" | "8BitDo Ultimate 2 - Read-only",
     AppTitle => "8BitDo Ultimate 2" | "8BitDo Ultimate 2",
-    ReadOnly => "読み取り専用" | "Read-only",
-    ReadOnlyHint => "このビルドは読み取り専用です。書き込み・マクロ保存・復元・OTA は含まれません。" | "This build is read-only. No writes, macro save, restore, or OTA are included.",
-    Language => "表示言語" | "Language",
+    ReadOnly => "読み取り専用ビルド" | "Read-only build",
     LangJapanese => "日本語" | "日本語",
     LangEnglish => "English" | "English",
 
@@ -72,83 +72,79 @@ define_keys! {
     StatusScanning => "スキャン中" | "Scanning",
     StatusConnecting => "接続中" | "Connecting",
     StatusConnected => "接続済み" | "Connected",
-    Error => "エラー" | "Error",
     ErrorDetails => "詳細" | "Details",
     Dismiss => "閉じる" | "Dismiss",
-    Copy => "コピー" | "Copy",
-    Clear => "クリア" | "Clear",
+    CopySha256 => "SHA-256 をコピー" | "Copy SHA-256",
+    Clear => "ログを消す" | "Clear log",
 
     // Busy indicators.
-    BusyScanning => "BLE デバイスをスキャンしています…" | "Scanning for BLE devices…",
+    BusyScanning => "スキャンしています…" | "Scanning…",
     BusyConnecting => "接続しています…" | "Connecting…",
     BusyReconnecting => "再接続しています…" | "Reconnecting…",
-    BusyInitialRead => "バージョンと設定を読み取っています…" | "Reading version and configuration…",
+    BusyInitialRead => "バージョンと設定値を読み取っています…" | "Reading version and configuration…",
     BusyReadVersion => "バージョンを読み取っています…" | "Reading version…",
-    BusyReadConfig => "設定を読み取っています…" | "Reading configuration…",
-    BusyBackup => "設定を読み取ってバックアップしています…" | "Reading and writing backup…",
+    BusyReadConfig => "設定値を読み取っています…" | "Reading configuration…",
+    BusyBackup => "設定値を読み取って書き出しています…" | "Reading and writing the backup…",
     BusyDisconnecting => "切断しています…" | "Disconnecting…",
 
     // Section labels.
     NavDevice => "デバイス" | "Device",
     NavInput => "ライブ入力" | "Live input",
-    NavConfig => "設定" | "Configuration",
+    NavConfig => "設定値" | "Configuration",
     NavLog => "ログ" | "Log",
-    SectionConnection => "接続" | "Connection",
-    SectionActions => "読み取り専用の操作" | "Read-only actions",
-    SectionBackupFolder => "保存先" | "Backup folder",
+    SectionConnection => "接続状態" | "Connection",
+    SectionActions => "読み取り操作" | "Read-only actions",
+    SectionBackupFolder => "バックアップの保存先" | "Backup folder",
     SectionSafety => "安全上の注意" | "Safety",
     SectionDeviceInfo => "接続情報" | "Link",
     SectionFirmware => "ファームウェア" | "Firmware",
     SectionProfiles => "プロファイル" | "Profiles",
     SectionMacros => "マクロヘッダー" | "Macro headers",
-    SectionGettingStarted => "はじめかた" | "Getting started",
-    SectionScanResults => "スキャン結果" | "Scan results",
-    SectionSummary => "設定の概要" | "Summary",
+    SectionScanResults => "デバイス一覧" | "Device list",
+    SectionSummary => "設定値の概要" | "Summary",
+    SectionNextSteps => "次の一手" | "Next step",
 
     // Connection controls and onboarding.
-    Connect => "接続" | "Connect",
+    Connect => "80ND に接続" | "Connect to 80ND",
     Reconnect => "再接続" | "Reconnect",
     Scan => "スキャン" | "Scan",
     Disconnect => "切断" | "Disconnect",
-    AutoDetect80nd => "80ND を自動検出" | "Any 80ND",
-    SelectedDevice => "選択中: {}" | "Selected: {}",
-    ConnectUsesSelected => "選択したデバイスに接続します。" | "Connects to the selected device.",
-    NotAppMode => "選択したデバイスは App Mode ではありません。接続時は 80ND を名前で検索します。" | "The selected device is not in App Mode; Connect falls back to 80ND by name.",
-    NoScanResults => "まだスキャン結果がありません。スキャンするか、80ND を自動検出して接続してください。" | "No scan results yet. Scan, or connect by name.",
-    ScanHint => "周辺の BLE デバイスを検索します。" | "Looks for nearby BLE devices.",
+    SelectedDevice => "接続先 {}" | "Target {}",
+    ConnectUsesSelected => "一覧で選んだデバイスに接続します。" | "Connects to the device selected in the list.",
+    NotAppMode => "選んだデバイスは App Mode ではありません。80ND を名前で探します。" | "The selected device is not in App Mode; Connect looks for 80ND by name.",
+    NoScanResults => "まだ見つかっていません。「スキャン」を押すと、近くの 80ND が表示されます。" | "Nothing found yet. Press Scan to list nearby 80ND controllers.",
+    ScanHint => "周辺の BLE デバイスをスキャンします。" | "Scans for nearby BLE devices.",
     AppModeBadge => "App Mode" | "App Mode",
     OtherModeBadge => "通常モード" | "Other mode",
-    DeviceRowHint => "行を選んで「接続」を押します。ダブルクリックでも接続できます。" | "Select a row and press Connect, or double-click the row.",
-    ConnectFirstHint => "接続後に使えます。" | "Available after connecting.",
-    BusyHint => "処理中は操作できません。" | "Unavailable while an operation runs.",
-    NoDeviceHint => "接続するとデバイス情報が表示されます。" | "Device information appears after connecting.",
+    DeviceRowHint => "行を選ぶと接続先になります。ダブルクリックでも接続できます。" | "Select a row to set the target; double-click also connects.",
+    ConnectFirstHint => "接続すると読み取り操作が使えます。" | "Read-only actions become available after connecting.",
+    BusyHint => "処理が終わると使えます。" | "Available when the current operation finishes.",
+    NoDeviceHint => "接続すると、名前・アドレス・MTU が表示されます。" | "Connecting shows the name, address, and MTU.",
     Name => "名前" | "Name",
     Address => "アドレス" | "Address",
     Mtu => "MTU" | "MTU",
     Characteristic => "キャラクタリスティック" | "Characteristic",
-    OnboardingBody => "コントローラを App Mode にして接続します。接続すると、デバイス情報・ライブ入力・設定を読み取り専用で表示できます。" | "Put the controller in App Mode and connect. Device information, live input, and configuration are then shown read-only.",
     Step1Title => "USB ケーブルを抜く" | "Unplug the USB cable",
     Step1Body => "有線接続を解除し、Bluetooth で使える状態にします。" | "Disconnect the cable so the controller can be used over Bluetooth.",
     Step2Title => "Profile ボタンを 3 秒長押し" | "Hold Profile for 3 seconds",
     Step2Body => "コントローラを App Mode（80ND）に切り替えます。" | "Switch the controller into App Mode (80ND).",
-    Step3Title => "一覧から 80ND を選んで接続" | "Pick 80ND from the list and connect",
-    Step3Body => "スキャン結果から 80ND を選び、「接続」を押します。" | "Select 80ND in the scan results and press Connect.",
+    Step3Title => "80ND を選んで接続" | "Select 80ND and connect",
+    Step3Body => "デバイス一覧から 80ND を選び、「80ND に接続」を押します。" | "Select 80ND in the device list and press Connect to 80ND.",
 
     // Read-only actions.
     ReadVersionAction => "バージョンを読み取る" | "Read version",
-    ReadConfigAction => "設定を読み取る" | "Read configuration",
-    BackupConfigAction => "設定をバックアップ" | "Backup config",
-    BackupConfigHint => "設定 2768 バイトの raw と JSON サマリを保存します。" | "Saves the 2768-byte raw block and a JSON summary.",
+    ReadConfigAction => "設定値を読み取る" | "Read configuration",
+    BackupConfigAction => "設定を書き出す" | "Write a backup",
+    BackupConfigHint => "設定 2768 バイトの raw と JSON を保存します。" | "Saves the 2768-byte raw block and a JSON summary.",
     StartLiveAction => "ライブ入力を開始" | "Start live input",
     StopLiveAction => "ライブ入力を停止" | "Stop live input",
-    LiveStoppedHint => "ライブ入力は停止中です。keepalive も停止しています。" | "Live input is stopped; the keepalive is paused.",
-    HintReadVersion => "現在のファームウェアバージョンを読み取ります。" | "Reads the current firmware version.",
-    HintReadConfig => "設定 2768 バイトを読み取って表示します。" | "Reads and shows the 2768-byte configuration.",
-    HintLive => "ライブ入力を停止すると keepalive も止まります。" | "Stopping live input also pauses the keepalive.",
+    LiveStoppedHint => "ライブ入力は停止しています。" | "Live input is stopped.",
+    HintReadVersion => "ファームウェアのバージョンを読み取ります。" | "Reads the firmware version.",
+    HintReadConfig => "設定 2768 バイトを読み取ります。" | "Reads the 2768-byte configuration.",
+    HintLive => "ライブ入力を止めると、接続維持の通信も止まります。" | "Stopping live input also pauses the keepalive.",
     HintDisconnect => "接続を切断します。" | "Closes the current connection.",
     LastBackup => "直前のバックアップ" | "Last backup",
-    CopySha256 => "SHA-256 をコピー" | "Copy SHA-256",
-    SafetyText => "このビルドは読み取り専用です。設定の書き込み、マクロの消去・保存、バックアップからの復元、ファームウェア更新は実装していません。" | "Read-only build. No settings writes, macro erase/save, restore, or firmware update are implemented.",
+    SafetyText => "設定の書き込み、マクロの保存、復元、ファームウェア更新は行いません。" | "It does not write settings, save macros, restore backups, or update firmware.",
 
     // Device and firmware view.
     NoDeviceInfo => "デバイス情報はまだありません。" | "No device information yet.",
@@ -163,32 +159,31 @@ define_keys! {
     EmptyProfileName => "未設定" | "(empty)",
 
     // Live input.
-    NoInputYet => "入力レポートはまだありません。接続すると自動でライブ入力を開始します。" | "No input report yet. Live input starts automatically after connecting.",
-    InputWaitingReports => "入力レポートを待っています。コントローラを操作すると表示が更新されます。" | "Waiting for input reports. Operate the controller to see updates.",
-    InputWaitingConnect => "接続するとライブ入力が表示されます。" | "Connect to see live input.",
-    ReportsRate => "受信レート: {} 回/秒" | "Reports: {}/s",
-    LastReportAgo => "最終受信: {} ms 前" | "Last report: {} ms ago",
-    BatteryRaw => "バッテリー（生値）: {}" | "Battery raw: {}",
+    NoInputYet => "接続すると、入力がここに流れます。" | "Input appears here after connecting.",
+    InputWaitingReports => "コントローラを操作すると、スティックとボタンの状態が表示されます。" | "Operate the controller to see the sticks and buttons.",
+    InputWaitingConnect => "スティックとボタンの状態が表示されます。" | "Stick and button state appears here.",
+    ReportsRate => "受信レート {} 回/秒" | "Reports {} per second",
+    LastReportAgo => "最終受信 {} ms 前" | "Last report {} ms ago",
+    BatteryRaw => "バッテリー生値 {}" | "Battery raw {}",
     LeftStick => "左スティック" | "Left stick",
     RightStick => "右スティック" | "Right stick",
-    TriggerL => "L2 / ZL: {} / 255" | "L2 / ZL: {} / 255",
-    TriggerR => "R2 / ZR: {} / 255" | "R2 / ZR: {} / 255",
+    TriggerL => "L2 / ZL {} / 255" | "L2 / ZL {} / 255",
+    TriggerR => "R2 / ZR {} / 255" | "R2 / ZR {} / 255",
     Buttons => "ボタン" | "Buttons",
     NormalizedLeft => "左スティック（正規化）" | "Left stick (normalized)",
     NormalizedRight => "右スティック（正規化）" | "Right stick (normalized)",
     KeyMask => "キーマスク" | "Key mask",
 
     // Configuration view.
-    NoConfigYet => "設定スナップショットはまだありません。接続すると自動で読み取ります。" | "No configuration snapshot yet. It is read automatically after connecting.",
-    ConfigWaitingConnect => "接続すると設定が表示されます。" | "Connect to see the configuration.",
-    LastSessionWarning => "前回のセッションの内容です（再接続で更新）。" | "Showing the last session; reconnect to refresh.",
-    LastSessionHint => "再接続すると最新の内容に更新されます。" | "Reconnect to refresh this view.",
+    NoConfigYet => "接続すると、設定 2768 バイトを読み取ります。" | "Connecting reads the 2768-byte configuration.",
+    ConfigWaitingConnect => "プロファイルとマクロヘッダーを表示します。" | "Shows profiles and macro headers.",
+    LastSessionWarning => "前回の内容を表示しています。再接続で更新されます。" | "Showing content from the last session. Reconnect to refresh.",
     SizeLabel => "サイズ" | "Size",
     BytesValue => "{} バイト" | "{} bytes",
     CrcStored => "保存 CRC" | "CRC stored",
     CrcInPlace => "計算 CRC" | "CRC in place",
     CrcMatch => "一致" | "match",
-    CrcMismatch => "不一致（参考）" | "mismatch (informational)",
+    CrcMismatch => "不一致" | "mismatch",
     CrcNote => "CRC は参考値です。公式の in-place 方式は保存 CRC 領域を含みます。" | "CRC is informational: the official in-place algorithm includes the stored CRC field.",
     ActiveProfile => "有効なプロファイル" | "Active profile",
     GamepadMode => "ゲームパッドモード" | "Gamepad mode",
@@ -199,9 +194,8 @@ define_keys! {
     ProfileUnknownWithRaw => "不明（raw {}）" | "Unknown (raw {})",
     ModeUnknownRaw => "不明（raw {}）" | "unknown (raw {})",
     ProfileLabel => "プロファイル {}" | "Profile {}",
-    MacroHeaderHint => "このビルドはヘッダーのみ読み取ります。マクロのステップは取得しません。" | "Only headers are read. Macro steps are not downloaded.",
+    MacroHeaderHint => "マクロのヘッダーだけを読み取ります。ステップは取得しません。" | "Only macro headers are read; steps are not downloaded.",
     MacroSlotLabel => "プロファイル {}（フラグ {}、マクロ {}）" | "Profile {} (flag {}, macros {})",
-    ProfileRow => "{}: {} ({})" | "{}: {} ({})",
     IntervalMs => "{} ms" | "{} ms",
     StickRaw => "x={} y={}" | "x={} y={}",
     MtuValue => "MTU {} / {}" | "MTU {} / {}",
@@ -238,40 +232,41 @@ define_keys! {
     KeyUnknown => "不明({})" | "Unknown({})",
 
     // Log.
-    LogEmpty => "ログはまだありません。" | "No log entries yet.",
+    LogEmpty => "まだ記録がありません。" | "No entries yet.",
+    LogEmptyBody => "接続や読み取りの結果がここに残ります。" | "Connection and read results appear here.",
     LogScanStarted => "スキャンを開始しました。" | "Scan started.",
-    LogScanFinished => "スキャン完了: {} 件（App Mode {} 件）。" | "Scan finished: {} device(s), {} App Mode.",
-    LogConnecting => "接続しています: {}" | "Connecting to {}…",
+    LogScanFinished => "デバイス {} 件、App Mode {} 件。" | "{} device(s); {} in App Mode.",
+    LogConnecting => "{} に接続しています…" | "Connecting to {}…",
     LogConnected => "接続しました。" | "Connected.",
-    LogVersion => "バージョン: {}" | "Version: {}",
-    LogConfig => "設定: {} バイト、SHA-256 {}" | "Configuration: {} bytes, SHA-256 {}",
+    LogVersion => "バージョン {}" | "Version {}",
+    LogConfig => "設定値 {} バイト、SHA-256 {}" | "Configuration {} bytes, SHA-256 {}",
     LogLiveStarted => "ライブ入力を開始しました。" | "Live input started.",
     LogLiveStopped => "ライブ入力を停止しました。" | "Live input stopped.",
-    LogBackup => "バックアップを保存しました: {}（SHA-256 {}）" | "Backup written: {} (SHA-256 {})",
+    LogBackup => "設定を書き出しました。{} / SHA-256 {}" | "Backup written: {} / SHA-256 {}",
     LogDisconnected => "切断しました。" | "Disconnected.",
-    LogWorkerStopped => "バックグラウンドワーカーが停止しました。アプリを再起動してください。" | "The background worker stopped. Restart the application.",
-    LogAppNotRunning => "バックグラウンドワーカーが動作していません。アプリを再起動してください。" | "The background worker is not running. Restart the application.",
+    LogWorkerStopped => "バックグラウンド処理が停止しました。アプリを再起動してください。" | "The background worker stopped. Restart the application.",
+    LogAppNotRunning => "バックグラウンド処理が動作していません。アプリを再起動してください。" | "The background worker is not running. Restart the application.",
 
-    // Worker errors (message text; technical detail is kept separately).
-    ErrWorkerRuntime => "BLE ワーカーのランタイムを開始できませんでした。" | "Cannot start the BLE worker runtime.",
-    ErrWorkerThread => "BLE ワーカースレッドを開始できませんでした。" | "Cannot start the BLE worker thread.",
-    ErrConnectFirst => "先にコントローラへ接続してください。" | "Connect to the controller first.",
-    ErrDisconnectBeforeScan => "再スキャンするには切断してください。" | "Disconnect before scanning again.",
+    // Worker errors: headline only; technical detail is separate.
+    ErrWorkerRuntime => "BLE の処理を開始できませんでした。" | "Could not start the BLE worker runtime.",
+    ErrWorkerThread => "BLE の処理を開始できませんでした。" | "Could not start the BLE worker thread.",
+    ErrConnectFirst => "先にコントローラに接続してください。" | "Connect to the controller first.",
+    ErrDisconnectBeforeScan => "スキャンするには、いったん切断してください。" | "Disconnect before scanning again.",
     ErrAlreadyConnected => "すでに接続しています。" | "Already connected.",
-    ErrScanFailed => "スキャンに失敗しました。" | "Scan failed.",
-    ErrVersionReadFailed => "バージョンの読み取りに失敗しました。" | "Version read failed.",
-    ErrConfigReadFailed => "設定の読み取りに失敗しました。" | "Configuration read failed.",
-    ErrBackupFailed => "バックアップに失敗しました。" | "Backup failed.",
-    ErrStopLiveFailed => "ライブ入力を安全に停止できませんでした。" | "Cannot stop live input cleanly.",
-    ErrStartLiveFailed => "ライブ入力を開始できませんでした。" | "Cannot start live input.",
-    ErrConnectionFailed => "接続に失敗しました。" | "Connection failed.",
-    ErrVersionLostLink => "バージョンの読み取り中に接続が切れました。" | "Version read lost the link.",
-    ErrConfigLostLink => "設定の読み取り中に接続が切れました。" | "Configuration read lost the link.",
-    ErrBackupLostLink => "バックアップ中に接続が切れました。" | "Backup lost the link.",
-    ErrLiveInputFailed => "ライブ入力に失敗しました。" | "Live input failed.",
-    ErrLiveStoppedAfterFailures => "ライブ入力が {} 回失敗したため停止しました。" | "Live input stopped after {} failure(s).",
-    ErrLiveStartLostLink => "ライブ入力の開始時に接続が切れました。" | "Live input could not start.",
-    ErrLiveStopLostLink => "ライブ入力の停止時に接続が切れました。" | "Live input stop lost the link.",
+    ErrScanFailed => "スキャンできませんでした。" | "Could not scan.",
+    ErrVersionReadFailed => "バージョンを読み取れませんでした。" | "Could not read the version.",
+    ErrConfigReadFailed => "設定値を読み取れませんでした。" | "Could not read the configuration.",
+    ErrBackupFailed => "設定を書き出せませんでした。" | "Could not write the backup.",
+    ErrStopLiveFailed => "ライブ入力を停止できませんでした。" | "Could not stop live input.",
+    ErrStartLiveFailed => "ライブ入力を開始できませんでした。" | "Could not start live input.",
+    ErrConnectionFailed => "接続できませんでした。" | "Could not connect.",
+    ErrVersionLostLink => "バージョンの読み取り中に接続が切れました。" | "The link dropped while reading the version.",
+    ErrConfigLostLink => "設定値の読み取り中に接続が切れました。" | "The link dropped while reading the configuration.",
+    ErrBackupLostLink => "設定の書き出し中に接続が切れました。" | "The link dropped while writing the backup.",
+    ErrLiveInputFailed => "ライブ入力が途切れました。" | "Live input failed.",
+    ErrLiveStoppedAfterFailures => "ライブ入力が {} 回失敗したため停止しました。" | "Live input stopped after {} failures.",
+    ErrLiveStartLostLink => "ライブ入力の開始時に接続が切れました。" | "The link dropped when live input started.",
+    ErrLiveStopLostLink => "ライブ入力の停止時に接続が切れました。" | "The link dropped when live input stopped.",
 
     // Misc labels.
     Sha256 => "SHA-256" | "SHA-256",
@@ -405,8 +400,11 @@ mod tests {
     #[test]
     fn japanese_is_the_default_language() {
         assert_eq!(Lang::default(), Lang::Ja);
-        assert_eq!(t(Lang::Ja, Key::Connect), "接続");
-        assert_eq!(t(Lang::En, Key::Connect), "Connect");
+        assert_eq!(t(Lang::Ja, Key::Connect), "80ND に接続");
+        assert_eq!(t(Lang::En, Key::Connect), "Connect to 80ND");
+        assert_eq!(t(Lang::Ja, Key::NavConfig), "設定値");
+        assert_eq!(t(Lang::Ja, Key::SectionActions), "読み取り操作");
+        assert_eq!(t(Lang::Ja, Key::SectionConnection), "接続状態");
     }
 
     #[test]
@@ -443,18 +441,13 @@ mod tests {
             Key::LogScanFinished,
             &["3".to_string(), "2".to_string()],
         );
-        assert_eq!(filled, "スキャン完了: 3 件（App Mode 2 件）。");
+        assert_eq!(filled, "デバイス 3 件、App Mode 2 件。");
         let english = format(
             Lang::En,
             Key::LogScanFinished,
             &["3".to_string(), "2".to_string()],
         );
-        assert_eq!(english, "Scan finished: 3 device(s), 2 App Mode.");
-        assert_eq!(
-            format(Lang::Ja, Key::Connect, &[]),
-            "接続",
-            "keys without placeholders ignore arguments"
-        );
+        assert_eq!(english, "3 device(s); 2 in App Mode.");
     }
 
     #[test]
@@ -508,6 +501,48 @@ mod tests {
                         0x3000..=0x30FF | 0x4E00..=0x9FFF | 0xFF00..=0xFFEF)
                 }),
                 "{key:?} English text contains Japanese: {en:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn labels_stay_short_and_unpunctuated() {
+        for key in [
+            Key::Connect,
+            Key::Reconnect,
+            Key::Scan,
+            Key::Disconnect,
+            Key::NavDevice,
+            Key::NavInput,
+            Key::NavConfig,
+            Key::NavLog,
+            Key::ReadVersionAction,
+            Key::ReadConfigAction,
+            Key::BackupConfigAction,
+            Key::StartLiveAction,
+            Key::StopLiveAction,
+            Key::Clear,
+            Key::ErrorDetails,
+            Key::Dismiss,
+            Key::CopySha256,
+        ] {
+            let ja = t(Lang::Ja, key);
+            assert!(!ja.ends_with('。'), "{key:?} ends with a period: {ja}");
+            assert!(!ja.contains('：'), "{key:?} uses a full-width colon: {ja}");
+            assert!(
+                ja.chars().count() <= 12,
+                "{key:?} is longer than 12 characters: {ja}"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_does_not_use_full_width_colons() {
+        for &key in Key::ALL {
+            assert!(
+                !t(Lang::Ja, key).contains('：'),
+                "{key:?} uses a full-width colon: {:?}",
+                t(Lang::Ja, key)
             );
         }
     }
