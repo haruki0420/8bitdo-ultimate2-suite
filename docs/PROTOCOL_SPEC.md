@@ -428,7 +428,7 @@ sequenceDiagram
 
 | `cmd` | `subcmd_or_param` | `total_len` / `offset` | 方向 | 機能・用途 |
 | --- | --- | --- | --- | --- |
-| **`0x0001`** | `0x0000` | `total_len = 0x0AD0`（常に全体長）、`chunk_len` = このパケットの実データ長（例: 部分書込 `0x74` / `0x0C`）、`offset` = 構造体内オフセット | Host → Ctrl | **設定構造体書き込み**（全体 `2768B` または各項目差分書き込み。部分書込でも `total_len` は `0x0AD0` のまま。下記 6.3 参照） |
+| **`0x0001`** | `0x0000` | `total_len = 0x0AD0`（通常は全体長。**例外**: マクロヘッダ `getBT2_WriteMacroi` は `0xD8`、§6.5）、`chunk_len` = このパケットの実データ長（例: 部分書込 `0x74` / `0x0C`）、`offset` = 構造体内オフセット | Host → Ctrl | **設定構造体書き込み**（全体 `2768B` または各項目差分書き込み。下記 6.3 参照） |
 | **`0x0002`** | `0x0000` | 全体: `offset=0, total_len = chunk_len = 0x0AD0`<br/>ヘッダ: `offset=0, total_len = chunk_len = 0x74`<br/>現在スロット: `offset=0x12, total_len = chunk_len = 2` | Host → Ctrl | **設定構造体読み出し**。ペイロードなしだが `chunk_len` に要求長を宣言する（§4.1.1）。**1 要求 = 1 チャンク**（実機 142B）で、`offset += payload.len()` の再要求が必要。最終チャンクも 142B で返り、残り 70B に切り詰める（§4.3.1） |
 | **`0x0003`** | `0x0000` | `total_len=0x0C`, `offset=0x0C` | Ctrl ↔ Host | **リアルタイム入力レポート取得 / 通知**（12 バイト、セクション 7 参照） |
 | **`0x0006`** | **`0x0067`** (BLE)<br/>**`0x0123`** (Windows USB) | `total_len=0, offset=0` | Host → Ctrl | **Save（Flash 永続化）**。書き込み系（`0x0001` / `0x0103`）完了後に必ず発行。**BLE(Android) と USB(Windows) でサブコマンドが異なる点に注意**（6.4 参照） |
@@ -454,7 +454,7 @@ sequenceDiagram
 
 ### 6.3 Ultimate 2 Bluetooth 設定データ構造体 (`record_ultimatebt2`, `0x0AD0` = 2768 バイト) 部分書き込みオフセット一覧
 
-`cmd = 0x0001` は構造体全体 (`0x0AD0` B) の一括送信だけでなく、機能別の部分オフセット書き込みにも対応している。部分書込でも **`total_len` は常に `0x0AD0`** で、部分的なデータ長は `chunk_len` に載せる。いずれの場合も事前に `ANSI_CRC_16_sh(buf, 0x0AD0)` を計算し `+0x0C` へ格納する。ただしマクロヘッダの 216B 部分書込の wire には `+0x00C` を含めない（§6.5）。
+`cmd = 0x0001` は構造体全体 (`0x0AD0` B) の一括送信だけでなく、機能別の部分オフセット書き込みにも対応している。部分書込でも **`total_len` は通常 `0x0AD0`** で、部分的なデータ長は `chunk_len` に載せる。ただしマクロヘッダ `getBT2_WriteMacroi` は **`total_len = 0xD8`** の例外である（§6.5）。いずれの場合も事前に `ANSI_CRC_16_sh(buf, 0x0AD0)` を計算し `+0x0C` へ格納するが、216B のマクロヘッダ wire には `+0x00C` を含めない（§6.5）。
 
 | 機能 / セッター (`libadvancelib.so`) | 先頭オフセット | サイズ | 備考 |
 | --- | --- | --- | --- |
@@ -489,20 +489,21 @@ sequenceDiagram
 
 `eightbitdo-core` の `write_macro` は次の順序を固定する。実機への書き込みはまだ行っていない。
 
-1. **Erase (`0x0104`)**: `total_len = chunk_len = 0x1000`, `offset = macro_idx << 12`, `crc16 = 0xFFFF`, ペイロードなし。ACK は 2 秒。ACK 後 **100ms** の settle delay を置いてから Write を送る（`MACRO_ERASE_SETTLE_DELAY`。Erase 完了を待つための暫定値で、実測で調整する）。
-   - 実機 Erase ACK（2026-11-22）は **16B ヘッダのみ**で、`04 00 04 01 00 10 01 01 00 10 00 00 00 00 00 00`（`cmd=0x0004`, `subcmd=0x0104`, `chunk_len=0x1000`, `crc16=0x0101`, `total_len=0x1000`, `offset=0`）。`chunk_len` をエコーしていてもペイロードはない。ACK 判定はヘッダ先行で行い、`chunk_len` / `total_len` のエコーを許容する（`decode_app_response` のペイロード長検査を ACK に適用しない）。
-2. **Write (`0x0103`)**: `total_len = align32(steps * 10)`、`offset = (macro_idx << 12) + chunk_index * chunk_size`、各チャンクの CRC-16/MODBUS。ACK は 2 秒。チャンクは MTU 連動で、`max_payload = mtu - 3 - 17`（ATT 3B + 1B prefix + 16B header）が `64` 以上なら 64B、`32` 以上なら 32B、それ未満は `Error::MtuTooSmall` で書き込みを開始しない（32B アライン不能）。`MacroWritePlan.chunk_size` / CLI `--chunk-size 32` で **32B 均一**を明示できる（460B → 480B = 15 × 32B、500B → 512B = 16 × 32B、最終も 32B）。`--chunk-size 64` は 64B 均一。32/64 以外は `UnsupportedChunkSize`、MTU 不足は `MtuTooSmall`。**最終チャンクの ACK 後 50ms** 待ってから Header を送る（`MACRO_WRITE_SETTLE_DELAY`、暫定値）。
-3. **Header (`0x0001`)**: `offset = 0x68C + slot * 0xD8`, `len = 0xD8`, `total_len = 0x0AD0`。`ANSI_CRC_16_sh` を 2768B 全体で再計算した後に 216B を切り出す。216B は `chunk_len = min(142, max_payload)` で分割し、`total_len = 0x0AD0` を維持したまま `offset` を実チャンク長だけ進める。各チャンクの ACK は 2 秒。
+1. **Header (`0x0001`)**: `offset = 0x68C + slot * 0xD8`, `len = 0xD8`, **`total_len = 0xD8` (216)**。公式 `getBT2_WriteMacroi`（`writeBT2Macro` から呼ばれる）は descriptor `+0x40` に 216 を設定し、`Generate_CustomDataCmd` の `cmd 0x0001` 特例で `+0x04` の descriptor offset を使う。216B は `chunk_len = min(142, max_payload)` で分割し、`offset` を実チャンク長だけ進める。各チャンクの ACK は 2 秒。
    - MTU 200: `max_payload = 180` → **142 + 74**（159B / 91B フレーム）
    - MTU 64: `max_payload = 44` → **44 × 4 + 40**（61B / 61B / 61B / 61B / 57B フレーム）
    - MTU 23: `max_payload = 3` → **3 × 72**（20B フレーム）。ただし `0x0103` は 32B チャンクを作れないため、Header を送る前に `Error::MtuTooSmall` で中止する。
-   - すべての送信フレームは `mtu - 3` 以下。`BleTransport::send` の上限に合わせるため、`mtu - 17` ではなく **`mtu - 3 - 17`** を使う。
    - 216B の Header 部分書込には config CRC (`+0x00C`) を含めない。これは公式の 216B 部分書込と同じである。Save 時に device が CRC を再計算するかは**実機未確認**。
-4. **Save (`0x0006`)**: BLE `subcmd = 0x0067` のみ。ACK は 3 秒で、**リトライしない**。BLE の正式タイムアウトは未文書化であり、Windows USB HID の 3 秒を暫定使用している。
-5. **Read-back**: Save ACK 後に **300ms** 待ってから `0x0002` で 2768B config を読み、対象 slot の **216B ヘッダ**を送信した `header_bytes` とバイト比較する。次に `0x0102` で同じ `(slot, macro_idx)` を読み、`steps * 10` バイトが一致することを確認する。どちらの不一致も `Error::MacroWrite { stage: Verify, saved: true }` になる。ヘッダ不一致のメッセージは、flag / total_cnt / 予約バイトのどこが違うかと「device が正規化した可能性、saved=true なので再書き込みしない」を含む。300ms は暫定値で実機未確認。
-   - 実機観測（2026-11-22）: `macro restore` で slot 0 macro 0（500B）は成功したが、macro 1（460B）は Erase → Write 8 chunks → Header → Save の ACK がすべて返った後、100ms 後の `0x0102` が zeros で Verify 失敗した。216B ヘッダは一致（`max_steps = 46`, `offset = 0x1000`）。Erase ACK 直後に Write を送っていたため、Erase 完了待ちと Save コミット待ちを延ばす仮説を採用した（実測で調整）。**追加観測**: delay 追加後も macro 0（500B = 64B × 8、最終も 64B）は成功し、macro 1（460B = 64B × 7 + 最終 32B）だけが全 ACK 後に zeros だった。Header 216B と Save は一致しているため、**最終 32B チャンクで device が write を無効化する可能性**を仮説とし、`--chunk-size 32` で全チャンクを 32B 均一にして切り分ける。
+2. **Header Save (`0x0006`)**: BLE `subcmd = 0x0067` のみ。ACK は 3 秒・リトライなし。公式は `writeBT2Macro_onfinished` でヘッダ書込完了時に Save を送る。Header またはこの Save が失敗した場合、**Erase は送らない**（データを消さない）。
+3. **Erase (`0x0104`)**: `total_len = chunk_len = 0x1000`, `offset = macro_idx << 12`, `crc16 = 0xFFFF`, ペイロードなし。ACK は 2 秒。ACK 後 **100ms** の settle delay を置いてから Write を送る（`MACRO_ERASE_SETTLE_DELAY`。Erase 完了を待つための暫定値で、実測で調整する）。
+   - 実機 Erase ACK（2026-11-22）は **16B ヘッダのみ**で、`04 00 04 01 00 10 01 01 00 10 00 00 00 00 00 00`（`cmd=0x0004`, `subcmd=0x0104`, `chunk_len=0x1000`, `crc16=0x0101`, `total_len=0x1000`, `offset=0`）。`chunk_len` をエコーしていてもペイロードはない。ACK 判定はヘッダ先行で行い、`chunk_len` / `total_len` のエコーを許容する（`decode_app_response` のペイロード長検査を ACK に適用しない）。
+4. **Write (`0x0103`)**: `total_len = align32(steps * 10)`、`offset = (macro_idx << 12) + chunk_index * chunk_size`、各チャンクの CRC-16/MODBUS。ACK は 2 秒。チャンクは MTU 連動で、`max_payload = mtu - 3 - 17` が `64` 以上なら 64B、`32` 以上なら 32B、それ未満は `Error::MtuTooSmall`。`MacroWritePlan.chunk_size` / CLI `--chunk-size 32` で **32B 均一**を明示できる（460B → 480B = 15 × 32B、500B → 512B = 16 × 32B、最終も 32B）。`--chunk-size 64` は 64B 均一。32/64 以外は `UnsupportedChunkSize`、MTU 不足は `MtuTooSmall`。**最終チャンクの ACK 後 50ms** 待ってから次の Save を送る（`MACRO_WRITE_SETTLE_DELAY`、暫定値）。
+5. **Final Save (`0x0006`)**: BLE `subcmd = 0x0067` のみ。ACK は 3 秒・リトライなし。公式は `EraseMacroDataDone` / `WriteMacroDataDone` の連鎖後に Save を送る。
+6. **Read-back**: 最終 Save ACK 後に **300ms** 待ってから `0x0002` で 2768B config を読み、対象 slot の **216B ヘッダ**を送信した `header_bytes` とバイト比較する。次に `0x0102` で同じ `(slot, macro_idx)` を読み、`steps * 10` バイトが一致することを確認する。どちらの不一致も `Error::MacroWrite { stage: Verify, saved: true }` になる。ヘッダ不一致のメッセージは、flag / total_cnt / 予約バイトのどこが違うかと「device が正規化した可能性、saved=true なので再書き込みしない」を含む。300ms は暫定値で実機未確認。
+   - 公式順序の RE 根拠: `writeCustomConfig`（ヘッダ書込）→ `writeCustomConfig_onfinished` で **Save** → Java `writeCustomConfigDone` → `Erase(0) → Write(0) → Erase(1) → Write(1) …` → 最後に Save（`EraseMacroDataDone` / `WriteMacroDataDone`）。本実装はこの順序に合わせた。
+   - 実機観測（2026-11-22）: 旧順序（Erase → Write → Header(total_len=0x0AD0) → Save）で macro 0（500B）は成功し、macro 1（460B）だけが全 ACK 後に `0x0102` zeros で Verify 失敗した。216B ヘッダは一致していた。公式の **Header(total_len=0xD8) → Save → Erase/Write → Save** との差分を原因候補とし、本修正で検証する。最終 32B チャンク仮説に対しては `--chunk-size 32` も指定できる。
 
-**Fail-closed**: Erase / Write / Header のいずれかで失敗したら Save を送らない。ただし Erase 済み・Write 途中のセクタはすでに変更されている可能性があるため、`Error::MacroWrite` の `saved` が `false` でも「旧マクロが無傷」とはみなさない。`true` は Save 送信後（ACK または読み戻し失敗）である。どちらも 3 スロット × 4 マクロの完全バックアップから復元する。
+**Fail-closed**: Header または最初の Save が失敗した場合、Erase を送らない。Erase / Write が失敗した場合は、**ヘッダは既に Save 済み**なので `saved = true` として「ヘッダは保存済み。バックアップから復元が必要」と報告する。最終 Save または Verify の失敗も `saved = true` で、再書き込みせず再読込・restore で確認する。
 
 **書き込み対象とヘッダ**:
 

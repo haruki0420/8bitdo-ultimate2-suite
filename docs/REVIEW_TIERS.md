@@ -268,12 +268,16 @@ EraseFlash 0x0004
 - `EraseFlash` の ACK 前に `WriteFirmware` を送らない。各 64B `WriteFirmware` チャンクの ACK を待ち、ACK 前に次のチャンクを送らない。タイムアウトは 1 秒、リトライ方針を記録する。
 - 失敗時は BLE なら `"8bt"` へ再接続し、`readPID` → 全セクタ消去 → 再書き込みで復旧する。USB は再列挙 / 再接続で Bootloader に入り直す（USB Boot の TX フレーミングは未文書化のため、USB OTA 書込は上記の停止規則に従う）。「再接続だけ」で復旧したとみなさない。
 - `WriteFirmwareVersion` 完了前に電源断しても Bootloader に留まるため再試行できることを確認する。
-- マクロの `Erase 0x0104 → Write 0x0103 → ヘッダ 0x0001 → Save 0x0006` と混同しない。
+- マクロの `ヘッダ 0x0001 (total_len=0xD8) → Save 0x0006 → Erase 0x0104 → Write 0x0103 → Save 0x0006` と混同しない。
 
 ### 6.4 マクロ Flash チェックリスト
 
 ```text
-Erase 0x0104
+マクロヘッダ更新 0x0001
+  (subcmd 0x0000, offset = 0x68C + slot * 0xD8, len = total_len = 0xD8,
+   216B を MTU に応じて分割。ANSI_CRC_16_sh は全体で計算するが +0x00C は wire に含めない)
+→ Save 0x0006 (BLE: subcmd 0x0067)
+→ Erase 0x0104
   (cmd = 0x0104, subcmd = (mode << 8) | slot,
    offset = macro_idx << 12, total_len = 0x1000,
    chunk_len = 0x1000（wire header +0x04 は公式実装のチャンク設定値。
@@ -282,14 +286,9 @@ Erase 0x0104
   (subcmd = (mode << 8) | slot,
    offset = (macro_idx << 12) + chunk_index * chunk_size,
    total_len = align32(max_steps * 10),
-   chunk_size = BLE 64B / USB HID 32B（32B アライン。それ以外は拒否。
-   64B 超は 64B にクランプしてから判定）,
-   32B アライン、各チャンク CRC-16/MODBUS)
-→ マクロヘッダ更新 0x0001
-  (subcmd 0x0000, offset = 0x68C + slot * 0xD8, len 0xD8,
-   total_len 0xAD0、ANSI_CRC_16_sh を再計算)
-→ Save 0x0006
-  (BLE: subcmd 0x0067 / USB: subcmd 0x0123)
+   chunk_size = 32/64B（32B アライン。--chunk-size 32 で 32B 均一）,
+   各チャンク CRC-16/MODBUS)
+→ Save 0x0006 (BLE: subcmd 0x0067)
 ```
 
 - `Erase 0x0104` はペイロードを持たない。公式実装（`getBT2_EraseMacro`）は `total_len` と `chunk_len` をともに `0x1000` に設定し、`Generate_CustomDataCmd` が wire header `+0x04` にその値を書く。実ペイロードは `len = 0`。`total_len = 0x1000` は消去サイズであり、ペイロード長ではない。`chunk_len = 0` と混同しない。Rust 実装の修正は本 PR に含まれる。

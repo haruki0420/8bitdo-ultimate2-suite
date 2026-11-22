@@ -193,14 +193,15 @@ Track C: モバイル
 - **ゴール**: 3 スロット（`slot 0..2`）× 4 マクロ（`macro_idx 0..3`）のバックアップと、Erase → Write → Header → Save の実機書き込み。
 - **実装項目**:
   - `0x0102` ReadBT2Macro（1 要求 = 1 チャンク 142B、`offset = (macro_idx << 12) + chunk_offset`, `total_len = chunk_len = steps * 10`。実機で macro 0 / 500B と macro 1 / 460B の応答 offset を確認）
+  - 公式順序: **Header `0x0001` (`total_len = 0xD8`) → Save → Erase `0x0104` → Write `0x0103` → Save**
+  - `0x0001` Header（`offset = 0x68C + slot * 0xD8`, `len = 0xD8`, `total_len = 0xD8`、216B を `min(142, max_payload)` で分割、2 秒/チャンク）
   - `0x0104` Erase（`total_len = chunk_len = 0x1000`, `crc16 = 0xFFFF`, ペイロードなし、2 秒）
   - `0x0103` Write（`max_payload = mtu - 3 - 17` に応じて 64B / 32B、`--chunk-size 32|64` で明示指定可能、32B アライン、チャンクごと CRC、2 秒）
-  - `0x0001` Header（`offset = 0x68C + slot * 0xD8`, `len = 0xD8`, `total_len = 0xAD0`、216B を `min(142, max_payload)` で分割、2 秒/チャンク）
-  - `0x0006` Save（BLE `subcmd = 0x0067`、3 秒・リトライなし）
+  - `0x0006` Save（BLE `subcmd = 0x0067`、ヘッダ後と最終の 2 回、3 秒・リトライなし）
   - 3 スロット × 4 マクロのバックアップ（raw `.bin` + JSON/TOML + SHA-256 + config snapshot）
   - Mock でパケット列・CRC・チャンク境界・タイムアウト・fail-closed・読み戻し不一致を固定
   - CLI: `macro backup --dir <DIR>` / `macro write --slot N --index N --file <JSON/TOML> [--trigger M1..M4]` / `macro restore --dir <DIR> [--force]`
-  - fail-closed（Erase / Write / Header 失敗時に Save しない）、`0x0002` の 216B ヘッダ検証 + `0x0102` の raw 検証、`--trigger` のヘッダ反映
+  - fail-closed（Header / 最初の Save 失敗時は Erase しない。Erase / Write 失敗時はヘッダ Save 済みとして復元を案内）、`0x0002` の 216B ヘッダ検証 + `0x0102` の raw 検証、`--trigger` のヘッダ反映
   - 実機の部分復元観測を受け、Erase ACK 後 100ms、Write 最終チャンク後 50ms、Save 後 verify 300ms の暫定 delay を追加
   - 空きマクロ（`max_steps == 0` / `0xFFFF`）への write を拒否（step data clear 未実装）
   - `macro write` は 12 マクロ完全バックアップ必須。対象 slot に読めないマクロがあれば `unreadable macro in target slot` で拒否

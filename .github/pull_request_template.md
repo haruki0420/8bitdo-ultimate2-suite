@@ -114,7 +114,8 @@ Tier 3 では A-E の全セクションが PR 本文に存在しなければな�
 - [ ] 非 gamepad_type == 1 の場合、`readVersionInBoot` / `JumpApp` の offset を推測せず、`docs/PROTOCOL_SPEC.md` / Issue を確認して停止した
 - [ ] OTA 失敗時: BLE は `"8bt"` へ再接続 → `readPID` → 全セクタ消去 → 再書き込みで復旧できることを確認した。USB は再列挙 / 再接続で Bootloader に入り直す（BLE の `"8bt"` を流用しない）。再接続だけでは復旧とみなさない
 - [ ] 設定書き込み: `cmd 0x0001` の CRC / offset / chunking（`total_len` は部分書込でも `0x0AD0`、部分長は `chunk_len`）、`Save 0x0006` の ACK（BLE `0x0067` / USB `0x0123`）を確認した
-- [ ] マクロ: `Erase 0x0104`（`cmd=0x0104`, `subcmd=(mode<<8)|slot`, `offset=macro_idx<<12`, `total_len=0x1000`, `chunk_len=0x1000` [wire header 値。payload なし `len=0`], 4KB）→ `Write 0x0103`（subcmd は同じ; `offset=(macro_idx<<12)+chunk_index*chunk_size`, `chunk_size=BLE 64B / USB HID 32B（32B アライン。それ以外は拒否。64B 超は 64B にクランプしてから判定）`, `total_len=align32(max_steps*10)`, 32B アライン, 各チャンク CRC16, 最終チャンクは 32B アライン長）→ ヘッダ `0x0001`（`subcmd 0x0000`, `offset=0x68C + slot*0xD8`, `len=0xD8`, `total_len=0xAD0`）→ `Save 0x0006`（BLE `0x0067` / USB `0x0123`）の順序を確認した
+- [ ] マクロ: ヘッダ `0x0001`（`subcmd 0x0000`, `offset=0x68C + slot*0xD8`, `len=total_len=0xD8`）→ `Save 0x0006`（BLE `0x0067`）→ `Erase 0x0104`（`offset=macro_idx<<12`, `total_len=chunk_len=0x1000`, payload なし）→ `Write 0x0103`（`offset=(macro_idx<<12)+chunk_index*chunk_size`, `chunk_size=32/64B（32B アライン）`, `total_len=align32(max_steps*10)`, 各チャンク CRC16, 最終チャンクも 32B 均一可）→ 最終 `Save 0x0006` の公式順序を確認した
+- [ ] マクロヘッダは **`total_len=0xD8`** で送り、**Header → Save → Erase → Write → Save** の公式順序を確認した（旧 Erase → Write → Header(total_len=0x0AD0) → Save ではない）
 - [ ] マクロ Erase は `total_len = chunk_len = 0x1000`（wire header `+0x04` は公式実装の設定値）、ペイロードなし（`len=0`）。`total_len=0x1000` は消去サイズであり、ペイロード長ではない
 - [ ] マクロ ACK: `Erase` / `Write` / ヘッダは 2s、`Save` は **3s・リトライなし**（BLE の正式値は未文書化。USB HID は 3s）。OTA の 10s erase / 1s chunk / 64B 固定をマクロに適用していない
 - [ ] マクロ `Write 0x0103` の `chunk_size` が BLE `0x40` / USB HID `0x20` を超える場合、拒否または上限へクランプし、上限超過をテストした

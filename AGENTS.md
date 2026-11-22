@@ -25,7 +25,7 @@
 2. **[docs/STRUCT_BT2_2768B.md](docs/STRUCT_BT2_2768B.md)**
    - 2768 バイト（`0xAD0`）`record_ultimatebt2` 設定構造体の全オフセット・型・デフォルト値・部分書き込みパラメータ
    - 32-bit `KeyMap` ビットマスク全表と 22 キーインデックス
-   - 10 バイト `MacroDatas` ステップ構造（1ms 単位、8-bit スティック・トリガー）、Flash セクタ配置（`macro_idx << 12`）、Erase → Write → Header → Save のコミット手順
+   - 10 バイト `MacroDatas` ステップ構造（1ms 単位、8-bit スティック・トリガー）、Flash セクタ配置（`macro_idx << 12`）、Header (`total_len=0xD8`) → Save → Erase → Write → Save のコミット手順
 3. **[docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)**
    - 全体アーキテクチャ、ワークスペース構成、Phase 1〜5 の実装ロードマップ、安全原則
 
@@ -105,4 +105,4 @@
 1. `crates/eightbitdo-core` に `Transport` トレイト（BLE / USB HID / Mock）とセッション管理を実装する。
 2. `crates/eightbitdo-cli` に `scan` / `info` / `config dump` / `monitor` を実装する。
 3. 実機では **読み取り専用コマンドから**検証し、最初の書き込み前に必ず 2768B 設定とマクロ 3 スロット × 4 マクロをバックアップし、ファイル名と SHA-256 を記録する。
-4. 書き込み系の前に、モックトランスポートで `Erase 0x0104 → Write 0x0103 → Header 0x0001 → Save 0x0006` のパケット列と CRC を固定する。
+4. 書き込み系の前に、モックトランスポートで `Header 0x0001 (total_len=0xD8) → Save 0x0006 → Erase 0x0104 → Write 0x0103 → Save 0x0006` のパケット列と CRC を固定する。
