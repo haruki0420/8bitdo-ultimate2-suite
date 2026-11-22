@@ -13,20 +13,25 @@
 //! has no session-owned keepalive yet (the CLI has the reference
 //! implementation), so the link stays active while live input is on.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
+use eightbitdo_core::config_ops::ConfigWritePlan;
+use eightbitdo_core::macro_ops::{MacroEntry, MacroWritePlan};
 use eightbitdo_core::{
-    scan_devices, BleDevice, BleOptions, BleTransport, Error as CoreError, Session, Transport,
-    APP_BLE_NAME,
+    scan_devices, BleDevice, BleOptions, BleTransport, ConfigSnapshot, Error as CoreError, Session,
+    Transport, APP_BLE_NAME,
 };
+use eightbitdo_protocol::config_bt2::{MacroIndex, Slot};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::{interval, Interval, MissedTickBehavior};
 
-use crate::backup::BackupReport;
-use crate::driver::{DeviceSession, GuiError};
+use crate::backup::{BackupRef, BackupReport};
+use crate::driver::{
+    ConfigWriteReport, DeviceSession, GuiError, MacroWriteReport, WriteFailure, WritePhase,
+};
 use crate::i18n::Key;
 use crate::model::{ConfigView, DeviceInfoView, InputView, ScanEntry, VersionView};
 
@@ -54,7 +59,7 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_LIVE_FAILURES: u32 = 3;
 
 /// A request from the UI thread.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Command {
     /// Scan for BLE devices.
     Scan,
@@ -73,6 +78,31 @@ pub enum Command {
     Backup {
         /// Destination directory shown in the UI.
         dir: PathBuf,
+    },
+    /// Read one macro with its steps.
+    ReadMacro {
+        /// Profile slot.
+        slot: Slot,
+        /// Macro index.
+        index: MacroIndex,
+    },
+    /// Write a validated configuration plan after the user confirmed it.
+    WriteConfig {
+        /// Plan built against the snapshot shown in the confirmation dialog.
+        plan: ConfigWritePlan,
+        /// Directory for the mandatory pre-write backup.
+        backup_dir: PathBuf,
+    },
+    /// Write one existing non-empty macro after the user confirmed it.
+    WriteMacro {
+        /// Profile slot.
+        slot: Slot,
+        /// Macro index.
+        index: MacroIndex,
+        /// Macro write plan.
+        plan: MacroWritePlan,
+        /// Directory for the mandatory pre-write macro backup.
+        backup_dir: PathBuf,
     },
     /// Enable `0x0007` and start the `0x0003` poll loop.
     StartLive,
@@ -137,14 +167,38 @@ pub enum Event {
     Connected(DeviceInfoView),
     /// A version read completed.
     Version(VersionView),
-    /// A configuration read completed.
-    Config(Box<ConfigView>),
+    /// A configuration read completed, with the snapshot it was decoded from.
+    Config {
+        /// Raw 2768-byte block and CRC status.
+        snapshot: Box<ConfigSnapshot>,
+        /// Display summary built on the worker thread.
+        view: Box<ConfigView>,
+    },
+    /// One macro read completed.
+    MacroLoaded {
+        /// Profile slot.
+        slot: Slot,
+        /// Macro index.
+        index: MacroIndex,
+        /// Macro steps and header.
+        entry: Box<MacroEntry>,
+    },
     /// One realtime input report.
     Input(InputView),
     /// Live input started or stopped.
     Live(bool),
     /// A backup completed.
     Backup(Box<BackupReport>),
+    /// The mandatory pre-write backup was written; no flash frame has been
+    /// sent yet.
+    WriteBackup(BackupRef),
+    /// A configuration write completed and its read-back matched.
+    ConfigWritten(Box<ConfigWriteReport>),
+    /// A macro write completed and its read-back matched.
+    MacroWritten(Box<MacroWriteReport>),
+    /// A write failed. `backup` inside the failure names the pre-write backup
+    /// when one exists.
+    WriteFailed(Box<WriteFailure>),
     /// The link is down. `reason` is set when the worker closed it itself.
     Disconnected {
         /// Why the worker disconnected.
@@ -222,11 +276,54 @@ impl Drop for Worker {
     }
 }
 
+/// Live-input / keepalive state.
+///
+/// A flash write pauses the 20 ms `0x0003` poll so the keepalive cannot race
+/// the write's ACK stream; it resumes with a fresh ticker after the write.
+/// This mirrors the CLI's operation lock without a second task.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LiveState {
+    live: bool,
+    suspended: bool,
+}
+
+impl LiveState {
+    /// True while the worker should send one `0x0003` poll per tick.
+    fn can_poll(self) -> bool {
+        self.live && !self.suspended
+    }
+
+    /// Reports are enabled and polling may run.
+    fn start(&mut self) {
+        self.live = true;
+        self.suspended = false;
+    }
+
+    /// Reports are disabled or the user stopped live input.
+    fn stop(&mut self) {
+        self.live = false;
+        self.suspended = false;
+    }
+
+    /// Pause polling for a flash operation. Returns whether it was polling.
+    fn begin_write(&mut self) -> bool {
+        let was_polling = self.can_poll();
+        self.suspended = true;
+        was_polling
+    }
+
+    /// Resume the state the write paused, without emitting a Live event.
+    fn end_write(&mut self) {
+        self.suspended = false;
+    }
+}
+
 struct Link {
     driver: DeviceSession<BleTransport>,
     ticker: Interval,
-    live: bool,
+    live: LiveState,
     failures: u32,
+    snapshot: Option<ConfigSnapshot>,
 }
 
 enum Wake {
@@ -237,7 +334,7 @@ enum Wake {
 async fn run_loop(mut commands: UnboundedReceiver<Command>, events: Sender<Event>) {
     let mut link: Option<Link> = None;
     loop {
-        let live = link.as_ref().is_some_and(|link| link.live);
+        let live = link.as_ref().is_some_and(|link| link.live.can_poll());
         if live {
             let wake = {
                 let Some(link) = link.as_mut() else {
@@ -370,7 +467,13 @@ async fn handle_command(command: Command, link: &mut Option<Link>, events: &Send
             };
             match result {
                 Ok(read) => {
-                    let _ = events.send(Event::Config(Box::new(read.view)));
+                    if let Some(link) = link.as_mut() {
+                        link.snapshot = Some(read.snapshot.clone());
+                    }
+                    let _ = events.send(Event::Config {
+                        snapshot: Box::new(read.snapshot),
+                        view: Box::new(read.view),
+                    });
                 }
                 Err(error) => {
                     let disconnected = is_disconnected(&error);
@@ -398,7 +501,13 @@ async fn handle_command(command: Command, link: &mut Option<Link>, events: &Send
             };
             match result {
                 Ok(outcome) => {
-                    let _ = events.send(Event::Config(Box::new(outcome.view)));
+                    if let Some(link) = link.as_mut() {
+                        link.snapshot = Some(outcome.snapshot.clone());
+                    }
+                    let _ = events.send(Event::Config {
+                        snapshot: Box::new(outcome.snapshot),
+                        view: Box::new(outcome.view),
+                    });
                     let _ = events.send(Event::Backup(Box::new(outcome.report)));
                 }
                 Err(error) => {
@@ -418,6 +527,52 @@ async fn handle_command(command: Command, link: &mut Option<Link>, events: &Send
                 }
             }
         }
+        Command::ReadMacro { slot, index } => {
+            let Some(snapshot) = ensure_snapshot(link, events).await else {
+                return true;
+            };
+            let result = {
+                let Some(link) = link.as_mut() else {
+                    return true;
+                };
+                link.driver.read_macro(&snapshot, slot, index).await
+            };
+            match result {
+                Ok(entry) => {
+                    let _ = events.send(Event::MacroLoaded {
+                        slot,
+                        index,
+                        entry: Box::new(entry),
+                    });
+                }
+                Err(error) => {
+                    let disconnected = is_disconnected(&error);
+                    let detail = error.to_string();
+                    let _ = events.send(Event::Error(
+                        Notice::new(Key::ErrMacroReadFailed).with_detail(&detail),
+                    ));
+                    if disconnected {
+                        teardown(
+                            link.take(),
+                            Some(Notice::new(Key::ErrMacroReadLostLink).with_detail(&detail)),
+                            events,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        Command::WriteConfig { plan, backup_dir } => {
+            write_config(link, plan, &backup_dir, events).await;
+        }
+        Command::WriteMacro {
+            slot,
+            index,
+            plan,
+            backup_dir,
+        } => {
+            write_macro(link, slot, index, plan, &backup_dir, events).await;
+        }
         Command::StartLive => {
             enable_live(link, events).await;
         }
@@ -429,7 +584,7 @@ async fn handle_command(command: Command, link: &mut Option<Link>, events: &Send
                 link.driver.set_reports_enabled(false).await
             };
             if let Some(link) = link.as_mut() {
-                link.live = false;
+                link.live.stop();
             }
             let _ = events.send(Event::Live(false));
             if let Err(error) = result {
@@ -450,6 +605,210 @@ async fn handle_command(command: Command, link: &mut Option<Link>, events: &Send
         }
     }
     true
+}
+
+/// Return the cached snapshot, reading the configuration first when needed.
+///
+/// Emits the resulting [`Event::Config`] and tears the link down on a
+/// disconnecting read error.
+async fn ensure_snapshot(
+    link: &mut Option<Link>,
+    events: &Sender<Event>,
+) -> Option<ConfigSnapshot> {
+    if let Some(snapshot) = link.as_ref().and_then(|link| link.snapshot.clone()) {
+        return Some(snapshot);
+    }
+    let link_ref = link.as_mut()?;
+    let result = link_ref.driver.read_config().await;
+    match result {
+        Ok(read) => {
+            if let Some(link) = link.as_mut() {
+                link.snapshot = Some(read.snapshot.clone());
+            }
+            let snapshot = read.snapshot.clone();
+            let _ = events.send(Event::Config {
+                snapshot: Box::new(read.snapshot),
+                view: Box::new(read.view),
+            });
+            Some(snapshot)
+        }
+        Err(error) => {
+            let disconnected = is_disconnected(&error);
+            let detail = error.to_string();
+            let _ = events.send(Event::Error(
+                Notice::new(Key::ErrConfigReadFailed).with_detail(&detail),
+            ));
+            if disconnected {
+                teardown(
+                    link.take(),
+                    Some(Notice::new(Key::ErrConfigLostLink).with_detail(&detail)),
+                    events,
+                )
+                .await;
+            }
+            None
+        }
+    }
+}
+
+/// Worker-side configuration write: prepare, back up, commit.
+///
+/// The pre-write backup event is emitted before any flash frame is sent, so the
+/// UI can show its path and SHA-256 while the write is still running.
+async fn execute_config_write<T: Transport>(
+    driver: &DeviceSession<T>,
+    plan: ConfigWritePlan,
+    backup_dir: &Path,
+    events: &Sender<Event>,
+) -> Result<ConfigWriteReport, Box<WriteFailure>> {
+    let preparation = driver.prepare_config_write(&plan, backup_dir).await?;
+    let _ = events.send(Event::WriteBackup(BackupRef::from(&preparation.backup)));
+    let _ = events.send(Event::Log(
+        Notice::new(Key::LogPreWriteBackup)
+            .with_arg(preparation.backup.raw_path.display().to_string())
+            .with_arg(preparation.backup.sha256.clone()),
+    ));
+    driver.commit_config_write(&preparation).await
+}
+
+/// Worker-side macro write: prepare, back up, commit.
+async fn execute_macro_write<T: Transport>(
+    driver: &DeviceSession<T>,
+    slot: Slot,
+    index: MacroIndex,
+    plan: MacroWritePlan,
+    backup_dir: &Path,
+    events: &Sender<Event>,
+) -> Result<MacroWriteReport, Box<WriteFailure>> {
+    let preparation = driver.prepare_macro_write(slot, index, backup_dir).await?;
+    let _ = events.send(Event::WriteBackup(BackupRef::from(&preparation.backup)));
+    let _ = events.send(Event::Log(
+        Notice::new(Key::LogPreWriteMacroBackup)
+            .with_arg(preparation.backup.dir.display().to_string())
+            .with_arg(preparation.backup.config_sha256.clone()),
+    ));
+    driver.commit_macro_write(&preparation, &plan).await
+}
+
+/// Pause the 20 ms keepalive, run a configuration write, and resume.
+async fn write_config(
+    link: &mut Option<Link>,
+    plan: ConfigWritePlan,
+    backup_dir: &Path,
+    events: &Sender<Event>,
+) {
+    let result = {
+        let Some(link) = link.as_mut() else {
+            return;
+        };
+        let _was_polling = link.live.begin_write();
+        let result = execute_config_write(&link.driver, plan, backup_dir, events).await;
+        link.live.end_write();
+        link.ticker.reset();
+        result
+    };
+    match result {
+        Ok(report) => {
+            if let Some(link) = link.as_mut() {
+                link.snapshot = Some(report.snapshot.clone());
+            }
+            let _ = events.send(Event::Config {
+                snapshot: Box::new(report.snapshot.clone()),
+                view: Box::new(report.view.clone()),
+            });
+            let _ = events.send(Event::ConfigWritten(Box::new(report)));
+        }
+        Err(failure) => fail_write(link, failure, events).await,
+    }
+}
+
+/// Pause the 20 ms keepalive, run a macro write, and resume.
+async fn write_macro(
+    link: &mut Option<Link>,
+    slot: Slot,
+    index: MacroIndex,
+    plan: MacroWritePlan,
+    backup_dir: &Path,
+    events: &Sender<Event>,
+) {
+    let result = {
+        let Some(link) = link.as_mut() else {
+            return;
+        };
+        let _was_polling = link.live.begin_write();
+        let result = execute_macro_write(&link.driver, slot, index, plan, backup_dir, events).await;
+        link.live.end_write();
+        link.ticker.reset();
+        result
+    };
+    match result {
+        Ok(report) => {
+            let _ = events.send(Event::MacroWritten(Box::new(report)));
+            // The macro header lives in the 2768-byte configuration. Re-read it
+            // so the settings tab shows the committed header values.
+            let result = {
+                let Some(link) = link.as_mut() else {
+                    return;
+                };
+                link.driver.read_config().await
+            };
+            match result {
+                Ok(read) => {
+                    if let Some(link) = link.as_mut() {
+                        link.snapshot = Some(read.snapshot.clone());
+                    }
+                    let _ = events.send(Event::Config {
+                        snapshot: Box::new(read.snapshot),
+                        view: Box::new(read.view),
+                    });
+                }
+                Err(error) => {
+                    let disconnected = is_disconnected(&error);
+                    let detail = error.to_string();
+                    let _ = events.send(Event::Error(
+                        Notice::new(Key::ErrConfigReadFailed).with_detail(&detail),
+                    ));
+                    if disconnected {
+                        teardown(
+                            link.take(),
+                            Some(Notice::new(Key::ErrConfigLostLink).with_detail(detail)),
+                            events,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        Err(failure) => fail_write(link, failure, events).await,
+    }
+}
+
+/// Report a failed write and tear the link down when it disconnected.
+async fn fail_write(link: &mut Option<Link>, failure: Box<WriteFailure>, events: &Sender<Event>) {
+    let disconnected = failure.disconnected;
+    let detail = failure.detail.clone();
+    let _ = events.send(Event::Error(write_failure_notice(&failure)));
+    let _ = events.send(Event::WriteFailed(failure));
+    if disconnected {
+        teardown(
+            link.take(),
+            Some(Notice::new(Key::ErrWriteLostLink).with_detail(detail)),
+            events,
+        )
+        .await;
+    }
+}
+
+/// Translation key for a write failure phase, with the technical detail kept
+/// separate.
+fn write_failure_notice(failure: &WriteFailure) -> Notice {
+    let key = match failure.phase {
+        WritePhase::Read => Key::ErrWriteReadFailed,
+        WritePhase::Prepare => Key::ErrWritePrepareFailed,
+        WritePhase::Backup => Key::ErrWriteBackupFailed,
+        WritePhase::Device => Key::ErrDeviceWriteFailed,
+    };
+    Notice::new(key).with_detail(failure.detail.clone())
 }
 
 async fn scan(events: &Sender<Event>) {
@@ -501,8 +860,9 @@ async fn connect(address: Option<String>, link: &mut Option<Link>, events: &Send
             *link = Some(Link {
                 driver: DeviceSession::new(Session::new(transport), info),
                 ticker,
-                live: false,
+                live: LiveState::default(),
                 failures: 0,
+                snapshot: None,
             });
             refresh_after_connect(link, events).await;
             if link.is_some() {
@@ -532,7 +892,7 @@ async fn enable_live(link: &mut Option<Link>, events: &Sender<Event>) {
     match result {
         Ok(()) => {
             if let Some(link) = link.as_mut() {
-                link.live = true;
+                link.live.start();
                 link.failures = 0;
                 link.ticker.reset();
             }
@@ -594,7 +954,13 @@ async fn refresh_after_connect(link: &mut Option<Link>, events: &Sender<Event>) 
     };
     match config {
         Ok(read) => {
-            let _ = events.send(Event::Config(Box::new(read.view)));
+            if let Some(link) = link.as_mut() {
+                link.snapshot = Some(read.snapshot.clone());
+            }
+            let _ = events.send(Event::Config {
+                snapshot: Box::new(read.snapshot),
+                view: Box::new(read.view),
+            });
         }
         Err(error) => {
             let disconnected = is_disconnected(&error);
@@ -654,7 +1020,40 @@ fn sorted_entries(devices: Vec<BleDevice>) -> Vec<ScanEntry> {
 
 #[cfg(test)]
 mod tests {
+    use eightbitdo_core::config_ops::{config_write_chunk_len, ConfigEdit, ConfigWritePlan};
+    use eightbitdo_core::MockTransport;
+    use eightbitdo_protocol::commands;
+    use eightbitdo_protocol::config_bt2::{Bt2Config, CONFIG_SIZE};
+    use eightbitdo_protocol::CustomHeader;
+
     use super::*;
+
+    fn push_config_chunks(mock: &MockTransport, bytes: &[u8], chunk_size: usize) {
+        for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
+            let header = CustomHeader::new(
+                commands::cmd::READ_CONFIG,
+                0,
+                CONFIG_SIZE as u32,
+                (index * chunk_size) as u32,
+            )
+            .with_chunk_len(chunk.len() as u16);
+            mock.push_response(&header, chunk);
+        }
+    }
+
+    fn push_ack(mock: &MockTransport, cmd: u16, subcmd: u16) {
+        let header = CustomHeader::new(cmd, subcmd, 0, 0);
+        mock.push_response(&header, &[]);
+    }
+
+    fn info() -> DeviceInfoView {
+        DeviceInfoView {
+            name: Some("80ND".to_string()),
+            address: "AA:BB:CC:DD:EE:FF".to_string(),
+            mtu: 64,
+            characteristic: "ff13".to_string(),
+        }
+    }
 
     fn device(name: Option<&str>, address: &str, is_app: bool) -> BleDevice {
         BleDevice {
@@ -693,6 +1092,98 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<Worker>();
         assert_send::<Event>();
+    }
+
+    #[test]
+    fn live_state_pauses_polling_for_a_write_and_resumes_it() {
+        let mut live = LiveState::default();
+        assert!(!live.can_poll());
+        live.start();
+        assert!(live.can_poll());
+        assert!(
+            live.begin_write(),
+            "the write must report that polling was active"
+        );
+        assert!(!live.can_poll(), "no 20 ms poll may run during a write");
+        live.end_write();
+        assert!(live.can_poll(), "polling resumes after the write");
+        live.stop();
+        assert!(!live.can_poll());
+
+        let mut idle = LiveState::default();
+        assert!(!idle.begin_write(), "a paused link stays paused");
+        idle.end_write();
+        assert!(!idle.can_poll());
+    }
+
+    #[test]
+    fn write_failure_phases_map_to_specific_headlines() {
+        for (phase, key) in [
+            (WritePhase::Read, Key::ErrWriteReadFailed),
+            (WritePhase::Prepare, Key::ErrWritePrepareFailed),
+            (WritePhase::Backup, Key::ErrWriteBackupFailed),
+            (WritePhase::Device, Key::ErrDeviceWriteFailed),
+        ] {
+            let failure = WriteFailure {
+                phase,
+                detail: "technical".to_string(),
+                backup: None,
+                recovery: None,
+                disconnected: false,
+            };
+            let notice = write_failure_notice(&failure);
+            assert_eq!(notice.key, key);
+            assert_eq!(notice.detail.as_deref(), Some("technical"));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_worker_write_path_emits_the_backup_before_the_result() {
+        let mock = MockTransport::new();
+        let mut config = Bt2Config::default();
+        config.recompute_crc();
+        push_config_chunks(&mock, config.as_bytes(), 142);
+        let write_chunk = config_write_chunk_len(mock.mtu()).unwrap();
+        for _ in 0..CONFIG_SIZE.div_ceil(write_chunk) {
+            push_ack(&mock, commands::cmd::RESPONSE, commands::cmd::WRITE_CONFIG);
+        }
+        push_ack(&mock, commands::cmd::SAVE, commands::subcmd::SAVE_BLE);
+        let mut after = config.clone();
+        after.set_gamepad_mode(eightbitdo_protocol::config_bt2::GamepadMode::Mac);
+        after.recompute_crc();
+        push_config_chunks(&mock, after.as_bytes(), 142);
+
+        let driver = DeviceSession::new(Session::new(mock), info());
+        let dir = std::env::temp_dir().join(format!(
+            "eightbitdo-gui-worker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let plan = ConfigWritePlan::new().with(ConfigEdit::GamepadMode(
+            eightbitdo_protocol::config_bt2::GamepadMode::Mac,
+        ));
+        let (events, receiver) = std::sync::mpsc::channel();
+        let report = execute_config_write(&driver, plan, &dir, &events)
+            .await
+            .expect("mock write succeeds");
+
+        let events: Vec<Event> = receiver.try_iter().collect();
+        assert!(
+            matches!(events.first(), Some(Event::WriteBackup(_))),
+            "the pre-write backup must be visible before the result"
+        );
+        assert!(
+            events.iter().any(
+                |event| matches!(event, Event::Log(notice) if notice.key == Key::LogPreWriteBackup)
+            ),
+            "the backup path and SHA-256 are logged before the flash commit"
+        );
+        assert_eq!(report.view.gamepad_mode_raw, 2);
+        assert!(report.backup.raw_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

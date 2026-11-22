@@ -13,10 +13,11 @@
 //! glossary: labels are noun phrases without a trailing `。`, body copy uses
 //! です・ます, and errors end with the next action.
 
-use eightbitdo_protocol::config_bt2::{GamepadMode, Slot};
+use eightbitdo_protocol::config_bt2::{GamepadMode, Slot, SpecialFeature};
 use eightbitdo_protocol::keymap::KeyMap;
 
 use crate::model::BUTTON_LABELS;
+use crate::write::{ChangeKind, DraftError, MacroChange, MAX_NAME_UNITS};
 
 /// UI language.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -61,9 +62,9 @@ macro_rules! define_keys {
 
 define_keys! {
     // Window and top bar.
-    WindowTitle => "8BitDo Ultimate 2 - 読み取り専用" | "8BitDo Ultimate 2 - Read-only",
+    WindowTitle => "8BitDo Ultimate 2" | "8BitDo Ultimate 2",
     AppTitle => "8BitDo Ultimate 2" | "8BitDo Ultimate 2",
-    ReadOnly => "読み取り専用ビルド" | "Read-only build",
+    WriteCapable => "書き込み対応ビルド" | "Write-capable build",
     LangJapanese => "日本語" | "日本語",
     LangEnglish => "English" | "English",
 
@@ -86,11 +87,16 @@ define_keys! {
     BusyReadConfig => "設定値を読み取っています…" | "Reading configuration…",
     BusyBackup => "設定値を読み取って書き出しています…" | "Reading and writing the backup…",
     BusyDisconnecting => "切断しています…" | "Disconnecting…",
+    BusyReadMacro => "マクロを読み取っています…" | "Reading the macro…",
+    BusyWriteConfig => "設定値を書き込んで検証しています…" | "Writing and verifying the configuration…",
+    BusyWriteMacro => "マクロを書き込んで検証しています…" | "Writing and verifying the macro…",
 
     // Section labels.
     NavDevice => "デバイス" | "Device",
     NavInput => "ライブ入力" | "Live input",
     NavConfig => "設定値" | "Configuration",
+    NavSettings => "設定" | "Settings",
+    NavMacro => "マクロ" | "Macro",
     NavLog => "ログ" | "Log",
     SectionDevice => "デバイス" | "Device",
     SectionActions => "読み取り操作" | "Read-only actions",
@@ -102,9 +108,22 @@ define_keys! {
     SectionMacros => "マクロヘッダー" | "Macro headers",
     SectionScanResults => "デバイス一覧" | "Device list",
     SectionSummary => "設定値の概要" | "Summary",
+    SectionWriteSettings => "設定の書き込み" | "Write settings",
+    SectionProfileSettings => "プロファイル設定" | "Profile settings",
+    SectionRumble => "振動" | "Rumble",
+    SectionSticks => "スティック" | "Sticks",
+    SectionTriggers => "トリガー" | "Triggers",
+    SectionSpecial => "特殊機能" | "Special features",
+    SectionGyro => "ジャイロ" | "Gyro",
+    SectionLed => "LED" | "LED",
+    SectionRemap => "ボタン割り当て" | "Button remapping",
+    SectionMacroEditor => "マクロ編集" | "Macro editor",
+    SectionMacroHeader => "マクロヘッダー" | "Macro header",
+    SectionMacroSteps => "ステップ" | "Steps",
+    SectionWriteResult => "書き込み結果" | "Write result",
     SectionNextSteps => "次の一手" | "Next step",
     SectionConnectSteps => "接続の手順" | "Connection steps",
-    FooterMeta => "読み取り専用 / 設定 2768 バイト / マクロ 4×3" | "Read-only / 2768-byte config / 4×3 macros",
+    FooterMeta => "書き込み対応 / 設定 2768 バイト / マクロ 4×3" | "Write-capable / 2768-byte config / 4×3 macros",
 
     // Connection controls and onboarding.
     Connect => "80ND に接続" | "Connect to 80ND",
@@ -146,7 +165,7 @@ define_keys! {
     HintLive => "ライブ入力を止めると、接続維持の通信も止まります。" | "Stopping live input also pauses the keepalive.",
     HintDisconnect => "接続を切断します。" | "Closes the current connection.",
     LastBackup => "直前のバックアップ" | "Last backup",
-    SafetyText => "設定の書き込み、マクロの保存、バックアップの復元、ファームウェア更新は行いません。" | "It does not write settings, save macros, restore backups, or update firmware.",
+    SafetyText => "書き込みは確認後だけ。直前にバックアップし、read-back で検証します。" | "Writes only after confirmation; backup first, then read-back verification.",
 
     // Device and firmware view.
     NoDeviceInfo => "デバイス情報はまだありません。" | "No device information yet.",
@@ -228,10 +247,165 @@ define_keys! {
     ButtonTurbo => "ターボ" | "Turbo",
     ButtonTurboAuto => "ターボ連射" | "Turbo Auto",
     ButtonScreenshot => "スクリーンショット" | "Screenshot",
+    ButtonP1 => "P1 / PL" | "P1 / PL",
+    ButtonP2 => "P2 / PR" | "P2 / PR",
+    ButtonP3 => "P3 / L4" | "P3 / L4",
+    ButtonP4 => "P4 / R4" | "P4 / R4",
 
     // Key masks.
     KeyNone => "なし" | "None",
     KeyUnknown => "不明({})" | "Unknown({})",
+
+    // Write settings.
+    ProfileNameLabel => "プロファイル名" | "Profile name",
+    ProfileNameHint => "16 文字まで（UTF-16）" | "Up to 16 UTF-16 units",
+    ProfileNoSelection => "プロファイルなし" | "No profile",
+    RumbleEnabled => "カスタム振動" | "Custom rumble",
+    RumbleLeft => "左モーター" | "Left motor",
+    RumbleRight => "右モーター" | "Right motor",
+    StickEnabled => "カスタムスティック" | "Custom sticks",
+    StickLeftStart => "左スティック 開始" | "Left stick start",
+    StickLeftEnd => "左スティック 終了" | "Left stick end",
+    StickRightStart => "右スティック 開始" | "Right stick start",
+    StickRightEnd => "右スティック 終了" | "Right stick end",
+    TriggerEnabled => "カスタムトリガー" | "Custom triggers",
+    TriggerLeftStart => "L2 開始" | "L2 start",
+    TriggerLeftEnd => "L2 終了" | "L2 end",
+    TriggerRightStart => "R2 開始" | "R2 start",
+    TriggerRightEnd => "R2 終了" | "R2 end",
+    SpecialEnabled => "特殊機能を有効化" | "Enable special features",
+    SpecialLxFlip => "左スティック X 反転" | "Left stick X invert",
+    SpecialLyFlip => "左スティック Y 反転" | "Left stick Y invert",
+    SpecialRxFlip => "右スティック X 反転" | "Right stick X invert",
+    SpecialRyFlip => "右スティック Y 反転" | "Right stick Y invert",
+    SpecialStickSwap => "スティック入れ替え" | "Swap sticks",
+    SpecialTriggerSwap => "トリガー入れ替え" | "Swap triggers",
+    SpecialDpadSwap => "十字キー入れ替え" | "Swap D-pad",
+    SpecialRsTriggerFlip => "右スティック/トリガー反転" | "Right stick / trigger invert",
+    SpecialMotionSensitivity => "モーション感度" | "Motion sensitivity",
+    SpecialZeroDeadzone => "デッドゾーンなし" | "No dead zone",
+    SpecialFourWay => "十字キー 4 方向" | "4-way D-pad",
+    SpecialTriggerVibration => "トリガー振動" | "Trigger vibration",
+    SpecialVibration => "本体振動" | "Body vibration",
+    GyroEnabled => "ジャイロを有効化" | "Enable gyro",
+    GyroTriggerMode => "作動方法" | "Activation",
+    GyroHold => "押している間" | "Hold",
+    GyroToggle => "切り替え" | "Toggle",
+    GyroSensitivity => "感度" | "Sensitivity",
+    GyroDeadCompensate => "デッドゾーン補正" | "Dead-zone compensation",
+    GyroMapping => "出力先" | "Output",
+    GyroMouse => "マウス" | "Mouse",
+    GyroButton => "作動ボタン" | "Activation button",
+    LedEnabled => "有効" | "Enabled",
+    LedDynamic => "ダイナミック" | "Dynamic",
+    LedHotWheel => "ホットホイール" | "Hot wheel",
+    LedSingle => "単色" | "Single color",
+    LedForeground => "前景色" | "Foreground",
+    LedBackground => "背景色" | "Background",
+    LedSpeed => "速度" | "Speed",
+    LedAllColor => "全 LED の色" | "All LED color",
+    RemapEnabled => "リマップを有効化" | "Enable remapping",
+    RemapPhysical => "物理ボタン" | "Physical button",
+    RemapTarget => "割り当て先" | "Assigned to",
+    RemapUnsupported => "0x{}（選択不可）" | "0x{} (not selectable)",
+    RemapHint => "227・未知ビット・複合割り当ては選択肢に出ません。" | "227, unknown bits, and combined assignments are not offered.",
+    SettingsNeedsConfig => "接続して設定値を読み取ると編集できます。" | "Connect and read the configuration to edit it.",
+    SettingsStale => "前回読み取った設定を編集しています。書き込み直前に再読み取りして検証します。" | "Editing the last read configuration; it is re-read and re-validated immediately before writing.",
+    SettingsDirtyHint => "変更は「変更を確認」から確認ダイアログを開いた後だけ書き込まれます。" | "Changes are written only after opening the confirmation dialog with Review changes.",
+    ApplySettings => "変更を確認" | "Review changes",
+    DiscardChanges => "変更を破棄" | "Discard changes",
+    WriteConfirm => "書き込む" | "Write",
+    WriteCancel => "キャンセル" | "Cancel",
+    ConfirmTitle => "書き込みの確認" | "Confirm write",
+    ConfirmBackupNote => "書き込みの直前にバックアップを作成し、書き込み後に read-back で検証します。" | "A backup is written immediately before the write, and the result is verified by read-back.",
+    ConfirmConfigSummary => "設定値 2768 バイトを書き換えます。" | "Writes the 2768-byte configuration.",
+    ConfirmMacroSummary => "プロファイル {} のマクロ {}（{} ステップ / {} ms）を書き換えます。" | "Writes profile {} macro {} ({} steps / {} ms).",
+    ConfirmMacroHeader => "名前 {} / トリガー {} / 回数 {} / 間隔 {} ms" | "Name {} / trigger {} / cycles {} / interval {} ms",
+    ConfirmBackupDir => "バックアップ先 {}" | "Backup folder {}",
+    ConfirmChangeCount => "変更 {} 件" | "{} change(s)",
+    ConfirmTarget => "対象" | "Target",
+    ConfirmConfigTarget => "設定値（2768 バイト）" | "Configuration (2768 bytes)",
+    ConfirmMacroTarget => "プロファイル {} / マクロ {}" | "Profile {} / macro {}",
+    ConfirmDuration => "再生時間" | "Playback duration",
+    ConfirmNoteReadback => "書き込み後に read-back で検証します。" | "The result is verified by read-back after writing.",
+    ConfirmWarning => "失敗した場合、設定の一部だけが更新される可能性があります。表示されるバックアップを保管してください。" | "If it fails, part of the configuration may remain updated. Keep the backup shown after the write.",
+    ChangeProfileName => "プロファイル {} の名前" | "Profile {} name",
+    ChangeGamepadMode => "ゲームパッドモード" | "Gamepad mode",
+    ChangeActiveProfile => "有効なプロファイル" | "Active profile",
+    ChangeRumble => "プロファイル {} の振動" | "Profile {} rumble",
+    ChangeSticks => "プロファイル {} のスティック" | "Profile {} sticks",
+    ChangeTriggers => "プロファイル {} のトリガー" | "Profile {} triggers",
+    ChangeSpecial => "プロファイル {} の特殊機能" | "Profile {} special features",
+    ChangeGyro => "プロファイル {} のジャイロ" | "Profile {} gyro",
+    ChangeLedTheme => "プロファイル {} の LED" | "Profile {} LED",
+    ChangeRemapFlag => "プロファイル {} のリマップ有効化" | "Profile {} remapping flag",
+    ChangeRemapButton => "プロファイル {} の {} 割り当て" | "Profile {} {} assignment",
+    MacroChangeSteps => "ステップ" | "Steps",
+    MacroChangeName => "名前" | "Name",
+    MacroChangeTrigger => "トリガー" | "Trigger",
+    MacroChangeCycles => "回数" | "Cycles",
+    MacroChangeInterval => "間隔" | "Interval",
+    MacroProfile => "プロファイル" | "Profile",
+    MacroIndexLabel => "マクロ" | "Macro",
+    MacroLoad => "マクロを読み取る" | "Read macro",
+    MacroLoadHint => "選んだマクロのステップを読み取ります。" | "Reads the selected macro's steps.",
+    MacroEmptyTarget => "空のマクロには書き込めません。既存のマクロを選んでください。" | "An empty macro cannot be written; choose an existing macro.",
+    MacroNotLoaded => "マクロを読み取るとステップを編集できます。" | "Read a macro to edit its steps.",
+    MacroNeedsConfig => "接続して設定値を読み取ってください。" | "Connect and read the configuration first.",
+    MacroStartRecording => "録音を開始" | "Start recording",
+    MacroStopRecording => "録音を停止" | "Stop recording",
+    MacroRecordingHint => "ライブ入力の 20 ms レポートを録音します。録音を止めると現在のステップを置き換えます。" | "Records the 20 ms live reports. Stopping replaces the current steps.",
+    MacroRecordingNeedsLive => "録音を開始するとライブ入力も有効にします。" | "Starting a recording also enables live input.",
+    MacroRecordedSteps => "録音 {} ステップ / {} ms" | "Recorded {} steps / {} ms",
+    MacroNoSteps => "ステップがありません。" | "No steps.",
+    MacroStepMs => "時間 (ms)" | "Duration (ms)",
+    MacroStepKeys => "キー" | "Keys",
+    MacroStepSticks => "スティック" | "Sticks",
+    MacroStepTriggers => "トリガー" | "Triggers",
+    MacroDeleteStep => "このステップを削除" | "Delete step",
+    MacroInsertWait => "待ち時間を挿入" | "Insert wait",
+    MacroWaitMs => "待ち時間 (ms)" | "Wait (ms)",
+    MacroSelectStepHint => "一覧の行を選ぶと、そのステップの値を編集できます。" | "Select a row to edit that step's values.",
+    MacroTotalDuration => "合計 {} ms / {} ステップ" | "{} ms total / {} steps",
+    MacroWriteAction => "マクロの書き込みを確認" | "Review macro write",
+    MacroTrigger => "トリガー" | "Trigger",
+    MacroCycles => "回数" | "Cycles",
+    MacroInterval => "間隔 (ms)" | "Interval (ms)",
+    MacroKeysHint => "マクロに記録できるのは Start〜R2 の 16 ボタンです。" | "A macro step stores the 16 buttons from Start to R2.",
+    MacroRecordingFull => "200 ステップに達したため録音を停止しました。" | "Recording stopped at the 200-step limit.",
+    WriteSuccess => "書き込みました。" | "Write complete.",
+    WriteBackup => "バックアップ {} / SHA-256 {}" | "Backup {} / SHA-256 {}",
+    WriteMacroBackup => "マクロバックアップ {} / config SHA-256 {}" | "Macro backup {} / config SHA-256 {}",
+    WritePackets => "送信 {} フレーム" | "{} frames sent",
+    WriteChangedRegions => "変更領域 {} 件" | "{} changed region(s)",
+    WriteCrcOk => "read-back CRC 一致" | "read-back CRC matches",
+    WriteCrcMismatch => "read-back CRC 不一致" | "read-back CRC mismatch",
+    WriteMacroVerified => "プロファイル {} マクロ {} / {} ステップを検証しました。" | "Verified profile {} macro {} with {} steps.",
+    WriteCloseResult => "結果を閉じる" | "Close result",
+    CopyPath => "パスをコピー" | "Copy path",
+    WriteFailureTitle => "書き込みに失敗しました。" | "The write failed.",
+    WriteReadFailed => "書き込み前の読み取りに失敗しました。書き込みは行っていません。" | "The pre-write read failed. Nothing was written.",
+    WritePrepareFailed => "書き込み内容の検証に失敗しました。書き込みは行っていません。" | "The write request was rejected. Nothing was written.",
+    WriteBackupFailed => "バックアップを作成できなかったため、書き込みを中止しました。" | "The backup could not be written, so the write was stopped.",
+    WriteDeviceFailed => "書き込み中に失敗しました。" | "The write failed on the controller.",
+    WriteFailureBackup => "復旧用バックアップ" | "Recovery backup",
+    WriteFailureRecovery => "復旧手順" | "Recovery",
+    WriteFailureRecoveryText => "1. 再接続して設定値を読み取り、現在値を確認します。 2. 失敗が書き込み前なら、そのまま再試行できます。 3. Save 後なら、表示されたバックアップから復元します。" | "1. Reconnect and read the configuration to inspect the current values. 2. If the failure was before Save, retry. 3. If Save was sent, restore from the backup shown.",
+    WriteFailureMacroRestore => "マクロバックアップは `eightbitdo macro restore --dir <パス>` で復元できます。" | "The macro backup can be restored with `eightbitdo macro restore --dir <path>`.",
+    WriteFailureConfigRestore => "設定の raw バックアップは CLI の設定書き込みで復元できます。" | "The raw configuration backup can be restored with the CLI configuration write.",
+    WriteLostLink => "書き込み中に接続が切れました。" | "The link dropped during the write.",
+    NameTooLong => "名前は {} 文字までです（現在 {}）。" | "Names are limited to {} units (currently {}).",
+    NameHasNul => "名前に NUL 文字は使えません。" | "Names cannot contain NUL.",
+    InvalidTargetError => "割り当て先には単一のキーを選んでください。" | "Choose a single documented assignment target.",
+    InvalidTriggerError => "トリガーには単一のキーを選んでください。" | "Choose a single documented trigger.",
+    EmptyStepsError => "マクロには 1 ステップ以上必要です。" | "A macro needs at least one step.",
+    ZeroStepError => "ステップ {} の時間が 0 ms です。" | "Step {} has a 0 ms duration.",
+    MacroStepLimitError => "マクロは 200 ステップまでです（現在 {}）。" | "A macro is limited to 200 steps (currently {}).",
+    NoChangesError => "書き込む変更がありません。" | "There are no changes to write.",
+    InvalidPlanError => "変更内容を検証できませんでした。" | "The changes could not be validated.",
+    KeyBtCon => "Bluetooth 接続" | "Bluetooth",
+    KeySwap => "スワップ" | "Swap",
+    KeyTurbo3 => "ターボ 3" | "Turbo 3",
 
     // Log.
     LogEmpty => "まだ記録がありません。" | "No entries yet.",
@@ -245,6 +419,11 @@ define_keys! {
     LogLiveStarted => "ライブ入力を開始しました。" | "Live input started.",
     LogLiveStopped => "ライブ入力を停止しました。" | "Live input stopped.",
     LogBackup => "設定を書き出しました。{} / SHA-256 {}" | "Backup written: {} / SHA-256 {}",
+    LogPreWriteBackup => "書き込み前バックアップ: {} / SHA-256 {}" | "Pre-write backup: {} / SHA-256 {}",
+    LogPreWriteMacroBackup => "書き込み前マクロバックアップ: {} / config SHA-256 {}" | "Pre-write macro backup: {} / config SHA-256 {}",
+    LogConfigWritten => "設定値を書き込みました。" | "Configuration written.",
+    LogMacroWritten => "プロファイル {} のマクロ {} を書き込みました。" | "Wrote macro {} in profile {}.",
+    LogMacroRead => "プロファイル {} のマクロ {} を読み取りました。" | "Read macro {} in profile {}.",
     LogDisconnected => "切断しました。" | "Disconnected.",
     LogWorkerStopped => "バックグラウンド処理が停止しました。アプリを再起動してください。" | "The background worker stopped. Restart the application.",
     LogAppNotRunning => "バックグラウンド処理が動作していません。アプリを再起動してください。" | "The background worker is not running. Restart the application.",
@@ -259,6 +438,13 @@ define_keys! {
     ErrVersionReadFailed => "バージョンを読み取れませんでした。" | "Could not read the version.",
     ErrConfigReadFailed => "設定値を読み取れませんでした。" | "Could not read the configuration.",
     ErrBackupFailed => "設定を書き出せませんでした。" | "Could not write the backup.",
+    ErrMacroReadFailed => "マクロを読み取れませんでした。" | "Could not read the macro.",
+    ErrMacroReadLostLink => "マクロの読み取り中に接続が切れました。" | "The link dropped while reading the macro.",
+    ErrWriteReadFailed => "書き込み前の読み取りに失敗しました。書き込みは行っていません。" | "The pre-write read failed. Nothing was written.",
+    ErrWritePrepareFailed => "書き込み内容の検証に失敗しました。書き込みは行っていません。" | "The write request was rejected. Nothing was written.",
+    ErrWriteBackupFailed => "バックアップを作成できなかったため、書き込みを中止しました。" | "The backup could not be written, so the write was stopped.",
+    ErrDeviceWriteFailed => "書き込み中に失敗しました。" | "The write failed on the controller.",
+    ErrWriteLostLink => "書き込み中に接続が切れました。" | "The link dropped during the write.",
     ErrStopLiveFailed => "ライブ入力を停止できませんでした。" | "Could not stop live input.",
     ErrStartLiveFailed => "ライブ入力を開始できませんでした。" | "Could not start live input.",
     ErrConnectionFailed => "接続できませんでした。" | "Could not connect.",
@@ -327,6 +513,10 @@ pub fn button_name(lang: Lang, engraved: &'static str) -> &'static str {
         "Turbo" => t(lang, Key::ButtonTurbo),
         "Turbo Auto" => t(lang, Key::ButtonTurboAuto),
         "Screenshot" => t(lang, Key::ButtonScreenshot),
+        "P1" => t(lang, Key::ButtonP1),
+        "P2" => t(lang, Key::ButtonP2),
+        "P3" => t(lang, Key::ButtonP3),
+        "P4" => t(lang, Key::ButtonP4),
         other => BUTTON_LABELS
             .iter()
             .find(|(label, _)| *label == other)
@@ -391,6 +581,129 @@ pub fn active_profile_text(lang: Lang, raw: u16) -> String {
 #[must_use]
 pub fn profile_text(lang: Lang, number: u8) -> String {
     format(lang, Key::ProfileLabel, &[number.to_string()])
+}
+
+/// Display name of one documented key target (remap, trigger or gyro button).
+///
+/// Unsupported stored values (`KeyMap::MY_NULL` = 227, unknown bits, composite
+/// masks) are shown as a raw mask so the user can see why the combo box does
+/// not offer them.
+#[must_use]
+pub fn key_target_text(lang: Lang, map: KeyMap) -> String {
+    match map.name() {
+        Some("None") => t(lang, Key::KeyNone).to_string(),
+        Some("ScreenShot") => t(lang, Key::ButtonScreenshot).to_string(),
+        Some("Turbo_Auto") => t(lang, Key::ButtonTurboAuto).to_string(),
+        Some("Turbo_3") => t(lang, Key::KeyTurbo3).to_string(),
+        Some("BT_CON") => t(lang, Key::KeyBtCon).to_string(),
+        Some("Swap") => t(lang, Key::KeySwap).to_string(),
+        Some("M1" | "M2" | "M3" | "M4") => map.name().unwrap_or_default().to_string(),
+        Some("My_Null") => format!("0x{:08X}", map.bits()),
+        Some(name) => button_name(lang, name).to_string(),
+        None => format(lang, Key::KeyUnknown, &[format!("0x{:08X}", map.bits())]),
+    }
+}
+
+/// Display name of one special-feature bit.
+#[must_use]
+pub fn special_feature_text(lang: Lang, feature: SpecialFeature) -> &'static str {
+    if feature == SpecialFeature::LX_FLIP {
+        t(lang, Key::SpecialLxFlip)
+    } else if feature == SpecialFeature::LY_FLIP {
+        t(lang, Key::SpecialLyFlip)
+    } else if feature == SpecialFeature::RX_FLIP {
+        t(lang, Key::SpecialRxFlip)
+    } else if feature == SpecialFeature::RY_FLIP {
+        t(lang, Key::SpecialRyFlip)
+    } else if feature == SpecialFeature::STICK_SWAP {
+        t(lang, Key::SpecialStickSwap)
+    } else if feature == SpecialFeature::TRIGGER_SWAP {
+        t(lang, Key::SpecialTriggerSwap)
+    } else if feature == SpecialFeature::DPAD_SWAP {
+        t(lang, Key::SpecialDpadSwap)
+    } else if feature == SpecialFeature::RS_TRIGGER_FLIP {
+        t(lang, Key::SpecialRsTriggerFlip)
+    } else if feature == SpecialFeature::MOTION_SENSITIVITY {
+        t(lang, Key::SpecialMotionSensitivity)
+    } else if feature == SpecialFeature::ZERO_DEADZONE {
+        t(lang, Key::SpecialZeroDeadzone)
+    } else if feature == SpecialFeature::FOUR_WAY {
+        t(lang, Key::SpecialFourWay)
+    } else if feature == SpecialFeature::TRIGGER_VIBRATION {
+        t(lang, Key::SpecialTriggerVibration)
+    } else {
+        t(lang, Key::SpecialVibration)
+    }
+}
+
+/// Display name of one grouped configuration change.
+#[must_use]
+pub fn change_text(lang: Lang, change: ChangeKind) -> String {
+    match change {
+        ChangeKind::ProfileName(slot) => {
+            format(lang, Key::ChangeProfileName, &[slot.number().to_string()])
+        }
+        ChangeKind::GamepadMode => t(lang, Key::ChangeGamepadMode).to_string(),
+        ChangeKind::ActiveProfile => t(lang, Key::ChangeActiveProfile).to_string(),
+        ChangeKind::Rumble(slot) => format(lang, Key::ChangeRumble, &[slot.number().to_string()]),
+        ChangeKind::Sticks(slot) => format(lang, Key::ChangeSticks, &[slot.number().to_string()]),
+        ChangeKind::Triggers(slot) => {
+            format(lang, Key::ChangeTriggers, &[slot.number().to_string()])
+        }
+        ChangeKind::Special(slot) => format(lang, Key::ChangeSpecial, &[slot.number().to_string()]),
+        ChangeKind::Gyro(slot) => format(lang, Key::ChangeGyro, &[slot.number().to_string()]),
+        ChangeKind::LedTheme(slot) => {
+            format(lang, Key::ChangeLedTheme, &[slot.number().to_string()])
+        }
+        ChangeKind::RemapFlag(slot) => {
+            format(lang, Key::ChangeRemapFlag, &[slot.number().to_string()])
+        }
+        ChangeKind::RemapButton(slot, button) => format(
+            lang,
+            Key::ChangeRemapButton,
+            &[
+                slot.number().to_string(),
+                button_name(lang, button.label()).to_string(),
+            ],
+        ),
+    }
+}
+
+/// Display name of one changed macro header field.
+#[must_use]
+pub fn macro_change_text(lang: Lang, change: MacroChange) -> &'static str {
+    match change {
+        MacroChange::Steps => t(lang, Key::MacroChangeSteps),
+        MacroChange::Name => t(lang, Key::MacroChangeName),
+        MacroChange::Trigger => t(lang, Key::MacroChangeTrigger),
+        MacroChange::Cycles => t(lang, Key::MacroChangeCycles),
+        MacroChange::Interval => t(lang, Key::MacroChangeInterval),
+    }
+}
+
+/// Localized explanation of a refused draft.
+#[must_use]
+pub fn draft_error_text(lang: Lang, error: &DraftError) -> String {
+    match error {
+        DraftError::NameTooLong { units, .. } => format(
+            lang,
+            Key::NameTooLong,
+            &[MAX_NAME_UNITS.to_string(), units.to_string()],
+        ),
+        DraftError::NameHasNul { .. } => t(lang, Key::NameHasNul).to_string(),
+        DraftError::NoChanges => t(lang, Key::NoChangesError).to_string(),
+        DraftError::EmptyTarget { .. } => t(lang, Key::MacroEmptyTarget).to_string(),
+        DraftError::EmptySteps => t(lang, Key::EmptyStepsError).to_string(),
+        DraftError::TooManySteps { count } => {
+            format(lang, Key::MacroStepLimitError, &[count.to_string()])
+        }
+        DraftError::ZeroDuration { index } => {
+            format(lang, Key::ZeroStepError, &[(index + 1).to_string()])
+        }
+        DraftError::InvalidKeyTarget { .. } => t(lang, Key::InvalidTargetError).to_string(),
+        DraftError::InvalidTrigger { .. } => t(lang, Key::InvalidTriggerError).to_string(),
+        DraftError::InvalidPlan(_) => t(lang, Key::InvalidPlanError).to_string(),
+    }
 }
 
 #[cfg(test)]

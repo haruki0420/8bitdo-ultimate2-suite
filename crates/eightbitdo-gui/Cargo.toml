@@ -1,6 +1,6 @@
 [package]
 name = "eightbitdo-gui"
-description = "Read-only desktop GUI for the 8BitDo Ultimate 2 Bluetooth controller"
+description = "Desktop GUI for the 8BitDo Ultimate 2 Bluetooth controller: read-only views plus confirmed settings and macro writes"
 version.workspace = true
 edition.workspace = true
 # eframe 0.29 has an MSRV of 1.76; the rest of the workspace stays at 1.85.
@@ -15,11 +15,12 @@ path = "src/main.rs"
 
 [dependencies]
 eightbitdo-core = { path = "../eightbitdo-core" }
-eightbitdo-protocol = { path = "../eightbitdo-protocol" }
+eightbitdo-protocol = { path = "../eightbitdo-protocol", features = ["serde"] }
 chrono = "0.4"
 dirs = "5"
 eframe = "0.29.1"
 hex = "0.4"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
