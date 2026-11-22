@@ -201,7 +201,7 @@ Track C: モバイル
   - 3 スロット × 4 マクロのバックアップ（raw `.bin` + JSON/TOML + SHA-256 + config snapshot）
   - Mock でパケット列・CRC・チャンク境界・タイムアウト・fail-closed・読み戻し不一致を固定
   - CLI: `macro backup --dir <DIR>` / `macro write --slot N --index N --file <JSON/TOML> [--trigger M1..M4]` / `macro restore --dir <DIR> [--force]`
-  - fail-closed（`MacroWriteState::{NotSaved, HeaderSaved, DataSaved}`: Header 失敗は Save/Erase 未送信、最初の Save 失敗は Erase/Write 未送信、Erase/Write 失敗はヘッダ Save 済みとして復元を案内）、`0x0002` の 216B ヘッダ検証 + `0x0102` の raw 検証、`--trigger` のヘッダ反映
+  - fail-closed（`MacroWriteState::{NotSaved, HeaderSaved, DataSaved}`: Header 失敗は Save/Erase 未送信、最初の Save 失敗は Erase/Write 未送信、Erase/Write 失敗はヘッダ Save 済みとして復元を案内、空 slot のヘッダのみ restore で Verify が失敗した場合は `HeaderSaved` として復元を案内）、`0x0002` の 216B ヘッダ検証 + `0x0102` の raw 検証、`--trigger` のヘッダ反映
   - 実機の旧順序 macro1 verify 失敗（部分書込）を受け、Erase ACK 後 100ms、全 Write 後 50ms、最終 Save 後 verify 300ms の暫定 delay を追加（Header Save → Erase は 0ms）
   - 空きマクロ（`max_steps == 0` / `0xFFFF`）への write を拒否（step data clear 未実装）
   - `macro write` は 12 マクロ完全バックアップ必須。対象 slot に読めないマクロがあれば `unreadable macro in target slot` で拒否
@@ -210,7 +210,7 @@ Track C: モバイル
   - `MacroFile.cycles_num` / `interval_ms` は省略可能（未指定は既存値保持）。`gamepad_mode` は無視
 - **完了条件**: 実機で 1 マクロ書き込み → 読み戻し一致 → Switch 側で発動 → 元のマクロへ復元。
 - **Tier**: **3**（write-path / Flash / CRC / マクロ）。
-- **状態**: 読み取り・バックアップは実機確認済み（142B チャンク、offset エコー）。書き込み・restore は Mock 実装と CLI まで完了し、**実機書き込みは未実施**。実機前に残る未確定点は `PROTOCOL_SPEC.md` §6.5（BLE Save の ACK 形状 / タイムアウト、Save 時の config CRC 再計算、MTU 200 以外での実機挙動）。
+- **状態**: 読み取り・バックアップは実機確認済み（142B チャンク、offset エコー）。書き込み・restore は Mock 実装と CLI まで完了し、**新順序での実機書き込みは未実施（旧順序は試行済み: macro0 成功、macro1 は Verify 失敗）**。実機前に残る未確定点は `PROTOCOL_SPEC.md` §6.5（BLE Save の ACK 形状 / タイムアウト、Save 時の config CRC 再計算、MTU 200 以外での実機挙動）。
 
 ### Phase 2c: Linux BLE OTA
 - **ゴール**: Linux から BLE Bootloader 経由でファームウェア更新・復旧を行う。

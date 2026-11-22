@@ -499,15 +499,15 @@ sequenceDiagram
    - 実機 Erase ACK（2026-11-22）は **16B ヘッダのみ**で、`04 00 04 01 00 10 01 01 00 10 00 00 00 00 00 00`（`cmd=0x0004`, `subcmd=0x0104`, `chunk_len=0x1000`, `crc16=0x0101`, `total_len=0x1000`, `offset=0`）。`chunk_len` をエコーしていてもペイロードはない。ACK 判定はヘッダ先行で行い、`chunk_len` / `total_len` のエコーを許容する（`decode_app_response` のペイロード長検査を ACK に適用しない）。
 4. **Write (`0x0103`)**: `total_len = align32(steps * 10)`、`offset = (macro_idx << 12) + chunk_index * chunk_size`、各チャンクの CRC-16/MODBUS。ACK は 2 秒。チャンクは MTU 連動で、`max_payload = mtu - 3 - 17` が `64` 以上なら 64B、`32` 以上なら 32B、それ未満は `Error::MtuTooSmall`。`MacroWritePlan.chunk_size` / CLI `--chunk-size 32` で **32B 均一**を明示できる（460B → 480B = 15 × 32B、500B → 512B = 16 × 32B、最終も 32B）。`--chunk-size 64` は 64B 基本で、最終チャンクが 32B になることがある（**均一になるのは 32B 指定のみ**）。32/64 以外は `UnsupportedChunkSize`、MTU 不足は `MtuTooSmall`。**全マクロの最終 Write ACK 後 50ms** 待ってから最終 Save を送る（`MACRO_WRITE_SETTLE_DELAY`、暫定値）。
 5. **Final Save (`0x0006`)**: BLE `subcmd = 0x0067` のみ。slot バッチ内の全マクロを Erase/Write した後に **1 回だけ**送る。ACK は 3 秒・リトライなし。公式は `EraseMacroDataDone` / `WriteMacroDataDone` の連鎖後に Save を送る。
-6. **Read-back**: 最終 Save ACK 後に **300ms** 待ってから `0x0002` で 2768B config を読み、対象 slot の **216B ヘッダ**を送信した `header_bytes` とバイト比較する。続けて `0x0102` でバッチ内の各 `(slot, macro_idx)` を読み、`steps * 10` バイトが一致することを確認する。どちらの不一致も `Error::MacroWrite { stage: Verify, state: DataSaved }` になる。ヘッダ不一致のメッセージは、flag / total_cnt / 予約バイトのどこが違うかと「device が正規化した可能性、state=DataSaved なので再書き込みしない」を含む。300ms は暫定値で実機未確認。
+6. **Read-back**: 最終 Save ACK 後に **300ms** 待ってから `0x0002` で 2768B config を読み、対象 slot の **216B ヘッダ**を送信した `header_bytes` とバイト比較する。続けて `0x0102` でバッチ内の各 `(slot, macro_idx)` を読み、`steps * 10` バイトが一致することを確認する。ヘッダ + データを書いた `macro write` / 非空 slot の restore では、どちらの不一致も `Error::MacroWrite { stage: Verify, state: DataSaved }` になる。ヘッダのみを書く空 slot の restore は step data を送っていないため、Verify 不一致は `state: HeaderSaved` になる。ヘッダ不一致のメッセージは、flag / total_cnt / 予約バイトのどこが違うかと「device が正規化した可能性、Save 送信済みなので再書き込みしない」を含む。300ms は暫定値で実機未確認。
    - 公式順序の RE 根拠: `writeCustomConfig`（ヘッダ書込）→ `writeCustomConfig_onfinished` で **Save** → Java `writeCustomConfigDone` → `Erase(0) → Write(0) → Erase(1) → Write(1) …` → 最後に Save（`EraseMacroDataDone` / `WriteMacroDataDone`）。本実装はこの順序に合わせた。
    - 実機観測（2026-11-22）: 旧順序（Erase → Write → Header(total_len=0x0AD0) → Save）で macro 0（500B）は成功し、macro 1（460B）だけが全 ACK 後に `0x0102` zeros で Verify 失敗した。216B ヘッダは一致していた。公式の **Header(total_len=0xD8) → Save → Erase/Write → Save** との差分を原因候補とし、本 PR で順序を変更した（新順序は実機未検証）。最終 32B チャンク仮説に対しては `--chunk-size 32` も指定できる。
 
 **Fail-closed / 状態**: `Error::MacroWrite` は `MacroWriteState` で 3 段階を区別する。
 
 - `NotSaved`（stage `Header`）: Save も Erase も送っておらず、マクロ sector は未変更。config を再読込して再試行してよい。
-- `HeaderSaved`（stage `HeaderSave` / `Erase` / `Write`）: ヘッダ Save は送信済み。`HeaderSave` 失敗では Erase/Write 未送信で sector は未変更、Erase/Write 失敗では sector が消去済み/部分書込の可能性がある。12 マクロ backup から復元する。
-- `DataSaved`（stage `FinalSave` / `Verify`）: ヘッダ + データ送信済み。再読込し、必要なら backup から復元する。
+- `HeaderSaved`（stage `HeaderSave` / `Erase` / `Write`、およびヘッダのみの restore の `Verify`）: ヘッダ Save は送信済み。`HeaderSave` 失敗では Erase/Write 未送信で sector は未変更、Erase/Write 失敗では sector が消去済み/部分書込の可能性がある。12 マクロ backup から復元する。
+- `DataSaved`（stage `FinalSave` / `Verify`）: ヘッダ + データ送信済み。再読込し、必要なら backup から復元する。この状態になるのは step data を送った書き込みだけであり、ヘッダのみを書く空 slot の restore で Verify が失敗した場合は `HeaderSaved` になる。
 
 Header または最初の Save が失敗した場合、Erase は送らない。復旧文は段階ごとに固定し、テストで文字列と state を assert する。
 
@@ -530,16 +530,16 @@ Header または最初の Save が失敗した場合、Erase は送らない。�
 - 216B ヘッダの更新では、既存の予約バイト（slot `+0x05..+0x07`、record `+0x26..+0x27`）を保持する。既知フィールドだけを変更する。`total_cnt` が 5 以上になる更新は拒否する。
 - restore 前には現在の 3 スロット × 4 マクロを pre-restore backup に保存する（`--force` 時は best-effort）。backup dir は既存の非空ディレクトリを拒否する。
 - 非 skipped エントリの `raw_sha256` は manifest に必須。欠落は restore 前に拒否する。
-- restore の最後に config を再読込し、**全 slot の 216B ヘッダ**と**非空マクロの raw steps** を比較する。不一致は `Error::UnexpectedResponse` で、pre-restore backup の path を含む。**Verify 失敗は書込み失敗ではない**。`DataSaved` の場合は再書き込みせず、再読込と restore で確認する。2768B 全体の SHA-256 は device の CRC 再計算で変わり得るため、情報表示のみ。`config_crc_valid == false` も CLI の警告に留める。
+- restore の最後に config を再読込し、**全 slot の 216B ヘッダ**と**非空マクロの raw steps** を比較する。不一致は `Error::UnexpectedResponse` で、pre-restore backup の path を含む。**Verify 失敗は書込み失敗ではない**。`DataSaved`（または空 slot のヘッダのみ restore で `HeaderSaved`）の場合は再書き込みせず、再読込と restore で確認する。2768B 全体の SHA-256 は device の CRC 再計算で変わり得るため、情報表示のみ。`config_crc_valid == false` も CLI の警告に留める。
 - USB 32B 書き込みは未実装。`SaveTransport::Usb` は `Error::Unsupported` で拒否し、CLI は BLE のみを使う。
 
 **バックアップ出力**: `macro backup` / `macro write` の pre-write backup / `macro restore` の pre-restore backup は、**空の path**、既存の**非空ディレクトリ**（`config.bin` などが 1 つでもある）、symlink（末尾 `/` / `.` を含む）を拒否する。空ディレクトリまたは新規ディレクトリだけを使い、既存バックアップを上書きしない。`macro backup` が読み取り途中で失敗し、作成した最終ディレクトリが空のままなら削除する。相対パス `.` / `./` はバックアップ先として拒否するので、絶対パスを使う。symlink 検査は最終コンポーネントのみで、中間 symlink は対象外。
 
 **未確定点**:
 
-- Header / Write のチャンク長は MTU 連動（`max_payload = mtu - 3 - 17`）。実機書き込みで使う想定は MTU 200（Header 142B / Write 64B）だが、実機書き込みは未実施。MTU 64 / 23 は Mock のみ。
+- Header / Write のチャンク長は MTU 連動（`max_payload = mtu - 3 - 17`）。実機書き込みで使う想定は MTU 200（Header 142B / Write 64B）だが、**新順序（Header 0xD8 → Save → Erase/Write → Save）での実機書き込みは未実施**（旧順序は試行済み: macro0 成功、macro1 は Verify 失敗）。MTU 64 / 23 は Mock のみ。
 - BLE Save の正式タイムアウトと、Save ACK の実際の `cmd` / `subcmd` 形状（`0x0006` 直か `0x0004, subcmd=0x0006/0x0067` か）。
-- Erase / Write / Header の ACK 形状（`0x0004` エンベロープか直接エコーか）。実装は両方を受け入れる。`0x04` prefix 付き frame は prefix + 16B header として**排他的**に解析し、prefix なし解釈へ fallback しない（`04 01 00 ...` を Erase ACK と誤認しない）。
+- Erase / Write / Header の ACK 形状（`0x0004` エンベロープか直接エコーか）。実装は両方を受け入れる。`0x04` prefix 付き frame は、まず prefix + 16B header として解析する。この解釈で読めたコマンドが既知の別 App Mode コマンドなら、そのコマンドの ACK として読み飛ばす。未知コマンド（または解析失敗）の場合は、prefix なしヘッダとして読み直す。これにより `04 01 00 ...`（prefix + direct Header ACK）を Erase ACK と誤認しない。ただし、この fallback で拾えるのは envelope ACK（`cmd = 0x0004`）に限られる。prefix なしの direct ACK に payload が付いて先頭が `0x04` になる場合は、prefix + Header ACK とバイト列で区別できず、prefixed 解釈のまま扱う。実機で観測した Erase ACK は envelope かつ payload なし（§6.5 手順 3）なので、現時点で実害は想定していない。ACK 判定の `ack_matches` は、envelope ACK の `subcmd` に要求コマンド ID（Erase `0x0104` / Write `0x0103` / Header `0x0001`）を期待し、`macro_subcmd = (mode << 8) | slot` は受理しない。実機で形状を観測済みなのは Erase の `cmd = 0x0004, subcmd = 0x0104` だけで、Header / Write の envelope ACK 形状は未確認である。Switch slot 0 では `macro_subcmd` が 0 になり、裸の envelope と区別できないため、意図的に受理しない設計としている。
 - Save 時の device による config CRC 再計算。
 - 最終 Save 後の読み戻し待機は暫定 300ms（実機未確認）。Header Save → Erase の settle は 0ms。実機でまだ verify が落ちる場合、次の候補はこの区間への settle delay 追加と `--chunk-size 32` の再確認。
 - 216B Header 部分書込後の device 側 `flag` / `total_cnt` の解釈。

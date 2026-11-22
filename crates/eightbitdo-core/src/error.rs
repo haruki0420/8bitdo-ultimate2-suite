@@ -45,9 +45,13 @@ pub enum MacroWriteState {
     NotSaved,
     /// Header Save was sent, or Erase/Write failed after the header Save.
     /// The sector may be unchanged (header-save failure) or erased/partially
-    /// written (erase/write failure).
+    /// written (erase/write failure). A header-only write (`0x0001` +
+    /// `0x0006` with no Erase/Write) that fails its Verify also reports
+    /// `HeaderSaved`: no step data and no Erase were sent, so the macro sector
+    /// is unchanged.
     HeaderSaved,
-    /// Final Save or Verify failed after header + data were sent.
+    /// Final Save or Verify failed after header + data were sent. Only paths
+    /// that sent the step data (and its Erase) report `DataSaved`.
     DataSaved,
 }
 

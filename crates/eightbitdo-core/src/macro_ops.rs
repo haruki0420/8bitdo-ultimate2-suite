@@ -1197,8 +1197,8 @@ impl<T: Transport> Session<T> {
                 macro_write_failure(
                     MacroWriteStage::Verify,
                     error,
-                    MacroWriteState::DataSaved,
-                    RECOVERY_DATA_SAVED,
+                    MacroWriteState::HeaderSaved,
+                    RECOVERY_HEADER_VERIFY,
                 )
             })?;
 
@@ -1230,8 +1230,8 @@ impl<T: Transport> Session<T> {
             return Err(Error::UnexpectedResponse(format!(
                 "macro header read-back mismatch at config offset 0x{header_offset:X} (first \
                  differing byte +0x{first_diff:X} in {field}: device 0x{:02X}, sent 0x{:02X}). \
-                 The device may normalize flag/total_cnt/reserved bytes; Save was sent \
-                 (state=DataSaved), so do not rewrite blindly.",
+                 The device may normalize flag/total_cnt/reserved bytes; Save was sent, \
+                 so do not rewrite blindly.",
                 actual.get(first_diff).copied().unwrap_or(0),
                 expected.get(first_diff).copied().unwrap_or(0)
             )));
@@ -1248,10 +1248,20 @@ impl<T: Transport> Session<T> {
     /// ACKs are matched by `cmd` / `subcmd`; `chunk_len` and `total_len` echoes
     /// are accepted (the observed Erase ACK carries `chunk_len=0x1000` with no
     /// payload). No payload is required. Unrelated frames are skipped, and
-    /// `0x000E` is surfaced as an error. A frame with a `0x04` prefix is parsed
-    /// **exclusively** as prefix + 16-byte header; it never falls back to
-    /// treating the prefix as `cmd` low byte, so a prefixed direct Header ACK
-    /// cannot be mistaken for an Erase ACK.
+    /// `0x000E` is surfaced as an error.
+    ///
+    /// A frame longer than a bare header whose first byte is `0x04` is first
+    /// parsed as prefix + 16-byte header. If that parse yields an ACK of a
+    /// different known App command the frame is skipped; otherwise an unknown
+    /// `cmd` falls back to the unprefixed parse. The fallback keeps a 17-byte
+    /// unprefixed Save ACK carrying one payload byte (its `cmd` low byte is
+    /// `0x04`) from being dropped, while skipping known commands keeps a
+    /// prefixed direct Header ACK from being mistaken for an Erase ACK.
+    ///
+    /// The prefixed parse itself cannot fail in this branch: the
+    /// `frame.len() > HEADER_SIZE` condition guarantees at least `HEADER_SIZE`
+    /// bytes from byte 1, and [`CustomHeader::parse`] only rejects short input.
+    /// The fallback therefore triggers on an unknown `cmd` in practice.
     async fn send_and_await_ack(
         &self,
         request: &commands::Request,
@@ -1280,26 +1290,32 @@ impl<T: Transport> Session<T> {
                 Err(_) => return Err(ack_timeout(description, ack_cmd, timeout)),
             };
 
-            // A BLE App frame may arrive with a 0x04 prefix. When that prefix
-            // is present, parse exclusively from byte 1 and do not fall back to
-            // the unprefixed interpretation: `04 01 00 ...` (prefix + direct
-            // Header ACK) would otherwise look like cmd=0x0104 (Erase).
+            // A BLE App frame may arrive with a 0x04 prefix. Parse from byte 1
+            // first: an ACK of a different known App command is skipped so
+            // `04 01 00 ...` (prefix + direct Header ACK) is never re-parsed as
+            // cmd=0x0104 (Erase). An unknown `cmd` falls back to the
+            // unprefixed parse, because a 17-byte unprefixed Save ACK with one
+            // payload byte also starts with 0x04 (the low byte of
+            // cmd=RESPONSE). This parse cannot fail: `frame.len() >
+            // HEADER_SIZE` leaves at least HEADER_SIZE bytes from byte 1, and
+            // `CustomHeader::parse` rejects only short input.
             if frame.len() > HEADER_SIZE && frame[0] == 0x04 {
-                let prefixed = match CustomHeader::parse(&frame[1..]) {
-                    Ok(header) => header,
-                    Err(_) => continue,
-                };
-                let payload = &frame[HEADER_SIZE + 1..];
-                if prefixed.cmd == 0x000E {
-                    return Err(Error::UnexpectedResponse(format!(
-                        "controller returned error 0x000E while waiting for {description} ACK: {:02X?}",
-                        payload
-                    )));
+                if let Ok(prefixed) = CustomHeader::parse(&frame[1..]) {
+                    let payload = &frame[HEADER_SIZE + 1..];
+                    if prefixed.cmd == 0x000E {
+                        return Err(Error::UnexpectedResponse(format!(
+                            "controller returned error 0x000E while waiting for {description} ACK: {:02X?}",
+                            payload
+                        )));
+                    }
+                    if ack_matches(&prefixed, ack_cmd, ack_subcmd) {
+                        return Ok(());
+                    }
+                    if is_known_app_command(prefixed.cmd) {
+                        // ACK of a different App command; skip it.
+                        continue;
+                    }
                 }
-                if ack_matches(&prefixed, ack_cmd, ack_subcmd) {
-                    return Ok(());
-                }
-                continue;
             }
 
             // Prefix-less ACK: a bare 16-byte header, even if it echoes a
@@ -1480,6 +1496,11 @@ const RECOVERY_HEADER_SAVED: &str = "Header is saved. The macro sector may be er
 /// Final Save/Verify failed after header + data were sent.
 const RECOVERY_DATA_SAVED: &str =
     "Header and data were sent. Re-read the macros and restore from the 12-macro backup if needed.";
+/// Header-only write (`0x0001` + `0x0006`) failed its read-back. No step data
+/// and no Erase were sent, so the macro sector is unchanged.
+const RECOVERY_HEADER_VERIFY: &str =
+    "Header was saved; step data was not written and the macro sector is unchanged. \
+     Re-read the header and restore from the 12-macro backup if it differs.";
 
 fn macro_write_failure(
     stage: MacroWriteStage,
@@ -1517,9 +1538,47 @@ fn ack_timeout(description: &str, ack_cmd: u16, timeout: Duration) -> Error {
 }
 
 fn ack_matches(response: &CustomHeader, ack_cmd: u16, ack_subcmd: u16) -> bool {
-    response.cmd == ack_cmd
-        || (response.cmd == cmd::RESPONSE
-            && (response.subcmd == ack_cmd || response.subcmd == ack_subcmd))
+    if response.cmd == ack_cmd {
+        return true;
+    }
+    if response.cmd != cmd::RESPONSE {
+        return false;
+    }
+    // Save replies with a fixed sub-command (0x0067). The observed Erase ACK
+    // (`cmd=0x0004, subcmd=0x0104`) echoes the request command in `subcmd`;
+    // the Header/Write ACK envelope shapes are not confirmed on hardware. A
+    // generic `subcmd == ack_subcmd` fallback would accept a bare 16-byte
+    // response envelope (`cmd=0x0004, subcmd=0`) as an Erase/Write ACK for
+    // Switch slot 0, where `macro_subcmd` is 0.
+    response.subcmd == ack_cmd || (ack_cmd == cmd::SAVE && response.subcmd == ack_subcmd)
+}
+
+/// App Mode commands this crate sends, used to decide whether a frame parsed
+/// with the BLE `0x04` prefix is a known ACK of another command.
+///
+/// Update this list when adding an App Mode command to [`commands::cmd`].
+const KNOWN_APP_COMMANDS: [u16; 17] = [
+    cmd::WRITE_CONFIG,
+    cmd::READ_CONFIG,
+    cmd::INPUT,
+    cmd::SAVE,
+    cmd::REPORT_ENABLE,
+    cmd::READ_VERSION,
+    cmd::RESPONSE,
+    cmd::ENTER_BOOT,
+    cmd::DISCONNECT_BT,
+    cmd::SET_PHONE_PLATFORM,
+    cmd::SET_CONFIG_STATE,
+    cmd::ALLOW_CONFIG_DONE,
+    cmd::START_CONFIG,
+    cmd::WRITE_SLOT,
+    cmd::READ_MACRO,
+    cmd::WRITE_MACRO,
+    cmd::ERASE_MACRO,
+];
+
+fn is_known_app_command(command: u16) -> bool {
+    KNOWN_APP_COMMANDS.contains(&command)
 }
 
 fn header_field_name(offset: usize) -> &'static str {
@@ -3215,11 +3274,16 @@ mod write_tests {
             result,
             Err(Error::MacroWrite {
                 stage: MacroWriteStage::Verify,
-                state: MacroWriteState::DataSaved,
+                state: MacroWriteState::HeaderSaved,
                 reason,
-                ..
-            }) if reason.contains("normalize")
+                recovery,
+            }) if reason.contains("normalize") && recovery == RECOVERY_HEADER_VERIFY
         ));
+        // RECOVERY_HEADER_VERIFY claims the macro sector is unchanged: a
+        // header-only write must not have sent Erase or Write.
+        let sent = mock.sent_frames();
+        assert_eq!(count_cmd(&sent, cmd::ERASE_MACRO), 0);
+        assert_eq!(count_cmd(&sent, cmd::WRITE_MACRO), 0);
     }
 
     #[tokio::test]
@@ -3446,9 +3510,10 @@ mod write_tests {
     async fn prefixed_direct_header_ack_is_not_treated_as_erase_ack() {
         let steps = sample_steps(10);
         // `04` prefix + a direct Header ACK (`cmd=0x0001`) looks like
-        // cmd=0x0004 (RESPONSE) / subcmd=0x0000 when parsed as one header.
-        // For slot S1 in Switch mode the expected Erase ACK is exactly
-        // cmd=0x0004 / subcmd=0x0000, so a fallback would accept it.
+        // cmd=0x0104 (ERASE_MACRO) / subcmd=0x0000 when parsed as one header.
+        // The observed Erase ACK is cmd=0x0004 (RESPONSE) / subcmd=0x0104, so a
+        // fallback that matched only the parsed `cmd` would accept this frame
+        // as an Erase ACK.
         let mut prefixed = vec![0x04];
         prefixed.extend_from_slice(&CustomHeader::new(cmd::WRITE_CONFIG, 0, 0, 0).to_bytes());
         let script = vec![
@@ -3471,22 +3536,185 @@ mod write_tests {
     }
 
     #[tokio::test]
+    async fn unprefixed_save_ack_with_payload_is_accepted() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(10); // 100B -> align32 128B -> two 64B Writes
+        let plan = MacroWritePlan::new(steps.clone());
+        let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
+
+        let mock = MockTransport::with_mtu(200);
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        push_ack(&mock, cmd::SAVE, true);
+        push_ack(&mock, cmd::ERASE_MACRO, true);
+        push_ack(&mock, cmd::WRITE_MACRO, true);
+        push_ack(&mock, cmd::WRITE_MACRO, true);
+        // 17-byte unprefixed Save ACK carrying one payload byte. Its first
+        // byte is 0x04 (`cmd` low byte), so the old exclusive prefix parse
+        // dropped it.
+        mock.push_response(
+            &CustomHeader::new(cmd::RESPONSE, cmd::SAVE, 0, 0).with_chunk_len(1),
+            &[0x00],
+        );
+        push_config(&mock, &expected);
+        push_readback(&mock, &steps);
+
+        let session = Session::new(&mock);
+        let outcome = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await
+            .unwrap();
+        assert_eq!(count_cmd(&mock.sent_frames(), cmd::SAVE), 2);
+        assert_eq!(outcome.packets_sent, 7);
+    }
+
+    #[tokio::test]
+    async fn bare_response_envelope_is_not_an_erase_ack() {
+        let steps = sample_steps(10);
+        // Switch mode + slot 0 makes `macro_subcmd` 0, so the old generic
+        // `subcmd == ack_subcmd` fallback accepted this bare envelope as Erase.
+        let bare = ScriptedTransport::response(CustomHeader::new(cmd::RESPONSE, 0, 0, 0), &[]);
+        let script = vec![
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::SAVE, true),
+            bare,
+        ];
+        let (result, sent) = write_with_script(script, true, &steps).await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Erase,
+                state: MacroWriteState::HeaderSaved,
+                recovery,
+                ..
+            }) if recovery == RECOVERY_HEADER_SAVED
+        ));
+        assert_eq!(count_cmd(&sent, cmd::WRITE_MACRO), 0);
+        assert_eq!(sent.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn unprefixed_error_envelope_is_surfaced_while_waiting_for_erase_ack() {
+        let steps = sample_steps(10);
+        let error = ScriptedTransport::response(CustomHeader::new(0x000E, 0, 0, 0), &[]);
+        let script = vec![
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::SAVE, true),
+            error,
+        ];
+        let (result, _) = write_with_script(script, true, &steps).await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Erase,
+                reason,
+                ..
+            }) if reason.contains("0x000E")
+        ));
+    }
+
+    #[tokio::test]
+    async fn prefixed_error_envelope_is_surfaced_while_waiting_for_erase_ack() {
+        let steps = sample_steps(10);
+        let mut prefixed = vec![0x04];
+        prefixed.extend_from_slice(&CustomHeader::new(0x000E, 0, 0, 0).to_bytes());
+        let script = vec![
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::SAVE, true),
+            prefixed,
+        ];
+        let (result, _) = write_with_script(script, true, &steps).await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Erase,
+                reason,
+                ..
+            }) if reason.contains("0x000E")
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_zero_macro_subcmd_envelope_is_not_an_erase_ack() {
+        // XInput mode (low byte 3) + slot S2 (index 1) makes `macro_subcmd`
+        // 0x0301. The Erase ACK echoes the request command (0x0104), not the
+        // macro sub-command, so an envelope carrying 0x0301 must not count as
+        // an Erase ACK.
+        let mut config = Bt2Config::zeroed();
+        config.set_gamepad_mode(GamepadMode::XInput);
+        let mut record = MacroRecord {
+            max_steps: 4,
+            ..MacroRecord::default()
+        };
+        record.set_name("Old").unwrap();
+        config.set_macro_record(Slot::S2, MacroIndex::M1, &record);
+        config.recompute_crc();
+        assert_eq!(
+            commands::macro_subcmd(config.gamepad_mode_raw() & 0xFF, Slot::S2),
+            0x0301
+        );
+        let backup = backup_from(config);
+
+        let steps = sample_steps(10);
+        let plan = MacroWritePlan::new(steps).with_timeouts(short_timeouts());
+        let envelope =
+            ScriptedTransport::response(CustomHeader::new(cmd::RESPONSE, 0x0301, 0, 0), &[]);
+        let script = vec![
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::SAVE, true),
+            envelope,
+        ];
+        let transport = ScriptedTransport::new(script, true, 200);
+        let session = Session::new(&transport);
+        let result = session
+            .write_macro(&backup, Slot::S2, MacroIndex::M1, &plan)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Erase,
+                state: MacroWriteState::HeaderSaved,
+                ..
+            })
+        ));
+        let sent = transport.sent();
+        assert_eq!(count_cmd(&sent, cmd::WRITE_MACRO), 0);
+    }
+
+    #[tokio::test]
     async fn write_macro_slot_writes_two_macros_with_one_header_and_one_final_save() {
         let backup = backup_from(config_with_macros(&[
             (MacroIndex::M1, "One", 4),
             (MacroIndex::M2, "Two", 4),
         ]));
-        let m1_steps = sample_steps(4);
-        let m2_steps = sample_steps(4);
+        // 6 steps = 60B -> align32 64B = 1 chunk; 8 steps = 80B -> align32
+        // 96B = 64 + 32 = 2 chunks.
+        let m1_steps = sample_steps(6);
+        let m2_steps = sample_steps(8);
         let plans = vec![
-            (MacroIndex::M1, MacroWritePlan::new(m1_steps.clone())),
-            (MacroIndex::M2, MacroWritePlan::new(m2_steps.clone())),
+            (
+                MacroIndex::M1,
+                MacroWritePlan::new(m1_steps.clone()).with_name("NewOne"),
+            ),
+            (
+                MacroIndex::M2,
+                MacroWritePlan::new(m2_steps.clone()).with_name("NewTwo"),
+            ),
         ];
         let expected = expected_slot_config(&backup, Slot::S1, &plans);
 
         let mock = MockTransport::with_mtu(200);
-        push_official_acks(&mock, 2, 1);
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        push_ack(&mock, cmd::SAVE, true);
         push_ack(&mock, cmd::ERASE_MACRO, true);
+        push_ack(&mock, cmd::WRITE_MACRO, true);
+        push_ack(&mock, cmd::ERASE_MACRO, true);
+        push_ack(&mock, cmd::WRITE_MACRO, true);
         push_ack(&mock, cmd::WRITE_MACRO, true);
         push_ack(&mock, cmd::SAVE, true);
         push_config(&mock, &expected);
@@ -3515,6 +3743,7 @@ mod write_tests {
                 cmd::WRITE_MACRO,
                 cmd::ERASE_MACRO,
                 cmd::WRITE_MACRO,
+                cmd::WRITE_MACRO,
                 cmd::SAVE,
             ]
         );
@@ -3523,14 +3752,98 @@ mod write_tests {
             .filter(|frame| matches!(frame_cmd(frame), cmd::ERASE_MACRO | cmd::WRITE_MACRO))
             .map(|frame| CustomHeader::parse(&frame[1..]).unwrap().offset)
             .collect();
-        assert_eq!(offsets, vec![0, 0, 0x1000, 0x1000]);
+        assert_eq!(offsets, vec![0, 0, 0x1000, 0x1000, 0x1040]);
         assert_eq!(count_cmd(&sent, cmd::SAVE), 2);
-        assert_eq!(outcome.packets_sent, 8);
+        assert_eq!(outcome.packets_sent, 9);
         assert_eq!(outcome.readbacks.len(), 2);
         assert_eq!(outcome.readbacks[0].raw(), raw_steps(&m1_steps));
-        assert_eq!(outcome.readbacks[0].record().name(), "One");
+        assert_eq!(outcome.readbacks[0].record().name(), "NewOne");
         assert_eq!(outcome.readbacks[1].raw(), raw_steps(&m2_steps));
-        assert_eq!(outcome.readbacks[1].record().name(), "Two");
+        assert_eq!(outcome.readbacks[1].record().name(), "NewTwo");
+
+        // The single 216-byte header write must carry every plan, not only the
+        // last one: check each record's name (UTF-16BE, first 32B) and
+        // `max_steps` at +0x22.
+        let header: Vec<u8> = sent
+            .iter()
+            .filter(|frame| frame_cmd(frame) == cmd::WRITE_CONFIG)
+            .flat_map(|frame| frame[17..].iter().copied())
+            .collect();
+        assert_eq!(header.len(), MACRO_SLOT_SIZE);
+        let mut new_one = MacroRecord::default();
+        new_one.set_name("NewOne").unwrap();
+        let mut new_two = MacroRecord::default();
+        new_two.set_name("NewTwo").unwrap();
+        let record0 = 8;
+        let record1 = 8 + MACRO_RECORD_SIZE;
+        assert_eq!(&header[record0..record0 + 0x20], &new_one.name);
+        assert_eq!(
+            u16::from_le_bytes([header[record0 + 0x22], header[record0 + 0x23]]),
+            6
+        );
+        assert_eq!(&header[record1..record1 + 0x20], &new_two.name);
+        assert_eq!(
+            u16::from_le_bytes([header[record1 + 0x22], header[record1 + 0x23]]),
+            8
+        );
+    }
+
+    #[tokio::test]
+    async fn write_macro_slot_second_erase_failure_skips_final_save_and_m2_write() {
+        // M1 write succeeds, M2 erase times out: final Save must not be sent
+        // and M2 must not be written.
+        let backup = backup_from(config_with_macros(&[
+            (MacroIndex::M1, "One", 4),
+            (MacroIndex::M2, "Two", 4),
+        ]));
+        let plans = vec![
+            (
+                MacroIndex::M1,
+                MacroWritePlan::new(sample_steps(6))
+                    .with_name("NewOne")
+                    .with_timeouts(short_timeouts()),
+            ),
+            (
+                MacroIndex::M2,
+                MacroWritePlan::new(sample_steps(8))
+                    .with_name("NewTwo")
+                    .with_timeouts(short_timeouts()),
+            ),
+        ];
+        let script = vec![
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::SAVE, true),
+            ack_frame(cmd::ERASE_MACRO, true),
+            ack_frame(cmd::WRITE_MACRO, true),
+        ];
+        let transport = ScriptedTransport::new(script, true, 200);
+        let session = Session::new(&transport);
+        let result = session.write_macro_slot(&backup, Slot::S1, &plans).await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Erase,
+                state: MacroWriteState::HeaderSaved,
+                recovery,
+                ..
+            }) if recovery == RECOVERY_HEADER_SAVED
+        ));
+        let sent = transport.sent();
+        assert_eq!(count_cmd(&sent, cmd::SAVE), 1);
+        assert_eq!(count_cmd(&sent, cmd::WRITE_MACRO), 1);
+        assert_eq!(frame_cmd(sent.last().unwrap()), cmd::ERASE_MACRO);
+
+        let header: Vec<u8> = sent
+            .iter()
+            .filter(|frame| frame_cmd(frame) == cmd::WRITE_CONFIG)
+            .flat_map(|frame| frame[17..].iter().copied())
+            .collect();
+        assert_eq!(header.len(), MACRO_SLOT_SIZE);
+        let mut new_one = MacroRecord::default();
+        new_one.set_name("NewOne").unwrap();
+        assert_eq!(&header[8..8 + 0x20], &new_one.name);
+        assert_eq!(u16::from_le_bytes([header[8 + 0x22], header[8 + 0x23]]), 6);
     }
 
     async fn write_macro_slot_460_with_chunk_size(chunk_size: Option<u16>, frame_count: usize) {

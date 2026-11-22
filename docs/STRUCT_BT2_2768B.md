@@ -545,9 +545,9 @@ struct Bt2Header {
 
 > ACK は各コマンド送信後の transport `wait_ack` で待つ。マクロの `Erase` / `Write` / ヘッダは 2 秒（実装定数 `0x44fa0000`）。マクロ `Save` は 3 秒で **リトライしない**（USB HID の仕様記載。BLE は未文書化のため暫定で 3 秒を使う）。OTA の 10 秒 erase / 1 秒 chunk / 64B 固定はマクロに適用しない。
 
-> **実装ノート（Mock 検証済み・実機書き込み未検証）**:
+> **実装ノート（Mock 検証済み・新順序の実機書き込み未検証）**:
 > - **実機観測（2026-11-22）**: 旧順序（Erase → Write → Header(total_len=0x0AD0) → Save）で macro 0（500B）は成功し、macro 1（460B）だけが全 ACK 後に `0x0102` zeros で Verify 失敗した。216B ヘッダは一致していた。公式 RE の **Header(total_len=0xD8) → Save → Erase/Write → Save** との差分を原因候補とし、本実装を公式順序に変更した。**新順序は実機未検証**。最終 32B チャンク仮説に対しては `--chunk-size 32` も利用できる。Header Save → Erase の settle は 0ms。RE 根拠: `getBT2_WriteMacroi` / `writeCustomConfig_onfinished` / `writeBT2Macro_onfinished` / `EraseMacroDataDone` / `WriteMacroDataDone`。
-> - **Fail-closed / 状態**: `Error::MacroWrite` は `MacroWriteState::{NotSaved, HeaderSaved, DataSaved}` で区別する。Header 失敗は Save/Erase 未送信で sector 未変更（`NotSaved`）。最初の Save 失敗は Erase/Write 未送信で sector 未変更、Erase/Write 失敗はヘッダ Save 済みで sector が消去/部分書込の可能性（`HeaderSaved`）。最終 Save / Verify の失敗はヘッダ + データ送信済み（`DataSaved`）。`HeaderSaved` / `DataSaved` は再書き込みせず、12 マクロ backup から復元する。
+> - **Fail-closed / 状態**: `Error::MacroWrite` は `MacroWriteState::{NotSaved, HeaderSaved, DataSaved}` で区別する。Header 失敗は Save/Erase 未送信で sector 未変更（`NotSaved`）。最初の Save 失敗は Erase/Write 未送信で sector 未変更、Erase/Write 失敗はヘッダ Save 済みで sector が消去/部分書込の可能性（`HeaderSaved`）。step data を送った書き込みでは、最終 Save / Verify の失敗はヘッダ + データ送信済み（`DataSaved`）。ヘッダのみを書く空 slot の restore では step data を送らないため、Verify 失敗は `HeaderSaved` になる。`HeaderSaved` / `DataSaved` は再書き込みせず、12 マクロ backup から復元する。
 > - **空きマクロ拒否**: `max_steps == 0` / `0xFFFF` への `macro write` は `Error::EmptyMacroWrite` で拒否する。step data の clear が未実装で、`macro write` では新規作成できない。`macro restore` はバックアップが非空なら現在のマクロが空でも書ける（pre-restore backup と 216B ヘッダ更新を使う）。
 > - **ヘッダ値**: `max_steps` は新しいステップ数。`key_map` / `cycles_num` / `interval_ms` / `flag` / `total_cnt` は指定がなければ既存値を保持する。既存の予約バイト（slot `+0x05..+0x07`、record `+0x26..+0x27`）も保持する。
 > - **CRC**: 216B の Header 部分書込には config CRC (`+0x00C`) を含めない（公式の部分書込と同じ）。Save 時に device が CRC を再計算するかは実機未確認。
