@@ -1152,6 +1152,24 @@ async fn macro_write_session<T: Transport>(
     trigger: Option<KeyMap>,
     backup_dir: &Path,
 ) -> Result<(), Error> {
+    let created = !backup_dir.exists();
+    let result = macro_write_session_inner(session, slot, index, file, trigger, backup_dir).await;
+    if result.is_err() && created {
+        // Do not leave an empty directory behind on an early failure (empty
+        // macro, MTU too small, config read failure).
+        let _ = std::fs::remove_dir(lexical_directory(backup_dir));
+    }
+    result
+}
+
+async fn macro_write_session_inner<T: Transport>(
+    session: &Session<T>,
+    slot: Slot,
+    index: MacroIndex,
+    file: &MacroFile,
+    trigger: Option<KeyMap>,
+    backup_dir: &Path,
+) -> Result<(), Error> {
     let mtu = session.transport().mtu();
     // Fail before creating a pre-write backup directory if this MTU cannot
     // support the macro write at all.
@@ -1824,8 +1842,9 @@ fn lexical_directory(path: &Path) -> PathBuf {
 /// Prepare a backup output directory without overwriting an existing backup.
 ///
 /// A non-existent or empty directory is accepted. An empty path, a non-empty
-/// directory, a symlink (including `link/` / `link/.`), or a non-directory is
-/// rejected before any file is written.
+/// directory, or a non-directory is rejected before any file is written.
+/// Symlinks are rejected only at the **final path component** (including
+/// `link/` / `link/.`); symlinks in intermediate components are not detected.
 fn prepare_output_directory(dir: &Path) -> Result<(), Error> {
     if dir.as_os_str().is_empty() {
         return Err(invalid_input("backup directory must not be empty"));
@@ -6429,6 +6448,7 @@ mod tests {
                 .any(|frame| is_write_command(frame)),
             "empty macro rejection must not send Erase/Write/Header/Save"
         );
+        assert!(!backup_dir.exists(), "empty backup dir must be removed");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6453,6 +6473,7 @@ mod tests {
             .sent_frames()
             .iter()
             .any(|frame| is_write_command(frame)));
+        assert!(!backup_dir.exists(), "empty backup dir must be removed");
         let _ = std::fs::remove_dir_all(&root);
     }
 
