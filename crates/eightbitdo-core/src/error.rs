@@ -4,31 +4,59 @@ use std::fmt;
 
 /// Stage of a macro flash write that failed.
 ///
-/// The stages run in order: Erase → Write → Header → Save → Verify. `Save`
-/// and `Verify` failures happen after the flash commit command was sent;
-/// `Erase` / `Write` / `Header` failures happen before it.
+/// The official order is Header → HeaderSave → Erase → Write → FinalSave →
+/// Verify. `NotSaved` means neither Save nor Erase was sent; `HeaderSaved`
+/// means the header Save was sent (the sector may also be erased/partially
+/// written); `DataSaved` means header + data were sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MacroWriteStage {
-    /// `0x0104` erase of the macro's 4 KB sector.
+    /// `0x0001` macro header write (216 bytes, `total_len = 0xD8`).
+    Header,
+    /// `0x0006` Save immediately after the header write.
+    HeaderSave,
+    /// `0x0104` erase of a macro's 4 KB sector.
     Erase,
     /// `0x0103` macro step chunk write.
     Write,
-    /// `0x0001` macro header update (216 bytes of the config block).
-    Header,
-    /// `0x0006` flash commit.
-    Save,
-    /// `0x0102` read-back comparison.
+    /// `0x0006` Save after all data chunks.
+    FinalSave,
+    /// `0x0002` config header / `0x0102` raw read-back comparison.
     Verify,
 }
 
 impl fmt::Display for MacroWriteStage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Header => formatter.write_str("Header"),
+            Self::HeaderSave => formatter.write_str("HeaderSave"),
             Self::Erase => formatter.write_str("Erase"),
             Self::Write => formatter.write_str("Write"),
-            Self::Header => formatter.write_str("Header"),
-            Self::Save => formatter.write_str("Save"),
+            Self::FinalSave => formatter.write_str("FinalSave"),
             Self::Verify => formatter.write_str("Verify"),
+        }
+    }
+}
+
+/// How far a failed macro write got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacroWriteState {
+    /// Header write failed; neither Save nor Erase was sent. The macro sector
+    /// is unchanged.
+    NotSaved,
+    /// Header Save was sent, or Erase/Write failed after the header Save.
+    /// The sector may be unchanged (header-save failure) or erased/partially
+    /// written (erase/write failure).
+    HeaderSaved,
+    /// Final Save or Verify failed after header + data were sent.
+    DataSaved,
+}
+
+impl fmt::Display for MacroWriteState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotSaved => formatter.write_str("NotSaved"),
+            Self::HeaderSaved => formatter.write_str("HeaderSaved"),
+            Self::DataSaved => formatter.write_str("DataSaved"),
         }
     }
 }
@@ -97,6 +125,13 @@ pub enum Error {
     #[error("unsupported operation: {0}")]
     Unsupported(String),
 
+    /// The request is internally inconsistent.
+    ///
+    /// Examples: an empty per-slot batch, duplicate macro indices in one
+    /// batch, or macros with different chunk sizes in one batch.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+
     /// A response carried an unexpected command or range.
     #[error("unexpected response: {0}")]
     UnexpectedResponse(String),
@@ -115,20 +150,14 @@ pub enum Error {
     Disconnected,
 
     /// A macro flash write failed.
-    ///
-    /// `saved` is true once the `0x0006` Save command was sent **or its send
-    /// was attempted**, even if its acknowledgement or the read-back did not
-    /// complete. When `saved` is false the Save command was not sent, but
-    /// Erase or a partial Write may already have changed the sector. Restore
-    /// from the full 3-slot × 4-macro backup before retrying.
-    #[error("macro write failed during {stage}: {reason}; {recovery}")]
+    #[error("macro write failed during {stage} ({state}): {reason}; {recovery}")]
     MacroWrite {
         /// Stage that failed.
         stage: MacroWriteStage,
+        /// How far the write got.
+        state: MacroWriteState,
         /// Underlying error text.
         reason: String,
-        /// True once the Save command was sent.
-        saved: bool,
         /// Operator-facing recovery guidance.
         recovery: &'static str,
     },

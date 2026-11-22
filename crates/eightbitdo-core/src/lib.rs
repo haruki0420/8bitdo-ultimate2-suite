@@ -23,11 +23,12 @@ pub mod transport;
 pub mod ble;
 
 pub use error::Error;
-pub use error::MacroWriteStage;
+pub use error::{MacroWriteStage, MacroWriteState};
 pub use macro_ops::{
     macro_header_chunk_len, macro_write_chunk_len, macro_write_chunk_len_requested,
-    max_protocol_payload, MacroBackup, MacroEntry, MacroHeaderOutcome, MacroTimeouts,
-    MacroWriteOutcome, MacroWritePlan, MACRO_HEADER_CHUNK_SIZE, MACRO_READ_TOTAL_TIMEOUT,
+    max_protocol_payload, validate_macro_chunk_size, MacroBackup, MacroEntry, MacroHeaderOutcome,
+    MacroSlotWriteOutcome, MacroTimeouts, MacroWriteOutcome, MacroWritePlan,
+    MACRO_HEADER_CHUNK_SIZE, MACRO_READ_TOTAL_TIMEOUT,
 };
 pub use mock::MockTransport;
 pub use session::{
