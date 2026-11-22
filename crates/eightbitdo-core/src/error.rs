@@ -1,5 +1,38 @@
 //! Error type shared by the transport and session layers.
 
+use std::fmt;
+
+/// Stage of a macro flash write that failed.
+///
+/// The stages run in order: Erase → Write → Header → Save → Verify. `Save`
+/// and `Verify` failures happen after the flash commit command was sent;
+/// `Erase` / `Write` / `Header` failures happen before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacroWriteStage {
+    /// `0x0104` erase of the macro's 4 KB sector.
+    Erase,
+    /// `0x0103` macro step chunk write.
+    Write,
+    /// `0x0001` macro header update (216 bytes of the config block).
+    Header,
+    /// `0x0006` flash commit.
+    Save,
+    /// `0x0102` read-back comparison.
+    Verify,
+}
+
+impl fmt::Display for MacroWriteStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Erase => formatter.write_str("Erase"),
+            Self::Write => formatter.write_str("Write"),
+            Self::Header => formatter.write_str("Header"),
+            Self::Save => formatter.write_str("Save"),
+            Self::Verify => formatter.write_str("Verify"),
+        }
+    }
+}
+
 /// Errors returned by `eightbitdo-core`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -60,6 +93,25 @@ pub enum Error {
     /// The peer closed the notification channel.
     #[error("transport disconnected")]
     Disconnected,
+
+    /// A macro flash write failed.
+    ///
+    /// `saved` is true once the `0x0006` Save command was sent, even if its
+    /// acknowledgement or the read-back did not complete. When `saved` is
+    /// false the Save command was not sent, but Erase or a partial Write may
+    /// already have changed the sector. Restore from the full 3-slot ×
+    /// 4-macro backup before retrying.
+    #[error("macro write failed during {stage}: {reason}; {recovery}")]
+    MacroWrite {
+        /// Stage that failed.
+        stage: MacroWriteStage,
+        /// Underlying error text.
+        reason: String,
+        /// True once the Save command was sent.
+        saved: bool,
+        /// Operator-facing recovery guidance.
+        recovery: &'static str,
+    },
 
     /// Local file I/O failed.
     #[error("I/O error: {0}")]

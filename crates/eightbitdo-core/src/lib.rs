@@ -21,7 +21,11 @@ pub mod transport;
 pub mod ble;
 
 pub use error::Error;
-pub use macro_ops::{MacroBackup, MacroEntry, MACRO_READ_TOTAL_TIMEOUT};
+pub use error::MacroWriteStage;
+pub use macro_ops::{
+    MacroBackup, MacroEntry, MacroTimeouts, MacroWriteOutcome, MacroWritePlan,
+    MACRO_READ_TOTAL_TIMEOUT,
+};
 pub use mock::MockTransport;
 pub use session::{
     ConfigSnapshot, Session, VersionInfo, CONFIG_TOTAL_TIMEOUT, DEFAULT_TIMEOUT,

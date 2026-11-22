@@ -1,25 +1,26 @@
-//! Macro flash read operations for all 3 slots × 4 macro indices.
+//! Macro flash read and write operations for all 3 slots × 4 macro indices.
 //!
 //! The macro step payload lives outside the 2768-byte configuration block.
 //! Each macro owns one 4 KB flash sector (`macro_idx << 12`) and its length is
 //! taken from the `max_steps` field of the matching `MacroFunPro3Record` in
 //! the configuration read. One step is 10 bytes.
 //!
-//! This module is read-only for now; the write state machine is added
-//! separately so a read-only build cannot send `0x0104` / `0x0103` / `0x0001`
-//! / `0x0006` by accident.
+//! The write state machine requires a [`MacroBackup`] (all 12 entries) and
+//! never sends `Save` (`0x0006`) if Erase, Write or the header update fails.
 
 use std::time::Duration;
 
-use eightbitdo_protocol::commands::{self, cmd};
+use eightbitdo_protocol::commands::{self, cmd, SaveTransport};
 use eightbitdo_protocol::config_bt2::{
-    Bt2Config, MacroIndex, MacroRecord, Slot, MACROS_PER_SLOT, SLOT_COUNT,
+    macro_slot_offset, Bt2Config, MacroIndex, MacroRecord, Slot, MACROS_PER_SLOT, MACRO_SLOT_SIZE,
+    SLOT_COUNT,
 };
 use eightbitdo_protocol::header::PacketKind;
 use eightbitdo_protocol::macro_data::{self, MacroStep};
+use eightbitdo_protocol::KeyMap;
 use tokio::time::Instant;
 
-use crate::error::Error;
+use crate::error::{Error, MacroWriteStage};
 use crate::session::{deadline_after, ConfigSnapshot, Session, TransferBuffer};
 use crate::transport::Transport;
 
@@ -29,6 +30,166 @@ use crate::transport::Transport;
 /// notifications. The per-frame wait is the session timeout
 /// ([`Session::with_timeout`]).
 pub const MACRO_READ_TOTAL_TIMEOUT: Duration = crate::session::CONFIG_TOTAL_TIMEOUT;
+
+/// ACK wait after `EraseBT2Macro` (`0x0104`, official 2 s).
+pub const MACRO_ERASE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// ACK wait after each `WriteBT2Macro` chunk (`0x0103`, official 2 s).
+pub const MACRO_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// ACK wait after the `0x0001` header update (official 2 s).
+pub const MACRO_HEADER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// ACK wait after `Save` (`0x0006`).
+///
+/// 3 s is the documented Windows USB HID value. The BLE timeout is not
+/// documented; this implementation uses the same 3 s and records the
+/// uncertainty in `docs/PROTOCOL_SPEC.md`.
+pub const MACRO_SAVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Per-stage ACK timeouts for a macro write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacroTimeouts {
+    /// `0x0104` erase ACK wait.
+    pub erase: Duration,
+    /// Each `0x0103` chunk ACK wait.
+    pub write: Duration,
+    /// `0x0001` header ACK wait.
+    pub header: Duration,
+    /// `0x0006` save ACK wait.
+    pub save: Duration,
+}
+
+impl Default for MacroTimeouts {
+    fn default() -> Self {
+        Self {
+            erase: MACRO_ERASE_TIMEOUT,
+            write: MACRO_WRITE_TIMEOUT,
+            header: MACRO_HEADER_TIMEOUT,
+            save: MACRO_SAVE_TIMEOUT,
+        }
+    }
+}
+
+/// How to update one macro and its slot header.
+///
+/// Every `Option` field preserves the value from the backup header when
+/// `None`. The CLI decides whether an unused macro (`max_steps == 0`) should
+/// enable the slot flag and raise `total_cnt`; the core does not guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroWritePlan {
+    /// New 10-byte steps (`1..=200`).
+    pub steps: Vec<MacroStep>,
+    /// New name; `None` preserves the existing name.
+    pub name: Option<String>,
+    /// Trigger key mask; `None` preserves the existing `key_map`.
+    pub key_map: Option<KeyMap>,
+    /// Loop count; `None` preserves the existing value.
+    pub cycles_num: Option<u32>,
+    /// Inter-loop delay; `None` preserves the existing value.
+    pub interval_ms: Option<u32>,
+    /// Slot macro-enabled flag; `None` preserves the existing value.
+    pub flag: Option<u32>,
+    /// Registered macro count (`0..=4`); `None` preserves the existing value.
+    pub total_cnt: Option<u8>,
+    /// `0x0103` chunk size (`32` or `64`).
+    pub chunk_size: usize,
+    /// Save sub-command variant.
+    pub save_transport: SaveTransport,
+    /// ACK timeouts.
+    pub timeouts: MacroTimeouts,
+}
+
+impl MacroWritePlan {
+    /// A plan with 64-byte chunks, BLE Save and default timeouts.
+    #[must_use]
+    pub fn new(steps: Vec<MacroStep>) -> Self {
+        Self {
+            steps,
+            name: None,
+            key_map: None,
+            cycles_num: None,
+            interval_ms: None,
+            flag: None,
+            total_cnt: None,
+            chunk_size: commands::MACRO_MAX_CHUNK_SIZE,
+            save_transport: SaveTransport::Ble,
+            timeouts: MacroTimeouts::default(),
+        }
+    }
+
+    /// Set the macro name.
+    #[must_use]
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Set the trigger key mask.
+    #[must_use]
+    pub fn with_key_map(mut self, key_map: KeyMap) -> Self {
+        self.key_map = Some(key_map);
+        self
+    }
+
+    /// Set the loop count.
+    #[must_use]
+    pub fn with_cycles_num(mut self, cycles_num: u32) -> Self {
+        self.cycles_num = Some(cycles_num);
+        self
+    }
+
+    /// Set the inter-loop delay.
+    #[must_use]
+    pub fn with_interval_ms(mut self, interval_ms: u32) -> Self {
+        self.interval_ms = Some(interval_ms);
+        self
+    }
+
+    /// Set the slot flag and registered count explicitly.
+    #[must_use]
+    pub fn with_header_state(mut self, flag: u32, total_cnt: u8) -> Self {
+        self.flag = Some(flag);
+        self.total_cnt = Some(total_cnt);
+        self
+    }
+
+    /// Set the `0x0103` chunk size.
+    #[must_use]
+    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.chunk_size = chunk_size;
+        self
+    }
+
+    /// Set the Save sub-command variant.
+    #[must_use]
+    pub fn with_save_transport(mut self, save_transport: SaveTransport) -> Self {
+        self.save_transport = save_transport;
+        self
+    }
+
+    /// Override the ACK timeouts (used by tests and future tuning).
+    #[must_use]
+    pub fn with_timeouts(mut self, timeouts: MacroTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+}
+
+/// Result of a confirmed macro write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroWriteOutcome {
+    /// Final header record written for this macro.
+    pub record: MacroRecord,
+    /// Slot macro-enabled flag after the update.
+    pub flag: u32,
+    /// Registered macro count after the update.
+    pub total_cnt: u8,
+    /// Total packets sent, including Erase, every Write chunk, Header and Save.
+    pub packets_sent: usize,
+    /// Read-back entry that matched the requested steps.
+    pub readback: MacroEntry,
+}
 
 /// One macro read from the controller.
 ///
@@ -395,6 +556,283 @@ impl<T: Transport> Session<T> {
 
         Ok((buffer.into_vec(), response_offsets))
     }
+
+    /// Write one macro with the mandatory Erase → Write → Header → Save flow.
+    ///
+    /// `backup` must contain all 12 entries (see [`MacroBackup::new`]); this is
+    /// the "backup first" precondition. If Erase, any Write chunk or the
+    /// 216-byte header update fails, **Save is not sent** and
+    /// [`Error::MacroWrite`] is returned with `saved = false`. After Save, the
+    /// macro is read back with `0x0102` and compared byte-for-byte.
+    ///
+    /// The header values `flag`, `total_cnt`, `key_map`, `cycles_num` and
+    /// `interval_ms` are preserved from the backup unless the plan overrides
+    /// them. `max_steps` is always set to `steps.len()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol error before any packet for empty or oversized
+    /// steps, or [`Error::MacroWrite`] for a failed stage, timeout, CRC error,
+    /// disconnect or read-back mismatch.
+    pub async fn write_macro(
+        &self,
+        backup: &MacroBackup,
+        slot: Slot,
+        index: MacroIndex,
+        plan: &MacroWritePlan,
+    ) -> Result<MacroWriteOutcome, Error> {
+        if plan.steps.is_empty() {
+            return Err(Error::Protocol(eightbitdo_protocol::Error::EmptyPayload));
+        }
+        if plan.steps.len() > macro_data::MAX_MACRO_STEPS {
+            return Err(Error::Protocol(eightbitdo_protocol::Error::TooManySteps {
+                max: macro_data::MAX_MACRO_STEPS,
+                actual: plan.steps.len(),
+            }));
+        }
+        if plan
+            .total_cnt
+            .is_some_and(|count| usize::from(count) > MACROS_PER_SLOT)
+        {
+            return Err(Error::Protocol(eightbitdo_protocol::Error::InvalidFrame(
+                "macro total_cnt must be 0..=4",
+            )));
+        }
+        if backup.get(slot, index).is_none() {
+            return Err(Error::UnexpectedResponse(format!(
+                "macro backup is missing slot {} macro {}",
+                slot.index(),
+                index.index()
+            )));
+        }
+
+        self.prepare_read().await?;
+        self.run_write(self.write_macro_inner(backup, slot, index, plan))
+            .await
+    }
+
+    async fn write_macro_inner(
+        &self,
+        backup: &MacroBackup,
+        slot: Slot,
+        index: MacroIndex,
+        plan: &MacroWritePlan,
+    ) -> Result<MacroWriteOutcome, Error> {
+        let base_config = &backup.snapshot().config;
+        let mode = base_config.gamepad_mode_raw() & 0xFF;
+
+        // Build the complete header update before sending Erase. Any name or
+        // range error therefore happens before the flash sector is touched.
+        let mut updated = base_config.clone();
+        let mut header = updated.macro_slot(slot);
+        let mut record = header.records[index.index()];
+        record.max_steps = u16::try_from(plan.steps.len()).map_err(|_| {
+            Error::Protocol(eightbitdo_protocol::Error::TooManySteps {
+                max: macro_data::MAX_MACRO_STEPS,
+                actual: plan.steps.len(),
+            })
+        })?;
+        if let Some(name) = &plan.name {
+            record.set_name(name)?;
+        }
+        if let Some(key_map) = plan.key_map {
+            record.key_map = key_map;
+        }
+        if let Some(cycles_num) = plan.cycles_num {
+            record.cycles_num = cycles_num;
+        }
+        if let Some(interval_ms) = plan.interval_ms {
+            record.interval_ms = interval_ms;
+        }
+        header.records[index.index()] = record;
+        if let Some(flag) = plan.flag {
+            header.flag = flag;
+        }
+        if let Some(total_cnt) = plan.total_cnt {
+            header.total_cnt = total_cnt;
+        }
+        updated.set_macro_slot(slot, &header);
+        updated.recompute_crc();
+
+        let header_offset = macro_slot_offset(slot);
+        let header_bytes =
+            updated.as_bytes()[header_offset..header_offset + MACRO_SLOT_SIZE].to_vec();
+
+        // Build every request before erasing so a local encoding error cannot
+        // leave the sector erased without new data.
+        let erase = commands::erase_macro(mode, slot, index);
+        let write_packets =
+            commands::write_macro_steps(mode, slot, index, &plan.steps, plan.chunk_size)?;
+        let header_request = commands::write_config(header_offset as u32, &header_bytes)?;
+        let save = commands::save(plan.save_transport);
+
+        let mut packets_sent = 0usize;
+        self.send_and_await_ack(
+            &erase,
+            true,
+            cmd::ERASE_MACRO,
+            commands::macro_subcmd(mode, slot),
+            plan.timeouts.erase,
+            "EraseBT2Macro",
+        )
+        .await
+        .map_err(|error| macro_write_failure(MacroWriteStage::Erase, error, false))?;
+        packets_sent += 1;
+
+        for request in &write_packets {
+            self.send_and_await_ack(
+                request,
+                false,
+                cmd::WRITE_MACRO,
+                commands::macro_subcmd(mode, slot),
+                plan.timeouts.write,
+                "WriteBT2Macro",
+            )
+            .await
+            .map_err(|error| macro_write_failure(MacroWriteStage::Write, error, false))?;
+            packets_sent += 1;
+        }
+
+        self.send_and_await_ack(
+            &header_request,
+            false,
+            cmd::WRITE_CONFIG,
+            0,
+            plan.timeouts.header,
+            "WriteMacroHeader",
+        )
+        .await
+        .map_err(|error| macro_write_failure(MacroWriteStage::Header, error, false))?;
+        packets_sent += 1;
+
+        self.send_and_await_ack(
+            &save,
+            false,
+            cmd::SAVE,
+            plan.save_transport.subcmd(),
+            plan.timeouts.save,
+            "Save",
+        )
+        .await
+        .map_err(|error| macro_write_failure(MacroWriteStage::Save, error, true))?;
+        packets_sent += 1;
+
+        let readback = self
+            .read_macro_with_config(&updated, slot, index)
+            .await
+            .map_err(|error| macro_write_failure(MacroWriteStage::Verify, error, true))?;
+        let expected = macro_data::encode_macro_steps(&plan.steps)?;
+        let expected_len = plan.steps.len() * macro_data::MACRO_STEP_SIZE;
+        if readback.raw() != &expected[..expected_len] {
+            return Err(macro_write_failure(
+                MacroWriteStage::Verify,
+                Error::UnexpectedResponse(format!(
+                    "macro read-back mismatch for slot {} macro {} ({} bytes)",
+                    slot.number(),
+                    index.index(),
+                    readback.raw().len()
+                )),
+                true,
+            ));
+        }
+
+        Ok(MacroWriteOutcome {
+            record,
+            flag: header.flag,
+            total_cnt: header.total_cnt,
+            packets_sent,
+            readback,
+        })
+    }
+
+    /// Send one App Mode request and wait for its ACK.
+    ///
+    /// Accepts a direct `cmd == ack_cmd` echo and the `cmd 0x0004` envelope
+    /// whose `subcmd` is either the request command or `ack_subcmd`. A
+    /// payload-less ACK (`chunk_len == 0`) is required; a data response while
+    /// waiting for an ACK fails closed. Unrelated notifications (input
+    /// reports, other ACKs) are skipped. `0x000E` is surfaced as an error.
+    async fn send_and_await_ack(
+        &self,
+        request: &commands::Request,
+        payloadless: bool,
+        ack_cmd: u16,
+        ack_subcmd: u16,
+        timeout: Duration,
+        description: &str,
+    ) -> Result<(), Error> {
+        let frame = if payloadless {
+            request.encode_ble_payloadless(PacketKind::App)?
+        } else {
+            request.encode_ble(PacketKind::App)?
+        };
+        self.transport().send(&frame).await?;
+
+        let deadline = deadline_after(timeout)?;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(ack_timeout(description, ack_cmd, timeout));
+            }
+            let wait = deadline.saturating_duration_since(now);
+            let frame = match tokio::time::timeout(wait, self.transport().recv()).await {
+                Ok(result) => result?,
+                Err(_) => return Err(ack_timeout(description, ack_cmd, timeout)),
+            };
+
+            let (response, payload) = eightbitdo_protocol::header::decode_app_response(&frame)
+                .map_err(|error| {
+                    Error::UnexpectedResponse(format!(
+                        "malformed frame while waiting for {description} ACK: {error}"
+                    ))
+                })?;
+
+            if response.cmd == 0x000E {
+                return Err(Error::UnexpectedResponse(format!(
+                    "controller returned error 0x000E while waiting for {description} ACK: {:02X?}",
+                    payload
+                )));
+            }
+
+            let matched = response.cmd == ack_cmd
+                || (response.cmd == cmd::RESPONSE
+                    && (response.subcmd == ack_cmd || response.subcmd == ack_subcmd));
+            if !matched {
+                continue;
+            }
+            if response.chunk_len != 0 {
+                return Err(Error::UnexpectedResponse(format!(
+                    "{description} ACK carried {} data bytes",
+                    response.chunk_len
+                )));
+            }
+            return Ok(());
+        }
+    }
+}
+
+/// Recovery guidance for a write that failed before Save.
+const MACRO_NOT_SAVED_RECOVERY: &str = "Save was not sent, but the sector may already be erased or partially written; do not retry blindly, re-read the macro and restore from the 3-slot x 4-macro backup";
+/// Recovery guidance for a write that failed after Save was sent.
+const MACRO_SAVED_RECOVERY: &str = "Save was sent but the write could not be confirmed; re-read the macro and restore from the 3-slot x 4-macro backup if it differs";
+
+fn macro_write_failure(stage: MacroWriteStage, error: Error, saved: bool) -> Error {
+    Error::MacroWrite {
+        stage,
+        reason: error.to_string(),
+        saved,
+        recovery: if saved {
+            MACRO_SAVED_RECOVERY
+        } else {
+            MACRO_NOT_SAVED_RECOVERY
+        },
+    }
+}
+
+fn ack_timeout(description: &str, ack_cmd: u16, timeout: Duration) -> Error {
+    Error::Timeout {
+        operation: format!("{description} ACK (cmd=0x{ack_cmd:04X}) within {timeout:?}"),
+    }
 }
 
 fn macro_read_timeout(chunk_offset: usize, expected: usize, response_offsets: &[u32]) -> Error {
@@ -597,30 +1035,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_macro_accepts_sector_based_and_zero_offsets_and_logs_them() {
+    async fn read_macro_reads_460_bytes_from_sector_4096_with_echoed_offsets() {
         let mut config = config_with_macros();
         config.set_gamepad_mode(GamepadMode::XInput);
         let mut record = config.macro_record(Slot::S2, MacroIndex::M2);
-        record.max_steps = 20;
+        record.max_steps = 46;
         config.set_macro_record(Slot::S2, MacroIndex::M2, &record);
         config.recompute_crc();
         let snapshot = snapshot(config);
 
-        let steps = sample_steps(20);
+        let steps = sample_steps(46);
         let raw = sample_entry_payload(&steps);
-        assert_eq!(raw.len(), 200);
+        assert_eq!(raw.len(), 460);
 
-        // First response reports the absolute sector base, the second uses the
-        // device's sequential-chunk convention (offset 0).
         let mock = MockTransport::new();
-        let first = &raw[..142];
-        let second = &raw[142..];
-        let mut first_header = envelope(cmd::READ_MACRO, 200, 0x1000, first);
-        first_header.crc16 = packet_crc16(first);
-        mock.push_response(&first_header, first);
-        let mut second_header = envelope(cmd::READ_MACRO, 200, 0, second);
-        second_header.crc16 = packet_crc16(second);
-        mock.push_response(&second_header, second);
+        let expected_offsets = [4096u32, 4238, 4380, 4522];
+        let mut chunk_offset = 0usize;
+        for (chunk, expected_offset) in raw.chunks(142).zip(expected_offsets) {
+            let mut header = envelope(cmd::READ_MACRO, 460, expected_offset, chunk);
+            header.crc16 = packet_crc16(chunk);
+            mock.push_response(&header, chunk);
+            chunk_offset += chunk.len();
+        }
+        assert_eq!(chunk_offset, 460);
 
         let session = Session::new(&mock);
         let entry = session
@@ -629,17 +1066,53 @@ mod tests {
             .unwrap();
 
         let sent = mock.sent_frames();
-        assert_eq!(sent.len(), 2);
-        let first_request = CustomHeader::parse(&sent[0][1..]).unwrap();
-        assert_eq!(first_request.subcmd, 0x0301);
-        assert_eq!(first_request.chunk_len, 200);
-        assert_eq!(first_request.total_len, 200);
-        assert_eq!(first_request.offset, 0x1000);
-        let second_request = CustomHeader::parse(&sent[1][1..]).unwrap();
-        assert_eq!(second_request.offset, 0x1000 + 142);
+        assert_eq!(sent.len(), 4);
+        let request_offsets = [4096u32, 4238, 4380, 4522];
+        for (frame, expected_offset) in sent.iter().zip(request_offsets) {
+            let request = CustomHeader::parse(&frame[1..]).unwrap();
+            assert_eq!(request.cmd, 0x0102);
+            assert_eq!(request.subcmd, 0x0301);
+            assert_eq!(request.chunk_len, 460);
+            assert_eq!(request.total_len, 460);
+            assert_eq!(request.offset, expected_offset);
+        }
 
         assert_eq!(entry.raw(), raw);
-        assert_eq!(entry.read_offsets(), &[0x1000, 0]);
+        assert_eq!(entry.steps(), steps);
+        assert_eq!(entry.read_offsets(), &request_offsets);
+    }
+
+    #[tokio::test]
+    async fn read_macro_accepts_zero_offsets_as_a_sequential_fallback() {
+        let mut config = config_with_macros();
+        let mut record = config.macro_record(Slot::S1, MacroIndex::M1);
+        record.max_steps = 20;
+        config.set_macro_record(Slot::S1, MacroIndex::M1, &record);
+        config.recompute_crc();
+        let snapshot = snapshot(config);
+
+        let steps = sample_steps(20);
+        let raw = sample_entry_payload(&steps);
+        assert_eq!(raw.len(), 200);
+
+        let mock = MockTransport::new();
+        for chunk in raw.chunks(142) {
+            let mut header = envelope(cmd::READ_MACRO, 200, 0, chunk);
+            header.crc16 = packet_crc16(chunk);
+            mock.push_response(&header, chunk);
+        }
+
+        let session = Session::new(&mock);
+        let entry = session
+            .read_macro(&snapshot, Slot::S1, MacroIndex::M1)
+            .await
+            .unwrap();
+
+        let sent = mock.sent_frames();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(CustomHeader::parse(&sent[1][1..]).unwrap().offset, 142);
+        assert_eq!(entry.raw(), raw);
+        assert_eq!(entry.read_offsets(), &[0, 0]);
     }
 
     #[tokio::test]
@@ -691,5 +1164,562 @@ mod tests {
                 if operation.contains("chunk offset 0x8E")
                     && operation.contains("response offsets: [0]")
         ));
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use eightbitdo_protocol::config_bt2::GamepadMode;
+    use eightbitdo_protocol::config_bt2::MACRO_RECORD_SIZE;
+    use eightbitdo_protocol::crc::packet_crc16;
+    use eightbitdo_protocol::header::CustomHeader;
+
+    use super::*;
+    use crate::mock::MockTransport;
+
+    fn sample_steps(count: usize) -> Vec<MacroStep> {
+        (0..count)
+            .map(|i| MacroStep {
+                ms_times: (i as u16 + 1) * 10,
+                keys: if i % 2 == 0 {
+                    KeyMap::A.bits() as u16
+                } else {
+                    0
+                },
+                rt_value: i as u8,
+                lt_value: 0,
+                left_x: 0x7F,
+                left_y: 0x7F,
+                right_x: 0x7F,
+                right_y: 0x7F,
+            })
+            .collect()
+    }
+
+    fn raw_steps(steps: &[MacroStep]) -> Vec<u8> {
+        macro_data::encode_macro_steps(steps).unwrap()[..steps.len() * 10].to_vec()
+    }
+
+    fn config_with_existing_macro() -> Bt2Config {
+        let mut config = Bt2Config::zeroed();
+        config.set_gamepad_mode(GamepadMode::Switch);
+        let mut record = MacroRecord {
+            max_steps: 4,
+            key_map: KeyMap::M1,
+            cycles_num: 2,
+            interval_ms: 10,
+            ..MacroRecord::default()
+        };
+        record.set_name("Old").unwrap();
+        config.set_macro_record(Slot::S1, MacroIndex::M1, &record);
+        config.recompute_crc();
+        config
+    }
+
+    fn snapshot(config: Bt2Config) -> ConfigSnapshot {
+        let stored_crc = config.crc16_stored() as u16;
+        let mut check = config.clone();
+        let computed_crc = check.recompute_crc();
+        ConfigSnapshot {
+            config,
+            stored_crc,
+            computed_crc,
+            crc_valid: stored_crc == computed_crc,
+        }
+    }
+
+    fn backup_from(config: Bt2Config) -> MacroBackup {
+        let mut entries = Vec::new();
+        for slot in Slot::ALL {
+            for index in MacroIndex::ALL {
+                let record = config.macro_record(slot, index);
+                let raw = if is_skipped_steps(record.max_steps) {
+                    Vec::new()
+                } else {
+                    raw_steps(&sample_steps(usize::from(record.max_steps)))
+                };
+                entries.push(MacroEntry::new(slot, index, record, raw).unwrap());
+            }
+        }
+        MacroBackup::new(snapshot(config), entries).unwrap()
+    }
+
+    fn push_ack(mock: &MockTransport, request_cmd: u16, direct: bool) {
+        let header = if direct {
+            CustomHeader::new(request_cmd, 0, 0, 0)
+        } else {
+            CustomHeader::new(cmd::RESPONSE, request_cmd, 0, 0)
+        };
+        mock.push_response(&header, &[]);
+    }
+
+    fn push_readback(mock: &MockTransport, steps: &[MacroStep]) {
+        let raw = raw_steps(steps);
+        let mut offset = 0u32;
+        for chunk in raw.chunks(142) {
+            let mut header =
+                CustomHeader::new(cmd::RESPONSE, cmd::READ_MACRO, raw.len() as u32, offset)
+                    .with_chunk_len(chunk.len() as u16);
+            header.crc16 = packet_crc16(chunk);
+            mock.push_response(&header, chunk);
+            offset += chunk.len() as u32;
+        }
+    }
+
+    fn frame_cmd(frame: &[u8]) -> u16 {
+        CustomHeader::parse(&frame[1..]).unwrap().cmd
+    }
+
+    #[tokio::test]
+    async fn write_macro_sends_erase_write_chunks_header_save_and_verifies() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(20);
+        let mut plan = MacroWritePlan::new(steps.clone()).with_name("Edited");
+        plan.key_map = Some(KeyMap::M3);
+        plan.cycles_num = Some(5);
+        plan.interval_ms = Some(30);
+
+        let mock = MockTransport::new();
+        push_ack(&mock, cmd::ERASE_MACRO, true);
+        for _ in 0..4 {
+            push_ack(&mock, cmd::WRITE_MACRO, false);
+        }
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        // Real BLE saves may echo the platform sub-command (0x0067) instead
+        // of 0x0006 in an envelope.
+        let save_ack = CustomHeader::new(cmd::RESPONSE, SaveTransport::Ble.subcmd(), 0, 0);
+        mock.push_response(&save_ack, &[]);
+        push_readback(&mock, &steps);
+
+        let session = Session::new(&mock);
+        let outcome = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await
+            .unwrap();
+
+        let sent = mock.sent_frames();
+        let commands: Vec<u16> = sent.iter().map(|frame| frame_cmd(frame)).collect();
+        assert_eq!(
+            commands,
+            vec![
+                cmd::ERASE_MACRO,
+                cmd::WRITE_MACRO,
+                cmd::WRITE_MACRO,
+                cmd::WRITE_MACRO,
+                cmd::WRITE_MACRO,
+                cmd::WRITE_CONFIG,
+                cmd::SAVE,
+                cmd::READ_MACRO,
+                cmd::READ_MACRO,
+            ]
+        );
+
+        // Erase: payload-less, 4 KB declared length, crc16 = 0xFFFF.
+        assert_eq!(
+            sent[0],
+            vec![
+                0x04, 0x04, 0x01, 0x00, 0x00, 0x00, 0x10, 0xFF, 0xFF, 0x00, 0x10, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00,
+            ]
+        );
+
+        // 200 steps = 200 bytes, 32-byte aligned to 224: 64/64/64/32.
+        let aligned = macro_data::encode_macro_steps(&steps).unwrap();
+        assert_eq!(aligned.len(), 224);
+        for (i, chunk) in aligned.chunks(64).enumerate() {
+            let request = &sent[1 + i];
+            let header = CustomHeader::parse(&request[1..]).unwrap();
+            assert_eq!(header.cmd, cmd::WRITE_MACRO);
+            assert_eq!(header.subcmd, 0);
+            assert_eq!(header.total_len, 224);
+            assert_eq!(header.offset, (i * 64) as u32);
+            assert_eq!(header.chunk_len as usize, chunk.len());
+            assert_eq!(header.crc16, packet_crc16(chunk));
+            assert_eq!(&request[17..], chunk);
+        }
+
+        // Header: 216 bytes at 0x68C, total_len 0x0AD0.
+        let header = CustomHeader::parse(&sent[5][1..]).unwrap();
+        assert_eq!(header.cmd, cmd::WRITE_CONFIG);
+        assert_eq!(header.subcmd, 0);
+        assert_eq!(header.total_len, 0x0AD0);
+        assert_eq!(header.offset, 0x68C);
+        assert_eq!(header.chunk_len, MACRO_SLOT_SIZE as u16);
+        assert_eq!(header.crc16, packet_crc16(&sent[5][17..]));
+        let header_payload = &sent[5][17..];
+        assert_eq!(header_payload.len(), MACRO_SLOT_SIZE);
+        let record = &header_payload[8..8 + MACRO_RECORD_SIZE];
+        assert_eq!(&record[0..4], &[0x00, 0x45, 0x00, 0x64]); // "Ed" UTF-16BE
+        assert_eq!(u16::from_le_bytes([record[0x22], record[0x23]]), 20);
+        assert_eq!(
+            u32::from_le_bytes([record[0x28], record[0x29], record[0x2A], record[0x2B]]),
+            KeyMap::M3.bits()
+        );
+        assert_eq!(
+            u32::from_le_bytes([record[0x2C], record[0x2D], record[0x2E], record[0x2F]]),
+            5
+        );
+        assert_eq!(
+            u32::from_le_bytes([record[0x30], record[0x31], record[0x32], record[0x33]]),
+            30
+        );
+        assert_eq!(record[0x20], 0);
+
+        // Save: BLE subcmd 0x0067, no payload.
+        assert_eq!(
+            sent[6],
+            vec![
+                0x04, 0x06, 0x00, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00,
+            ]
+        );
+
+        assert_eq!(outcome.packets_sent, 7);
+        assert_eq!(outcome.record.max_steps, 20);
+        assert_eq!(outcome.record.key_map, KeyMap::M3);
+        assert_eq!(outcome.record.name(), "Edited");
+        assert_eq!(outcome.record.cycles_num, 5);
+        assert_eq!(outcome.record.interval_ms, 30);
+        assert_eq!(outcome.readback.raw(), raw_steps(&steps));
+        assert_eq!(outcome.readback.read_offsets(), &[0, 142]);
+        assert_eq!(outcome.flag, 0);
+        assert_eq!(outcome.total_cnt, 0);
+    }
+
+    #[tokio::test]
+    async fn write_macro_uses_32_byte_usb_chunks() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(10);
+        let plan = MacroWritePlan::new(steps.clone()).with_chunk_size(32);
+
+        let mock = MockTransport::new();
+        push_ack(&mock, cmd::ERASE_MACRO, false);
+        for _ in 0..4 {
+            push_ack(&mock, cmd::WRITE_MACRO, false);
+        }
+        push_ack(&mock, cmd::WRITE_CONFIG, false);
+        push_ack(&mock, cmd::SAVE, false);
+        push_readback(&mock, &steps);
+
+        let session = Session::new(&mock);
+        session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await
+            .unwrap();
+
+        let sent = mock.sent_frames();
+        // 100 bytes -> 128 aligned -> 4 x 32.
+        for (i, request) in sent[1..5].iter().enumerate() {
+            let header = CustomHeader::parse(&request[1..]).unwrap();
+            assert_eq!(header.total_len, 128);
+            assert_eq!(header.chunk_len, 32);
+            assert_eq!(header.offset, (i * 32) as u32);
+        }
+        assert_eq!(
+            CustomHeader::parse(&sent[5][1..]).unwrap().cmd,
+            cmd::WRITE_CONFIG
+        );
+    }
+
+    #[tokio::test]
+    async fn write_macro_applies_flag_and_total_cnt_overrides() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(20);
+        let plan = MacroWritePlan::new(steps.clone())
+            .with_key_map(KeyMap::P1)
+            .with_header_state(1, 2);
+
+        let mock = MockTransport::new();
+        push_ack(&mock, cmd::ERASE_MACRO, true);
+        for _ in 0..4 {
+            push_ack(&mock, cmd::WRITE_MACRO, true);
+        }
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        push_ack(&mock, cmd::SAVE, true);
+        push_readback(&mock, &steps);
+
+        let session = Session::new(&mock);
+        let outcome = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await
+            .unwrap();
+
+        let header = CustomHeader::parse(&mock.sent_frames()[5][1..]).unwrap();
+        let payload = &mock.sent_frames()[5][17..];
+        assert_eq!(header.offset, 0x68C);
+        assert_eq!(u32::from_le_bytes(payload[0..4].try_into().unwrap()), 1);
+        assert_eq!(payload[4], 2);
+        assert_eq!(outcome.flag, 1);
+        assert_eq!(outcome.total_cnt, 2);
+        assert_eq!(outcome.record.key_map, KeyMap::P1);
+    }
+
+    /// Transport with a preloaded response queue that stalls (instead of
+    /// disconnecting) when the queue is empty, so ACK timeouts are testable.
+    struct ScriptedTransport {
+        incoming: Mutex<VecDeque<Vec<u8>>>,
+        sent: Mutex<Vec<Vec<u8>>>,
+        stall_when_empty: bool,
+    }
+
+    impl ScriptedTransport {
+        fn new(frames: Vec<Vec<u8>>, stall_when_empty: bool) -> Self {
+            Self {
+                incoming: Mutex::new(frames.into()),
+                sent: Mutex::new(Vec::new()),
+                stall_when_empty,
+            }
+        }
+
+        fn response(header: CustomHeader, payload: &[u8]) -> Vec<u8> {
+            let mut frame = header.to_bytes().to_vec();
+            frame.extend_from_slice(payload);
+            frame
+        }
+
+        fn sent(&self) -> Vec<Vec<u8>> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Transport for ScriptedTransport {
+        async fn send(&self, data: &[u8]) -> Result<(), Error> {
+            self.sent.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }
+
+        async fn recv(&self) -> Result<Vec<u8>, Error> {
+            let next = self.incoming.lock().unwrap().pop_front();
+            match next {
+                Some(frame) => Ok(frame),
+                None if self.stall_when_empty => std::future::pending().await,
+                None => Err(Error::Disconnected),
+            }
+        }
+
+        fn mtu(&self) -> u16 {
+            64
+        }
+
+        async fn disconnect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn short_timeouts() -> MacroTimeouts {
+        MacroTimeouts {
+            erase: Duration::from_millis(10),
+            write: Duration::from_millis(10),
+            header: Duration::from_millis(10),
+            save: Duration::from_millis(10),
+        }
+    }
+
+    fn ack_frame(request_cmd: u16, direct: bool) -> Vec<u8> {
+        let header = if direct {
+            CustomHeader::new(request_cmd, 0, 0, 0)
+        } else {
+            CustomHeader::new(cmd::RESPONSE, request_cmd, 0, 0)
+        };
+        ScriptedTransport::response(header, &[])
+    }
+
+    async fn write_with_script(
+        script: Vec<Vec<u8>>,
+        stall_when_empty: bool,
+        steps: &[MacroStep],
+    ) -> (Result<MacroWriteOutcome, Error>, Vec<Vec<u8>>) {
+        let backup = backup_from(config_with_existing_macro());
+        let plan = MacroWritePlan::new(steps.to_vec()).with_timeouts(short_timeouts());
+        let transport = ScriptedTransport::new(script, stall_when_empty);
+        let session = Session::new(&transport);
+        let result = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await;
+        let sent = transport.sent();
+        (result, sent)
+    }
+
+    fn assert_no_save(sent: &[Vec<u8>]) {
+        assert!(
+            sent.iter().all(|frame| frame_cmd(frame) != cmd::SAVE),
+            "Save must not be sent after a pre-Save failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn erase_timeout_does_not_send_save() {
+        let steps = sample_steps(10);
+        let (result, sent) = write_with_script(Vec::new(), true, &steps).await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Erase,
+                saved: false,
+                ..
+            })
+        ));
+        assert_eq!(sent.len(), 1);
+        assert_no_save(&sent);
+    }
+
+    #[tokio::test]
+    async fn write_timeout_does_not_send_header_or_save() {
+        let steps = sample_steps(10);
+        let script = vec![ack_frame(cmd::ERASE_MACRO, true)];
+        let (result, sent) = write_with_script(script, true, &steps).await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Write,
+                saved: false,
+                ..
+            })
+        ));
+        assert_eq!(sent.len(), 2);
+        assert_no_save(&sent);
+        assert!(sent
+            .iter()
+            .all(|frame| frame_cmd(frame) != cmd::WRITE_CONFIG));
+    }
+
+    #[tokio::test]
+    async fn header_timeout_does_not_send_save() {
+        let steps = sample_steps(20);
+        let mut script = vec![ack_frame(cmd::ERASE_MACRO, false)];
+        for _ in 0..4 {
+            script.push(ack_frame(cmd::WRITE_MACRO, false));
+        }
+        let (result, sent) = write_with_script(script, true, &steps).await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Header,
+                saved: false,
+                ..
+            })
+        ));
+        assert_eq!(sent.len(), 6);
+        assert_no_save(&sent);
+    }
+
+    #[tokio::test]
+    async fn save_timeout_is_reported_as_saved() {
+        let steps = sample_steps(20);
+        let mut script = vec![ack_frame(cmd::ERASE_MACRO, true)];
+        for _ in 0..4 {
+            script.push(ack_frame(cmd::WRITE_MACRO, true));
+        }
+        script.push(ack_frame(cmd::WRITE_CONFIG, true));
+        let (result, sent) = write_with_script(script, true, &steps).await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Save,
+                saved: true,
+                ..
+            })
+        ));
+        assert_eq!(frame_cmd(sent.last().unwrap()), cmd::SAVE);
+    }
+
+    #[tokio::test]
+    async fn disconnect_mid_write_does_not_send_save() {
+        let steps = sample_steps(10);
+        let script = vec![ack_frame(cmd::ERASE_MACRO, true)];
+        let (result, sent) = write_with_script(script, false, &steps).await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Write,
+                saved: false,
+                ..
+            })
+        ));
+        assert_no_save(&sent);
+    }
+
+    fn full_success_script(steps: &[MacroStep]) -> Vec<Vec<u8>> {
+        let mut script = vec![ack_frame(cmd::ERASE_MACRO, true)];
+        for _ in 0..4 {
+            script.push(ack_frame(cmd::WRITE_MACRO, true));
+        }
+        script.push(ack_frame(cmd::WRITE_CONFIG, true));
+        script.push(ack_frame(cmd::SAVE, true));
+        let raw = raw_steps(steps);
+        let mut offset = 0u32;
+        for chunk in raw.chunks(142) {
+            let mut header =
+                CustomHeader::new(cmd::RESPONSE, cmd::READ_MACRO, raw.len() as u32, offset)
+                    .with_chunk_len(chunk.len() as u16);
+            header.crc16 = packet_crc16(chunk);
+            script.push(ScriptedTransport::response(header, chunk));
+            offset += chunk.len() as u32;
+        }
+        script
+    }
+
+    #[tokio::test]
+    async fn readback_crc_mismatch_fails_after_save() {
+        let steps = sample_steps(20);
+        let mut script = full_success_script(&steps);
+        // Corrupt the first read-back CRC.
+        let first_readback = script.len() - 1;
+        let mut header = CustomHeader::parse(&script[first_readback][..16]).unwrap();
+        header.crc16 = header.crc16.wrapping_add(1);
+        script[first_readback][..16].copy_from_slice(&header.to_bytes());
+
+        let (result, sent) = write_with_script(script, true, &steps).await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Verify,
+                saved: true,
+                ..
+            })
+        ));
+        assert!(sent.iter().any(|frame| frame_cmd(frame) == cmd::SAVE));
+    }
+
+    #[tokio::test]
+    async fn readback_mismatch_fails_after_save() {
+        let steps = sample_steps(20);
+        let mut script = full_success_script(&steps);
+        // Replace the last read-back payload with different bytes of the same
+        // length and a valid CRC.
+        let last = script.len() - 1;
+        let payload = vec![0xAAu8; script[last].len() - 16];
+        let mut header = CustomHeader::parse(&script[last][..16]).unwrap();
+        header.crc16 = packet_crc16(&payload);
+        script[last] = ScriptedTransport::response(header, &payload);
+
+        let (result, sent) = write_with_script(script, true, &steps).await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Verify,
+                saved: true,
+                ..
+            })
+        ));
+        assert!(sent.iter().any(|frame| frame_cmd(frame) == cmd::SAVE));
+    }
+
+    #[tokio::test]
+    async fn backup_timeout_starts_no_write() {
+        let backup = backup_from(config_with_existing_macro());
+        let transport = ScriptedTransport::new(Vec::new(), true);
+        let session = Session::new(&transport).with_timeout(Duration::from_millis(10));
+        let result = session.read_macro_backup(backup.snapshot()).await;
+        assert!(result.is_err());
+        let sent = transport.sent();
+        assert!(!sent.is_empty());
+        assert!(sent.iter().all(|frame| frame_cmd(frame) == cmd::READ_MACRO));
+        assert_no_save(&sent);
     }
 }

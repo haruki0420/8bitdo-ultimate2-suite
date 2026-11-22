@@ -6,6 +6,7 @@
 //!
 //! Every operation in this module is read-only except
 //! [`Session::set_report_enable`], which toggles the realtime input stream.
+//! Macro flash writes live in [`crate::macro_ops`].
 //!
 //! Reads fail closed: a stale-frame drain that cannot finish within its
 //! budget refuses the read ([`Error::UnexpectedResponse`] with
@@ -114,11 +115,13 @@ enum DrainOutcome {
     Exhausted,
 }
 
-/// Marks a session for resync when a read returns an error or its future is
-/// dropped before completion, and records what the session has in flight.
+/// Marks a session for resync when a read or write returns an error or its
+/// future is dropped before completion, and records what the session has in
+/// flight.
 ///
-/// Dropping a **read** leaves its response in flight, so the next read must
-/// drain stale frames first. Dropping an **input poll** leaves only a realtime
+/// Dropping a **read** leaves its response in flight, and dropping a **write**
+/// leaves an ACK (or read-back data) behind, so the next operation must drain
+/// stale frames first. Dropping an **input poll** leaves only a realtime
 /// report (or nothing) behind, which the input path always skips, so a normal
 /// input poll (report, `Ok(None)`, or a drop while waiting) needs no resync.
 /// A **protocol error** on the input path is different: `try_next_input` calls
@@ -172,11 +175,11 @@ impl<'a> ResyncGuard<'a> {
 impl Drop for ResyncGuard<'_> {
     fn drop(&mut self) {
         self.clear();
-        // A read whose future is dropped mid-flight leaves a response that the
-        // next read must not mistake for its own. A successfully completed read
-        // was disarmed, which took the early return below. An input poll never
-        // needs the resync path.
-        if self.kind != InFlight::Read || self.disarmed {
+        // A read or write whose future is dropped mid-flight leaves a
+        // response that the next operation must not mistake for its own. A
+        // successfully completed operation was disarmed, which took the early
+        // return below. An input poll never needs the resync path.
+        if self.kind == InFlight::Input || self.disarmed {
             return;
         }
         self.needs_resync.store(true, Ordering::SeqCst);
@@ -193,6 +196,8 @@ enum InFlight {
     Read,
     /// A realtime input poll (`0x0003` / `0x0007`) is waiting for a report.
     Input,
+    /// A macro flash write is waiting for an ACK or read-back.
+    Write,
 }
 
 /// Decoded firmware version response.
@@ -315,8 +320,26 @@ impl<T: Transport> Session<T> {
     where
         F: Future<Output = Result<O, Error>>,
     {
-        let mut guard = ResyncGuard::new(&self.needs_resync, &self.in_flight, InFlight::Read);
-        let output = read.await;
+        self.run_operation(InFlight::Read, read).await
+    }
+
+    /// Run a write body, recording what is in flight and whether it failed.
+    ///
+    /// A failed or dropped write may leave an ACK or notification queued, so
+    /// the next operation drains stale frames first.
+    pub(crate) async fn run_write<F, O>(&self, write: F) -> Result<O, Error>
+    where
+        F: Future<Output = Result<O, Error>>,
+    {
+        self.run_operation(InFlight::Write, write).await
+    }
+
+    async fn run_operation<F, O>(&self, kind: InFlight, operation: F) -> Result<O, Error>
+    where
+        F: Future<Output = Result<O, Error>>,
+    {
+        let mut guard = ResyncGuard::new(&self.needs_resync, &self.in_flight, kind);
+        let output = operation.await;
         if output.is_err() {
             guard.fail();
         } else {
