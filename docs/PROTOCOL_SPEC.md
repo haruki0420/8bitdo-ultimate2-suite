@@ -505,6 +505,7 @@ sequenceDiagram
 **書き込み対象とヘッダ**:
 
 - **空きマクロ（`max_steps == 0` / `0xFFFF`）への `macro write` は拒否する**（`Error::EmptyMacroWrite`）。step data の clear が未実装であり、`macro write` で新規作成できないため。既存の非空マクロだけを対象にする。`macro restore` はバックアップが非空なら現在のマクロが空でも書ける（pre-restore backup と 216B ヘッダ更新を使う）。
+- `macro write` は **12 マクロ全部の完全バックアップ**を前提とする。1 マクロでも読めない場合は書き込まない。特に対象 slot 内に読めないマクロがある場合は、その slot の 216B ヘッダ書込が未読マクロを消すため、必ず拒否する（`unreadable macro in target slot; use macro restore or official app`）。
 - `max_steps` は常に新しい `steps.len()`。
 - `key_map` / `cycles_num` / `interval_ms` / `flag` / `total_cnt` は指定がなければバックアップ時点の値を保持する。`cycles_num` / `interval_ms` は `MacroFile` で省略可能（`None` = 保持）。
 - 名前は `MacroWritePlan.name = None` のとき、バックアップの raw ヘッダ名（UTF-16BE バイト列）を再エンコードせずに保持する。
@@ -515,15 +516,15 @@ sequenceDiagram
 **restore**:
 
 - `macro restore` は `--force` なしで「バックアップでは空、現在は非空」のマクロがあれば、対象を列挙して書き込み前に中止する。
-- `--force` 時は pre-restore backup の path を表示する。pre-restore backup は best-effort で、読めないマクロは `skipped` として記録して続行する。`--force` なしでは不完全な pre-restore backup を検出した時点で中止する。`macro write` の pre-write backup は必須のまま。読めないマクロがある場合、pre-restore backup の `config.bin` はそのマクロの `max_steps` だけを 0 にした合成値であり、device の元のヘッダそのものではない。
+- `--force` は「読めない現在マクロを skipped として続行する」ためだけに使う。**pre-restore backup の書込み自体が失敗した場合は `--force` でも中止**する（complete recovery backup を作成できないため）。読めないマクロがある場合、pre-restore backup の `config.bin` はそのマクロの `max_steps` だけを 0 にした合成値であり、device の元のヘッダそのものではない。合成値の `flag` / `total_cnt` は元のままで、非空マクロ数と一致しない場合がある（best-effort の限界）。不完全な backup で `--force` 続行する場合、CLI は `recover with` を出さず「complete recovery backup なし」「skipped: ...」を表示する。
 - 空エントリのステップデータは書かない（消去もしない）。ただし slot に 1 つでも非空マクロがあれば、その書き込みで **216B ヘッダ全体**がバックアップ値に上書きされ、空エントリの `max_steps` は 0 になる。全マクロが空の slot は、現在のヘッダと差分がある場合だけ `0x0001` + `0x0006` のヘッダのみ書込で上書きする（stale step data は flash に残る）。非空マクロを含む slot に `write_macro_header` を使うことはできない。
 - 216B ヘッダの更新では、既存の予約バイト（slot `+0x05..+0x07`、record `+0x26..+0x27`）を保持する。既知フィールドだけを変更する。`total_cnt` が 5 以上になる更新は拒否する。
 - restore 前には現在の 3 スロット × 4 マクロを pre-restore backup に保存する（`--force` 時は best-effort）。backup dir は既存の非空ディレクトリを拒否する。
 - 非 skipped エントリの `raw_sha256` は manifest に必須。欠落は restore 前に拒否する。
-- restore の最後に config を再読込し、**全 slot の 216B ヘッダ**と**非空マクロの raw steps** を比較する。不一致は `Error::UnexpectedResponse` で、pre-restore backup の path を含む。2768B 全体の SHA-256 は device の CRC 再計算で変わり得るため、情報表示のみ。
+- restore の最後に config を再読込し、**全 slot の 216B ヘッダ**と**非空マクロの raw steps** を比較する。不一致は `Error::UnexpectedResponse` で、pre-restore backup の path を含む。**Verify 失敗は書込み失敗ではない**。`saved=true` の場合は再書き込みせず、再読込と restore で確認する。2768B 全体の SHA-256 は device の CRC 再計算で変わり得るため、情報表示のみ。
 - USB 32B 書き込みは未実装。`SaveTransport::Usb` は `Error::Unsupported` で拒否し、CLI は BLE のみを使う。
 
-**バックアップ出力**: `macro backup` / `macro write` の pre-write backup / `macro restore` の pre-restore backup は、**空の path**、既存の**非空ディレクトリ**（`config.bin` などが 1 つでもある）、symlink（末尾 `/` / `.` を含む）を拒否する。空ディレクトリまたは新規ディレクトリだけを使い、既存バックアップを上書きしない。`macro backup` が読み取り途中で失敗し、作成したディレクトリが空のままなら削除する。
+**バックアップ出力**: `macro backup` / `macro write` の pre-write backup / `macro restore` の pre-restore backup は、**空の path**、既存の**非空ディレクトリ**（`config.bin` などが 1 つでもある）、symlink（末尾 `/` / `.` を含む）を拒否する。空ディレクトリまたは新規ディレクトリだけを使い、既存バックアップを上書きしない。`macro backup` が読み取り途中で失敗し、作成した最終ディレクトリが空のままなら削除する。相対パス `.` / `./` はバックアップ先として拒否するので、絶対パスを使う。symlink 検査は最終コンポーネントのみで、中間 symlink は対象外。
 
 **未確定点**:
 
