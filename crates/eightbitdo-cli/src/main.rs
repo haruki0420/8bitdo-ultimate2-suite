@@ -21,7 +21,8 @@ use eightbitdo_core::{
 };
 use eightbitdo_protocol::commands::SaveTransport;
 use eightbitdo_protocol::config_bt2::{
-    Bt2Config, MacroIndex, Slot, CONFIG_SIZE, MACROS_PER_SLOT, SLOT_COUNT,
+    macro_slot_offset, Bt2Config, MacroIndex, Slot, CONFIG_SIZE, MACROS_PER_SLOT, MACRO_SLOT_SIZE,
+    SLOT_COUNT,
 };
 use eightbitdo_protocol::input_report::InputReport;
 use eightbitdo_protocol::macro_data::{MacroFile, MacroStep, MAX_MACRO_STEPS};
@@ -177,6 +178,12 @@ enum MacroCommand {
         /// Backup directory created by `macro backup`.
         #[arg(long, value_name = "DIR")]
         dir: PathBuf,
+
+        /// Allow restoring a backup where a macro is empty but the current
+        /// controller macro is non-empty (the 216B slot header is overwritten;
+        /// stale step data remains in flash).
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -230,8 +237,8 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                 )
                 .await?;
             }
-            MacroCommand::Restore { dir } => {
-                macro_restore(&options, &dir).await?;
+            MacroCommand::Restore { dir, force } => {
+                macro_restore(&options, &dir, force).await?;
             }
         },
         Command::Backup { raw, json, hold } => {
@@ -1081,22 +1088,23 @@ fn pre_restore_dir(dir: &Path) -> PathBuf {
     ))
 }
 
-/// Build the core write plan, including the unused-macro policy.
+/// Build the core write plan.
 ///
-/// The slot `flag` and `total_cnt` policy for a previously unused macro is
-/// **not confirmed on hardware**. This keeps it deterministic and visible:
-/// writing into a `max_steps == 0` (or `0xFFFF`) entry sets `flag = 1` and
-/// `total_cnt = max(existing, index + 1)`. `key_map` is preserved unless
-/// `--trigger` is supplied, so an unused macro is enabled but may remain
-/// unassigned.
+/// Writing into an empty macro (`max_steps == 0` / `0xFFFF`) is rejected:
+/// restoring it would require clear support, and `macro restore` skips empty
+/// entries. `key_map` / `name` / `cycles_num` / `interval_ms` are overridden
+/// only when the file or `--trigger` specifies them.
 fn build_macro_write_plan(
     file: &MacroFile,
     trigger: Option<KeyMap>,
     backup: &MacroBackup,
     slot: Slot,
     index: MacroIndex,
-) -> MacroWritePlan {
+) -> Result<MacroWritePlan, Error> {
     let record = backup.snapshot().config.macro_record(slot, index);
+    if is_skipped_steps(record.max_steps) {
+        return Err(Error::EmptyMacroWrite);
+    }
     let mut plan = MacroWritePlan::new(file.steps.clone());
     if let Some(name) = &file.name {
         plan.name = Some(name.clone());
@@ -1104,14 +1112,9 @@ fn build_macro_write_plan(
     if let Some(trigger) = trigger {
         plan.key_map = Some(trigger);
     }
-    plan.cycles_num = Some(file.cycles_num);
-    plan.interval_ms = Some(file.interval_ms);
-    if is_skipped_steps(record.max_steps) {
-        let header = backup.snapshot().config.macro_slot(slot);
-        plan.flag = Some(1);
-        plan.total_cnt = Some(header.total_cnt.max(index.index() as u8 + 1));
-    }
-    plan
+    plan.cycles_num = file.cycles_num;
+    plan.interval_ms = file.interval_ms;
+    Ok(plan)
 }
 
 async fn macro_write(
@@ -1146,36 +1149,34 @@ async fn macro_write_session<T: Transport>(
     trigger: Option<KeyMap>,
     backup_dir: &Path,
 ) -> Result<(), Error> {
-    println!("reading configuration and full 3-slot × 4-macro backup...");
+    prepare_output_directory(backup_dir)?;
+    println!("reading configuration...");
     let snapshot = session.read_config_snapshot().await?;
+    let target = snapshot.config.macro_record(slot, index);
+    if is_skipped_steps(target.max_steps) {
+        return Err(Error::EmptyMacroWrite);
+    }
+
+    println!("reading full 3-slot × 4-macro backup...");
     let backup = session.read_macro_backup(&snapshot).await?;
     let config_sha256 = sha256_hex(snapshot.config.as_bytes());
     write_macro_backup(backup_dir, &snapshot, &backup, &config_sha256)?;
     println!("pre-write backup: {}", backup_dir.display());
 
-    let target = snapshot.config.macro_record(slot, index);
-    if is_skipped_steps(target.max_steps) {
-        println!(
-            "note: slot {} macro {} is unused; setting flag = 1 and total_cnt = max(existing, {}) \
-             (policy 実機未確認)",
-            slot.number(),
-            index.index(),
-            index.index() + 1
-        );
-        if trigger.is_none() {
-            println!(
-                "warning: no --trigger given; key_map stays 0x{:08X} (unassigned)",
-                target.key_map.bits()
-            );
-        }
-    } else if trigger.is_none() && !file.key_map.is_empty() {
+    if trigger.is_none() && !file.key_map.is_empty() {
         println!(
             "note: the file key_map 0x{:08X} is ignored; use --trigger to change the trigger",
             file.key_map.bits()
         );
     }
+    if file.gamepad_mode != 0 {
+        println!(
+            "note: MacroFile.gamepad_mode = {} is ignored; the current device mode is used",
+            file.gamepad_mode
+        );
+    }
 
-    let mut plan = build_macro_write_plan(file, trigger, &backup, slot, index);
+    let mut plan = build_macro_write_plan(file, trigger, &backup, slot, index)?;
     plan.save_transport = SaveTransport::Ble;
 
     println!(
@@ -1187,6 +1188,11 @@ async fn macro_write_session<T: Transport>(
         plan.steps.len(),
         session.transport().mtu()
     );
+    println!(
+        "warning: do not press Ctrl-C during the macro write; a failure can leave a sector \
+         partially updated."
+    );
+    println!("pre-write backup: {}", backup_dir.display());
     let outcome = session.write_macro(&backup, slot, index, &plan).await?;
 
     println!("wrote macro: slot {} macro {}", slot.index(), index.index());
@@ -1368,17 +1374,59 @@ fn ensure_backup_gamepad_mode(
     Ok(())
 }
 
-async fn macro_restore(options: &BleOptions, dir: &Path) -> Result<(), Error> {
+async fn macro_restore(options: &BleOptions, dir: &Path, force: bool) -> Result<(), Error> {
     let transport = BleTransport::connect(options).await?;
     let session = Session::new(transport);
-    let result = macro_restore_session(&session, dir).await;
+    let result = macro_restore_session(&session, dir, force).await;
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
+}
+
+fn restore_conflicts(backup: &MacroBackup, current: &MacroBackup) -> Vec<String> {
+    let mut conflicts = Vec::new();
+    for slot in Slot::ALL {
+        for index in MacroIndex::ALL {
+            let target = backup.get(slot, index).expect("full backup has 12 entries");
+            let current = current
+                .get(slot, index)
+                .expect("full backup has 12 entries");
+            if target.is_empty() && !current.is_empty() {
+                conflicts.push(format!(
+                    "slot {} macro {} ({} steps -> 0)",
+                    slot.index(),
+                    index.index(),
+                    current.record().max_steps
+                ));
+            }
+        }
+    }
+    conflicts
+}
+
+fn ensure_restore_allowed(
+    backup: &MacroBackup,
+    current: &MacroBackup,
+    force: bool,
+) -> Result<Vec<String>, Error> {
+    let conflicts = restore_conflicts(backup, current);
+    if !conflicts.is_empty() && !force {
+        return Err(invalid_input(format!(
+            "restore would make non-empty macros empty; rerun with --force. targets: {}",
+            conflicts.join(", ")
+        )));
+    }
+    Ok(conflicts)
+}
+
+fn macro_header_bytes(config: &Bt2Config, slot: Slot) -> &[u8] {
+    let offset = macro_slot_offset(slot);
+    &config.as_bytes()[offset..offset + MACRO_SLOT_SIZE]
 }
 
 async fn macro_restore_session<T: Transport>(
     session: &Session<T>,
     dir: &Path,
+    force: bool,
 ) -> Result<(), Error> {
     let backup = read_restore_backup(dir)?;
     println!("loaded backup: {}", dir.display());
@@ -1396,6 +1444,17 @@ async fn macro_restore_session<T: Transport>(
     )?;
     println!("pre-restore backup: {}", pre_dir.display());
 
+    let conflicts = ensure_restore_allowed(&backup, &current, force)?;
+    if !conflicts.is_empty() {
+        println!(
+            "warning: --force will overwrite the 216B slot header, making these macros empty \
+             (step data remains in flash): {}",
+            conflicts.join(", ")
+        );
+        println!("pre-restore backup: {}", pre_dir.display());
+    }
+
+    let mut slots_with_non_empty = [false; SLOT_COUNT];
     let mut restored = 0usize;
     let mut skipped = 0usize;
     for slot in Slot::ALL {
@@ -1404,11 +1463,35 @@ async fn macro_restore_session<T: Transport>(
             let record = entry.record();
             if is_skipped_steps(record.max_steps) {
                 skipped += 1;
-                println!(
-                    "skip slot {} macro {}: empty in backup (deletion is not implemented)",
-                    slot.index(),
-                    index.index()
-                );
+                continue;
+            }
+            slots_with_non_empty[slot.index()] = true;
+        }
+    }
+
+    let mut has_writes = slots_with_non_empty.iter().any(|written| *written);
+    for slot in Slot::ALL {
+        if !slots_with_non_empty[slot.index()]
+            && macro_header_bytes(&backup.snapshot().config, slot)
+                != macro_header_bytes(&current_snapshot.config, slot)
+        {
+            has_writes = true;
+        }
+    }
+
+    if has_writes {
+        println!(
+            "warning: do not press Ctrl-C during the macro write; a failure can leave a sector \
+             partially updated."
+        );
+        println!("pre-write backup: {}", pre_dir.display());
+    }
+
+    for slot in Slot::ALL {
+        for index in MacroIndex::ALL {
+            let entry = backup.get(slot, index).expect("full backup has 12 entries");
+            let record = entry.record();
+            if is_skipped_steps(record.max_steps) {
                 continue;
             }
             let header = backup.snapshot().config.macro_slot(slot);
@@ -1437,9 +1520,68 @@ async fn macro_restore_session<T: Transport>(
             restored += 1;
         }
     }
+
+    for slot in Slot::ALL {
+        if slots_with_non_empty[slot.index()] {
+            continue;
+        }
+        if macro_header_bytes(&backup.snapshot().config, slot)
+            == macro_header_bytes(&current_snapshot.config, slot)
+        {
+            continue;
+        }
+        println!(
+            "restoring slot {} 216B header only (no step data written)...",
+            slot.index()
+        );
+        if let Err(error) = session.write_macro_header(&backup, slot).await {
+            eprintln!("restore header stopped at slot {}: {error}", slot.index());
+            eprintln!("pre-restore backup: {}", pre_dir.display());
+            return Err(error);
+        }
+    }
+
+    verify_restored_state(session, &backup).await?;
     println!(
-        "restore finished: {restored} macros restored, {skipped} empty entries skipped (deletion not implemented)"
+        "restore finished: {restored} macros restored, {skipped} empty entries skipped (step data not erased)"
     );
+    Ok(())
+}
+
+async fn verify_restored_state<T: Transport>(
+    session: &Session<T>,
+    backup: &MacroBackup,
+) -> Result<(), Error> {
+    let final_snapshot = session.read_config_snapshot().await?;
+    for slot in Slot::ALL {
+        if macro_header_bytes(&backup.snapshot().config, slot)
+            != macro_header_bytes(&final_snapshot.config, slot)
+        {
+            return Err(invalid_data(format!(
+                "restore verification failed: slot {} 216B header differs",
+                slot.index()
+            )));
+        }
+    }
+    for slot in Slot::ALL {
+        for index in MacroIndex::ALL {
+            let entry = backup.get(slot, index).expect("full backup has 12 entries");
+            if entry.is_empty() {
+                continue;
+            }
+            let readback = session.read_macro(&final_snapshot, slot, index).await?;
+            if readback.raw() != entry.raw() {
+                return Err(invalid_data(format!(
+                    "restore verification failed: slot {} macro {} raw steps differ",
+                    slot.index(),
+                    index.index()
+                )));
+            }
+        }
+    }
+    let final_sha = sha256_hex(final_snapshot.config.as_bytes());
+    let backup_sha = sha256_hex(backup.snapshot().config.as_bytes());
+    println!("final config sha256 (informational): {final_sha} (backup {backup_sha})");
     Ok(())
 }
 
@@ -1457,6 +1599,7 @@ async fn macro_backup(options: &BleOptions, dir: &Path) -> Result<(), Error> {
 /// Files are written only after every macro read succeeds, so a directory
 /// never looks like a complete backup while one read is missing.
 async fn macro_backup_session<T: Transport>(session: &Session<T>, dir: &Path) -> Result<(), Error> {
+    prepare_output_directory(dir)?;
     println!("reading configuration...");
     let snapshot = session.read_config_snapshot().await?;
     let config_sha256 = sha256_hex(snapshot.config.as_bytes());
@@ -1538,6 +1681,41 @@ fn macro_skip_reason(max_steps: u16) -> Option<&'static str> {
     }
 }
 
+/// Prepare a backup output directory without overwriting an existing backup.
+///
+/// A non-existent or empty directory is accepted. A non-empty directory, a
+/// symlink, or a non-directory is rejected before any file is written.
+fn prepare_output_directory(dir: &Path) -> Result<(), Error> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(invalid_input(format!(
+                    "{} is a symlink; choose a new backup directory",
+                    dir.display()
+                )));
+            }
+            if !metadata.is_dir() {
+                return Err(invalid_input(format!(
+                    "{} is not a directory",
+                    dir.display()
+                )));
+            }
+            if std::fs::read_dir(dir)?.next().is_some() {
+                return Err(invalid_input(format!(
+                    "{} is not empty; choose a new backup directory",
+                    dir.display()
+                )));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir)?;
+            Ok(())
+        }
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
 /// Write a complete backup directory.
 ///
 /// `config.bin` and per-macro `.bin` files are raw bytes. `macros.json` and
@@ -1549,13 +1727,7 @@ fn write_macro_backup(
     backup: &MacroBackup,
     config_sha256: &str,
 ) -> Result<(), Error> {
-    std::fs::create_dir_all(dir)?;
-    if !dir.is_dir() {
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is not a directory", dir.display()),
-        )));
-    }
+    prepare_output_directory(dir)?;
 
     write_atomic(&dir.join("config.bin"), snapshot.config.as_bytes())?;
     let summary = json_summary(snapshot, config_sha256);
@@ -5724,8 +5896,11 @@ mod tests {
         let result = macro_backup_session(&session, &dir).await;
 
         assert!(matches!(result, Err(Error::Disconnected)));
+        let empty = std::fs::read_dir(&dir)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true);
         assert!(
-            !dir.exists(),
+            empty,
             "a failed macro read must not create a partial backup directory"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -5747,8 +5922,8 @@ mod tests {
             name: Some("Combo".to_string()),
             gamepad_mode: 0,
             key_map: KeyMap::M1,
-            cycles_num: 2,
-            interval_ms: 15,
+            cycles_num: Some(2),
+            interval_ms: Some(15),
             steps: vec![MacroStep::neutral(10), MacroStep::neutral(20)],
         };
         let json = dir.join("macro.json");
@@ -5763,6 +5938,147 @@ mod tests {
         assert!(read_macro_file(&dir.join("empty.json")).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn push_config_responses(mock: &MockTransport, config: &Bt2Config) {
+        for (index, chunk) in config.as_bytes().chunks(142).enumerate() {
+            let header = CustomHeader::new(
+                commands::cmd::READ_CONFIG,
+                0,
+                CONFIG_SIZE as u32,
+                (index * 142) as u32,
+            )
+            .with_chunk_len(chunk.len() as u16);
+            mock.push_response(&header, chunk);
+        }
+    }
+
+    fn push_macro_read(mock: &MockTransport, config: &Bt2Config, slot: Slot, index: MacroIndex) {
+        use eightbitdo_protocol::macro_data;
+
+        let record = config.macro_record(slot, index);
+        if is_skipped_steps(record.max_steps) {
+            return;
+        }
+        let steps = vec![MacroStep::neutral(10); usize::from(record.max_steps)];
+        let raw = macro_data::encode_macro_steps(&steps).unwrap()
+            [..usize::from(record.max_steps) * 10]
+            .to_vec();
+        let mut header = CustomHeader::new(
+            commands::cmd::RESPONSE,
+            commands::cmd::READ_MACRO,
+            raw.len() as u32,
+            0,
+        )
+        .with_chunk_len(raw.len() as u16);
+        header.crc16 = eightbitdo_protocol::crc::packet_crc16(&raw);
+        mock.push_response(&header, &raw);
+    }
+
+    fn push_backup_macro_read(
+        mock: &MockTransport,
+        backup: &MacroBackup,
+        slot: Slot,
+        index: MacroIndex,
+    ) {
+        let entry = backup.get(slot, index).unwrap();
+        if entry.is_empty() {
+            return;
+        }
+        let raw = entry.raw();
+        let mut offset = 0u32;
+        for chunk in raw.chunks(142) {
+            let mut header = CustomHeader::new(
+                commands::cmd::RESPONSE,
+                commands::cmd::READ_MACRO,
+                raw.len() as u32,
+                offset,
+            )
+            .with_chunk_len(chunk.len() as u16);
+            header.crc16 = eightbitdo_protocol::crc::packet_crc16(chunk);
+            mock.push_response(&header, chunk);
+            offset += chunk.len() as u32;
+        }
+    }
+
+    fn is_write_command(frame: &[u8]) -> bool {
+        let command = CustomHeader::parse(&frame[1..]).unwrap().cmd;
+        matches!(
+            command,
+            commands::cmd::ERASE_MACRO
+                | commands::cmd::WRITE_MACRO
+                | commands::cmd::WRITE_CONFIG
+                | commands::cmd::SAVE
+        )
+    }
+
+    fn empty_backup_fixture(dir: &Path) -> (ConfigSnapshot, MacroBackup) {
+        use eightbitdo_protocol::config_bt2::GamepadMode;
+
+        let mut config = Bt2Config::zeroed();
+        config.set_gamepad_mode(GamepadMode::Switch);
+        config.recompute_crc();
+        let stored_crc = config.crc16_stored() as u16;
+        let mut check = config.clone();
+        let computed_crc = check.recompute_crc();
+        let snapshot = ConfigSnapshot {
+            config: config.clone(),
+            stored_crc,
+            computed_crc,
+            crc_valid: stored_crc == computed_crc,
+        };
+        let mut entries = Vec::new();
+        for slot in Slot::ALL {
+            for index in MacroIndex::ALL {
+                entries.push(
+                    MacroEntry::new(slot, index, config.macro_record(slot, index), Vec::new())
+                        .unwrap(),
+                );
+            }
+        }
+        let backup = MacroBackup::new(snapshot.clone(), entries).unwrap();
+        write_macro_backup(
+            dir,
+            &snapshot,
+            &backup,
+            &sha256_hex(snapshot.config.as_bytes()),
+        )
+        .unwrap();
+        (snapshot, backup)
+    }
+
+    #[test]
+    fn macro_file_omits_and_defaults_unset_loop_fields() {
+        let file = MacroFile {
+            name: None,
+            gamepad_mode: 0,
+            key_map: KeyMap::NONE,
+            cycles_num: None,
+            interval_ms: None,
+            steps: vec![MacroStep::neutral(10)],
+        };
+        let json = serde_json::to_value(&file).unwrap();
+        assert!(json.get("cycles_num").is_none());
+        assert!(json.get("interval_ms").is_none());
+        let toml = toml::to_string(&file).unwrap();
+        assert!(!toml.contains("cycles_num"));
+        assert!(!toml.contains("interval_ms"));
+
+        let parsed: MacroFile = serde_json::from_value(serde_json::json!({
+            "steps": [{
+                "ms_times": 10,
+                "keys": 0,
+                "rt_value": 0,
+                "lt_value": 0,
+                "left_x": 127,
+                "left_y": 127,
+                "right_x": 127,
+                "right_y": 127
+            }]
+        }))
+        .unwrap();
+        assert_eq!(parsed.cycles_num, None);
+        assert_eq!(parsed.interval_ms, None);
     }
 
     fn backup_fixture(dir: &Path) -> (ConfigSnapshot, MacroBackup) {
@@ -5817,31 +6133,43 @@ mod tests {
     }
 
     #[test]
-    fn build_write_plan_enables_unused_macro_but_preserves_used_header() {
+    fn build_write_plan_rejects_empty_target_and_preserves_unspecified_values() {
         let dir = scratch_dir("macro-plan");
         let (_, backup) = backup_fixture(&dir);
         let file = MacroFile {
             name: None,
             gamepad_mode: 0,
             key_map: KeyMap::NONE,
-            cycles_num: 1,
-            interval_ms: 5,
+            cycles_num: Some(1),
+            interval_ms: Some(5),
             steps: vec![MacroStep::neutral(10), MacroStep::neutral(20)],
         };
 
-        let unused =
-            build_macro_write_plan(&file, Some(KeyMap::M2), &backup, Slot::S1, MacroIndex::M3);
-        assert_eq!(unused.flag, Some(1));
-        assert_eq!(unused.total_cnt, Some(3));
-        assert_eq!(unused.key_map, Some(KeyMap::M2));
-        assert_eq!(unused.cycles_num, Some(1));
-        assert_eq!(unused.interval_ms, Some(5));
+        assert!(matches!(
+            build_macro_write_plan(&file, Some(KeyMap::M2), &backup, Slot::S1, MacroIndex::M3),
+            Err(Error::EmptyMacroWrite)
+        ));
 
-        let used = build_macro_write_plan(&file, None, &backup, Slot::S1, MacroIndex::M1);
+        let used = build_macro_write_plan(&file, None, &backup, Slot::S1, MacroIndex::M1).unwrap();
         assert_eq!(used.flag, None);
         assert_eq!(used.total_cnt, None);
         assert_eq!(used.key_map, None);
         assert_eq!(used.name, None);
+        assert_eq!(used.cycles_num, Some(1));
+        assert_eq!(used.interval_ms, Some(5));
+
+        let steps_only = MacroFile {
+            name: None,
+            gamepad_mode: 0,
+            key_map: KeyMap::NONE,
+            cycles_num: None,
+            interval_ms: None,
+            steps: vec![MacroStep::neutral(10)],
+        };
+        let preserved =
+            build_macro_write_plan(&steps_only, None, &backup, Slot::S1, MacroIndex::M1).unwrap();
+        assert_eq!(preserved.cycles_num, None);
+        assert_eq!(preserved.interval_ms, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5881,8 +6209,8 @@ mod tests {
 
         // Restore the bytes and point the manifest at a path outside the
         // directory: the plain-file-name rule must reject it before reading.
-        let (_, backup) = backup_fixture(&dir);
-        let _ = backup;
+        let _ = std::fs::remove_dir_all(&dir);
+        backup_fixture(&dir);
         let manifest_path = dir.join("macros.json");
         let mut manifest: MacroBackupDocument =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
@@ -5898,5 +6226,334 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    fn test_macro_file() -> MacroFile {
+        MacroFile {
+            name: None,
+            gamepad_mode: 0,
+            key_map: KeyMap::NONE,
+            cycles_num: None,
+            interval_ms: None,
+            steps: vec![MacroStep::neutral(10), MacroStep::neutral(20)],
+        }
+    }
+
+    #[tokio::test]
+    async fn macro_write_empty_target_sends_no_write_frames() {
+        let root = scratch_dir("macro-empty-target");
+        let fixture_dir = root.join("fixture");
+        let (snapshot, _) = backup_fixture(&fixture_dir);
+        let backup_dir = root.join("backup");
+
+        let mock = MockTransport::new();
+        push_config_responses(&mock, &snapshot.config);
+        let session = Session::new(&mock);
+        let result = macro_write_session(
+            &session,
+            Slot::S1,
+            MacroIndex::M3,
+            &test_macro_file(),
+            None,
+            &backup_dir,
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::EmptyMacroWrite)));
+        assert!(
+            !mock
+                .sent_frames()
+                .iter()
+                .any(|frame| is_write_command(frame)),
+            "empty macro rejection must not send Erase/Write/Header/Save"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn macro_write_pre_backup_failure_sends_no_write_frames() {
+        let root = scratch_dir("macro-prebackup-fail");
+        let backup_dir = root.join("backup");
+        let mock = MockTransport::new();
+        let session = Session::new(&mock);
+        let result = macro_write_session(
+            &session,
+            Slot::S1,
+            MacroIndex::M1,
+            &test_macro_file(),
+            None,
+            &backup_dir,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!mock
+            .sent_frames()
+            .iter()
+            .any(|frame| is_write_command(frame)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn macro_write_rejects_non_empty_backup_dir_before_reading() {
+        let root = scratch_dir("macro-backup-nonempty");
+        let backup_dir = root.join("backup");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(backup_dir.join("config.bin"), [0u8; 1]).unwrap();
+
+        let mock = MockTransport::new();
+        let session = Session::new(&mock);
+        let result = macro_write_session(
+            &session,
+            Slot::S1,
+            MacroIndex::M1,
+            &test_macro_file(),
+            None,
+            &backup_dir,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(mock.sent_frames().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_gamepad_mode_mismatch_before_writes() {
+        use eightbitdo_protocol::config_bt2::GamepadMode;
+
+        let root = scratch_dir("macro-restore-mode");
+        let fixture_dir = root.join("fixture");
+        let (snapshot, _) = backup_fixture(&fixture_dir);
+        let mut current = snapshot.config.clone();
+        current.set_gamepad_mode(GamepadMode::XInput);
+        current.recompute_crc();
+
+        let mock = MockTransport::new();
+        push_config_responses(&mock, &current);
+        let session = Session::new(&mock);
+        let result = macro_restore_session(&session, &fixture_dir, false).await;
+
+        assert!(result.is_err());
+        assert!(!mock
+            .sent_frames()
+            .iter()
+            .any(|frame| is_write_command(frame)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn restore_verifies_final_config_headers() {
+        let root = scratch_dir("macro-restore-verify");
+        let fixture_dir = root.join("fixture");
+        let (snapshot, _) = empty_backup_fixture(&fixture_dir);
+
+        let mock = MockTransport::new();
+        push_config_responses(&mock, &snapshot.config);
+        push_config_responses(&mock, &snapshot.config);
+        let session = Session::new(&mock);
+        macro_restore_session(&session, &fixture_dir, false)
+            .await
+            .unwrap();
+
+        assert!(!mock
+            .sent_frames()
+            .iter()
+            .any(|frame| is_write_command(frame)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn restore_final_config_mismatch_is_an_error() {
+        let root = scratch_dir("macro-restore-verify-fail");
+        let fixture_dir = root.join("fixture");
+        let (snapshot, _) = empty_backup_fixture(&fixture_dir);
+
+        let mut changed = snapshot.config.clone();
+        let mut header = changed.macro_slot(Slot::S1);
+        header.flag = 1;
+        changed.set_macro_slot(Slot::S1, &header);
+        changed.recompute_crc();
+
+        let mock = MockTransport::new();
+        push_config_responses(&mock, &snapshot.config);
+        push_config_responses(&mock, &changed);
+        let session = Session::new(&mock);
+        let result = macro_restore_session(&session, &fixture_dir, false).await;
+
+        assert!(result.is_err());
+        assert!(!mock
+            .sent_frames()
+            .iter()
+            .any(|frame| is_write_command(frame)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_force_gate_lists_targets_and_allows_with_force() {
+        let root = scratch_dir("macro-force-gate");
+        let empty_dir = root.join("empty");
+        let current_dir = root.join("current");
+        let (_, empty_backup) = empty_backup_fixture(&empty_dir);
+        let (_, current_backup) = backup_fixture(&current_dir);
+
+        let conflicts = restore_conflicts(&empty_backup, &current_backup);
+        assert!(conflicts
+            .iter()
+            .any(|target| target.contains("slot 0 macro 0")));
+        assert!(ensure_restore_allowed(&empty_backup, &current_backup, false).is_err());
+        assert_eq!(
+            ensure_restore_allowed(&empty_backup, &current_backup, true).unwrap(),
+            conflicts
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn backup_directory_must_be_empty() {
+        let root = scratch_dir("macro-dir-guard");
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(prepare_output_directory(&empty).is_ok());
+
+        std::fs::write(empty.join("config.bin"), [0u8; 1]).unwrap();
+        assert!(prepare_output_directory(&empty).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[tokio::test]
+    async fn restore_force_allows_header_only_overwrite() {
+        let root = scratch_dir("macro-force-restore");
+        let empty_dir = root.join("empty");
+        let current_dir = root.join("current");
+        let (empty_snapshot, _) = empty_backup_fixture(&empty_dir);
+        let (current_snapshot, _) = backup_fixture(&current_dir);
+
+        let mock = MockTransport::with_mtu(200);
+        push_config_responses(&mock, &current_snapshot.config);
+        push_macro_read(&mock, &current_snapshot.config, Slot::S1, MacroIndex::M1);
+        // Header-only write for slot 0: two header chunks + Save, then the
+        // device returns the empty backup header on the verification read.
+        mock.push_response(
+            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
+            &[],
+        );
+        mock.push_response(
+            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
+            &[],
+        );
+        mock.push_response(&CustomHeader::new(commands::cmd::SAVE, 0, 0, 0), &[]);
+        push_config_responses(&mock, &empty_snapshot.config);
+        push_config_responses(&mock, &empty_snapshot.config);
+
+        let session = Session::new(&mock);
+        macro_restore_session(&session, &empty_dir, true)
+            .await
+            .unwrap();
+
+        let sent = mock.sent_frames();
+        assert!(sent
+            .iter()
+            .any(|frame| { CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::SAVE }));
+        assert!(!sent.iter().any(|frame| {
+            matches!(
+                CustomHeader::parse(&frame[1..]).unwrap().cmd,
+                commands::cmd::ERASE_MACRO | commands::cmd::WRITE_MACRO
+            )
+        }));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn restore_without_force_refuses_before_header_write() {
+        let root = scratch_dir("macro-no-force-restore");
+        let empty_dir = root.join("empty");
+        let current_dir = root.join("current");
+        empty_backup_fixture(&empty_dir);
+        let (current_snapshot, _) = backup_fixture(&current_dir);
+
+        let mock = MockTransport::new();
+        push_config_responses(&mock, &current_snapshot.config);
+        push_macro_read(&mock, &current_snapshot.config, Slot::S1, MacroIndex::M1);
+        let session = Session::new(&mock);
+        let result = macro_restore_session(&session, &empty_dir, false).await;
+
+        assert!(result.is_err());
+        assert!(!mock
+            .sent_frames()
+            .iter()
+            .any(|frame| is_write_command(frame)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[tokio::test]
+    async fn macro_backup_rejects_non_empty_dir_before_reading() {
+        let root = scratch_dir("macro-backup-session-guard");
+        let dir = root.join("backup");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.bin"), [0u8; 1]).unwrap();
+
+        let mock = MockTransport::new();
+        let session = Session::new(&mock);
+        let result = macro_backup_session(&session, &dir).await;
+        assert!(result.is_err());
+        assert!(mock.sent_frames().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_macro_backup_refuses_existing_files() {
+        let root = scratch_dir("macro-write-backup-guard");
+        let fixture_dir = root.join("fixture");
+        let (snapshot, backup) = backup_fixture(&fixture_dir);
+        let dir = root.join("existing");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.bin"), b"keep").unwrap();
+
+        let result = write_macro_backup(
+            &dir,
+            &snapshot,
+            &backup,
+            &sha256_hex(snapshot.config.as_bytes()),
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(dir.join("config.bin")).unwrap(), b"keep");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[tokio::test]
+    async fn restore_verifies_non_empty_macro_raw() {
+        let root = scratch_dir("macro-restore-raw");
+        let fixture_dir = root.join("fixture");
+        let (snapshot, backup) = backup_fixture(&fixture_dir);
+
+        let mock = MockTransport::with_mtu(200);
+        push_config_responses(&mock, &snapshot.config);
+        push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M1);
+        mock.push_response(&CustomHeader::new(commands::cmd::ERASE_MACRO, 0, 0, 0), &[]);
+        mock.push_response(&CustomHeader::new(commands::cmd::WRITE_MACRO, 0, 0, 0), &[]);
+        mock.push_response(
+            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
+            &[],
+        );
+        mock.push_response(
+            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
+            &[],
+        );
+        mock.push_response(&CustomHeader::new(commands::cmd::SAVE, 0, 0, 0), &[]);
+        push_config_responses(&mock, &snapshot.config);
+        push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M1);
+        push_config_responses(&mock, &snapshot.config);
+        push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M1);
+
+        let session = Session::new(&mock);
+        macro_restore_session(&session, &fixture_dir, false)
+            .await
+            .unwrap();
+
+        let sent = mock.sent_frames();
+        assert!(sent
+            .iter()
+            .any(|frame| { CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::SAVE }));
+        assert!(sent.iter().any(|frame| {
+            CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::READ_MACRO
+        }));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

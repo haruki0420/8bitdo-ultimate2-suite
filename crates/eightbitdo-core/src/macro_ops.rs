@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use eightbitdo_protocol::commands::{self, cmd, SaveTransport};
 use eightbitdo_protocol::config_bt2::{
-    macro_slot_offset, Bt2Config, MacroIndex, MacroRecord, Slot, MACROS_PER_SLOT, MACRO_SLOT_SIZE,
-    SLOT_COUNT,
+    macro_slot_offset, Bt2Config, MacroIndex, MacroRecord, MacroSlot, Slot, CONFIG_SIZE,
+    MACROS_PER_SLOT, MACRO_RECORD_SIZE, MACRO_SLOT_SIZE, SLOT_COUNT,
 };
 use eightbitdo_protocol::header::PacketKind;
 use eightbitdo_protocol::macro_data::{self, MacroStep};
@@ -21,7 +21,9 @@ use eightbitdo_protocol::KeyMap;
 use tokio::time::Instant;
 
 use crate::error::{Error, MacroWriteStage};
-use crate::session::{deadline_after, ConfigSnapshot, Session, TransferBuffer};
+use crate::session::{
+    deadline_after, ConfigSnapshot, Session, TransferBuffer, CONFIG_TOTAL_TIMEOUT,
+};
 use crate::transport::Transport;
 
 /// Payload budget for one BLE frame: `mtu - 3` (ATT overhead) minus the
@@ -151,6 +153,9 @@ pub struct MacroWritePlan {
     /// Registered macro count (`0..=4`); `None` preserves the existing value.
     pub total_cnt: Option<u8>,
     /// Save sub-command variant.
+    ///
+    /// Only [`SaveTransport::Ble`] is implemented; the USB path is rejected
+    /// with [`Error::Unsupported`].
     pub save_transport: SaveTransport,
     /// ACK timeouts.
     pub timeouts: MacroTimeouts,
@@ -237,6 +242,17 @@ pub struct MacroWriteOutcome {
     pub packets_sent: usize,
     /// Read-back entry that matched the requested steps.
     pub readback: MacroEntry,
+}
+
+/// Result of a header-only write (`0x0001` + `0x0006`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacroHeaderOutcome {
+    /// Slot macro-enabled flag after the update.
+    pub flag: u32,
+    /// Registered macro count after the update.
+    pub total_cnt: u8,
+    /// Header chunk packets plus Save.
+    pub packets_sent: usize,
 }
 
 /// One macro read from the controller.
@@ -530,7 +546,6 @@ impl<T: Transport> Session<T> {
         steps: u16,
         expected_len: usize,
     ) -> Result<(Vec<u8>, Vec<u32>), Error> {
-        let sector = index.sector_offset();
         let mut buffer = TransferBuffer::new(expected_len);
         let mut chunk_offset = 0usize;
         let mut response_offsets = Vec::new();
@@ -578,8 +593,7 @@ impl<T: Transport> Session<T> {
                 // - the requested absolute offset (`sector + chunk_offset`);
                 // - a sector-relative offset equal to `chunk_offset`
                 //   (未確定: macro_idx > 0 の実機応答で確認する).
-                let relative_match =
-                    reported >= sector && u64::from(reported - sector) == chunk_offset as u64;
+                let relative_match = u64::from(reported) == chunk_offset as u64;
                 if reported != 0 && reported != requested && !relative_match {
                     return Err(Error::UnexpectedResponse(format!(
                         "macro chunk response offset 0x{reported:X} does not match requested \
@@ -608,10 +622,14 @@ impl<T: Transport> Session<T> {
     /// Write one macro with the mandatory Erase → Write → Header → Save flow.
     ///
     /// `backup` must contain all 12 entries (see [`MacroBackup::new`]); this is
-    /// the "backup first" precondition. If Erase, any Write chunk or the
-    /// 216-byte header update fails, **Save is not sent** and
-    /// [`Error::MacroWrite`] is returned with `saved = false`. After Save, the
-    /// macro is read back with `0x0102` and compared byte-for-byte.
+    /// the "backup first" precondition. Writing into an empty macro
+    /// (`max_steps == 0` / `0xFFFF`) is rejected with
+    /// [`Error::EmptyMacroWrite`] because clear support is not implemented.
+    /// `SaveTransport::Usb` is rejected with [`Error::Unsupported`].
+    /// If Erase, any Write chunk or the 216-byte header update fails,
+    /// **Save is not sent** and [`Error::MacroWrite`] is returned with
+    /// `saved = false`. After Save, the 216-byte config header and the
+    /// `0x0102` raw steps are read back and compared.
     ///
     /// The header values `flag`, `total_cnt`, `key_map`, `cycles_num` and
     /// `interval_ms` are preserved from the backup unless the plan overrides
@@ -653,6 +671,15 @@ impl<T: Transport> Session<T> {
                 index.index()
             )));
         }
+        if backup.get(slot, index).is_some_and(MacroEntry::is_empty) {
+            return Err(Error::EmptyMacroWrite);
+        }
+        if plan.save_transport != SaveTransport::Ble {
+            return Err(Error::Unsupported(
+                "USB macro write is not implemented; only SaveTransport::Ble is supported"
+                    .to_string(),
+            ));
+        }
 
         let mtu = self.transport().mtu();
         let header_chunk_size = macro_header_chunk_len(mtu)?;
@@ -684,36 +711,7 @@ impl<T: Transport> Session<T> {
 
         // Build the complete header update before sending Erase. Any name or
         // range error therefore happens before the flash sector is touched.
-        let mut updated = base_config.clone();
-        let mut header = updated.macro_slot(slot);
-        let mut record = header.records[index.index()];
-        record.max_steps = u16::try_from(plan.steps.len()).map_err(|_| {
-            Error::Protocol(eightbitdo_protocol::Error::TooManySteps {
-                max: macro_data::MAX_MACRO_STEPS,
-                actual: plan.steps.len(),
-            })
-        })?;
-        if let Some(name) = &plan.name {
-            record.set_name(name)?;
-        }
-        if let Some(key_map) = plan.key_map {
-            record.key_map = key_map;
-        }
-        if let Some(cycles_num) = plan.cycles_num {
-            record.cycles_num = cycles_num;
-        }
-        if let Some(interval_ms) = plan.interval_ms {
-            record.interval_ms = interval_ms;
-        }
-        header.records[index.index()] = record;
-        if let Some(flag) = plan.flag {
-            header.flag = flag;
-        }
-        if let Some(total_cnt) = plan.total_cnt {
-            header.total_cnt = total_cnt;
-        }
-        updated.set_macro_slot(slot, &header);
-        updated.recompute_crc();
+        let (updated, record, header) = apply_macro_write_plan(backup, slot, index, plan)?;
 
         let header_offset = macro_slot_offset(slot);
         let header_bytes =
@@ -781,6 +779,10 @@ impl<T: Transport> Session<T> {
         .map_err(|error| macro_write_failure(MacroWriteStage::Save, error, true))?;
         packets_sent += 1;
 
+        self.verify_config_header(header_offset, &header_bytes)
+            .await
+            .map_err(|error| macro_write_failure(MacroWriteStage::Verify, error, true))?;
+
         let readback = self
             .read_macro_with_config(&updated, slot, index)
             .await
@@ -807,6 +809,111 @@ impl<T: Transport> Session<T> {
             packets_sent,
             readback,
         })
+    }
+
+    /// Write only one slot's 216-byte macro header and Save.
+    ///
+    /// Used by `macro restore` for slots whose backup contains no non-empty
+    /// macros: step data is not erased, but the header's `max_steps` values
+    /// are restored (so previously active macros become unreferenced). No
+    /// `0x0104` / `0x0103` is sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MtuTooSmall`] before sending, or
+    /// [`Error::MacroWrite`] for a failed Header/Save/Verify stage.
+    pub async fn write_macro_header(
+        &self,
+        backup: &MacroBackup,
+        slot: Slot,
+    ) -> Result<MacroHeaderOutcome, Error> {
+        let mtu = self.transport().mtu();
+        let header_chunk_size = macro_header_chunk_len(mtu)?;
+        self.prepare_read().await?;
+        self.run_write(self.write_macro_header_inner(backup, slot, header_chunk_size))
+            .await
+    }
+
+    async fn write_macro_header_inner(
+        &self,
+        backup: &MacroBackup,
+        slot: Slot,
+        header_chunk_size: usize,
+    ) -> Result<MacroHeaderOutcome, Error> {
+        let mut updated = backup.snapshot().config.clone();
+        let header = updated.macro_slot(slot);
+        set_macro_slot_preserving_reserved(&mut updated, slot, &header);
+        updated.recompute_crc();
+
+        let header_offset = macro_slot_offset(slot);
+        let header_bytes =
+            updated.as_bytes()[header_offset..header_offset + MACRO_SLOT_SIZE].to_vec();
+        let requests =
+            commands::write_config_packets(header_offset as u32, &header_bytes, header_chunk_size)?;
+        let save = commands::save(SaveTransport::Ble);
+
+        let mut packets_sent = 0usize;
+        for request in &requests {
+            self.send_and_await_ack(
+                request,
+                false,
+                cmd::WRITE_CONFIG,
+                0,
+                MACRO_HEADER_TIMEOUT,
+                "WriteMacroHeader",
+            )
+            .await
+            .map_err(|error| macro_write_failure(MacroWriteStage::Header, error, false))?;
+            packets_sent += 1;
+        }
+        self.send_and_await_ack(
+            &save,
+            false,
+            cmd::SAVE,
+            SaveTransport::Ble.subcmd(),
+            MACRO_SAVE_TIMEOUT,
+            "Save",
+        )
+        .await
+        .map_err(|error| macro_write_failure(MacroWriteStage::Save, error, true))?;
+        packets_sent += 1;
+
+        self.verify_config_header(header_offset, &header_bytes)
+            .await
+            .map_err(|error| macro_write_failure(MacroWriteStage::Verify, error, true))?;
+
+        Ok(MacroHeaderOutcome {
+            flag: header.flag,
+            total_cnt: header.total_cnt,
+            packets_sent,
+        })
+    }
+
+    /// Read the full configuration and compare one 216-byte slot header.
+    async fn verify_config_header(
+        &self,
+        header_offset: usize,
+        expected: &[u8],
+    ) -> Result<(), Error> {
+        let config = self
+            .read_config_chunks_inner(CONFIG_SIZE, self.per_frame_timeout(), CONFIG_TOTAL_TIMEOUT)
+            .await?;
+        let actual = &config[header_offset..header_offset + MACRO_SLOT_SIZE];
+        if actual != expected {
+            let first_diff = actual
+                .iter()
+                .zip(expected)
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or(0);
+            return Err(Error::UnexpectedResponse(format!(
+                "macro header read-back mismatch at config offset 0x{:X} (first differing byte \
+                 +0x{first_diff:X}: device 0x{:02X}, sent 0x{:02X})",
+                header_offset,
+                actual.get(first_diff).copied().unwrap_or(0),
+                expected.get(first_diff).copied().unwrap_or(0)
+            )));
+        }
+        Ok(())
     }
 
     /// Send one App Mode request and wait for its ACK.
@@ -872,6 +979,63 @@ impl<T: Transport> Session<T> {
             }
             return Ok(());
         }
+    }
+}
+
+fn apply_macro_write_plan(
+    backup: &MacroBackup,
+    slot: Slot,
+    index: MacroIndex,
+    plan: &MacroWritePlan,
+) -> Result<(Bt2Config, MacroRecord, MacroSlot), Error> {
+    let mut updated = backup.snapshot().config.clone();
+    let mut header = updated.macro_slot(slot);
+    let mut record = header.records[index.index()];
+    record.max_steps = u16::try_from(plan.steps.len()).map_err(|_| {
+        Error::Protocol(eightbitdo_protocol::Error::TooManySteps {
+            max: macro_data::MAX_MACRO_STEPS,
+            actual: plan.steps.len(),
+        })
+    })?;
+    if let Some(name) = &plan.name {
+        record.set_name(name)?;
+    }
+    if let Some(key_map) = plan.key_map {
+        record.key_map = key_map;
+    }
+    if let Some(cycles_num) = plan.cycles_num {
+        record.cycles_num = cycles_num;
+    }
+    if let Some(interval_ms) = plan.interval_ms {
+        record.interval_ms = interval_ms;
+    }
+    header.records[index.index()] = record;
+    if let Some(flag) = plan.flag {
+        header.flag = flag;
+    }
+    if let Some(total_cnt) = plan.total_cnt {
+        header.total_cnt = total_cnt;
+    }
+    set_macro_slot_preserving_reserved(&mut updated, slot, &header);
+    updated.recompute_crc();
+    Ok((updated, record, header))
+}
+
+/// Write a slot header while keeping the reserved bytes from the original.
+///
+/// `Bt2Config::set_macro_slot` zeroes the 3-byte slot padding and the 2-byte
+/// per-record padding. The controller may store non-zero values there, and the
+/// write path must not rewrite unknown bytes.
+fn set_macro_slot_preserving_reserved(config: &mut Bt2Config, slot: Slot, header: &MacroSlot) {
+    let offset = macro_slot_offset(slot);
+    let original = config.as_bytes()[offset..offset + MACRO_SLOT_SIZE].to_vec();
+    config.set_macro_slot(slot, header);
+    let bytes = &mut config.as_mut_bytes()[offset..offset + MACRO_SLOT_SIZE];
+    bytes[5..8].copy_from_slice(&original[5..8]);
+    for index in 0..MACROS_PER_SLOT {
+        let record = 8 + index * MACRO_RECORD_SIZE;
+        bytes[record + 0x26..record + 0x28]
+            .copy_from_slice(&original[record + 0x26..record + 0x28]);
     }
 }
 
@@ -1180,6 +1344,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_macro_accepts_sector_relative_offsets_for_macro_2() {
+        let mut config = config_with_macros();
+        let mut record = config.macro_record(Slot::S1, MacroIndex::M3);
+        record.max_steps = 30;
+        config.set_macro_record(Slot::S1, MacroIndex::M3, &record);
+        config.recompute_crc();
+        let snapshot = snapshot(config);
+
+        let steps = sample_steps(30);
+        let raw = sample_entry_payload(&steps);
+        assert_eq!(raw.len(), 300);
+
+        let mock = MockTransport::new();
+        let expected_offsets = [0u32, 142, 284];
+        for (chunk, offset) in raw.chunks(142).zip(expected_offsets) {
+            let mut header = envelope(cmd::READ_MACRO, 300, offset, chunk);
+            header.crc16 = packet_crc16(chunk);
+            mock.push_response(&header, chunk);
+        }
+
+        let session = Session::new(&mock);
+        let entry = session
+            .read_macro(&snapshot, Slot::S1, MacroIndex::M3)
+            .await
+            .unwrap();
+
+        let sent = mock.sent_frames();
+        let request_offsets = [0x2000u32, 0x208E, 0x211C];
+        for (frame, offset) in sent.iter().zip(request_offsets) {
+            let request = CustomHeader::parse(&frame[1..]).unwrap();
+            assert_eq!(request.offset, offset);
+            assert_eq!(request.total_len, 300);
+        }
+        assert_eq!(entry.raw(), raw);
+        assert_eq!(entry.read_offsets(), &expected_offsets);
+    }
+
+    #[tokio::test]
     async fn read_macro_response_crc_is_validated() {
         let config = config_with_macros();
         let snapshot = snapshot(config);
@@ -1334,6 +1536,38 @@ mod write_tests {
         }
     }
 
+    fn config_frames(config: &Bt2Config) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        for (index, chunk) in config.as_bytes().chunks(142).enumerate() {
+            let header = CustomHeader::new(
+                cmd::READ_CONFIG,
+                0,
+                CONFIG_SIZE as u32,
+                (index * 142) as u32,
+            )
+            .with_chunk_len(chunk.len() as u16);
+            let mut frame = header.to_bytes().to_vec();
+            frame.extend_from_slice(chunk);
+            frames.push(frame);
+        }
+        frames
+    }
+
+    fn push_config(mock: &MockTransport, config: &Bt2Config) {
+        for frame in config_frames(config) {
+            mock.push_incoming(&frame);
+        }
+    }
+
+    fn expected_config(
+        backup: &MacroBackup,
+        slot: Slot,
+        index: MacroIndex,
+        plan: &MacroWritePlan,
+    ) -> Bt2Config {
+        apply_macro_write_plan(backup, slot, index, plan).unwrap().0
+    }
+
     fn frame_cmd(frame: &[u8]) -> u16 {
         CustomHeader::parse(&frame[1..]).unwrap().cmd
     }
@@ -1358,6 +1592,8 @@ mod write_tests {
         // of 0x0006 in an envelope.
         let save_ack = CustomHeader::new(cmd::RESPONSE, SaveTransport::Ble.subcmd(), 0, 0);
         mock.push_response(&save_ack, &[]);
+        let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
+        push_config(&mock, &expected);
         push_readback(&mock, &steps);
 
         let session = Session::new(&mock);
@@ -1367,7 +1603,11 @@ mod write_tests {
             .unwrap();
 
         let sent = mock.sent_frames();
-        let commands: Vec<u16> = sent.iter().map(|frame| frame_cmd(frame)).collect();
+        let commands: Vec<u16> = sent
+            .iter()
+            .map(|frame| frame_cmd(frame))
+            .filter(|command| *command != cmd::READ_CONFIG)
+            .collect();
         assert_eq!(
             commands,
             vec![
@@ -1486,6 +1726,8 @@ mod write_tests {
             push_ack(&mock, cmd::WRITE_CONFIG, false);
         }
         push_ack(&mock, cmd::SAVE, false);
+        let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
+        push_config(&mock, &expected);
         push_readback(&mock, &steps);
 
         let session = Session::new(&mock);
@@ -1524,6 +1766,28 @@ mod write_tests {
             assert_eq!(header.offset, offset);
             assert_eq!(frame.len(), 17 + usize::from(length));
         }
+        let combined: Vec<u8> = header_frames
+            .iter()
+            .flat_map(|frame| frame[17..].iter().copied())
+            .collect();
+        assert_eq!(combined.len(), MACRO_SLOT_SIZE);
+        let record = &combined[8..8 + MACRO_RECORD_SIZE];
+        assert_eq!(&record[0..6], &[0x00, 0x4F, 0x00, 0x6C, 0x00, 0x64]); // "Old"
+        assert_eq!(u16::from_le_bytes([record[0x22], record[0x23]]), 10);
+        assert_eq!(
+            u32::from_le_bytes([record[0x28], record[0x29], record[0x2A], record[0x2B]]),
+            KeyMap::M1.bits()
+        );
+        assert_eq!(
+            u32::from_le_bytes([record[0x2C], record[0x2D], record[0x2E], record[0x2F]]),
+            2
+        );
+        assert_eq!(
+            u32::from_le_bytes([record[0x30], record[0x31], record[0x32], record[0x33]]),
+            10
+        );
+        assert_eq!(u32::from_le_bytes(combined[0..4].try_into().unwrap()), 0);
+        assert_eq!(combined[4], 0);
     }
 
     #[tokio::test]
@@ -1542,6 +1806,8 @@ mod write_tests {
         push_ack(&mock, cmd::WRITE_CONFIG, true);
         push_ack(&mock, cmd::WRITE_CONFIG, true);
         push_ack(&mock, cmd::SAVE, true);
+        let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
+        push_config(&mock, &expected);
         push_readback(&mock, &steps);
 
         let session = Session::new(&mock);
@@ -1779,7 +2045,7 @@ mod write_tests {
         assert_no_save(&sent);
     }
 
-    fn full_success_script(steps: &[MacroStep]) -> Vec<Vec<u8>> {
+    fn full_success_script(steps: &[MacroStep], config: &Bt2Config) -> Vec<Vec<u8>> {
         let mut script = vec![ack_frame(cmd::ERASE_MACRO, true)];
         for _ in 0..4 {
             script.push(ack_frame(cmd::WRITE_MACRO, true));
@@ -1787,6 +2053,7 @@ mod write_tests {
         script.push(ack_frame(cmd::WRITE_CONFIG, true));
         script.push(ack_frame(cmd::WRITE_CONFIG, true));
         script.push(ack_frame(cmd::SAVE, true));
+        script.extend(config_frames(config));
         let raw = raw_steps(steps);
         let mut offset = 0u32;
         for chunk in raw.chunks(142) {
@@ -1803,7 +2070,10 @@ mod write_tests {
     #[tokio::test]
     async fn readback_crc_mismatch_fails_after_save() {
         let steps = sample_steps(20);
-        let mut script = full_success_script(&steps);
+        let backup = backup_from(config_with_existing_macro());
+        let plan = MacroWritePlan::new(steps.clone());
+        let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
+        let mut script = full_success_script(&steps, &expected);
         // Corrupt the first read-back CRC.
         let first_readback = script.len() - 1;
         let mut header = CustomHeader::parse(&script[first_readback][..16]).unwrap();
@@ -1825,7 +2095,10 @@ mod write_tests {
     #[tokio::test]
     async fn readback_mismatch_fails_after_save() {
         let steps = sample_steps(20);
-        let mut script = full_success_script(&steps);
+        let backup = backup_from(config_with_existing_macro());
+        let plan = MacroWritePlan::new(steps.clone());
+        let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
+        let mut script = full_success_script(&steps, &expected);
         // Replace the last read-back payload with different bytes of the same
         // length and a valid CRC.
         let last = script.len() - 1;
@@ -1895,8 +2168,9 @@ mod write_tests {
         let steps = sample_steps(20);
         let backup = backup_from(config_with_existing_macro());
         let plan = MacroWritePlan::new(steps.clone());
+        let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
         let transport = LimitedTransport {
-            inner: ScriptedTransport::new(full_success_script(&steps), true, 200),
+            inner: ScriptedTransport::new(full_success_script(&steps, &expected), true, 200),
             limit: 200 - 3,
         };
         let session = Session::new(&transport);
@@ -1970,5 +2244,179 @@ mod write_tests {
             transport.sent().is_empty(),
             "MTU 23 must fail before Erase/Write/Header/Save"
         );
+    }
+    #[tokio::test]
+    async fn empty_macro_write_is_rejected_before_any_frame() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(10);
+        let plan = MacroWritePlan::new(steps);
+        let transport = ScriptedTransport::new(Vec::new(), true, 200);
+        let session = Session::new(&transport);
+        let result = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M3, &plan)
+            .await;
+        assert!(matches!(result, Err(Error::EmptyMacroWrite)));
+        assert!(
+            transport.sent().is_empty(),
+            "empty macro rejection must not send Erase/Write/Header/Save"
+        );
+    }
+
+    #[tokio::test]
+    async fn usb_save_transport_is_rejected_before_any_frame() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(10);
+        let plan = MacroWritePlan::new(steps).with_save_transport(SaveTransport::Usb);
+        let transport = ScriptedTransport::new(Vec::new(), true, 200);
+        let session = Session::new(&transport);
+        let result = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::Unsupported(message)) if message.contains("USB")
+        ));
+        assert!(transport.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn header_readback_mismatch_fails_after_save() {
+        let steps = sample_steps(20);
+        let backup = backup_from(config_with_existing_macro());
+        // The device returns the original header instead of the updated one.
+        let script = full_success_script(&steps, &backup.snapshot().config);
+        let (result, sent) = write_with_script(script, true, &steps).await;
+        assert!(matches!(
+            result,
+            Err(Error::MacroWrite {
+                stage: MacroWriteStage::Verify,
+                saved: true,
+                ..
+            })
+        ));
+        assert!(sent.iter().any(|frame| frame_cmd(frame) == cmd::SAVE));
+    }
+
+    #[tokio::test]
+    async fn write_macro_header_writes_only_the_header_and_saves() {
+        let backup = backup_from(config_with_existing_macro());
+        let mock = MockTransport::with_mtu(200);
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        push_ack(&mock, cmd::SAVE, true);
+        push_config(&mock, &backup.snapshot().config);
+
+        let session = Session::new(&mock);
+        let outcome = session.write_macro_header(&backup, Slot::S1).await.unwrap();
+
+        let sent = mock.sent_frames();
+        assert!(!sent
+            .iter()
+            .any(|frame| matches!(frame_cmd(frame), cmd::ERASE_MACRO | cmd::WRITE_MACRO)));
+        assert_eq!(outcome.packets_sent, 3);
+        let commands: Vec<u16> = sent
+            .iter()
+            .map(|frame| frame_cmd(frame))
+            .filter(|command| *command != cmd::READ_CONFIG)
+            .collect();
+        assert_eq!(
+            commands,
+            vec![cmd::WRITE_CONFIG, cmd::WRITE_CONFIG, cmd::SAVE]
+        );
+    }
+
+    #[tokio::test]
+    async fn write_macro_preserves_unspecified_header_fields() {
+        let mut config = Bt2Config::zeroed();
+        config.set_gamepad_mode(GamepadMode::XInput);
+        let mut header = config.macro_slot(Slot::S1);
+        header.flag = 1;
+        header.total_cnt = 2;
+        let mut record = MacroRecord {
+            max_steps: 4,
+            key_map: KeyMap::M2,
+            cycles_num: 7,
+            interval_ms: 25,
+            offset: 0x1234,
+            special_flag: 2,
+            gamepad_mode: 1,
+            ..MacroRecord::default()
+        };
+        record.set_name("Keep").unwrap();
+        header.records[0] = record;
+        config.set_macro_slot(Slot::S1, &header);
+        let header_offset = macro_slot_offset(Slot::S1);
+        config.as_mut_bytes()[header_offset + 5..header_offset + 8]
+            .copy_from_slice(&[0xA1, 0xA2, 0xA3]);
+        config.as_mut_bytes()[header_offset + 8 + 0x26..header_offset + 8 + 0x28]
+            .copy_from_slice(&[0xB1, 0xB2]);
+        config.recompute_crc();
+        let backup = backup_from(config);
+
+        let steps = sample_steps(10);
+        let plan = MacroWritePlan::new(steps.clone());
+        let mock = MockTransport::with_mtu(200);
+        push_ack(&mock, cmd::ERASE_MACRO, true);
+        for _ in 0..2 {
+            push_ack(&mock, cmd::WRITE_MACRO, true);
+        }
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        push_ack(&mock, cmd::SAVE, true);
+        let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
+        push_config(&mock, &expected);
+        push_readback(&mock, &steps);
+
+        let session = Session::new(&mock);
+        let outcome = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.record.max_steps, 10);
+        assert_eq!(outcome.record.name(), "Keep");
+        assert_eq!(outcome.record.key_map, KeyMap::M2);
+        assert_eq!(outcome.record.cycles_num, 7);
+        assert_eq!(outcome.record.interval_ms, 25);
+        assert_eq!(outcome.record.offset, 0x1234);
+        assert_eq!(outcome.record.special_flag, 2);
+        assert_eq!(outcome.record.gamepad_mode, 1);
+        assert_eq!(outcome.flag, 1);
+        assert_eq!(outcome.total_cnt, 2);
+
+        let header_payload: Vec<u8> = mock
+            .sent_frames()
+            .iter()
+            .filter(|frame| frame_cmd(frame) == cmd::WRITE_CONFIG)
+            .flat_map(|frame| frame[17..].iter().copied())
+            .collect();
+        let record = &header_payload[8..8 + MACRO_RECORD_SIZE];
+        assert_eq!(
+            &record[0..8],
+            &[0x00, 0x4B, 0x00, 0x65, 0x00, 0x65, 0x00, 0x70]
+        );
+        assert_eq!(record[0x20], 1);
+        assert_eq!(record[0x21], 2);
+        assert_eq!(u16::from_le_bytes([record[0x22], record[0x23]]), 10);
+        assert_eq!(u16::from_le_bytes([record[0x24], record[0x25]]), 0x1234);
+        assert_eq!(
+            u32::from_le_bytes([record[0x28], record[0x29], record[0x2A], record[0x2B]]),
+            KeyMap::M2.bits()
+        );
+        assert_eq!(
+            u32::from_le_bytes([record[0x2C], record[0x2D], record[0x2E], record[0x2F]]),
+            7
+        );
+        assert_eq!(
+            u32::from_le_bytes([record[0x30], record[0x31], record[0x32], record[0x33]]),
+            25
+        );
+        assert_eq!(
+            u32::from_le_bytes(header_payload[0..4].try_into().unwrap()),
+            1
+        );
+        assert_eq!(header_payload[4], 2);
+        assert_eq!(&header_payload[5..8], &[0xA1, 0xA2, 0xA3]);
+        assert_eq!(&record[0x26..0x28], &[0xB1, 0xB2]);
     }
 }

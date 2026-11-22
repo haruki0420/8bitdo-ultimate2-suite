@@ -787,7 +787,7 @@ impl<T: Transport> Session<T> {
             .await
     }
 
-    async fn read_config_chunks_inner(
+    pub(crate) async fn read_config_chunks_inner(
         &self,
         expected_len: usize,
         per_frame_timeout: Duration,

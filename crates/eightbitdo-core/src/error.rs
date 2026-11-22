@@ -86,6 +86,17 @@ pub enum Error {
         reason: String,
     },
 
+    /// Writing into an empty macro requires clear support that is not
+    /// implemented yet.
+    #[error(
+        "empty macro write requires clear support; not implemented. Choose an existing macro."
+    )]
+    EmptyMacroWrite,
+
+    /// The requested operation or transport variant is not implemented.
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
+
     /// A response carried an unexpected command or range.
     #[error("unexpected response: {0}")]
     UnexpectedResponse(String),
