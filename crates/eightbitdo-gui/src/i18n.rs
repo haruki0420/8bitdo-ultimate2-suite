@@ -1,11 +1,11 @@
 //! Centralized UI strings and language selection.
 //!
 //! Every user-visible string lives in this module. [`Key`] is an exhaustive
-//! enum: the two `match` arms in [`Key::ja`] and [`Key::en`] are generated from
+//! enum: the two `match` arms in `Key::ja` and `Key::en` are generated from
 //! the same list, so adding a key without both translations is a compile error.
 //!
 //! Values that vary at runtime use `{}` placeholders and are filled by
-//! [`format`]. [`placeholder_count`] lets tests assert that both languages
+//! `format!`. [`placeholder_count`] lets tests assert that both languages
 //! expect the same number of arguments.
 //!
 //! Japanese is the default language; English is the fallback for users who
