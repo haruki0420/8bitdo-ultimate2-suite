@@ -154,7 +154,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 | **[docs/BRANCH_PROTECTION.md](docs/BRANCH_PROTECTION.md)** | `main` の canonical ruleset、`review-gate` の付け方・監査とゲートの限界 |
 | **[docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)** | リスクに応じた独立レビューの Tier 1〜3、レビュアーの役割、故障リストの書き方 |
 | **[LICENSE-MIT](LICENSE-MIT)** / **[LICENSE-APACHE](LICENSE-APACHE)** | コードのライセンス全文（MIT / Apache-2.0） |
-| **[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)** | 依存ライブラリのライセンス一覧、帰属表示、同梱フォント（OFL）の扱い |
+| **[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)** | 依存ライブラリのライセンス一覧、帰属表示、同梱フォント（OFL / UFL）・Gradle wrapper（Apache-2.0）の扱い |
 | **[TRADEMARKS.md](TRADEMARKS.md)** | 第三者の商標、非公式・非提携、ロゴ不使用の方針 |
 
 ---
@@ -187,9 +187,10 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 ## ライセンス
 
 - **コード**（`crates/` 以下）: [MIT](LICENSE-MIT) または [Apache-2.0](LICENSE-APACHE) のいずれかを選択できます（`MIT OR Apache-2.0`）。
-- **ドキュメント**（`docs/` 以下と `README.md` など）: 特記がない限り、コードと同じ `MIT OR Apache-2.0` です。将来 CC BY 4.0 などの別ライセンスへ変更する場合は、変更時に本文へ明記します。ただし、第三者に由来する部分（同梱フォントの OFL、第三者コードの BSD / Unicode 表示、引用・出典）は、それぞれの権利者のライセンス条件に従います。
-- **同梱フォント**: SIL Open Font License 1.1。`crates/eightbitdo-gui/assets/fonts/OFL.txt` を同梱しています（GUI 内のライセンス表示画面は未実装）。
-- 依存ソフトウェアのライセンスは [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) を参照してください。同ファイルは要約と参照であり、全クレートの著作権表示・ライセンス本文を網羅しません。バイナリ配布時は `cargo-about` 等で完全な第三者通知を生成して同梱してください。
+- **ドキュメント**（`docs/` 以下と `README.md` など）: 特記がない限り、コードと同じ `MIT OR Apache-2.0` です。将来 CC BY 4.0 などの別ライセンスへ変更する場合は、変更時に本文へ明記します。ただし、第三者に由来する部分（同梱フォントの OFL、第三者コードの BSD / Unicode / MPL 表示、引用・出典）は、それぞれの権利者のライセンス条件に従います。
+- **同梱フォント**（GUI に同梱済み）: Noto Sans JP のサブセットは SIL Open Font License 1.1 です。`crates/eightbitdo-gui/assets/fonts/OFL.txt` を同梱しています。egui 既定フォント（Ubuntu-Light / NotoEmoji / Hack / emoji-icon-font）は OFL 1.1・Ubuntu Font Licence 1.0・MIT で、帰属は [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) §3.6.1 に整理しています。
+- **Gradle wrapper**（`mobile/android/gradle/wrapper/gradle-wrapper.jar` など、ビルド再現性のためコミット済み）: Apache-2.0（jar 内 `META-INF/LICENSE`、manifest の `SPDX-License-Identifier`）。帰属は [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) §3.6.3 を参照してください。
+- 依存ソフトウェアのライセンスは [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) を参照してください。2026-11-23 時点（main `6b39e23`）で **第三者クレート 497**（全 502 パッケージ − workspace 5）です。大半は MIT または Apache-2.0 で、代表的な依存は `eframe`/`egui`（MIT OR Apache-2.0）、`uniffi`（MPL-2.0、ファイル単位コピーレフト）、`btleplug`（MIT/Apache-2.0/BSD-3-Clause）です。Cargo 管理外では Noto Sans JP（OFL 1.1）と Gradle wrapper（Apache-2.0）を同梱しています。同ファイルは要約と参照であり、全クレートの著作権表示・ライセンス本文を網羅しません。バイナリ配布時は `cargo-about` 等で完全な第三者通知を生成して同梱してください。
 - 商標・非公式に関する方針は [TRADEMARKS.md](TRADEMARKS.md) を参照してください。
 
 ## 免責
