@@ -189,6 +189,9 @@ BLE Boot の `WriteFirmware` も同じ cmd/subcmd のため巻き込まれる。
 
 ## 11. 未確認事項（優先順）
 
+実機 btsnoop での確定手順・確認項目・本ノートへの追記方法は
+[docs/OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md) を参照。
+
 1. `cmd=0x0003, subcmd=0` の実フレーム長（§7.1）。btsnoop 採取が最優先。
 2. `0x00C3` 応答のレイアウト（端末側 4KB CRC が payload の `[2..3]` か）。
 3. `0x00C4` の実 wire（16B か 24B か）。Windows 実機との差。
