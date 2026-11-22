@@ -478,6 +478,7 @@ sequenceDiagram
 > 単一エントリ書込は `offset = 0x0E4 + slot * 0x5C + idx * 4`, `len = 4`, `total_len = 0x0AD0` で `0x0001` を送り、完了時に共通 onfinished から **`0x0006/0x0067` Save**（Android。Windows USB は `0x0123`）。公式は書込後の read-back を行わない。
 > 変更するのは対象 4B のみで、`flag`（`0` = 無効）は変更しない。`flag` を 1 にするのは `setMapKey` の全 22 + flag 一括コピー経由。全体 2768B 書込でも同じ領域を更新できる（本実装は全体書込 + Save + read-back 検証を使用）。
 > 無効値は `KeyMap_N = 0`。`KeyMap_My_NUll = 227` は書込・表示経路から参照されず用途未確認のため書かない。1 ボタン = 1 つの 32-bit `KeyMap` 値で、ビット合成は確認されていない。
+> **raw 2768B 書込経路も同じ検証を行う**: `config write --file` は 22 個の `key[]`、`gyro[].key_map`、マクロ `key_map` を documented single `KeyMap` ホワイトリストで検証し、227・未知ビット・複合値を拒否する（flag 類は 0/1、マクロ `max_steps` は 0/0xFFFF/1..=200、`total_cnt <= 4` も検証）。
 
 - **マクロ詳細ステップ (`MacroDatas`, 1 ステップ = 10 バイト)**:
   - `S_UltimateBT2Advance.setMacroStruct` より、1 ステップは以下の `5 x u16` (Little-Endian, 計 10 バイト) で構成される:

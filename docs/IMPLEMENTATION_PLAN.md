@@ -234,7 +234,7 @@ Track C: モバイル
   - CLI: `config dump` / **`config write --file <2768B>`** / **`config set <field> <value>`** / **`config remap <physical> <target>`** / **`config map show`**。`config write` はファイル読込・既知フィールド検証を **BLE 接続前** に行う。
   - 安全策: **pre-write backup 必須**（`config.bin` + `config.json`、`REVIEW_TIERS` §6 の例外としてマクロ step sector は対象外）、`--yes` なしの対話確認、**前後 SHA-256 表示**、確認後の **TOCTOU 再読込**（変化時は中止）、read-back 検証、ゲームパッドモード / cur_slot 変更とマクロヘッダ（`0x68C..0x914`）変更の警告。
   - 復旧: `config write --file <backup>/config.bin --yes`。device が予約バイトを正規化した場合は `--accept-reserved-drift` で現在の device 予約バイトに合わせる。
-  - `config set` の検証: joy start `0..=127` / end `0..=128`、gyro sensitivity `1..=15`、hotwheel speed `0..=15`、rumble level `0..=5`、flag 類 `0/1`、`gyro.key` は `config remap` と同じ documented single-`KeyMap` ホワイトリスト（227・未知ビット・複合拒否）。
+  - 検証: `config set` は joy start `0..=127` / end `0..=128`、gyro sensitivity `1..=15`、hotwheel speed `0..=15`、rumble level `0..=5`、flag 類 `0/1`、`gyro.key` は `config remap` と同じ documented single-`KeyMap` ホワイトリスト（227・未知ビット・複合拒否）。**raw `config write --file` も同じ検証**を行い、22 `key[]` / `gyro[].key_map` / マクロ `key_map` のホワイトリスト、flag 0/1、マクロ `max_steps` 0/0xFFFF/1..=200・`total_cnt <= 4` を確認する（不明な `cur_slot` は警告して保持）。`--write-chunk` は接続前に 1..=180 を検証し、交渉 MTU の上限は接続後に検証する。
   - **未実装 / 未確認**: USB HID config write（BLE のみ）、実機での full config write 検証、`config set` の joy/trigger flag=1・LED color flag=1 の副作用（help に明記）、公式 BLE Save の 2000ms / 2 再送との差（本実装は 3 秒 / リトライなし。`PROTOCOL_SPEC` §6.4 に記録）。
 - **完了条件**: 各セクションの書き込み → 読み戻し一致（Mock で固定済み。実機は未検証）。
 - **Tier**: **3**。
