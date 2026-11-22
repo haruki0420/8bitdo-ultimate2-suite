@@ -421,6 +421,54 @@ pub fn write_config_packets(
         .collect())
 }
 
+/// Split a 216-byte macro header write into transport-sized packets.
+///
+/// Official evidence (`getBT2_WriteMacroi`, called from `writeBT2Macro`): the
+/// macro header command uses `cmd = 0x0001`, `offset = 0x68C + slot * 0xD8`,
+/// and **`total_len = 0xD8`** (216), not the full 2768-byte configuration
+/// length. `chunk_len` is split by the MTU (142 + 74 on MTU 200). Every packet
+/// carries the CRC-16/MODBUS of its own payload.
+///
+/// This is deliberately separate from [`write_config_packets`], whose
+/// `total_len` remains `0x0AD0` for other configuration writes.
+///
+/// # Errors
+///
+/// Returns [`Error::EmptyPayload`] when `data` is empty,
+/// [`Error::InvalidChunkSize`] when `chunk_size` is zero, or
+/// [`Error::RangeOutOfBounds`] when `offset + data.len()` exceeds the
+/// 2768-byte configuration block.
+pub fn write_macro_header_packets(
+    offset: u32,
+    data: &[u8],
+    chunk_size: usize,
+) -> Result<Vec<Request>, Error> {
+    if data.is_empty() {
+        return Err(Error::EmptyPayload);
+    }
+    if chunk_size == 0 {
+        return Err(Error::InvalidChunkSize {
+            max: data.len(),
+            actual: 0,
+        });
+    }
+    check_config_range(offset, data.len() as u64)?;
+    let total_len = data.len() as u32;
+    Ok(data
+        .chunks(chunk_size)
+        .enumerate()
+        .map(|(i, chunk)| {
+            Request::new(
+                cmd::WRITE_CONFIG,
+                0,
+                total_len,
+                offset + (i * chunk_size) as u32,
+            )
+            .with_crc_payload(chunk)
+        })
+        .collect())
+}
+
 /// Commit pending configuration writes to flash.
 #[must_use]
 pub fn save(transport: SaveTransport) -> Request {
@@ -1080,6 +1128,45 @@ mod tests {
             );
             assert_ne!(packet.header.crc16, 0);
         }
+    }
+
+    #[test]
+    fn macro_header_packets_use_216_total_len() {
+        let data = [0x5Au8; 216];
+        let packets = write_macro_header_packets(0x68C, &data, 142).unwrap();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].header.cmd, 0x0001);
+        assert_eq!(packets[0].header.subcmd, 0);
+        assert_eq!(packets[0].header.offset, 0x68C);
+        assert_eq!(packets[0].header.total_len, 216);
+        assert_eq!(packets[0].header.chunk_len, 142);
+        assert_eq!(packets[0].payload.len(), 142);
+        assert_eq!(packets[1].header.offset, 0x68C + 142);
+        assert_eq!(packets[1].header.total_len, 216);
+        assert_eq!(packets[1].header.chunk_len, 74);
+        assert_eq!(packets[1].payload.len(), 74);
+        for packet in &packets {
+            assert_eq!(
+                packet.header.crc16,
+                crate::crc::packet_crc16(&packet.payload)
+            );
+        }
+
+        // The existing config writer keeps its 0x0AD0 total_len.
+        let config = write_config_packets(0x68C, &data, 142).unwrap();
+        assert_eq!(config[0].header.total_len, 0x0AD0);
+        assert!(matches!(
+            write_macro_header_packets(0x0AC0, &data, 32),
+            Err(Error::RangeOutOfBounds { .. })
+        ));
+        assert!(matches!(
+            write_macro_header_packets(0x68C, &[], 32),
+            Err(Error::EmptyPayload)
+        ));
+        assert!(matches!(
+            write_macro_header_packets(0x68C, &data, 0),
+            Err(Error::InvalidChunkSize { actual: 0, .. })
+        ));
     }
 
     #[test]
