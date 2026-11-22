@@ -537,9 +537,10 @@ struct Bt2Header {
 2. `max_steps > 0` の場合、Flash 読み出しを発行する：
    - `cmd = 0x0102`
    - `subcmd = (gamepad_mode << 8) | slot`
-   - `offset = macro_idx << 12`
-   - `total_len = max_steps * 10`
-   - 応答ペイロードを 10 バイト単位で `max_steps` 個の `MacroDatas` としてデコードする。
+   - `offset = (macro_idx << 12) + chunk_offset`
+   - `total_len = chunk_len = max_steps * 10`（全長のまま）
+   - 応答ペイロードを 10 バイト単位で `MacroDatas` としてデコードする。
+3. **1 要求 = 1 チャンク**（実機 2026-11-22 観測: 142B）。`chunk_offset += payload.len()` で `offset` を進めて再要求する。2 チャンク目以降の応答 `offset` が 0（逐次）/ 要求値 / セクタ相対のどれになるかは未確定であり、`macro backup` は 3 形式を受け入れて `response_offsets` に記録する。最終チャンクは残り長に切り詰める。
 
 ---
 

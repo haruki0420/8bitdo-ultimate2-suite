@@ -20,7 +20,7 @@ use eightbitdo_protocol::macro_data::{self, MacroStep};
 use tokio::time::Instant;
 
 use crate::error::Error;
-use crate::session::{deadline_after, out_of_range, ConfigSnapshot, Session, TransferBuffer};
+use crate::session::{deadline_after, ConfigSnapshot, Session, TransferBuffer};
 use crate::transport::Transport;
 
 /// Overall deadline for assembling one macro read.
@@ -41,6 +41,7 @@ pub struct MacroEntry {
     record: MacroRecord,
     raw: Vec<u8>,
     steps: Vec<MacroStep>,
+    read_offsets: Vec<u32>,
 }
 
 impl MacroEntry {
@@ -80,7 +81,18 @@ impl MacroEntry {
             record,
             raw,
             steps,
+            read_offsets: Vec::new(),
         })
+    }
+
+    /// Record the raw response offsets observed while reading this macro.
+    ///
+    /// The device may echo the requested offset, report `0` as its
+    /// sequential-chunk convention, or report a sector-relative offset.
+    /// Keeping the values makes a real-device log distinguish those cases.
+    pub(crate) fn with_read_offsets(mut self, offsets: Vec<u32>) -> Self {
+        self.read_offsets = offsets;
+        self
     }
 
     /// Slot (`0..=2`).
@@ -111,6 +123,17 @@ impl MacroEntry {
     #[must_use]
     pub fn steps(&self) -> &[MacroStep] {
         &self.steps
+    }
+
+    /// Raw `offset` values in the response headers, one per received chunk.
+    ///
+    /// Empty for a skipped macro. A value of `0` after the first chunk means
+    /// the device used its sequential-chunk convention; the requested offset
+    /// means it echoed the request. This is diagnostic data for confirming
+    /// real-device behaviour.
+    #[must_use]
+    pub fn read_offsets(&self) -> &[u32] {
+        &self.read_offsets
     }
 
     /// `true` when the header declares zero steps or the unset marker, so no
@@ -275,69 +298,111 @@ impl<T: Transport> Session<T> {
         // The official macro commands take the low 8 bits of the
         // configuration `gamepad_mode` field.
         let mode = config.gamepad_mode_raw() & 0xFF;
-        let request = commands::read_macro(mode, slot, index, record.max_steps)?;
         let expected_len = usize::from(record.max_steps) * macro_data::MACRO_STEP_SIZE;
-        let raw = self.read_macro_chunks(&request, expected_len).await?;
-        MacroEntry::new(slot, index, record, raw)
+        let (raw, read_offsets) = self
+            .read_macro_chunks(mode, slot, index, record.max_steps, expected_len)
+            .await?;
+        Ok(MacroEntry::new(slot, index, record, raw)?.with_read_offsets(read_offsets))
     }
 
+    /// Read one macro chunk per request, advancing the wire `offset`.
+    ///
+    /// The device returns 142 bytes per notification (observed) even when
+    /// `total_len` is 500 or more, so the loop requests
+    /// `offset = (macro_idx << 12) + chunk_offset` again after each chunk.
+    /// `total_len` / `chunk_len` stay at `steps * 10`; only the offset moves.
+    ///
+    /// Returns the assembled bytes plus every raw response `offset` in order.
     async fn read_macro_chunks(
         &self,
-        request: &commands::Request,
+        mode: u16,
+        slot: Slot,
+        index: MacroIndex,
+        steps: u16,
         expected_len: usize,
-    ) -> Result<Vec<u8>, Error> {
-        self.transport()
-            .send(&request.encode_ble_payloadless(PacketKind::App)?)
-            .await?;
-
-        let sector = request.header.offset as usize;
+    ) -> Result<(Vec<u8>, Vec<u32>), Error> {
+        let sector = index.sector_offset();
         let mut buffer = TransferBuffer::new(expected_len);
+        let mut chunk_offset = 0usize;
+        let mut response_offsets = Vec::new();
         let deadline = deadline_after(MACRO_READ_TOTAL_TIMEOUT)?;
 
-        while !buffer.is_complete() {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(macro_read_timeout(buffer.received(), expected_len));
-            }
-            let wait = self
-                .per_frame_timeout()
-                .min(deadline.saturating_duration_since(now));
-            let frame = match tokio::time::timeout(wait, self.transport().recv()).await {
-                Ok(result) => result?,
-                Err(_) => {
-                    return Err(macro_read_timeout(buffer.received(), expected_len));
+        while chunk_offset < expected_len {
+            let request = commands::read_macro_from(mode, slot, index, steps, chunk_offset as u32)?;
+            self.transport()
+                .send(&request.encode_ble_payloadless(PacketKind::App)?)
+                .await?;
+            let requested = request.header.offset;
+
+            let payload = loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(macro_read_timeout(
+                        chunk_offset,
+                        expected_len,
+                        &response_offsets,
+                    ));
                 }
+                let wait = self
+                    .per_frame_timeout()
+                    .min(deadline.saturating_duration_since(now));
+                let frame = match tokio::time::timeout(wait, self.transport().recv()).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Err(macro_read_timeout(
+                            chunk_offset,
+                            expected_len,
+                            &response_offsets,
+                        ));
+                    }
+                };
+
+                let Some((header, payload)) =
+                    Self::classify_response(&frame, cmd::READ_MACRO, expected_len)?
+                else {
+                    continue;
+                };
+
+                let reported = header.offset;
+                // Accepted forms for every chunk:
+                // - 0: the device's sequential-chunk convention;
+                // - the requested absolute offset (`sector + chunk_offset`);
+                // - a sector-relative offset equal to `chunk_offset`
+                //   (未確定: macro_idx > 0 の実機応答で確認する).
+                let relative_match =
+                    reported >= sector && u64::from(reported - sector) == chunk_offset as u64;
+                if reported != 0 && reported != requested && !relative_match {
+                    return Err(Error::UnexpectedResponse(format!(
+                        "macro chunk response offset 0x{reported:X} does not match requested \
+                         0x{requested:X} (accepted: 0 for the sequential convention, or the \
+                         requested offset; sector-relative 0x{chunk_offset:X} is also accepted)"
+                    )));
+                }
+                response_offsets.push(reported);
+                break payload.to_vec();
             };
 
-            let Some((header, payload)) =
-                Self::classify_response(&frame, cmd::READ_MACRO, expected_len)?
-            else {
-                continue;
-            };
-
-            let reported = header.offset as usize;
-            let relative = if reported >= sector && reported - sector < expected_len {
-                reported - sector
-            } else if reported < expected_len {
-                reported
-            } else {
-                return Err(out_of_range(reported, expected_len));
-            };
-
-            // A final notification may carry padding past the declared read
-            // length; only the step bytes are kept.
-            let remaining = expected_len - relative;
+            let remaining = expected_len - chunk_offset;
             let copy_len = payload.len().min(remaining);
-            buffer.insert(relative, &payload[..copy_len])?;
+            if copy_len == 0 {
+                return Err(Error::UnexpectedResponse(
+                    "macro chunk response carried no data".to_string(),
+                ));
+            }
+            buffer.insert(chunk_offset, &payload[..copy_len])?;
+            chunk_offset += copy_len;
         }
 
-        Ok(buffer.into_vec())
+        Ok((buffer.into_vec(), response_offsets))
     }
 }
 
-fn macro_read_timeout(received: usize, expected: usize) -> Error {
+fn macro_read_timeout(chunk_offset: usize, expected: usize, response_offsets: &[u32]) -> Error {
     Error::Timeout {
-        operation: format!("ReadBT2Macro cmd=0x0102 (received {received} of {expected} bytes)"),
+        operation: format!(
+            "ReadBT2Macro cmd=0x0102 at chunk offset 0x{chunk_offset:X} \
+             (received {chunk_offset} of {expected} bytes; response offsets: {response_offsets:?})"
+        ),
     }
 }
 
@@ -350,6 +415,34 @@ mod tests {
 
     use super::*;
     use crate::mock::MockTransport;
+    use crate::transport::Transport;
+
+    /// Replays one response, then never yields another frame.
+    struct StallAfterFirst {
+        first: std::sync::Mutex<Option<Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for StallAfterFirst {
+        async fn send(&self, _data: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn recv(&self) -> Result<Vec<u8>, Error> {
+            if let Some(frame) = self.first.lock().unwrap().take() {
+                return Ok(frame);
+            }
+            std::future::pending().await
+        }
+
+        fn mtu(&self) -> u16 {
+            64
+        }
+
+        async fn disconnect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
 
     fn sample_entry_payload(steps: &[MacroStep]) -> Vec<u8> {
         let encoded = macro_data::encode_macro_steps(steps).unwrap();
@@ -443,17 +536,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_macro_sends_exact_payloadless_request_and_decodes_split_envelope() {
-        let config = config_with_macros();
+    async fn read_macro_reads_500_bytes_as_four_142_byte_chunks() {
+        let mut config = config_with_macros();
+        let mut record = config.macro_record(Slot::S1, MacroIndex::M1);
+        record.max_steps = 50;
+        config.set_macro_record(Slot::S1, MacroIndex::M1, &record);
+        config.recompute_crc();
         let snapshot = snapshot(config);
-        let steps = sample_steps(4);
+
+        let steps = sample_steps(50);
         let raw = sample_entry_payload(&steps);
+        assert_eq!(raw.len(), 500);
 
         let mock = MockTransport::new();
-        let first = &raw[..20];
-        let second = &raw[20..];
-        mock.push_response(&envelope(cmd::READ_MACRO, 40, 0, first), first);
-        mock.push_response(&envelope(cmd::READ_MACRO, 40, 20, second), second);
+        let mut chunk_offset = 0usize;
+        for chunk in raw.chunks(142) {
+            let header = envelope(cmd::READ_MACRO, 500, chunk_offset as u32, chunk);
+            let mut header = header;
+            header.crc16 = packet_crc16(chunk);
+            mock.push_response(&header, chunk);
+            chunk_offset += chunk.len();
+        }
+        assert_eq!(chunk_offset, 500);
 
         let session = Session::new(&mock);
         let entry = session
@@ -462,45 +566,61 @@ mod tests {
             .unwrap();
 
         let sent = mock.sent_frames();
-        assert_eq!(sent.len(), 1);
+        assert_eq!(sent.len(), 4);
         assert_eq!(
             sent[0],
             vec![
                 0x04, // BLE App prefix
                 0x02, 0x01, // cmd = 0x0102
                 0x00, 0x00, // subcmd = (Switch 0 << 8) | slot 0
-                0x28, 0x00, // chunk_len = 40
+                0xF4, 0x01, // chunk_len = 500
                 0x00, 0x00, // crc16
-                0x28, 0x00, 0x00, 0x00, // total_len = 40
-                0x00, 0x00, 0x00, 0x00, // offset = macro 0 << 12
+                0xF4, 0x01, 0x00, 0x00, // total_len = 500
+                0x00, 0x00, 0x00, 0x00, // offset = macro 0 sector + 0
             ]
         );
+        let expected_offsets = [0u32, 142, 284, 426];
+        for (frame, expected_offset) in sent.iter().zip(expected_offsets) {
+            let header = CustomHeader::parse(&frame[1..]).unwrap();
+            assert_eq!(header.cmd, 0x0102);
+            assert_eq!(header.subcmd, 0);
+            assert_eq!(header.chunk_len, 500);
+            assert_eq!(header.total_len, 500);
+            assert_eq!(header.offset, expected_offset);
+        }
 
         assert_eq!(entry.raw(), raw);
         assert_eq!(entry.steps(), steps);
+        assert_eq!(entry.read_offsets(), &expected_offsets[..]);
         assert_eq!(entry.record().name(), "Combo");
         assert_eq!(entry.record().key_map, KeyMap::M1);
     }
 
     #[tokio::test]
-    async fn read_macro_accepts_sector_based_offsets_and_direct_responses() {
+    async fn read_macro_accepts_sector_based_and_zero_offsets_and_logs_them() {
         let mut config = config_with_macros();
         config.set_gamepad_mode(GamepadMode::XInput);
         let mut record = config.macro_record(Slot::S2, MacroIndex::M2);
-        record.max_steps = 3;
+        record.max_steps = 20;
         config.set_macro_record(Slot::S2, MacroIndex::M2, &record);
         config.recompute_crc();
         let snapshot = snapshot(config);
 
-        let steps = sample_steps(3);
+        let steps = sample_steps(20);
         let raw = sample_entry_payload(&steps);
+        assert_eq!(raw.len(), 200);
+
+        // First response reports the absolute sector base, the second uses the
+        // device's sequential-chunk convention (offset 0).
         let mock = MockTransport::new();
-        for (index, chunk) in raw.chunks(10).enumerate() {
-            let offset = 0x1000 + (index * 10) as u32;
-            let header = CustomHeader::new(cmd::READ_MACRO, 0x0301, 30, offset)
-                .with_chunk_len(chunk.len() as u16);
-            mock.push_response(&header, chunk);
-        }
+        let first = &raw[..142];
+        let second = &raw[142..];
+        let mut first_header = envelope(cmd::READ_MACRO, 200, 0x1000, first);
+        first_header.crc16 = packet_crc16(first);
+        mock.push_response(&first_header, first);
+        let mut second_header = envelope(cmd::READ_MACRO, 200, 0, second);
+        second_header.crc16 = packet_crc16(second);
+        mock.push_response(&second_header, second);
 
         let session = Session::new(&mock);
         let entry = session
@@ -509,12 +629,17 @@ mod tests {
             .unwrap();
 
         let sent = mock.sent_frames();
-        assert_eq!(sent.len(), 1);
-        // subcmd = (XInput 3 << 8) | slot 1, offset = macro 1 << 12.
-        assert_eq!(&sent[0][3..5], &[0x01, 0x03]);
-        assert_eq!(&sent[0][13..17], &[0x00, 0x10, 0x00, 0x00]);
+        assert_eq!(sent.len(), 2);
+        let first_request = CustomHeader::parse(&sent[0][1..]).unwrap();
+        assert_eq!(first_request.subcmd, 0x0301);
+        assert_eq!(first_request.chunk_len, 200);
+        assert_eq!(first_request.total_len, 200);
+        assert_eq!(first_request.offset, 0x1000);
+        let second_request = CustomHeader::parse(&sent[1][1..]).unwrap();
+        assert_eq!(second_request.offset, 0x1000 + 142);
+
         assert_eq!(entry.raw(), raw);
-        assert_eq!(entry.steps(), steps);
+        assert_eq!(entry.read_offsets(), &[0x1000, 0]);
     }
 
     #[tokio::test]
@@ -534,5 +659,37 @@ mod tests {
             .read_macro(&snapshot, Slot::S1, MacroIndex::M1)
             .await;
         assert!(matches!(result, Err(Error::UnexpectedResponse(_))));
+    }
+
+    #[tokio::test]
+    async fn read_macro_times_out_mid_transfer_without_returning_partial_data() {
+        let mut config = config_with_macros();
+        let mut record = config.macro_record(Slot::S1, MacroIndex::M1);
+        record.max_steps = 50;
+        config.set_macro_record(Slot::S1, MacroIndex::M1, &record);
+        config.recompute_crc();
+        let snapshot = snapshot(config);
+
+        let steps = sample_steps(50);
+        let raw = sample_entry_payload(&steps);
+        let first = &raw[..142];
+        let mut header = envelope(cmd::READ_MACRO, 500, 0, first);
+        header.crc16 = packet_crc16(first);
+        let mut frame = header.to_bytes().to_vec();
+        frame.extend_from_slice(first);
+
+        let transport = StallAfterFirst {
+            first: std::sync::Mutex::new(Some(frame)),
+        };
+        let session = Session::new(&transport).with_timeout(Duration::from_millis(10));
+        let result = session
+            .read_macro(&snapshot, Slot::S1, MacroIndex::M1)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::Timeout { operation })
+                if operation.contains("chunk offset 0x8E")
+                    && operation.contains("response offsets: [0]")
+        ));
     }
 }

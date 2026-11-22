@@ -869,6 +869,12 @@ struct MacroBackupDocumentEntry {
     raw_file: Option<String>,
     /// SHA-256 of the raw step bytes (`None` when skipped).
     raw_sha256: Option<String>,
+    /// Raw `offset` values in the `0x0102` response headers, one per chunk.
+    ///
+    /// `0` after the first chunk means the sequential-chunk convention; the
+    /// requested offset means the device echoed it. This is diagnostic data
+    /// for confirming real-device behaviour.
+    response_offsets: Vec<u32>,
     /// Decoded 10-byte steps for human editing (raw `.bin` is canonical).
     steps: Vec<MacroStep>,
 }
@@ -966,6 +972,7 @@ fn print_macro_progress(entry: &MacroEntry) {
             record.max_steps,
             entry.raw().len()
         );
+        println!("  response offsets: {:?}", entry.read_offsets());
     }
 }
 
@@ -1040,6 +1047,7 @@ fn write_macro_backup(
             interval_ms: record.interval_ms,
             raw_file,
             raw_sha256,
+            response_offsets: entry.read_offsets().to_vec(),
             steps: entry.steps().to_vec(),
         });
     }
@@ -2517,6 +2525,7 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
+    use eightbitdo_core::MockTransport;
     use eightbitdo_protocol::commands;
     use eightbitdo_protocol::config_bt2::Bt2Config;
     use eightbitdo_protocol::header::CustomHeader;
@@ -5129,5 +5138,51 @@ mod tests {
         assert_eq!(toml["config_sha256"].as_str(), Some("config-sha"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn macro_backup_writes_nothing_when_a_read_fails_mid_transfer() {
+        use eightbitdo_protocol::config_bt2::{GamepadMode, MacroRecord};
+
+        let root = scratch_dir("macro-backup-abort");
+        let dir = root.join("out");
+
+        let mut config = Bt2Config::zeroed();
+        config.set_gamepad_mode(GamepadMode::Switch);
+        let record = MacroRecord {
+            max_steps: 50,
+            ..MacroRecord::default()
+        };
+        config.set_macro_record(Slot::S1, MacroIndex::M1, &record);
+        config.recompute_crc();
+
+        let mock = MockTransport::new();
+        // A full 2768-byte config read, one 142-byte chunk per request.
+        for (index, chunk) in config.as_bytes().chunks(142).enumerate() {
+            let header = CustomHeader::new(
+                commands::cmd::READ_CONFIG,
+                0,
+                CONFIG_SIZE as u32,
+                (index * 142) as u32,
+            )
+            .with_chunk_len(chunk.len() as u16);
+            mock.push_response(&header, chunk);
+        }
+        // Only the first 142 bytes of the 500-byte macro. The second request
+        // finds an empty queue, so the read fails before any file is written.
+        let first = [0u8; 142];
+        let header = CustomHeader::new(commands::cmd::RESPONSE, commands::cmd::READ_MACRO, 500, 0)
+            .with_chunk_len(first.len() as u16);
+        mock.push_response(&header, &first);
+
+        let session = Session::new(&mock);
+        let result = macro_backup_session(&session, &dir).await;
+
+        assert!(matches!(result, Err(Error::Disconnected)));
+        assert!(
+            !dir.exists(),
+            "a failed macro read must not create a partial backup directory"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -295,7 +295,7 @@ ReadConfig head:  04 02 00 00 00 74 00 00 00 74 00 00 00 00 00 00 00
 **未確定のこと**:
 
 - `ReadConfig` のデータチャンクは実機で 142B (`0x8E`) を 1 要求につき 1 つ返す。`offset` を進めた再要求で 20 要求（19 × 142B + 最終 142B のうち有効 70B）を組み立てる。最終チャンクが 142B 固定で返り、ホスト側で 70B に切り詰めることは実機確認済みである。142B が MTU 依存で変化するかは未確定。応答 `offset` は最初のデータチャンク応答のみ 0、2 回目以降は要求 `offset` をエコーする（§4.3.1 の照合規則）。
-- `getBT2_ReadMacro` の公式 `Generate_CustomDataCmd` 経路は `16 + chunk_len` バイト（ペイロードはゼロ埋め）を送ると読める。本実装はタスク指示に従い 17B の payloadless 要求を送るため、ReadMacro の実機応答は未確認である。
+- `getBT2_ReadMacro` の公式 `Generate_CustomDataCmd` 経路は `16 + chunk_len` バイト（ペイロードはゼロ埋め）を送ると読める。本実装は 17B の payloadless 要求を送る。実機（2026-11-22、slot 0 / macro 0 / `max_steps = 50`）では、`total_len = chunk_len = 500`, `offset = 0` の要求に対して `cmd=0x0004, subcmd=0x0102, chunk_len=0x8E (142), total_len=500, offset=0` の **142B チャンクが 1 通知だけ**返った。2 チャンク目以降の応答 `offset` は未確認であり、0（逐次）/ 要求値 / セクタ相対のいずれもあり得るとして実装は 3 形式を受け入れ、`macro backup` のログと `macros.json` の `response_offsets` に記録する。要求は `offset = (macro_idx << 12) + chunk_offset` で 1 チャンクずつ前進させ、`total_len` / `chunk_len` は全長のまま維持する。
 - 公式アプリは要求ペイロードに直前の `gamepadVersion` を再利用する。本実装は常にゼロを送る。`session` REPL では `monitor` 停止後、同一接続で `info` / `config dump` / `backup` / `monitor` を再実行できる。`monitor` 実行中は `info` / `config dump` / `backup` / `monitor --count` を拒否し、先に `monitor stop` が必要である。`info` は実行ごとに新しい 4B ゼロペイロードで `ReadVersion` を送り直す（実機での 2 回目以降の応答は未確認）。
 - USB 給電併用が BLE 設定モードの持続時間を延ばすかは、1 回の成功では判断できない（ユーザー仮説・未検証）。
 

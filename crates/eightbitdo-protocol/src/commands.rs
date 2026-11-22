@@ -512,6 +512,10 @@ pub const fn macro_subcmd(gamepad_mode: u16, slot: Slot) -> u16 {
 /// `getBT2_ReadMacro` (0x2bd90) sets `+0x40 = +0x44 = +0x48` to that length,
 /// keeps the 4 KB sector base in `+0x38`, and uses `cmd 0x0102`.
 ///
+/// This is the first-chunk form. The device answers with one chunk per
+/// request, so subsequent chunks must use [`read_macro_from`] with an
+/// advancing `chunk_offset`.
+///
 /// # Errors
 ///
 /// Returns [`Error::TooManySteps`] when `steps` exceeds
@@ -522,6 +526,33 @@ pub fn read_macro(
     slot: Slot,
     macro_idx: MacroIndex,
     steps: u16,
+) -> Result<Request, Error> {
+    read_macro_from(gamepad_mode, slot, macro_idx, steps, 0)
+}
+
+/// Read one macro chunk at `chunk_offset` inside the macro's 4 KB sector.
+///
+/// The device returns **one chunk per request** (observed 142 bytes,
+/// `docs/PROTOCOL_SPEC.md` §4.3.2). `total_len` and `chunk_len` stay at the
+/// full macro length (`steps * 10`); only the wire `offset` advances:
+/// `offset = (macro_idx << 12) + chunk_offset`.
+///
+/// `chunk_offset` must be smaller than `steps * 10`. Use the response
+/// payload length to advance it. The zero-step form keeps the historical
+/// zero-length request.
+///
+/// # Errors
+///
+/// Returns [`Error::TooManySteps`] when `steps` exceeds
+/// [`macro_data::MAX_MACRO_STEPS`], [`Error::RangeOutOfBounds`] when the
+/// encoded steps would exceed one 4 KB flash sector, or
+/// [`Error::InvalidFrame`] when `chunk_offset` is not inside the macro.
+pub fn read_macro_from(
+    gamepad_mode: u16,
+    slot: Slot,
+    macro_idx: MacroIndex,
+    steps: u16,
+    chunk_offset: u32,
 ) -> Result<Request, Error> {
     let step_count = usize::from(steps);
     let total_len = u32::from(steps) * macro_data::MACRO_STEP_SIZE as u32;
@@ -538,11 +569,24 @@ pub fn read_macro(
             actual: step_count,
         });
     }
+    if total_len != 0 && chunk_offset >= total_len {
+        return Err(Error::InvalidFrame(
+            "macro chunk offset must be less than the declared length",
+        ));
+    }
+    let offset =
+        macro_idx
+            .sector_offset()
+            .checked_add(chunk_offset)
+            .ok_or(Error::AddressOverflow {
+                base: macro_idx.sector_offset(),
+                offset: u64::from(chunk_offset),
+            })?;
     Ok(Request::new_payloadless(
         cmd::READ_MACRO,
         macro_subcmd(gamepad_mode, slot),
         total_len,
-        macro_idx.sector_offset(),
+        offset,
     ))
 }
 
@@ -1171,6 +1215,33 @@ mod tests {
         assert!(matches!(
             read_macro(0, Slot::S1, MacroIndex::M1, 0x1000 / 10 + 1),
             Err(Error::RangeOutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn read_macro_from_advances_only_the_offset() {
+        let request = read_macro_from(3, Slot::S2, MacroIndex::M2, 50, 142).unwrap();
+        assert_eq!(request.header.cmd, 0x0102);
+        assert_eq!(request.header.subcmd, 0x0301);
+        assert_eq!(request.header.chunk_len, 500);
+        assert_eq!(request.header.total_len, 500);
+        assert_eq!(request.header.offset, 0x1000 + 142);
+        assert!(request.payload.is_empty());
+
+        let bytes = request.encode_ble_payloadless(PacketKind::App).unwrap();
+        assert_eq!(bytes.len(), 17);
+        let parsed = CustomHeader::parse(&bytes[1..]).unwrap();
+        assert_eq!(parsed.chunk_len, 500);
+        assert_eq!(parsed.total_len, 500);
+        assert_eq!(parsed.offset, 0x108E);
+
+        assert!(matches!(
+            read_macro_from(3, Slot::S2, MacroIndex::M2, 50, 500),
+            Err(Error::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            read_macro_from(3, Slot::S2, MacroIndex::M2, 50, 501),
+            Err(Error::InvalidFrame(_))
         ));
     }
 
