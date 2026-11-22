@@ -1,9 +1,8 @@
-//! Read-only command-line interface for the 8BitDo Ultimate 2 Bluetooth
-//! controller.
+//! Command-line interface for the 8BitDo Ultimate 2 Bluetooth controller.
 //!
 //! The binary exposes `scan`, `info`, `config dump`, `backup`, `monitor`,
-//! `keepalive`, `session` and `macro backup`. No configuration write, macro
-//! flash write, save or OTA command is reachable from this binary.
+//! `keepalive`, `session` and the `macro` backup / write / restore commands.
+//! Configuration writes and OTA are not reachable from this binary.
 
 use std::future::Future;
 use std::io::{IsTerminal, Write};
@@ -13,16 +12,20 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use eightbitdo_core::{
     macro_ops::is_skipped_steps, scan_devices, BleOptions, BleTransport, ConfigSnapshot, Error,
-    MacroBackup, MacroEntry, Session, Transport, VersionInfo,
+    MacroBackup, MacroEntry, MacroWritePlan, Session, Transport, VersionInfo,
 };
-use eightbitdo_protocol::config_bt2::{MacroIndex, Slot, CONFIG_SIZE, MACROS_PER_SLOT, SLOT_COUNT};
+use eightbitdo_protocol::commands::SaveTransport;
+use eightbitdo_protocol::config_bt2::{
+    Bt2Config, MacroIndex, Slot, CONFIG_SIZE, MACROS_PER_SLOT, SLOT_COUNT,
+};
 use eightbitdo_protocol::input_report::InputReport;
-use eightbitdo_protocol::macro_data::MacroStep;
+use eightbitdo_protocol::macro_data::{MacroFile, MacroStep, MAX_MACRO_STEPS};
+use eightbitdo_protocol::KeyMap;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
@@ -32,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 #[command(
     name = "eightbitdo",
     version,
-    about = "Read-only tools for the 8BitDo Ultimate 2 Bluetooth controller"
+    about = "Configuration and macro tools for the 8BitDo Ultimate 2 Bluetooth controller"
 )]
 struct Cli {
     /// Advertised BLE name of the App Mode peripheral.
@@ -73,7 +76,7 @@ enum Command {
         command: ConfigCommand,
     },
 
-    /// Macro operations (read-only; flash write is not implemented yet).
+    /// Macro operations: full 3-slot × 4-macro backup, single write, restore.
     Macro {
         #[command(subcommand)]
         command: MacroCommand,
@@ -143,6 +146,38 @@ enum MacroCommand {
         #[arg(long, value_name = "DIR")]
         dir: PathBuf,
     },
+
+    /// Write one macro from a JSON/TOML macro file.
+    Write {
+        /// Slot index (0..=2, matching the protocol and docs).
+        #[arg(long, value_name = "N")]
+        slot: u8,
+
+        /// Macro index (0..=3, matching the protocol and docs).
+        #[arg(long, value_name = "N")]
+        index: u8,
+
+        /// JSON or TOML macro file (MacroFile format).
+        #[arg(long, value_name = "FILE")]
+        file: PathBuf,
+
+        /// Trigger key: M1..M4, a KeyMap name, 0xHEX or decimal.
+        /// Omit to preserve the existing header value.
+        #[arg(long, value_name = "KEY")]
+        trigger: Option<String>,
+
+        /// Directory for the mandatory pre-write backup. Defaults to
+        /// `macro-backup-<unix-seconds>-<pid>`.
+        #[arg(long, value_name = "DIR")]
+        backup_dir: Option<PathBuf>,
+    },
+
+    /// Restore all non-empty macros from a backup directory.
+    Restore {
+        /// Backup directory created by `macro backup`.
+        #[arg(long, value_name = "DIR")]
+        dir: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -177,6 +212,26 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
         Command::Macro { command } => match command {
             MacroCommand::Backup { dir } => {
                 macro_backup(&options, &dir).await?;
+            }
+            MacroCommand::Write {
+                slot,
+                index,
+                file,
+                trigger,
+                backup_dir,
+            } => {
+                macro_write(
+                    &options,
+                    slot,
+                    index,
+                    &file,
+                    trigger.as_deref(),
+                    backup_dir.as_deref(),
+                )
+                .await?;
+            }
+            MacroCommand::Restore { dir } => {
+                macro_restore(&options, &dir).await?;
             }
         },
         Command::Backup { raw, json, hold } => {
@@ -839,7 +894,7 @@ async fn backup_session<T: Transport>(
 }
 
 /// One JSON/TOML entry for one macro in a backup directory.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct MacroBackupDocumentEntry {
     /// Slot index (`0..=2`), matching `Macro_Pro3_Struct` order.
     slot: u8,
@@ -848,19 +903,19 @@ struct MacroBackupDocumentEntry {
     /// Macro index (`0..=3`), matching `MacroFunPro3Record` order.
     index: u8,
     /// Display id (`M1`..`M4`).
-    id: &'static str,
+    id: String,
     /// Stored UTF-16BE name decoded to text.
     name: String,
     /// `true` when `max_steps` is `0` or the `0xFFFF` unset marker.
     skipped: bool,
     /// Why the flash read was skipped (`None` when read).
-    skip_reason: Option<&'static str>,
+    skip_reason: Option<String>,
     /// Raw `max_steps` value from the configuration header.
     max_steps: u16,
     /// Trigger key mask from the configuration header.
     key_map: u32,
     /// Name of the trigger key when it is a known single value.
-    key_map_name: Option<&'static str>,
+    key_map_name: Option<String>,
     /// Loop count (`0` = hold / infinite).
     cycles_num: u32,
     /// Delay between loops in milliseconds.
@@ -880,12 +935,12 @@ struct MacroBackupDocumentEntry {
 }
 
 /// Machine-readable manifest written as both `macros.json` and `macros.toml`.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct MacroBackupDocument {
     /// Manifest format version.
     format: u32,
     /// Relative file name of the 2768-byte configuration snapshot.
-    config_file: &'static str,
+    config_file: String,
     /// SHA-256 of the 2768-byte configuration snapshot.
     config_sha256: String,
     /// Raw `gamepad_mode` at `+0x010`; the low 8 bits form the macro `subcmd`.
@@ -896,6 +951,524 @@ struct MacroBackupDocument {
     macros_per_slot: usize,
     /// All 12 entries in slot-major order.
     macros: Vec<MacroBackupDocumentEntry>,
+}
+
+/// Read JSON or TOML macro input.
+fn read_macro_file(path: &Path) -> Result<MacroFile, Error> {
+    let text = std::fs::read_to_string(path)?;
+    let extension = path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_ascii_lowercase);
+    let parsed: MacroFile = match extension.as_deref() {
+        Some("toml") => toml::from_str(&text)
+            .map_err(|error| invalid_data(format!("{}: invalid TOML: {error}", path.display())))?,
+        Some("json") => serde_json::from_str(&text)
+            .map_err(|error| invalid_data(format!("{}: invalid JSON: {error}", path.display())))?,
+        _ => serde_json::from_str(&text).or_else(|json_error| {
+            toml::from_str(&text).map_err(|toml_error| {
+                invalid_data(format!(
+                    "{}: not valid JSON ({json_error}) or TOML ({toml_error})",
+                    path.display()
+                ))
+            })
+        })?,
+    };
+    if parsed.steps.is_empty() {
+        return Err(invalid_input(
+            "macro file has no steps; deleting a macro is not implemented",
+        ));
+    }
+    if parsed.steps.len() > MAX_MACRO_STEPS {
+        return Err(invalid_input(format!(
+            "macro file has {} steps; maximum is {MAX_MACRO_STEPS}",
+            parsed.steps.len()
+        )));
+    }
+    Ok(parsed)
+}
+
+fn invalid_input(message: impl Into<String>) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message.into(),
+    ))
+}
+
+fn invalid_data(message: impl Into<String>) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message.into(),
+    ))
+}
+
+/// Parse `--trigger`: M1..M4, a common KeyMap name, `0xHEX` or decimal.
+fn parse_trigger(text: &str) -> Result<KeyMap, Error> {
+    let trimmed = text.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    let named = match upper.as_str() {
+        "NONE" => Some(KeyMap::NONE),
+        "M1" => Some(KeyMap::M1),
+        "M2" => Some(KeyMap::M2),
+        "M3" => Some(KeyMap::M3),
+        "M4" => Some(KeyMap::M4),
+        "A" => Some(KeyMap::A),
+        "B" => Some(KeyMap::B),
+        "X" => Some(KeyMap::X),
+        "Y" => Some(KeyMap::Y),
+        "START" => Some(KeyMap::START),
+        "SELECT" => Some(KeyMap::SELECT),
+        "HOME" => Some(KeyMap::HOME),
+        "L1" => Some(KeyMap::L1),
+        "L2" => Some(KeyMap::L2),
+        "R1" => Some(KeyMap::R1),
+        "R2" => Some(KeyMap::R2),
+        "P1" => Some(KeyMap::P1),
+        "P2" => Some(KeyMap::P2),
+        "P3" => Some(KeyMap::P3),
+        "P4" => Some(KeyMap::P4),
+        "UP" => Some(KeyMap::UP),
+        "DOWN" => Some(KeyMap::DOWN),
+        "LEFT" => Some(KeyMap::LEFT),
+        "RIGHT" => Some(KeyMap::RIGHT),
+        _ => None,
+    };
+    if let Some(key) = named {
+        return Ok(key);
+    }
+    let parsed = if let Some(hex) = upper.strip_prefix("0X") {
+        u32::from_str_radix(hex, 16)
+    } else {
+        upper.parse::<u32>()
+    };
+    parsed.map(KeyMap::from_bits).map_err(|_| {
+        invalid_input(format!(
+            "unknown trigger {text:?}; use M1..M4, a KeyMap name, 0xHEX or decimal"
+        ))
+    })
+}
+
+fn parse_slot(value: u8) -> Result<Slot, Error> {
+    Slot::from_index(usize::from(value))
+        .ok_or_else(|| invalid_input(format!("slot must be 0..=2, got {value}")))
+}
+
+fn parse_macro_index(value: u8) -> Result<MacroIndex, Error> {
+    MacroIndex::from_index(usize::from(value))
+        .ok_or_else(|| invalid_input(format!("macro index must be 0..=3, got {value}")))
+}
+
+/// Pick a BLE chunk size that fits the negotiated MTU.
+///
+/// The macro write supports only 32 and 64 bytes. A 64-byte chunk needs
+/// `1 + 16 + 64` bytes plus 3 bytes of ATT overhead, so small MTUs fall back
+/// to 32.
+fn macro_chunk_size(mtu: u16) -> usize {
+    if u32::from(mtu) >= 64 + 16 + 1 + 3 {
+        64
+    } else {
+        32
+    }
+}
+
+fn default_backup_dir(prefix: &str) -> PathBuf {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    PathBuf::from(format!("{prefix}-{seconds}-{}", std::process::id()))
+}
+
+fn pre_restore_dir(dir: &Path) -> PathBuf {
+    let name = dir
+        .file_name()
+        .map_or_else(|| "macro-backup".into(), |name| name.to_string_lossy());
+    let parent = dir.parent().unwrap_or_else(|| Path::new("."));
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    parent.join(format!(
+        "{name}-pre-restore-{seconds}-{}",
+        std::process::id()
+    ))
+}
+
+/// Build the core write plan, including the unused-macro policy.
+///
+/// The slot `flag` and `total_cnt` policy for a previously unused macro is
+/// **not confirmed on hardware**. This keeps it deterministic and visible:
+/// writing into a `max_steps == 0` (or `0xFFFF`) entry sets `flag = 1` and
+/// `total_cnt = max(existing, index + 1)`. `key_map` is preserved unless
+/// `--trigger` is supplied, so an unused macro is enabled but may remain
+/// unassigned.
+fn build_macro_write_plan(
+    file: &MacroFile,
+    trigger: Option<KeyMap>,
+    backup: &MacroBackup,
+    slot: Slot,
+    index: MacroIndex,
+) -> MacroWritePlan {
+    let record = backup.snapshot().config.macro_record(slot, index);
+    let mut plan = MacroWritePlan::new(file.steps.clone());
+    if let Some(name) = &file.name {
+        plan.name = Some(name.clone());
+    }
+    if let Some(trigger) = trigger {
+        plan.key_map = Some(trigger);
+    }
+    plan.cycles_num = Some(file.cycles_num);
+    plan.interval_ms = Some(file.interval_ms);
+    if is_skipped_steps(record.max_steps) {
+        let header = backup.snapshot().config.macro_slot(slot);
+        plan.flag = Some(1);
+        plan.total_cnt = Some(header.total_cnt.max(index.index() as u8 + 1));
+    }
+    plan
+}
+
+async fn macro_write(
+    options: &BleOptions,
+    slot: u8,
+    index: u8,
+    file: &Path,
+    trigger: Option<&str>,
+    backup_dir: Option<&Path>,
+) -> Result<(), Error> {
+    let slot = parse_slot(slot)?;
+    let index = parse_macro_index(index)?;
+    let file = read_macro_file(file)?;
+    let trigger = trigger.map(parse_trigger).transpose()?;
+
+    let transport = BleTransport::connect(options).await?;
+    let session = Session::new(transport);
+    let chunk_size = macro_chunk_size(session.transport().mtu());
+    let backup_dir = backup_dir.map_or_else(
+        || default_backup_dir("macro-backup"),
+        std::path::Path::to_path_buf,
+    );
+    let result = macro_write_session(
+        &session,
+        slot,
+        index,
+        &file,
+        trigger,
+        &backup_dir,
+        chunk_size,
+    )
+    .await;
+    best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
+    result
+}
+
+async fn macro_write_session<T: Transport>(
+    session: &Session<T>,
+    slot: Slot,
+    index: MacroIndex,
+    file: &MacroFile,
+    trigger: Option<KeyMap>,
+    backup_dir: &Path,
+    chunk_size: usize,
+) -> Result<(), Error> {
+    println!("reading configuration and full 3-slot × 4-macro backup...");
+    let snapshot = session.read_config_snapshot().await?;
+    let backup = session.read_macro_backup(&snapshot).await?;
+    let config_sha256 = sha256_hex(snapshot.config.as_bytes());
+    write_macro_backup(backup_dir, &snapshot, &backup, &config_sha256)?;
+    println!("pre-write backup: {}", backup_dir.display());
+
+    let target = snapshot.config.macro_record(slot, index);
+    if is_skipped_steps(target.max_steps) {
+        println!(
+            "note: slot {} macro {} is unused; setting flag = 1 and total_cnt = max(existing, {}) \
+             (policy 実機未確認)",
+            slot.number(),
+            index.index(),
+            index.index() + 1
+        );
+        if trigger.is_none() {
+            println!(
+                "warning: no --trigger given; key_map stays 0x{:08X} (unassigned)",
+                target.key_map.bits()
+            );
+        }
+    } else if trigger.is_none() && !file.key_map.is_empty() {
+        println!(
+            "note: the file key_map 0x{:08X} is ignored; use --trigger to change the trigger",
+            file.key_map.bits()
+        );
+    }
+
+    let mut plan = build_macro_write_plan(file, trigger, &backup, slot, index);
+    plan.chunk_size = chunk_size;
+    plan.save_transport = SaveTransport::Ble;
+
+    println!(
+        "writing slot {} (profile {}) macro {} ({}): {} steps, {}B chunks",
+        slot.index(),
+        slot.number(),
+        index.index(),
+        macro_id(index),
+        plan.steps.len(),
+        plan.chunk_size
+    );
+    let outcome = session.write_macro(&backup, slot, index, &plan).await?;
+
+    println!("wrote macro: slot {} macro {}", slot.index(), index.index());
+    println!("  name: {:?}", outcome.record.name());
+    println!("  max_steps: {}", outcome.record.max_steps);
+    println!(
+        "  key_map: 0x{:08X} ({})",
+        outcome.record.key_map.bits(),
+        outcome
+            .record
+            .key_map
+            .name()
+            .map_or_else(|| "unknown/combination".to_string(), str::to_string)
+    );
+    println!(
+        "  flag: 0x{:08X}, total_cnt: {}",
+        outcome.flag, outcome.total_cnt
+    );
+    println!("  packets sent: {}", outcome.packets_sent);
+    println!("  read-back offsets: {:?}", outcome.readback.read_offsets());
+    println!(
+        "restore with: eightbitdo macro restore --dir {}",
+        backup_dir.display()
+    );
+    Ok(())
+}
+
+/// Read and validate `config.bin` / `macros.json` (or `macros.toml`).
+fn read_restore_backup(dir: &Path) -> Result<MacroBackup, Error> {
+    let config_path = dir.join("config.bin");
+    let config_bytes = std::fs::read(&config_path)?;
+    let config = Bt2Config::from_bytes(&config_bytes)?;
+    let stored_crc = config.crc16_stored() as u16;
+    let mut check = config.clone();
+    let computed_crc = check.recompute_crc();
+    let snapshot = ConfigSnapshot {
+        config,
+        stored_crc,
+        computed_crc,
+        crc_valid: stored_crc == computed_crc,
+    };
+
+    let manifest_path = if dir.join("macros.json").is_file() {
+        dir.join("macros.json")
+    } else if dir.join("macros.toml").is_file() {
+        dir.join("macros.toml")
+    } else {
+        return Err(invalid_input(format!(
+            "{} has neither macros.json nor macros.toml",
+            dir.display()
+        )));
+    };
+    let manifest_text = std::fs::read_to_string(&manifest_path)?;
+    let manifest: MacroBackupDocument =
+        if manifest_path.extension().is_some_and(|ext| ext == "json") {
+            serde_json::from_str(&manifest_text)
+                .map_err(|error| invalid_data(format!("{}: {error}", manifest_path.display())))?
+        } else {
+            toml::from_str(&manifest_text)
+                .map_err(|error| invalid_data(format!("{}: {error}", manifest_path.display())))?
+        };
+
+    if manifest.format != 1 {
+        return Err(invalid_data(format!(
+            "unsupported backup manifest format {}",
+            manifest.format
+        )));
+    }
+    if manifest.slot_count != SLOT_COUNT || manifest.macros_per_slot != MACROS_PER_SLOT {
+        return Err(invalid_data(format!(
+            "backup manifest declares {} slots x {} macros, expected 3 x 4",
+            manifest.slot_count, manifest.macros_per_slot
+        )));
+    }
+    let actual_sha = sha256_hex(&config_bytes);
+    if manifest.config_sha256 != actual_sha {
+        return Err(invalid_data(format!(
+            "config.bin SHA-256 {} does not match the manifest {}",
+            actual_sha, manifest.config_sha256
+        )));
+    }
+
+    let mut entries = Vec::with_capacity(SLOT_COUNT * MACROS_PER_SLOT);
+    for slot in Slot::ALL {
+        for index in MacroIndex::ALL {
+            let record = snapshot.config.macro_record(slot, index);
+            let document = manifest
+                .macros
+                .iter()
+                .find(|entry| {
+                    entry.slot == slot.index() as u8 && entry.index == index.index() as u8
+                })
+                .ok_or_else(|| {
+                    invalid_data(format!(
+                        "backup manifest is missing slot {} macro {}",
+                        slot.index(),
+                        index.index()
+                    ))
+                })?;
+            let skipped = is_skipped_steps(record.max_steps);
+            if document.skipped != skipped {
+                return Err(invalid_data(format!(
+                    "slot {} macro {}: manifest skipped={} but config max_steps={}",
+                    slot.index(),
+                    index.index(),
+                    document.skipped,
+                    record.max_steps
+                )));
+            }
+            if document.max_steps != record.max_steps {
+                return Err(invalid_data(format!(
+                    "slot {} macro {}: manifest max_steps={} but config max_steps={}",
+                    slot.index(),
+                    index.index(),
+                    document.max_steps,
+                    record.max_steps
+                )));
+            }
+            let raw = if skipped {
+                Vec::new()
+            } else {
+                let raw_file = document.raw_file.as_deref().ok_or_else(|| {
+                    invalid_data(format!(
+                        "slot {} macro {}: manifest has no raw_file",
+                        slot.index(),
+                        index.index()
+                    ))
+                })?;
+                let raw_path = safe_backup_path(dir, raw_file)?;
+                let bytes = std::fs::read(&raw_path)?;
+                let expected_len = usize::from(record.max_steps) * 10;
+                if bytes.len() != expected_len {
+                    return Err(invalid_data(format!(
+                        "{}: {} bytes, expected {expected_len}",
+                        raw_path.display(),
+                        bytes.len()
+                    )));
+                }
+                if let Some(expected) = &document.raw_sha256 {
+                    let actual = sha256_hex(&bytes);
+                    if &actual != expected {
+                        return Err(invalid_data(format!(
+                            "{}: SHA-256 {actual} does not match the manifest {expected}",
+                            raw_path.display()
+                        )));
+                    }
+                }
+                bytes
+            };
+            entries.push(MacroEntry::new(slot, index, record, raw)?);
+        }
+    }
+    MacroBackup::new(snapshot, entries)
+}
+
+fn safe_backup_path(dir: &Path, name: &str) -> Result<PathBuf, Error> {
+    let path = Path::new(name);
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(dir.join(path)),
+        _ => Err(invalid_input(format!(
+            "backup raw_file {name:?} must be a plain file name inside the backup directory"
+        ))),
+    }
+}
+
+fn ensure_backup_gamepad_mode(
+    backup: &ConfigSnapshot,
+    current: &ConfigSnapshot,
+) -> Result<(), Error> {
+    let expected = backup.config.gamepad_mode_raw() & 0xFF;
+    let actual = current.config.gamepad_mode_raw() & 0xFF;
+    if expected != actual {
+        return Err(invalid_input(format!(
+            "backup gamepad_mode 0x{expected:02X} does not match the current 0x{actual:02X}; \
+             switch the controller to the same mode before restoring"
+        )));
+    }
+    Ok(())
+}
+
+async fn macro_restore(options: &BleOptions, dir: &Path) -> Result<(), Error> {
+    let transport = BleTransport::connect(options).await?;
+    let session = Session::new(transport);
+    let chunk_size = macro_chunk_size(session.transport().mtu());
+    let result = macro_restore_session(&session, dir, chunk_size).await;
+    best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
+    result
+}
+
+async fn macro_restore_session<T: Transport>(
+    session: &Session<T>,
+    dir: &Path,
+    chunk_size: usize,
+) -> Result<(), Error> {
+    let backup = read_restore_backup(dir)?;
+    println!("loaded backup: {}", dir.display());
+
+    println!("taking a fresh pre-restore backup of the current controller...");
+    let current_snapshot = session.read_config_snapshot().await?;
+    ensure_backup_gamepad_mode(backup.snapshot(), &current_snapshot)?;
+    let current = session.read_macro_backup(&current_snapshot).await?;
+    let pre_dir = pre_restore_dir(dir);
+    write_macro_backup(
+        &pre_dir,
+        &current_snapshot,
+        &current,
+        &sha256_hex(current_snapshot.config.as_bytes()),
+    )?;
+    println!("pre-restore backup: {}", pre_dir.display());
+
+    let mut restored = 0usize;
+    let mut skipped = 0usize;
+    for slot in Slot::ALL {
+        for index in MacroIndex::ALL {
+            let entry = backup.get(slot, index).expect("full backup has 12 entries");
+            let record = entry.record();
+            if is_skipped_steps(record.max_steps) {
+                skipped += 1;
+                println!(
+                    "skip slot {} macro {}: empty in backup (deletion is not implemented)",
+                    slot.index(),
+                    index.index()
+                );
+                continue;
+            }
+            let header = backup.snapshot().config.macro_slot(slot);
+            let plan = MacroWritePlan::new(entry.steps().to_vec())
+                .with_name(record.name())
+                .with_key_map(record.key_map)
+                .with_cycles_num(record.cycles_num)
+                .with_interval_ms(record.interval_ms)
+                .with_header_state(header.flag, header.total_cnt)
+                .with_chunk_size(chunk_size)
+                .with_save_transport(SaveTransport::Ble);
+            println!(
+                "restoring slot {} macro {} ({} steps)...",
+                slot.index(),
+                index.index(),
+                plan.steps.len()
+            );
+            if let Err(error) = session.write_macro(&backup, slot, index, &plan).await {
+                eprintln!(
+                    "restore stopped at slot {} macro {}: {error}",
+                    slot.index(),
+                    index.index()
+                );
+                eprintln!("pre-restore backup: {}", pre_dir.display());
+                return Err(error);
+            }
+            restored += 1;
+        }
+    }
+    println!(
+        "restore finished: {restored} macros restored, {skipped} empty entries skipped (deletion not implemented)"
+    );
+    Ok(())
 }
 
 /// Read the configuration and all 3 slots × 4 macros into `dir`.
@@ -1036,13 +1609,13 @@ fn write_macro_backup(
             slot: slot.index() as u8,
             profile: slot.number(),
             index: index.index() as u8,
-            id: macro_id(index),
+            id: macro_id(index).to_string(),
             name: record.name(),
             skipped,
-            skip_reason: macro_skip_reason(record.max_steps),
+            skip_reason: macro_skip_reason(record.max_steps).map(str::to_string),
             max_steps: record.max_steps,
             key_map: record.key_map.bits(),
-            key_map_name: record.key_map.name(),
+            key_map_name: record.key_map.name().map(str::to_string),
             cycles_num: record.cycles_num,
             interval_ms: record.interval_ms,
             raw_file,
@@ -1054,7 +1627,7 @@ fn write_macro_backup(
 
     let document = MacroBackupDocument {
         format: 1,
-        config_file: "config.bin",
+        config_file: "config.bin".to_string(),
         config_sha256: config_sha256.to_string(),
         gamepad_mode: snapshot.config.gamepad_mode_raw(),
         slot_count: SLOT_COUNT,
@@ -5184,5 +5757,174 @@ mod tests {
             "a failed macro read must not create a partial backup directory"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn parse_trigger_accepts_macro_ids_names_and_numbers() {
+        assert_eq!(parse_trigger("M1").unwrap(), KeyMap::M1);
+        assert_eq!(parse_trigger("m4").unwrap(), KeyMap::M4);
+        assert_eq!(parse_trigger("P1").unwrap(), KeyMap::P1);
+        assert_eq!(parse_trigger(" 0x77 ").unwrap(), KeyMap::M1);
+        assert_eq!(parse_trigger("119").unwrap(), KeyMap::M1);
+        assert!(parse_trigger("not-a-key").is_err());
+    }
+
+    #[test]
+    fn read_macro_file_accepts_json_and_toml() {
+        let dir = scratch_dir("macro-file");
+        let file = MacroFile {
+            name: Some("Combo".to_string()),
+            gamepad_mode: 0,
+            key_map: KeyMap::M1,
+            cycles_num: 2,
+            interval_ms: 15,
+            steps: vec![MacroStep::neutral(10), MacroStep::neutral(20)],
+        };
+        let json = dir.join("macro.json");
+        let toml = dir.join("macro.toml");
+        std::fs::write(&json, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+        std::fs::write(&toml, toml::to_string(&file).unwrap()).unwrap();
+
+        assert_eq!(read_macro_file(&json).unwrap(), file);
+        assert_eq!(read_macro_file(&toml).unwrap(), file);
+
+        std::fs::write(dir.join("empty.json"), r#"{"steps":[]}"#).unwrap();
+        assert!(read_macro_file(&dir.join("empty.json")).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn backup_fixture(dir: &Path) -> (ConfigSnapshot, MacroBackup) {
+        use eightbitdo_protocol::config_bt2::{GamepadMode, MacroRecord};
+        use eightbitdo_protocol::macro_data;
+
+        let mut config = Bt2Config::zeroed();
+        config.set_gamepad_mode(GamepadMode::Switch);
+        let mut record = MacroRecord {
+            max_steps: 2,
+            key_map: KeyMap::M1,
+            ..MacroRecord::default()
+        };
+        record.set_name("Combo").unwrap();
+        config.set_macro_record(Slot::S1, MacroIndex::M1, &record);
+        config.recompute_crc();
+
+        let stored_crc = config.crc16_stored() as u16;
+        let mut check = config.clone();
+        let computed_crc = check.recompute_crc();
+        let snapshot = ConfigSnapshot {
+            config: config.clone(),
+            stored_crc,
+            computed_crc,
+            crc_valid: stored_crc == computed_crc,
+        };
+
+        let raw = macro_data::encode_macro_steps(&[MacroStep::neutral(10), MacroStep::neutral(20)])
+            .unwrap()[..20]
+            .to_vec();
+        let mut entries = Vec::new();
+        for slot in Slot::ALL {
+            for index in MacroIndex::ALL {
+                let record = config.macro_record(slot, index);
+                let entry_raw = if slot == Slot::S1 && index == MacroIndex::M1 {
+                    raw.clone()
+                } else {
+                    Vec::new()
+                };
+                entries.push(MacroEntry::new(slot, index, record, entry_raw).unwrap());
+            }
+        }
+        let backup = MacroBackup::new(snapshot.clone(), entries).unwrap();
+        write_macro_backup(
+            dir,
+            &snapshot,
+            &backup,
+            &sha256_hex(snapshot.config.as_bytes()),
+        )
+        .unwrap();
+        (snapshot, backup)
+    }
+
+    #[test]
+    fn build_write_plan_enables_unused_macro_but_preserves_used_header() {
+        let dir = scratch_dir("macro-plan");
+        let (_, backup) = backup_fixture(&dir);
+        let file = MacroFile {
+            name: None,
+            gamepad_mode: 0,
+            key_map: KeyMap::NONE,
+            cycles_num: 1,
+            interval_ms: 5,
+            steps: vec![MacroStep::neutral(10), MacroStep::neutral(20)],
+        };
+
+        let unused =
+            build_macro_write_plan(&file, Some(KeyMap::M2), &backup, Slot::S1, MacroIndex::M3);
+        assert_eq!(unused.flag, Some(1));
+        assert_eq!(unused.total_cnt, Some(3));
+        assert_eq!(unused.key_map, Some(KeyMap::M2));
+        assert_eq!(unused.cycles_num, Some(1));
+        assert_eq!(unused.interval_ms, Some(5));
+
+        let used = build_macro_write_plan(&file, None, &backup, Slot::S1, MacroIndex::M1);
+        assert_eq!(used.flag, None);
+        assert_eq!(used.total_cnt, None);
+        assert_eq!(used.key_map, None);
+        assert_eq!(used.name, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_rejects_gamepad_mode_mismatch() {
+        use eightbitdo_protocol::config_bt2::GamepadMode;
+
+        let dir = scratch_dir("macro-mode");
+        let (snapshot, _) = backup_fixture(&dir);
+        let mut current = snapshot.clone();
+        current.config.set_gamepad_mode(GamepadMode::XInput);
+        assert!(ensure_backup_gamepad_mode(&snapshot, &current).is_err());
+        assert!(ensure_backup_gamepad_mode(&snapshot, &snapshot).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_backup_loads_and_rejects_tampered_files() {
+        let dir = scratch_dir("macro-restore");
+        let (_, backup) = backup_fixture(&dir);
+
+        let loaded = read_restore_backup(&dir).unwrap();
+        assert_eq!(
+            loaded.get(Slot::S1, MacroIndex::M1).unwrap().steps().len(),
+            2
+        );
+        assert_eq!(loaded.get(Slot::S2, MacroIndex::M2).unwrap().raw().len(), 0);
+        assert_eq!(
+            backup.get(Slot::S1, MacroIndex::M1).unwrap().raw().len(),
+            20
+        );
+
+        // Tamper with the raw bytes: the manifest hash must reject them.
+        std::fs::write(dir.join("slot0-macro0.bin"), [0u8; 20]).unwrap();
+        assert!(read_restore_backup(&dir).is_err());
+
+        // Restore the bytes and point the manifest at a path outside the
+        // directory: the plain-file-name rule must reject it before reading.
+        let (_, backup) = backup_fixture(&dir);
+        let _ = backup;
+        let manifest_path = dir.join("macros.json");
+        let mut manifest: MacroBackupDocument =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        manifest.macros[0].raw_file = Some("../evil.bin".to_string());
+        std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+        assert!(read_restore_backup(&dir).is_err());
+
+        assert!(safe_backup_path(&dir, "../evil.bin").is_err());
+        assert!(safe_backup_path(&dir, "/etc/passwd").is_err());
+        assert_eq!(
+            safe_backup_path(&dir, "slot0-macro0.bin").unwrap(),
+            dir.join("slot0-macro0.bin")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

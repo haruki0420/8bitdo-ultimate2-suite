@@ -528,8 +528,15 @@ struct Bt2Header {
 4. **Step 4: 不揮発メモリへのコミット (`Save`)**
    - **BLE**: `cmd = 0x0006, subcmd = 0x0067, offset = 0, len = 0, total_len = 0`
    - **USB**: `cmd = 0x0006, subcmd = 0x0123, offset = 0, len = 0, total_len = 0`
+5. **Step 5: 読み戻し検証 (`Read`)**
+   - `cmd = 0x0102` で `(slot, macro_idx)` を読み、`max_steps * 10` バイトが書き込んだ `MacroDatas` と一致することを確認する。
 
-> ACK は各コマンド送信後の transport `wait_ack` で待つ。マクロの `Erase` / `Write` / ヘッダは 2 秒（実装定数 `0x44fa0000`）。マクロ `Save` は 3 秒（USB HID の仕様記載。BLE は transport の `wait_ack` 既定値とリトライ方針を記録する）。OTA の 10 秒 erase / 1 秒 chunk / 64B 固定はマクロに適用しない。
+> ACK は各コマンド送信後の transport `wait_ack` で待つ。マクロの `Erase` / `Write` / ヘッダは 2 秒（実装定数 `0x44fa0000`）。マクロ `Save` は 3 秒（USB HID の仕様記載。BLE は未文書化のため暫定で 3 秒を使う）。OTA の 10 秒 erase / 1 秒 chunk / 64B 固定はマクロに適用しない。
+
+> **実装ノート（Mock 検証済み・実機書き込み未検証）**:
+> - **Fail-closed**: Erase / Write / Header のいずれかが失敗したら Save を送らない。ただし Erase 済み・Write 途中のセクタは変更されている可能性がある。Save 後の ACK または読み戻しが失敗した場合だけ `saved = true` として報告する。どちらも 3 スロット × 4 マクロの完全バックアップから復元する。
+> - **ヘッダ値**: `max_steps` は新しいステップ数。`key_map` / `cycles_num` / `interval_ms` / `flag` / `total_cnt` は指定がなければ既存値を保持する。未使用マクロ（`max_steps == 0` または `0xFFFF`）へ書く場合、CLI は `flag = 1` と `total_cnt = max(existing, macro_idx + 1)` を設定し、`--trigger` がなければ `key_map` を `0` のままにする。**この未使用マクロの有効化ポリシーは実機未確認**。
+> - 216B の Header は現実装では 1 パケットで送る。MTU 200 でも `1 + 16 + 216 = 233B` になるため、MTU 次第では分割が必要になる（実機未確認）。
 
 #### マクロ読み出し手順
 
@@ -540,7 +547,7 @@ struct Bt2Header {
    - `offset = (macro_idx << 12) + chunk_offset`
    - `total_len = chunk_len = max_steps * 10`（全長のまま）
    - 応答ペイロードを 10 バイト単位で `MacroDatas` としてデコードする。
-3. **1 要求 = 1 チャンク**（実機 2026-11-22 観測: 142B）。`chunk_offset += payload.len()` で `offset` を進めて再要求する。2 チャンク目以降の応答 `offset` が 0（逐次）/ 要求値 / セクタ相対のどれになるかは未確定であり、`macro backup` は 3 形式を受け入れて `response_offsets` に記録する。最終チャンクは残り長に切り詰める。
+3. **1 要求 = 1 チャンク**（実機 2026-11-22 観測: 142B）。`chunk_offset += payload.len()` で `offset` を進めて再要求する。実機では応答 `offset` が要求した絶対 offset をエコーした（macro 0 / 500B: `[0, 142, 284, 426]`、macro 1 / 460B: `[4096, 4238, 4380, 4522]`）。`macro backup` は互換のため 0（逐次）とセクタ相対 offset も受け入れるが、`response_offsets` に実際の値を記録する。最終チャンクは残り長に切り詰める。
 
 ---
 

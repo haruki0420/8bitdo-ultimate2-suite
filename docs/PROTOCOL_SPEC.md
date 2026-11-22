@@ -295,7 +295,12 @@ ReadConfig head:  04 02 00 00 00 74 00 00 00 74 00 00 00 00 00 00 00
 **未確定のこと**:
 
 - `ReadConfig` のデータチャンクは実機で 142B (`0x8E`) を 1 要求につき 1 つ返す。`offset` を進めた再要求で 20 要求（19 × 142B + 最終 142B のうち有効 70B）を組み立てる。最終チャンクが 142B 固定で返り、ホスト側で 70B に切り詰めることは実機確認済みである。142B が MTU 依存で変化するかは未確定。応答 `offset` は最初のデータチャンク応答のみ 0、2 回目以降は要求 `offset` をエコーする（§4.3.1 の照合規則）。
-- `getBT2_ReadMacro` の公式 `Generate_CustomDataCmd` 経路は `16 + chunk_len` バイト（ペイロードはゼロ埋め）を送ると読める。本実装は 17B の payloadless 要求を送る。実機（2026-11-22、slot 0 / macro 0 / `max_steps = 50`）では、`total_len = chunk_len = 500`, `offset = 0` の要求に対して `cmd=0x0004, subcmd=0x0102, chunk_len=0x8E (142), total_len=500, offset=0` の **142B チャンクが 1 通知だけ**返った。2 チャンク目以降の応答 `offset` は未確認であり、0（逐次）/ 要求値 / セクタ相対のいずれもあり得るとして実装は 3 形式を受け入れ、`macro backup` のログと `macros.json` の `response_offsets` に記録する。要求は `offset = (macro_idx << 12) + chunk_offset` で 1 チャンクずつ前進させ、`total_len` / `chunk_len` は全長のまま維持する。
+- `getBT2_ReadMacro` の公式 `Generate_CustomDataCmd` 経路は `16 + chunk_len` バイト（ペイロードはゼロ埋め）を送ると読める。本実装は 17B の payloadless 要求を送る。実機（2026-11-22、slot 0）では次の 2 マクロを確認した：
+  - macro 0（sector base `0x0000`、`max_steps = 50`、500B）: 応答 `chunk_len = 0x8E (142)`, `total_len = 500`、応答 offset は **`[0, 142, 284, 426]`**。
+  - macro 1（sector base `0x1000`、`max_steps = 46`、460B）: 応答 `chunk_len = 0x8E (142)`, `total_len = 460`、応答 offset は **`[4096, 4238, 4380, 4522]`**。
+  - したがって **1 要求 = 1 チャンク（142B）** であり、2 チャンク目以降の応答 `offset` は **要求した絶対 offset をエコー**する。`total_len` は `steps * 10` のまま変化しない。
+  - 要求は `offset = (macro_idx << 12) + chunk_offset` で 1 チャンクずつ前進させ、`total_len` / `chunk_len` は全長のまま維持する。実装は互換のため 0（逐次）とセクタ相対 offset も受け入れるが、`macro backup` のログと `macros.json` の `response_offsets` に実際の値を記録する。
+  - 142B が MTU 依存で変化するかは未確定。
 - 公式アプリは要求ペイロードに直前の `gamepadVersion` を再利用する。本実装は常にゼロを送る。`session` REPL では `monitor` 停止後、同一接続で `info` / `config dump` / `backup` / `monitor` を再実行できる。`monitor` 実行中は `info` / `config dump` / `backup` / `monitor --count` を拒否し、先に `monitor stop` が必要である。`info` は実行ごとに新しい 4B ゼロペイロードで `ReadVersion` を送り直す（実機での 2 回目以降の応答は未確認）。
 - USB 給電併用が BLE 設定モードの持続時間を延ばすかは、1 回の成功では判断できない（ユーザー仮説・未検証）。
 
@@ -471,6 +476,36 @@ sequenceDiagram
     - `+0x04` (`u16`): `triggerValue`（トリガー入力値）
     - `+0x06` (`u16`): `leftJoy`（左スティック座標パック値）
     - `+0x08` (`u16`): `rightJoy`（右スティック座標パック値）
+
+### 6.5 マクロ書き込み実装ノート（Mock 検証済み・実機未検証）
+
+`eightbitdo-core` の `write_macro` は次の順序を固定する。実機への書き込みはまだ行っていない。
+
+1. **Erase (`0x0104`)**: `total_len = chunk_len = 0x1000`, `offset = macro_idx << 12`, `crc16 = 0xFFFF`, ペイロードなし。ACK は 2 秒。
+2. **Write (`0x0103`)**: `total_len = align32(steps * 10)`、BLE 64B / USB HID 32B、`offset = (macro_idx << 12) + chunk_index * chunk_size`、各チャンクの CRC-16/MODBUS。ACK は 2 秒。
+3. **Header (`0x0001`)**: `offset = 0x68C + slot * 0xD8`, `len = 0xD8`, `total_len = 0x0AD0`。`ANSI_CRC_16_sh` を 2768B 全体で再計算した後に 216B を切り出す。ACK は 2 秒。
+4. **Save (`0x0006`)**: BLE `subcmd = 0x0067`。ACK は 3 秒（BLE の正式値は未文書化。Windows USB HID の 3 秒を暫定使用）。
+5. **Read-back (`0x0102`)**: Save ACK 後に同じ `(slot, macro_idx)` を読み、`steps * 10` バイトが一致することを確認する。
+
+**Fail-closed**: Erase / Write / Header のいずれかで失敗したら Save を送らない。ただし Erase 済み・Write 途中のセクタはすでに変更されている可能性があるため、`Error::MacroWrite` の `saved` が `false` でも「旧マクロが無傷」とはみなさない。`true` は Save 送信後（ACK または読み戻し失敗）である。どちらも 3 スロット × 4 マクロの完全バックアップから復元する。
+
+**ヘッダのフィールド**:
+
+- `max_steps` は常に新しい `steps.len()`。
+- `key_map` / `cycles_num` / `interval_ms` / `flag` / `total_cnt` は指定がなければバックアップ時点の値を保持する。
+- 未使用マクロ（`max_steps == 0` または `0xFFFF`）へ書く場合、CLI は `flag = 1` と `total_cnt = max(existing, macro_idx + 1)` を設定する。`--trigger` がなければ `key_map` は変更しない（`0` のまま = 未割当）。**この未使用マクロの有効化ポリシーは実機未確認**であり、Mock テストで固定しているだけである。
+- `--trigger` は M1..M4 / KeyMap 名 / `0xHEX` / 10 進数を受け付ける。
+
+**未確定点**:
+
+- 216B の Header を 1 つの BLE Write で送れるか。MTU 200 の実機なら 233B のフレームになり、MTU 次第では分割が必要になる。現実装は 1 パケット（Mock で固定）。
+- BLE Save の正式タイムアウトと、Save ACK の実際の `cmd` / `subcmd` 形状（`0x0006` 直か `0x0004, subcmd=0x0006/0x0067` か）。
+- Erase / Write / Header の ACK 形状（`0x0004` エンベロープか直接エコーか）。実装は両方を受け入れる。
+- 未使用マクロの `flag` / `total_cnt` / `key_map` の実機挙動。
+- `macro restore` は現在の `gamepad_mode`（`+0x010` の下位 8bit）がバックアップと一致しなければ、書き込み前に中止する。
+- `macro restore` はバックアップで `max_steps == 0` / `0xFFFF` だったマクロをスキップする（Flash セクタの削除は未実装）。
+
+
 
 ### 6.4 USB HID と BLE での Save サブコマンド差異
 
