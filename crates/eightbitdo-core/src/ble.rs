@@ -183,6 +183,32 @@ pub struct BleDevice {
     pub is_app: bool,
 }
 
+/// Owns the single-owner BLE lock for one transport.
+///
+/// The lock is released early by a successful [`Transport::disconnect`], and
+/// unconditionally on drop. The drop path guarantees that a transport dropped
+/// without a successful teardown (process shutdown, error return) does not keep
+/// the adapter locked for the rest of the process lifetime.
+struct BleLockSlot(std::sync::Mutex<Option<BleLock>>);
+
+impl BleLockSlot {
+    fn new(lock: BleLock) -> Self {
+        Self(std::sync::Mutex::new(Some(lock)))
+    }
+
+    fn take(&self) {
+        if let Ok(mut lock) = self.0.lock() {
+            let _ = lock.take();
+        }
+    }
+}
+
+impl Drop for BleLockSlot {
+    fn drop(&mut self) {
+        self.take();
+    }
+}
+
 /// A connected BLE App Mode link.
 pub struct BleTransport {
     peripheral: Peripheral,
@@ -195,12 +221,11 @@ pub struct BleTransport {
     rx: Mutex<mpsc::Receiver<Vec<u8>>>,
     /// Single-owner lock, held from before the scan until disconnect/drop.
     ///
-    /// Wrapped in a mutex so [`Transport::disconnect`] can release it before
-    /// the value is dropped; a process exit releases it through the kernel
-    /// regardless. Declared last so it is the last field dropped: the
-    /// peripheral/notification fields go first and another process cannot take
-    /// the lock while this struct is still tearing down.
-    ble_lock: std::sync::Mutex<Option<BleLock>>,
+    /// [`Transport::disconnect`] releases it early on success; otherwise the
+    /// slot's `Drop` releases it when the transport is dropped. Declared last
+    /// so it is dropped after the peripheral/notification fields: another
+    /// process cannot take the lock while this struct is still tearing down.
+    ble_lock: BleLockSlot,
 }
 
 impl BleTransport {
@@ -348,7 +373,7 @@ impl BleTransport {
             name,
             verbose,
             rx: Mutex::new(rx),
-            ble_lock: std::sync::Mutex::new(Some(lock)),
+            ble_lock: BleLockSlot::new(lock),
         })
     }
 
@@ -520,14 +545,12 @@ impl Transport for BleTransport {
 /// start scanning. The kernel still releases the lock when the transport is
 /// dropped or the process exits; the CLI prints a warning in that case.
 fn release_ble_lock_after_teardown(
-    lock: &std::sync::Mutex<Option<BleLock>>,
+    lock: &BleLockSlot,
     teardown: &Result<(), Error>,
 ) -> Result<(), Error> {
     match teardown {
         Ok(()) => {
-            if let Ok(mut lock) = lock.lock() {
-                let _ = lock.take();
-            }
+            lock.take();
             Ok(())
         }
         Err(error) => Err(Error::Ble(format!(
@@ -962,7 +985,7 @@ mod tests {
     #[test]
     fn failed_teardown_keeps_the_ble_lock() {
         let path = temp_lock_path("teardown-failure");
-        let lock = std::sync::Mutex::new(Some(BleLock::acquire_at(&path).expect("hold the lock")));
+        let lock = BleLockSlot::new(BleLock::acquire_at(&path).expect("hold the lock"));
         let failed: Result<(), Error> = Err(Error::Ble("disconnect: timed out".to_string()));
 
         let error = release_ble_lock_after_teardown(&lock, &failed)
@@ -973,7 +996,7 @@ mod tests {
                 .contains("keeping the single-owner BLE lock"),
             "the failure must explain that the lock is kept: {error}"
         );
-        assert!(lock.lock().expect("lock mutex").is_some());
+        assert!(lock.0.lock().expect("lock mutex").is_some());
         let busy = BleLock::acquire_at(&path).expect_err("another process must still be refused");
         assert!(matches!(busy, Error::BleBusy { .. }), "got {busy:?}");
 
@@ -987,10 +1010,27 @@ mod tests {
     #[test]
     fn successful_teardown_releases_the_ble_lock() {
         let path = temp_lock_path("teardown-ok");
-        let lock = std::sync::Mutex::new(Some(BleLock::acquire_at(&path).expect("hold the lock")));
+        let lock = BleLockSlot::new(BleLock::acquire_at(&path).expect("hold the lock"));
         release_ble_lock_after_teardown(&lock, &Ok(())).expect("release");
-        assert!(lock.lock().expect("lock mutex").is_none());
+        assert!(lock.0.lock().expect("lock mutex").is_none());
         let reacquired = BleLock::acquire_at(&path).expect("lock must be free");
+        drop(reacquired);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dropping_the_transport_lock_slot_releases_the_lock() {
+        // `BleTransport` cannot be constructed without a live btleplug
+        // peripheral, but its lock is held by this exact field type. Verify the
+        // drop path used by the transport releases the flock.
+        let path = temp_lock_path("transport-slot-drop");
+        {
+            let slot = BleLockSlot::new(BleLock::acquire_at(&path).expect("hold the lock"));
+            assert!(BleLock::acquire_at(&path).is_err(), "still held");
+            drop(slot);
+        }
+        let reacquired =
+            BleLock::acquire_at(&path).expect("dropping the transport lock slot must release");
         drop(reacquired);
         let _ = std::fs::remove_file(&path);
     }

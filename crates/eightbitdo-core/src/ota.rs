@@ -238,7 +238,7 @@ pub const UT2_TYPE1_APP_FLASH_END: u32 = 0x0102_0000;
 ///
 /// For native mobile transports the sealed marker cannot be implemented by
 /// `eightbitdo-uniffi`. That crate enables the `mobile-boot` feature and uses
-/// the hidden [`MobileBootLink::from_native`] adapter, which exists only in
+/// the hidden `MobileBootLink::from_native` adapter, which exists only in
 /// that feature build. The adapter accepts any [`Transport`], so the boot
 /// framing / ownership / lock contract becomes the caller's responsibility;
 /// **USB and App Mode links are not excluded by the type system** on that path.
@@ -798,13 +798,6 @@ const RECOVERY_ENTER_BOOT: &str =
      controller is idle, and retry EnterBoot; if the controller already advertises \"8bt\", create \
      a new OtaUpdate (phase Idle) and start from prepare_boot.";
 
-/// Recovery text for a failed App-link teardown after EnterBoot.
-const RECOVERY_ENTER_BOOT_RELEASE: &str =
-    "EnterBoot was accepted but the App Mode link could not be closed. The boot link takes the \
-     same single-owner BLE lock as App Mode, so disconnect/drop the App Mode session (and any GUI \
-     or session process holding the lock) before connecting to \"8bt\"; then create a new \
-     OtaUpdate (phase Idle) and call prepare_boot.";
-
 /// Recovery text for an EraseFlash failure.
 const RECOVERY_ERASE: &str =
     "flash erase was sent but not acknowledged, so the application area may be erased. Start \
@@ -1029,52 +1022,51 @@ impl OtaUpdate {
         }
     }
 
-    /// Send EnterBoot, then consume the App Mode [`Session`] and close its link.
+    /// Send EnterBoot, then close the App Mode link through a borrowed
+    /// [`Session`].
     ///
-    /// This is the recommended pairing for a real update: EnterBoot makes the
-    /// controller reboot, and the App Mode link must be closed before
+    /// The App Mode link must be closed before
     /// [`BleBootTransport::connect`](crate::ble::BleBootTransport::connect) can
     /// take the single-owner BLE lock for `"8bt"` (otherwise it returns
     /// [`Error::BleBusy`]). The helper calls [`OtaUpdate::enter_boot`], then
-    /// [`Session::into_inner`] and [`Transport::disconnect`].
+    /// [`Transport::disconnect`] on the session's transport. The caller keeps
+    /// ownership of the session; drop it after this call so the transport's
+    /// lock is released even when the teardown could not complete.
     ///
-    /// The teardown is best-effort:
+    /// Teardown is best-effort: once EnterBoot was accepted (ACK or link
+    /// close), **any** disconnect error (`Error::Ble`, `Error::Transport`,
+    /// `Error::Disconnected`) is tolerated because the controller is rebooting
+    /// and the lock is released when the session is dropped. The disconnect is
+    /// still attempted even when EnterBoot itself fails.
     ///
-    /// * when EnterBoot was accepted because the link already closed, teardown
-    ///   errors are ignored (the link is gone and dropping the transport
-    ///   releases the BLE lock);
-    /// * a teardown [`Error::Disconnected`] is accepted after an acknowledged
-    ///   EnterBoot for the same reason;
-    /// * the App link is disconnect-attempted even when EnterBoot itself fails,
-    ///   so a failed attempt does not leave the lock holder behind.
+    /// The phase is validated before the session is touched, so an
+    /// [`Error::InvalidRequest`] (wrong phase) does not disconnect or otherwise
+    /// consume the caller's session.
     ///
     /// # Errors
     ///
-    /// Same as [`OtaUpdate::enter_boot`], or [`Error::Ota`] with stage
-    /// [`OtaFailureStage::EnterBoot`] when the App link teardown fails after an
-    /// acknowledged EnterBoot. Close the App session and restart from a new
-    /// `OtaUpdate`.
+    /// Returns [`Error::InvalidRequest`] unless the phase is
+    /// [`OtaPhase::Idle`], or the same error as [`OtaUpdate::enter_boot`] when
+    /// EnterBoot fails.
     pub async fn enter_boot_and_release<T: Transport>(
         &mut self,
-        app: Session<T>,
+        app: &Session<T>,
     ) -> Result<(), Error> {
-        let enter = self.enter_boot_inner(&app).await;
+        if self.phase != OtaPhase::Idle {
+            return Err(Error::InvalidRequest(format!(
+                "EnterBoot requires the Idle phase (current phase is {:?})",
+                self.phase
+            )));
+        }
+        let enter = self.enter_boot_inner(app).await;
         // Best effort: attempt the teardown even when EnterBoot failed.
-        let transport = app.into_inner();
-        let teardown = transport.disconnect().await;
+        let _teardown = app.transport().disconnect().await;
         match enter {
-            Ok(EnterBootOutcome::Acknowledged) => match teardown {
-                Ok(()) | Err(Error::Disconnected) => Ok(()),
-                Err(error) => Err(self.fail(
-                    OtaFailureStage::EnterBoot,
-                    OtaWriteState::Untouched,
-                    error,
-                    RECOVERY_ENTER_BOOT_RELEASE,
-                )),
-            },
-            // The controller rebooted and closed the link; any teardown error
-            // is expected. Dropping the transport releases the BLE lock.
-            Ok(EnterBootOutcome::LinkClosed) => Ok(()),
+            // Once EnterBoot was accepted the controller is rebooting; a
+            // teardown failure (including the common Error::Ble after the link
+            // already closed) must not fail the OTA. Dropping the session
+            // releases the lock.
+            Ok(_) => Ok(()),
             Err(error) => Err(error),
         }
     }
@@ -3262,19 +3254,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enter_boot_and_release_closes_the_app_link() {
-        let mock = high_mtu_mock();
-        mock.push_incoming(&frame(cmd::RESPONSE, cmd::ENTER_BOOT, &[]));
-        let session = Session::new(&mock);
-        let mut update = new_update();
-
-        update.enter_boot_and_release(session).await.unwrap();
-
-        assert_eq!(update.phase(), OtaPhase::AwaitingBootReconnect);
-        assert!(mock.is_disconnected());
-    }
-
-    #[tokio::test]
     async fn enter_boot_and_release_accepts_a_link_close_with_a_failing_disconnect() {
         let (link, _called) = ScriptedLink::new(
             Vec::new(),
@@ -3284,13 +3263,35 @@ mod tests {
         let session = Session::new(link);
         let mut update = new_update();
 
-        update.enter_boot_and_release(session).await.unwrap();
+        update.enter_boot_and_release(&session).await.unwrap();
 
         assert_eq!(update.phase(), OtaPhase::AwaitingBootReconnect);
     }
 
     #[tokio::test]
-    async fn enter_boot_and_release_reports_a_teardown_failure_after_ack() {
+    async fn enter_boot_and_release_accepts_a_ble_teardown_error_after_ack() {
+        // The observed real-hardware path: EnterBoot is acknowledged, then the
+        // controller closes the App link and `BleTransport::disconnect` reports
+        // Error::Ble("BLE teardown incomplete ..."). This must not fail the OTA.
+        let (link, called) = ScriptedLink::new(
+            vec![frame(cmd::RESPONSE, cmd::ENTER_BOOT, &[])],
+            RecvMode::Disconnected,
+            DisconnectMode::Ble("BLE teardown incomplete (already closed)".to_string()),
+        );
+        let session = Session::new(link);
+        let mut update = new_update();
+
+        update.enter_boot_and_release(&session).await.unwrap();
+
+        assert_eq!(update.phase(), OtaPhase::AwaitingBootReconnect);
+        assert!(
+            called.load(AtomicOrdering::SeqCst),
+            "teardown must be attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_boot_and_release_tolerates_other_teardown_errors_after_ack() {
         let (link, _called) = ScriptedLink::new(
             vec![frame(cmd::RESPONSE, cmd::ENTER_BOOT, &[])],
             RecvMode::Disconnected,
@@ -3299,20 +3300,9 @@ mod tests {
         let session = Session::new(link);
         let mut update = new_update();
 
-        let error = update.enter_boot_and_release(session).await.unwrap_err();
+        update.enter_boot_and_release(&session).await.unwrap();
 
-        assert!(
-            matches!(
-                error,
-                Error::Ota {
-                    stage: OtaFailureStage::EnterBoot,
-                    state: OtaWriteState::Untouched,
-                    ..
-                }
-            ),
-            "unexpected error: {error:?}"
-        );
-        assert_eq!(update.phase(), OtaPhase::Failed);
+        assert_eq!(update.phase(), OtaPhase::AwaitingBootReconnect);
     }
 
     #[tokio::test]
@@ -3325,7 +3315,7 @@ mod tests {
             ..OtaTimeouts::default()
         });
 
-        let error = update.enter_boot_and_release(session).await.unwrap_err();
+        let error = update.enter_boot_and_release(&session).await.unwrap_err();
 
         assert!(matches!(
             error,
@@ -3338,6 +3328,45 @@ mod tests {
             disconnect_called.load(AtomicOrdering::SeqCst),
             "the App link must be disconnect-attempted even when EnterBoot fails"
         );
+    }
+
+    #[tokio::test]
+    async fn enter_boot_and_release_rejects_a_wrong_phase_without_touching_the_session() {
+        let image_bytes = one_sector_image();
+        let image = FirmwareImage::parse(&image_bytes).unwrap();
+        let mock = high_mtu_mock();
+        queue_prepare(&mock, UT2_BOOT_PID, 0x0000_0102);
+        let mut update = new_update();
+        let _ready = update.prepare_boot(&mock).await.unwrap();
+
+        let app_mock = high_mtu_mock();
+        let app_session = Session::new(&app_mock);
+        let error = update
+            .enter_boot_and_release(&app_session)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidRequest(_)));
+        assert!(!app_mock.is_disconnected(), "session must not be consumed");
+        // The update can still be used for the write phase.
+        let outcome = update.write_firmware(_ready, &image, &mut |_| {}).await;
+        assert!(
+            outcome.is_err(),
+            "write needs its ACKs, but the phase is valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_boot_and_release_closes_the_app_link() {
+        let mock = high_mtu_mock();
+        mock.push_incoming(&frame(cmd::RESPONSE, cmd::ENTER_BOOT, &[]));
+        let session = Session::new(&mock);
+        let mut update = new_update();
+
+        update.enter_boot_and_release(&session).await.unwrap();
+
+        assert_eq!(update.phase(), OtaPhase::AwaitingBootReconnect);
+        assert!(mock.is_disconnected());
     }
 
     #[test]
@@ -3360,6 +3389,7 @@ mod tests {
     enum DisconnectMode {
         Ok,
         Disconnected,
+        Ble(String),
         Transport(String),
     }
 
@@ -3424,6 +3454,7 @@ mod tests {
             match &self.disconnect_mode {
                 DisconnectMode::Ok => Ok(()),
                 DisconnectMode::Disconnected => Err(Error::Disconnected),
+                DisconnectMode::Ble(message) => Err(Error::Ble(message.clone())),
                 DisconnectMode::Transport(message) => Err(Error::Transport(message.clone())),
             }
         }
