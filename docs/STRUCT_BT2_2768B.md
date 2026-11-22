@@ -75,7 +75,7 @@
 >
 > **部分書込と Save（RE 確定・2026-11-22）**: `getBT2_Write*` の部分書込も、完了時に共通 onfinished から **`0x0006/0x0067` Save が必ず 1 回**送られる（部分書込専用の Save 関数は無い）。
 >
-> **実機確認（2026-11-23、BLE・MTU 200・74B chunk）**: full 2768B `config write`（**38 write + 1 Save = 合計 39 packets**、74B chunk）で送信され、Save 後の read-back SHA-256 が送信内容と一致した。device は送信した CRC を `stored` として保持し、`in_place` 再計算値とは一致しない。変更は `+0x00C`（CRC）と対象フィールドのみで、予約領域は保持される。実機の全レコードの flag は `0x20200911` / `0xFFFFFFFF` / gyro slot0 `0x20190000` で意味は未確定（opaque）。**raw 検証は観測値集合（`0` / `1` / `0x20200911` / `0xFFFFFFFF`、gyro は `0x20190000` も）のみ受理し、実機 dump は `--force-raw` なしで再書込できる**（未観測値は `--force-raw` 必須。typed `config set` の flag のみ 0/1）。数値範囲は flag の値に関係なく常時検証するが、実機の完全消去 slot はその実機状態として受理する。実バイトの証跡は [DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) を参照。MTU 200 以外の実機挙動は未確認。
+> **実機確認（2026-11-23、BLE・MTU 200・74B chunk）**: full 2768B `config write`（**38 write + 1 Save = 合計 39 packets**、74B chunk）で送信され、Save 後の read-back SHA-256 が送信内容と一致した。device は送信した CRC を `stored` として保持し、`in_place` 再計算値とは一致しない。変更は `+0x00C`（CRC）と対象フィールドのみで、予約領域は保持される。実機の全レコードの flag は `0x20200911` / `0xFFFFFFFF` / gyro slot0 `0x20190000` で意味は未確定（opaque）。**raw 検証は観測値集合（`0` / `1` / `0x20200911` / `0xFFFFFFFF`、gyro は `0x20190000` も）のみ受理し、実機 dump は `--force-raw` なしで再書込できる**（未観測値は `--force-raw` 必須。typed `config set` の flag のみ 0/1）。数値範囲は flag の値に関係なく常時検証するが、実機の完全消去 slot（joy 全 255 + rumble NaN + map_key 全 22 `0xFFFFFFFF`、各 flag が `0xFFFFFFFF`）は **slot 全体が揃った場合のみ**その実機状態として受理する。`0xFFFFFFFF` の flag 値許可は全レコード共通だが、payload の消去扱いはこの slot 条件に限る。実バイトの証跡は [DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) を参照。MTU 200 以外の実機挙動は未確認。
 
 ### 1.3 `+0x1F4..+0x68B` (3 × 392B) および `+0x914..+0x92B` (3 × 8B) の解析結果
 

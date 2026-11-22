@@ -117,7 +117,7 @@
 - マクロ書込: slot S1・`macro_idx=0/1 (M1/M2)`。Write `0x0103` の `total_len` は **絶対終端** `(macro_idx << 12) + align32(steps * 10)` が必須（相対値は ACK のみで永続化されない）
 - マクロ復元: `macro restore` 後に config SHA-256 が元の `1dca47fa...59c600` に一致。**Switch 側でのマクロ発動は未確認**
 - 設定書込: full 2768B write（**38 write + 1 Save = 合計 39 packets**、74B chunk）→ read-back SHA 一致。device は送信した CRC を保持（`stored` 一致、`in_place` 解釈とは不一致）。`config remap` の A→B→A を同一接続で確認。**実機確認範囲は full write / remap のみ**
-- **実機 flag の扱い（修正済み）**: 実機の各レコード flag は `0x20200911` / `0xFFFFFFFF` / gyro slot0 `0x20190000` で意味は未確定（opaque）。raw 検証は観測値集合（`0` / `1` / `0x20200911` / `0xFFFFFFFF`、gyro は `0x20190000` も）のみ受理し、実機 dump は `--force-raw` なしで書き戻せる（未観測値は `--force-raw` 必須）。数値範囲は flag の値に関係なく常時検証（実機の完全消去 slot のみ例外）。実機 slot2 の `0xFFFFFFFF` key sentinel は「全 22 key + flag が消去」の場合のみ受理。typed `config set` の flag のみ 0/1。実バイト証跡は [docs/DEVICE_CONFIG_EVIDENCE.md](docs/DEVICE_CONFIG_EVIDENCE.md)
+- **実機 flag の扱い（修正済み）**: 実機の各レコード flag は `0x20200911` / `0xFFFFFFFF` / gyro slot0 `0x20190000` で意味は未確定（opaque）。raw 検証は観測値集合（`0` / `1` / `0x20200911` / `0xFFFFFFFF`、gyro は `0x20190000` も）のみ受理し、実機 dump は `--force-raw` なしで書き戻せる（未観測値は `--force-raw` 必須）。数値範囲は flag の値に関係なく常時検証（実機の完全消去 slot のみ例外）。消去例外は slot 全体（joy 全 255 + rumble NaN + map_key 全 22 `0xFFFFFFFF`、各 flag が `0xFFFFFFFF`）でのみ成立し、record 単体の partial state は拒否する。`0xFFFFFFFF` の flag 値許可は全レコード共通だが payload の消去扱いにはならない。typed `config set` の flag のみ 0/1。実バイト証跡は [docs/DEVICE_CONFIG_EVIDENCE.md](docs/DEVICE_CONFIG_EVIDENCE.md)
 - **未検証**: slot S2/S3 と `macro_idx=2/3 (M3/M4)`、MTU 200 以外、USB HID の config / macro write、REPL 内からの書き込み、GUI 書き込み、OTA の wire / ACK / アドレス / MTU、macOS / Windows / Android / iOS 実機
 
 ### 6.2 次に着手すべき作業（優先順）

@@ -2352,16 +2352,17 @@ fn push_unobserved_flag(problems: &mut Vec<String>, field: &str, flag: u32, gyro
     ));
 }
 
-/// The erased key-map sentinel is only accepted when the whole 22-entry slot
-/// is erased (the real slot 2 state) and the record flag is erased too.
-fn raw_erased_slot(keys: &[KeyMap; 22], flag: u32) -> bool {
-    flag == u32::MAX && keys.iter().all(|key| key.bits() == u32::MAX)
-}
-
-/// The real erased slot stores all 255 in the joy record (with flag
-/// `0xFFFFFFFF`). That payload is outside the documented joy ranges but is the
-/// observed erased state, so it is accepted instead of forcing `--force-raw`.
-fn raw_erased_joy(joy: &JoyRecord) -> bool {
+/// The real fully-erased slot state.
+///
+/// The hardware slot 2 combines all of these at once: joy flag `0xFFFFFFFF`
+/// with all four values 255, rumble flag `0xFFFFFFFF` with both multipliers
+/// NaN, and map_key flag `0xFFFFFFFF` with all 22 entries `0xFFFFFFFF`. The
+/// numeric-range / sentinel exceptions apply only to this complete state, not
+/// to one record independently.
+fn raw_erased_slot_state(config: &Bt2Config, slot: Slot) -> bool {
+    let joy = config.joy(slot);
+    let rumble = config.rumble(slot);
+    let map_key = config.map_key(slot);
     joy.flag == u32::MAX
         && [
             joy.left_start_value,
@@ -2371,11 +2372,11 @@ fn raw_erased_joy(joy: &JoyRecord) -> bool {
         ]
         .iter()
         .all(|value| *value == u8::MAX)
-}
-
-/// The real erased slot stores NaN in both rumble multipliers.
-fn raw_erased_rumble(rumble: &RumbleRecord) -> bool {
-    rumble.flag == u32::MAX && rumble.left.is_nan() && rumble.right.is_nan()
+        && rumble.flag == u32::MAX
+        && rumble.left.is_nan()
+        && rumble.right.is_nan()
+        && map_key.flag == u32::MAX
+        && map_key.keys.iter().all(|key| key.bits() == u32::MAX)
 }
 
 /// Validate the known fields of a complete raw configuration file.
@@ -2398,6 +2399,7 @@ fn raw_config_problems(config: &Bt2Config) -> Vec<String> {
         ));
     }
     for slot in Slot::ALL {
+        let erased_slot_state = raw_erased_slot_state(config, slot);
         let joy = config.joy(slot);
         if !raw_flag_is_observed(joy.flag) {
             push_unobserved_flag(
@@ -2407,7 +2409,7 @@ fn raw_config_problems(config: &Bt2Config) -> Vec<String> {
                 false,
             );
         }
-        if !raw_erased_joy(&joy) {
+        if !erased_slot_state {
             for (name, value, max) in [
                 ("left_start_value", joy.left_start_value, 127u8),
                 ("left_end_value", joy.left_end_value, 128),
@@ -2488,9 +2490,9 @@ fn raw_config_problems(config: &Bt2Config) -> Vec<String> {
                 false,
             );
         }
-        let erased_slot = raw_erased_slot(&map_key.keys, map_key.flag);
         for (button, key) in ButtonIndex::ALL.into_iter().zip(map_key.keys) {
-            let acceptable = key.is_single_documented() || (key.bits() == u32::MAX && erased_slot);
+            let acceptable =
+                key.is_single_documented() || (key.bits() == u32::MAX && erased_slot_state);
             if !acceptable {
                 problems.push(format!(
                     "button mapping slot {} index {} ({}): 0x{:08X} is not a documented single \
@@ -2529,7 +2531,7 @@ fn raw_config_problems(config: &Bt2Config) -> Vec<String> {
                 false,
             );
         }
-        if !raw_erased_rumble(&rumble) {
+        if !erased_slot_state {
             for (name, value) in [("left", rumble.left), ("right", rumble.right)] {
                 if !value.is_finite() || !(0.0..=1.0).contains(&value) {
                     problems.push(format!(
@@ -10924,6 +10926,124 @@ mod tests {
     }
 
     #[test]
+    fn raw_config_validation_rejects_partial_erased_slot_states() {
+        // The erased-slot exception must apply to the complete slot state, not
+        // to joy / rumble / map_key independently.
+
+        // joy only
+        let mut config = config_write_fixture();
+        let mut joy = config.joy(Slot::S3);
+        joy.flag = 0xFFFF_FFFF;
+        joy.left_start_value = 255;
+        joy.left_end_value = 255;
+        joy.right_start_value = 255;
+        joy.right_end_value = 255;
+        config.set_joy(Slot::S3, &joy);
+        assert!(
+            validate_raw_config_for_write(&config, false).is_err(),
+            "a joy-only erased record must not be accepted"
+        );
+        assert!(validate_raw_config_for_write(&config, true).is_ok());
+
+        // rumble only
+        let mut config = config_write_fixture();
+        let mut rumble = config.rumble(Slot::S3);
+        rumble.flag = 0xFFFF_FFFF;
+        rumble.left = f32::NAN;
+        rumble.right = f32::NAN;
+        config.set_rumble(Slot::S3, &rumble);
+        assert!(
+            validate_raw_config_for_write(&config, false).is_err(),
+            "a rumble-only erased record must not be accepted"
+        );
+        assert!(validate_raw_config_for_write(&config, true).is_ok());
+
+        // map_key only
+        let mut config = config_write_fixture();
+        let mut map_key = config.map_key(Slot::S3);
+        map_key.flag = 0xFFFF_FFFF;
+        map_key.keys = [KeyMap::from_bits(0xFFFF_FFFF); 22];
+        config.set_map_key(Slot::S3, &map_key);
+        assert!(
+            validate_raw_config_for_write(&config, false).is_err(),
+            "a map_key-only erased record must not be accepted"
+        );
+        assert!(validate_raw_config_for_write(&config, true).is_ok());
+
+        // joy + rumble but normal map_key
+        let mut config = config_write_fixture();
+        let mut joy = config.joy(Slot::S3);
+        joy.flag = 0xFFFF_FFFF;
+        joy.left_start_value = 255;
+        joy.left_end_value = 255;
+        joy.right_start_value = 255;
+        joy.right_end_value = 255;
+        config.set_joy(Slot::S3, &joy);
+        let mut rumble = config.rumble(Slot::S3);
+        rumble.flag = 0xFFFF_FFFF;
+        rumble.left = f32::NAN;
+        rumble.right = f32::NAN;
+        config.set_rumble(Slot::S3, &rumble);
+        assert!(validate_raw_config_for_write(&config, false).is_err());
+        assert!(validate_raw_config_for_write(&config, true).is_ok());
+    }
+
+    #[test]
+    fn real_device_dump_is_accepted_when_local_evidence_exists() {
+        // Local-only evidence file (gitignored). The test is a no-op in CI.
+        let path = Path::new(".tmp/restore-baseline/config.bin");
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        assert_eq!(bytes.len(), CONFIG_SIZE);
+        let config = Bt2Config::from_bytes(&bytes).expect("real dump length");
+        assert!(
+            validate_raw_config_for_write(&config, false).is_ok(),
+            "the real device dump must pass raw validation without --force-raw: {:?}",
+            validate_raw_config_for_write(&config, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn config_write_accepts_the_real_device_dump_when_present() {
+        let path = Path::new(".tmp/restore-baseline/config.bin");
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let initial = Bt2Config::from_bytes(&bytes).expect("real dump length");
+        let transport = ConfigDeviceTransport::new(initial.clone());
+        let session = Session::new(&transport);
+        let dir = scratch_dir("config-real-dump");
+        let mut edited = initial.clone();
+        edited.set_profile_name(Slot::S2, "RealDump").unwrap();
+        config_write_session(
+            &session,
+            &edited,
+            Some(&dir.join("backup")),
+            false,
+            ConfigConfirmation::AssumeYes,
+            None,
+        )
+        .await
+        .expect("the real device dump must be writable without --force-raw");
+        let device = transport.config();
+        assert_eq!(device.profile_name(Slot::S2), "RealDump");
+        assert_eq!(map_key_flag(&device, Slot::S3), 0xFFFF_FFFF);
+        assert_eq!(device.joy(Slot::S3).left_start_value, 255);
+        assert_eq!(
+            transport
+                .sent()
+                .iter()
+                .filter(|frame| {
+                    CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::SAVE
+                })
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn raw_config_validation_rejects_partial_map_key_sentinel_and_gyro_context() {
         // One 0xFFFFFFFF entry in an otherwise populated slot is corruption,
         // not the erased-slot sentinel.
@@ -11076,10 +11196,23 @@ mod tests {
         gyro.flag = 0xFFFF_FFFF;
         gyro.key_map = KeyMap::from_bits(0xFFFF_FFFF);
         config.set_six_axis(Slot::S3, &gyro);
+        // The map_key sentinel is slot-wide: joy and rumble must be erased too.
+        let mut joy = config.joy(Slot::S3);
+        joy.flag = 0xFFFF_FFFF;
+        joy.left_start_value = 255;
+        joy.left_end_value = 255;
+        joy.right_start_value = 255;
+        joy.right_end_value = 255;
+        config.set_joy(Slot::S3, &joy);
+        let mut rumble = config.rumble(Slot::S3);
+        rumble.flag = 0xFFFF_FFFF;
+        rumble.left = f32::NAN;
+        rumble.right = f32::NAN;
+        config.set_rumble(Slot::S3, &rumble);
 
         assert!(
             validate_raw_config(&config).is_ok(),
-            "erased-slot key maps must pass raw validation: {:?}",
+            "the complete erased slot must pass raw validation: {:?}",
             validate_raw_config(&config)
         );
         assert!(validate_raw_config_for_write(&config, false).is_ok());

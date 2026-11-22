@@ -111,7 +111,7 @@ slot2 keys:
 
 ## 6. raw 検証との不整合（修正済み。この節は修正前の記録）
 
-> **現在（`fix/mapkey-flag` 以降）**: raw 検証は実機で観測した flag 集合（`0` / `1` / `0x20200911` / `0xFFFFFFFF`、gyro は `0x20190000` も）を受理し、この実機ダンプは **`--force-raw` なしで書き戻せる**。観測集合外の flag、消去 slot 以外での `0xFFFFFFFF` key sentinel、flag に関係ない既知フィールドの範囲外値は引き続き拒否され、`--force-raw` が必要。以下のエラートランスクリプトは**修正前の記録**として残す。
+> **現在（`fix/mapkey-flag` 以降）**: raw 検証は実機で観測した flag 集合（`0` / `1` / `0x20200911` / `0xFFFFFFFF`、gyro は `0x20190000` も）を受理し、この実機ダンプは **`--force-raw` なしで書き戻せる**。観測集合外の flag、消去 slot 以外での `0xFFFFFFFF` key sentinel、flag に関係ない既知フィールドの範囲外値は引き続き拒否され、`--force-raw` が必要。消去 slot の例外は **slot 全体の条件**（joy 全 255 + rumble NaN + map_key 全 22 `0xFFFFFFFF`、各 flag が `0xFFFFFFFF`）でのみ成立し、record 単体の partial state は拒否する。以下のエラートランスクリプトは**修正前の記録**として残す。
 
 修正前は、この実機ダンプを `config write --file` でそのまま書き戻そうとすると、raw 検証（各レコードの `flag` は `0/1` のみ許可）が実機値と衝突して拒否された。`.tmp/sess.err` の実際のエラー:
 
