@@ -217,6 +217,38 @@ pub enum Error {
     #[error("BLE error: {0}")]
     Ble(String),
 
+    /// Another process owns the single-owner BLE lock.
+    ///
+    /// Scanning, connecting and holding a resident session all take
+    /// [`crate::BleLock`] first; contention is reported instead of waiting,
+    /// because waiting behind a resident session would look like a hang. The
+    /// controller intentionally is not touched.
+    #[cfg(feature = "ble")]
+    #[error(
+        "another process is using the BLE adapter (lock file {}); close the other \
+         scan/session/connect and retry",
+        path.display()
+    )]
+    BleBusy {
+        /// Lock file whose holder refused this operation.
+        path: std::path::PathBuf,
+    },
+
+    /// The BLE lock path is unsafe to use.
+    ///
+    /// The lock file must be a regular file owned by the effective user and
+    /// must not be a symbolic link: the guard truncates the file and tightens
+    /// its mode, so following an attacker-controlled path in a shared
+    /// directory could damage an arbitrary file.
+    #[cfg(feature = "ble")]
+    #[error("refusing to use BLE lock file {}: {reason}", path.display())]
+    BleLockInvalid {
+        /// Rejected lock path.
+        path: std::path::PathBuf,
+        /// Why the path was rejected.
+        reason: String,
+    },
+
     /// No matching peripheral was found during the scan.
     #[error("device not found: name={name}, address={address:?}")]
     DeviceNotFound {

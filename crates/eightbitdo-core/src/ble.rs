@@ -9,6 +9,7 @@
 //! live in later phases.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -21,6 +22,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::Instant;
 use uuid::Uuid;
 
+use crate::ble_lock::{default_ble_lock_path, BleLock};
 use crate::transport::Transport;
 use crate::{
     Error, APP_BLE_NAME, APP_CHARACTERISTIC_UUID, APP_CHARACTERISTIC_UUID_ALT, APP_SERVICE_UUID,
@@ -56,6 +58,12 @@ pub struct BleOptions {
     pub connect_timeout: Duration,
     /// Log every raw TX and RX frame to stderr.
     pub verbose: bool,
+    /// Override the single-owner BLE lock path.
+    ///
+    /// `None` (the default) uses [`crate::default_ble_lock_path`]. Tests and
+    /// wrappers set this to keep a temporary or per-user lock; see
+    /// [`crate::BleLock`].
+    pub lock_path: Option<PathBuf>,
 }
 
 impl Default for BleOptions {
@@ -66,6 +74,7 @@ impl Default for BleOptions {
             scan_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(20),
             verbose: false,
+            lock_path: None,
         }
     }
 }
@@ -84,6 +93,12 @@ pub struct BleBootOptions {
     pub connect_timeout: Duration,
     /// Log every raw TX and RX frame to stderr.
     pub verbose: bool,
+    /// Override the single-owner BLE lock path.
+    ///
+    /// `None` (the default) uses [`crate::default_ble_lock_path`]. The boot link
+    /// takes the same lock as the App Mode link, so an OTA cannot race a
+    /// resident `session` / GUI for the adapter.
+    pub lock_path: Option<PathBuf>,
 }
 
 impl Default for BleBootOptions {
@@ -93,6 +108,7 @@ impl Default for BleBootOptions {
             scan_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(20),
             verbose: false,
+            lock_path: None,
         }
     }
 }
@@ -148,6 +164,14 @@ pub struct BleTransport {
     name: Option<String>,
     verbose: bool,
     rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+    /// Single-owner lock, held from before the scan until disconnect/drop.
+    ///
+    /// Wrapped in a mutex so [`Transport::disconnect`] can release it before
+    /// the value is dropped; a process exit releases it through the kernel
+    /// regardless. Declared last so it is the last field dropped: the
+    /// peripheral/notification fields go first and another process cannot take
+    /// the lock while this struct is still tearing down.
+    ble_lock: std::sync::Mutex<Option<BleLock>>,
 }
 
 impl BleTransport {
@@ -161,14 +185,29 @@ impl BleTransport {
     ///
     /// Returns [`Error::Ble`] for adapter/backend failures,
     /// [`Error::DeviceNotFound`] when no matching peripheral appears within
-    /// [`BleOptions::scan_timeout`], or [`Error::CharacteristicNotFound`] when
-    /// service `FF10` has no usable App Mode characteristic.
+    /// [`BleOptions::scan_timeout`], [`Error::CharacteristicNotFound`] when
+    /// service `FF10` has no usable App Mode characteristic, or
+    /// [`Error::BleBusy`] when another process holds the single-owner BLE lock.
+    ///
+    /// The lock is taken before the adapter is touched and is held for the
+    /// lifetime of the returned transport: a resident `session`, a GUI and a
+    /// one-shot `scan` cannot scan or reconnect over each other.
     pub async fn connect(options: &BleOptions) -> Result<Self, Error> {
         Self::connect_mode(options, BleMode::APP).await
     }
 
     /// Shared connect path for App Mode and the `"8bt"` bootloader.
+    ///
+    /// The single-owner BLE lock is taken before the adapter is touched and is
+    /// held for the lifetime of the returned transport, including the boot
+    /// phase (the boot transport passes its own `lock_path`).
     async fn connect_mode(options: &BleOptions, mode: BleMode) -> Result<Self, Error> {
+        let lock = BleLock::acquire_at(
+            options
+                .lock_path
+                .clone()
+                .unwrap_or_else(default_ble_lock_path),
+        )?;
         let manager = Manager::new().await.map_err(ble_error)?;
         let adapters = manager.adapters().await.map_err(ble_error)?;
         let adapter = adapters
@@ -285,6 +324,7 @@ impl BleTransport {
             name,
             verbose,
             rx: Mutex::new(rx),
+            ble_lock: std::sync::Mutex::new(Some(lock)),
         })
     }
 
@@ -324,8 +364,9 @@ impl BleBootTransport {
     /// Scan for, connect to, and subscribe to a `"8bt"` bootloader peripheral.
     ///
     /// The advertised name is fixed to [`BOOT_BLE_NAME`]; `options.address`,
-    /// timeouts and verbose logging are honored. Service `FF20` is resolved
-    /// with characteristic `FF21` first, then `FF23`.
+    /// timeouts, verbose logging and the single-owner BLE lock
+    /// (`options.lock_path`) are honored. Service `FF20` is resolved with
+    /// characteristic `FF21` first, then `FF23`.
     ///
     /// # Errors
     ///
@@ -341,6 +382,7 @@ impl BleBootTransport {
             scan_timeout: options.scan_timeout,
             connect_timeout: options.connect_timeout,
             verbose: options.verbose,
+            lock_path: options.lock_path.clone(),
         };
         let inner = BleTransport::connect_mode(&app_options, mode).await?;
         Ok(Self { inner })
@@ -423,11 +465,48 @@ impl Transport for BleTransport {
     }
 
     async fn disconnect(&self) -> Result<(), Error> {
-        // Best effort: notify teardown and link teardown are both idempotent
-        // from the caller's point of view.
-        let _ = self.peripheral.unsubscribe(&self.characteristic).await;
-        let _ = self.peripheral.disconnect().await;
-        Ok(())
+        // Notify teardown and link teardown are both attempted so the error
+        // reports every failed step. The single-owner lock is released only
+        // when both succeed: after a partial teardown the old link may still
+        // be alive, and letting another process scan over it is exactly the
+        // contention this lock exists to prevent.
+        let mut failures = Vec::new();
+        if let Err(error) = self.peripheral.unsubscribe(&self.characteristic).await {
+            failures.push(format!("unsubscribe: {error}"));
+        }
+        if let Err(error) = self.peripheral.disconnect().await {
+            failures.push(format!("disconnect: {error}"));
+        }
+        let teardown = if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Ble(failures.join("; ")))
+        };
+        release_ble_lock_after_teardown(&self.ble_lock, &teardown)
+    }
+}
+
+/// Release the BLE lock only after a fully successful teardown.
+///
+/// A failed or timed-out teardown returns `Err` and keeps the lock in the
+/// transport: the link may still be half-closed, so another process must not
+/// start scanning. The kernel still releases the lock when the transport is
+/// dropped or the process exits; the CLI prints a warning in that case.
+fn release_ble_lock_after_teardown(
+    lock: &std::sync::Mutex<Option<BleLock>>,
+    teardown: &Result<(), Error>,
+) -> Result<(), Error> {
+    match teardown {
+        Ok(()) => {
+            if let Ok(mut lock) = lock.lock() {
+                let _ = lock.take();
+            }
+            Ok(())
+        }
+        Err(error) => Err(Error::Ble(format!(
+            "BLE teardown incomplete ({error}); keeping the single-owner BLE lock while this \
+             transport is alive so another process cannot scan over a half-closed link"
+        ))),
     }
 }
 
@@ -437,8 +516,28 @@ impl Transport for BleTransport {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Ble`] when no adapter is available or the backend fails.
+/// Returns [`Error::Ble`] when no adapter is available or the backend fails,
+/// and [`Error::BleBusy`] when another process (for example a resident
+/// `session`) holds the single-owner BLE lock.
 pub async fn scan_devices(timeout: Duration) -> Result<Vec<BleDevice>, Error> {
+    scan_devices_with_lock_path(timeout, None).await
+}
+
+/// [`scan_devices`] with an explicit lock path override.
+///
+/// `None` uses [`crate::default_ble_lock_path`]. Exposed so tests and wrappers
+/// can share a private lock without touching the developer's real one.
+///
+/// # Errors
+///
+/// Same as [`scan_devices`].
+pub async fn scan_devices_with_lock_path(
+    timeout: Duration,
+    lock_path: Option<PathBuf>,
+) -> Result<Vec<BleDevice>, Error> {
+    // Hold the lock for the whole scan: two scans at once are what makes the
+    // controller report `In Progress` on the next connect.
+    let _lock = BleLock::acquire_at(lock_path.unwrap_or_else(default_ble_lock_path))?;
     let manager = Manager::new().await.map_err(ble_error)?;
     let adapters = manager.adapters().await.map_err(ble_error)?;
     let adapter = adapters
@@ -650,6 +749,7 @@ mod tests {
         assert_eq!(options.scan_timeout, Duration::from_secs(10));
         assert_eq!(options.connect_timeout, Duration::from_secs(20));
         assert!(!options.verbose);
+        assert_eq!(options.lock_path, None);
     }
 
     #[test]
@@ -722,5 +822,103 @@ mod tests {
             compute_write_timeout(Duration::from_secs(2)),
             Duration::from_secs(2)
         );
+    }
+
+    fn temp_lock_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "eightbitdo-ble-{label}-{}-{}.lock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ))
+    }
+
+    #[test]
+    fn connect_options_default_to_the_shared_lock() {
+        assert_eq!(BleOptions::default().lock_path, None);
+    }
+
+    #[tokio::test]
+    async fn connect_is_refused_while_another_process_holds_the_lock() {
+        let path = temp_lock_path("connect-busy");
+        let _held = BleLock::acquire_at(&path).expect("hold the lock");
+        let options = BleOptions {
+            lock_path: Some(path.clone()),
+            ..BleOptions::default()
+        };
+        let error = match BleTransport::connect(&options).await {
+            Ok(_) => panic!("connect must refuse while the lock is held"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, Error::BleBusy { path: ref held } if held == &path),
+            "expected BleBusy before the adapter is touched, got {error:?}"
+        );
+        drop(_held);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn scan_is_refused_while_an_external_flock_is_held() {
+        use fs2::FileExt;
+
+        let path = temp_lock_path("scan-busy");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .expect("open lock file");
+        // `flock(1)`-style holder: the CLI must report busy, not block, and it
+        // must not touch the adapter.
+        FileExt::try_lock_exclusive(&file).expect("external flock");
+        let error = scan_devices_with_lock_path(Duration::from_millis(1), Some(path.clone()))
+            .await
+            .expect_err("scan must refuse while the lock is held");
+        assert!(
+            matches!(error, Error::BleBusy { path: ref held } if held == &path),
+            "expected BleBusy, got {error:?}"
+        );
+        FileExt::unlock(&file).expect("unlock");
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failed_teardown_keeps_the_ble_lock() {
+        let path = temp_lock_path("teardown-failure");
+        let lock = std::sync::Mutex::new(Some(BleLock::acquire_at(&path).expect("hold the lock")));
+        let failed: Result<(), Error> = Err(Error::Ble("disconnect: timed out".to_string()));
+
+        let error = release_ble_lock_after_teardown(&lock, &failed)
+            .expect_err("a failed teardown must not release the lock");
+        assert!(
+            error
+                .to_string()
+                .contains("keeping the single-owner BLE lock"),
+            "the failure must explain that the lock is kept: {error}"
+        );
+        assert!(lock.lock().expect("lock mutex").is_some());
+        let busy = BleLock::acquire_at(&path).expect_err("another process must still be refused");
+        assert!(matches!(busy, Error::BleBusy { .. }), "got {busy:?}");
+
+        // A successful retry releases it.
+        release_ble_lock_after_teardown(&lock, &Ok(())).expect("successful teardown releases");
+        let reacquired = BleLock::acquire_at(&path).expect("lock must be free after teardown");
+        drop(reacquired);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn successful_teardown_releases_the_ble_lock() {
+        let path = temp_lock_path("teardown-ok");
+        let lock = std::sync::Mutex::new(Some(BleLock::acquire_at(&path).expect("hold the lock")));
+        release_ble_lock_after_teardown(&lock, &Ok(())).expect("release");
+        assert!(lock.lock().expect("lock mutex").is_none());
+        let reacquired = BleLock::acquire_at(&path).expect("lock must be free");
+        drop(reacquired);
+        let _ = std::fs::remove_file(&path);
     }
 }

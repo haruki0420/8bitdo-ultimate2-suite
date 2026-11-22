@@ -130,6 +130,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use eightbitdo_protocol::commands::{self, boot, cmd};
 use eightbitdo_protocol::header::{decode_app_response, CustomHeader, HEADER_SIZE};
 use tokio::time::Instant;
@@ -235,6 +236,77 @@ impl OtaTransport for crate::mock::MockTransport {}
 impl sealed::Sealed for crate::ble::BleBootTransport {}
 #[cfg(feature = "ble")]
 impl OtaTransport for crate::ble::BleBootTransport {}
+
+/// Adapter for a boot transport supplied by another crate (UniFFI / mobile).
+///
+/// [`OtaTransport`] is sealed so downstream crates cannot implement it, but
+/// UniFFI must inject a native transport (CoreBluetooth / Android
+/// BluetoothGatt) for mobile BLE OTA. Wrap that transport in `OtaLink` and pass
+/// it to [`OtaUpdate::prepare_boot`] / [`OtaUpdate::write_firmware`].
+///
+/// # Framing contract
+///
+/// The wrapped transport must behave like the `"8bt"` bootloader link, not like
+/// the App Mode link:
+///
+/// * it is connected to the advertised name `"8bt"`, service `FF20`, and
+///   characteristic `FF21` or `FF23`;
+/// * [`Transport::send`] writes the bytes it is given unchanged (the core
+///   already prepends the `0x05` bootloader prefix; the native layer must not
+///   add or strip framing);
+/// * [`Transport::recv`] returns one complete notification frame starting with
+///   the 16-byte header (no prefix byte);
+/// * [`Transport::mtu`] reports the negotiated ATT MTU (`mtu - 3` usable);
+/// * the link is owned exclusively by this update (the native layer must not
+///   share it or perform its own scan/connect while the update runs).
+///
+/// `OtaLink` cannot verify any of this at runtime (a transport is just bytes),
+/// so wrapping an App Mode or USB link is a caller error. The adapter only
+/// delegates the [`Transport`] methods; it adds no framing and no locking.
+pub struct OtaLink<T: Transport>(T);
+
+impl<T: Transport> OtaLink<T> {
+    /// Wrap a native boot transport.
+    ///
+    /// The caller is responsible for the framing / ownership contract in the
+    /// [`OtaLink`] documentation. Prefer
+    /// [`BleBootTransport`](crate::ble::BleBootTransport) on desktop, which
+    /// enforces the `"8bt"` scan/service resolution and takes the single-owner
+    /// BLE lock.
+    #[must_use]
+    pub const fn new(transport: T) -> Self {
+        Self(transport)
+    }
+
+    /// Consume the adapter and return the wrapped transport.
+    #[must_use]
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T: Transport> sealed::Sealed for OtaLink<T> {}
+
+impl<T: Transport> OtaTransport for OtaLink<T> {}
+
+#[async_trait]
+impl<T: Transport> Transport for OtaLink<T> {
+    async fn send(&self, data: &[u8]) -> Result<(), Error> {
+        self.0.send(data).await
+    }
+
+    async fn recv(&self) -> Result<Vec<u8>, Error> {
+        self.0.recv().await
+    }
+
+    fn mtu(&self) -> u16 {
+        self.0.mtu()
+    }
+
+    async fn disconnect(&self) -> Result<(), Error> {
+        self.0.disconnect().await
+    }
+}
 
 /// The controller generation whose BLE OTA offsets are documented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3007,6 +3079,48 @@ mod tests {
             "unexpected error: {error:?}"
         );
         assert_eq!(update.chunks_written(), 64);
+    }
+
+    #[tokio::test]
+    async fn ota_link_adapter_allows_an_external_boot_transport() {
+        let image_bytes = one_sector_image();
+        let image = FirmwareImage::parse(&image_bytes).unwrap();
+        let mock = high_mtu_mock();
+        queue_prepare(&mock, UT2_BOOT_PID, 0x0000_0102);
+        queue_ack(&mock, &boot::erase_flash(TEST_BASE).unwrap());
+        let writes =
+            boot::write_firmware_packets(TEST_BASE, image.image_len(), image.image()).unwrap();
+        for request in &writes {
+            queue_ack(&mock, request);
+        }
+        queue_ack(
+            &mock,
+            &boot::write_version_header(image.image_len(), image.version_header()).unwrap(),
+        );
+        queue_ack(&mock, &boot::jump_app());
+
+        // UniFFI injects a native transport through this adapter; the sealed
+        // OtaTransport marker is implemented by the crate, not downstream.
+        let link = OtaLink::new(&mock);
+        assert_eq!(link.mtu(), 92);
+        let mut update = new_update();
+        let ready = update.prepare_boot(&link).await.unwrap();
+        let outcome = update
+            .write_firmware(ready, &image, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.chunks_written, 64);
+        assert_eq!(outcome.jump, JumpOutcome::Acknowledged);
+        assert_eq!(sent_boot(&mock).len(), 70);
+    }
+
+    #[test]
+    fn ota_link_adapter_returns_the_wrapped_transport() {
+        let mock = high_mtu_mock();
+        let link = OtaLink::new(mock);
+        let mock = link.into_inner();
+        assert_eq!(mock.mtu(), 92);
     }
 
     #[test]

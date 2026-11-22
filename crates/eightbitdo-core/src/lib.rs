@@ -29,6 +29,8 @@ pub mod transport;
 
 #[cfg(feature = "ble")]
 pub mod ble;
+#[cfg(feature = "ble")]
+pub mod ble_lock;
 
 pub use config_ops::{
     button_mapping, button_mappings, config_write_chunk_len, map_key_flag, ConfigCrcStatus,
@@ -49,7 +51,7 @@ pub use macro_ops::{
 };
 pub use mock::MockTransport;
 pub use ota::{
-    gamepad_type_from_pid, BootReady, FirmwareImage, GamepadType, JumpOutcome, OtaConfig,
+    gamepad_type_from_pid, BootReady, FirmwareImage, GamepadType, JumpOutcome, OtaConfig, OtaLink,
     OtaOutcome, OtaPhase, OtaProgress, OtaTimeouts, OtaTransport, OtaUpdate, OTA_CHUNK_SIZE,
     OTA_ENTER_BOOT_TIMEOUT, OTA_ERASE_TIMEOUT, OTA_IMAGE_HEADER_LEN, OTA_JUMP_TIMEOUT,
     OTA_MAX_FRAME_LEN, OTA_MIN_MTU, OTA_PID_TIMEOUT, OTA_SECTOR_SIZE, OTA_VERSION_HEADER_LEN,
@@ -64,8 +66,11 @@ pub use transport::Transport;
 
 #[cfg(feature = "ble")]
 pub use ble::{
-    scan_devices, BleBootOptions, BleBootTransport, BleDevice, BleOptions, BleTransport,
+    scan_devices, scan_devices_with_lock_path, BleBootOptions, BleBootTransport, BleDevice,
+    BleOptions, BleTransport,
 };
+#[cfg(feature = "ble")]
+pub use ble_lock::{default_ble_lock_path, BleLock, BLE_LOCK_FILE_NAME, BLE_LOCK_PATH_ENV};
 
 /// 8BitDo vendor ID.
 pub const VENDOR_ID: u16 = 0x2DC8;
