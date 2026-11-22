@@ -119,11 +119,32 @@ enum Command {
         duration: u64,
     },
 
-    /// Keep one connection open and run read-only commands interactively.
+    /// Keep one connection open and run commands interactively.
+    ///
+    /// The REPL is read-only by default. `macro write` and `macro restore`
+    /// additionally require `--allow-macro-write`.
     Session {
         /// Input poll interval in milliseconds.
         #[arg(long, default_value_t = 20, value_name = "MILLISECONDS")]
         interval_ms: u64,
+
+        /// Enable `macro write` / `macro restore` inside the REPL.
+        ///
+        /// `macro backup` is read-only on the controller and is always
+        /// available. This flag does not turn the session into a general
+        /// write mode: only the two macro flash commands are enabled.
+        #[arg(long)]
+        allow_macro_write: bool,
+
+        /// Do not send the `0x0007` ReportEnable(true) when the session
+        /// starts.
+        ///
+        /// The official app enables the realtime input stream before polling,
+        /// so the default is ON. With this flag the REPL keeps polling
+        /// `0x0003` but never sends `0x0007`, matching the top-level
+        /// `eightbitdo macro write` default (which sends no ReportEnable).
+        #[arg(long)]
+        no_report_enable: bool,
     },
 }
 
@@ -183,7 +204,7 @@ enum MacroCommand {
         trigger: Option<String>,
 
         /// Directory for the mandatory pre-write backup. Defaults to
-        /// `macro-backup-<unix-seconds>-<pid>`.
+        /// `macro-backup-<unix-nanos>-<pid>-<sequence>`.
         #[arg(long, value_name = "DIR")]
         backup_dir: Option<PathBuf>,
 
@@ -334,8 +355,18 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
             )
             .await;
         }
-        Command::Session { interval_ms } => {
-            return session(&options, Duration::from_millis(interval_ms)).await;
+        Command::Session {
+            interval_ms,
+            allow_macro_write,
+            no_report_enable,
+        } => {
+            return session(
+                &options,
+                Duration::from_millis(interval_ms),
+                allow_macro_write,
+                session_report_enable(no_report_enable),
+            )
+            .await;
         }
     }
 
@@ -1077,8 +1108,27 @@ struct MacroBackupDocument {
     macros: Vec<MacroBackupDocumentEntry>,
 }
 
+/// Reject a path that is not a regular file before any blocking read.
+///
+/// A FIFO, socket or directory passed to `read_to_string` / `read` can block
+/// indefinitely (or fail late). During a `session` macro write the preparation
+/// phase is not cancellable by Ctrl-C, so a FIFO would make the REPL hang
+/// with no way to interrupt it. `metadata` follows symlinks: a symlink to a
+/// regular file is accepted, a symlink to a FIFO/directory is not.
+fn ensure_regular_file(path: &Path, what: &str) -> Result<(), Error> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(invalid_input(format!(
+            "{what} {} is not a regular file; FIFOs, sockets and directories are refused",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Read JSON or TOML macro input.
 fn read_macro_file(path: &Path) -> Result<MacroFile, Error> {
+    ensure_regular_file(path, "macro file")?;
     let text = std::fs::read_to_string(path)?;
     let extension = path
         .extension()
@@ -1182,12 +1232,26 @@ fn parse_macro_index(value: u8) -> Result<MacroIndex, Error> {
         .ok_or_else(|| invalid_input(format!("macro index must be 0..=3, got {value}")))
 }
 
-fn default_backup_dir(prefix: &str) -> PathBuf {
-    let seconds = SystemTime::now()
+/// Process-wide counter that makes two backup directories created in the same
+/// nanosecond (or from a test overriding the clock) still distinct.
+static BACKUP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Unique `-<nanos>-<pid>-<sequence>` suffix for generated backup directories.
+///
+/// Seconds alone collided when two macro writes were started in the same
+/// second from one `session` (and with one process id). Nanoseconds make the
+/// intent obvious and the counter makes uniqueness unconditional.
+fn unique_backup_suffix() -> String {
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
+        .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    PathBuf::from(format!("{prefix}-{seconds}-{}", std::process::id()))
+    let sequence = BACKUP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos}-{}-{sequence}", std::process::id())
+}
+
+fn default_backup_dir(prefix: &str) -> PathBuf {
+    PathBuf::from(format!("{prefix}-{}", unique_backup_suffix()))
 }
 
 fn pre_restore_dir(dir: &Path) -> PathBuf {
@@ -1195,14 +1259,7 @@ fn pre_restore_dir(dir: &Path) -> PathBuf {
         .file_name()
         .map_or_else(|| "macro-backup".into(), |name| name.to_string_lossy());
     let parent = dir.parent().unwrap_or_else(|| Path::new("."));
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    parent.join(format!(
-        "{name}-pre-restore-{seconds}-{}",
-        std::process::id()
-    ))
+    parent.join(format!("{name}-pre-restore-{}", unique_backup_suffix()))
 }
 
 /// Build the core write plan.
@@ -1235,6 +1292,76 @@ fn build_macro_write_plan(
     Ok(plan)
 }
 
+/// A validated `macro write` request, parsed before any device I/O.
+///
+/// Parsing and file reading happen before the connection (CLI) or before the
+/// operation lock is taken (session REPL), so a bad slot, index, trigger or
+/// macro file never touches the controller and never leaves an empty pre-write
+/// backup directory behind.
+struct PreparedMacroWrite {
+    slot: Slot,
+    index: MacroIndex,
+    file: MacroFile,
+    trigger: Option<KeyMap>,
+}
+
+fn prepare_macro_write(
+    slot: u8,
+    index: u8,
+    file: &Path,
+    trigger: Option<&str>,
+) -> Result<PreparedMacroWrite, Error> {
+    Ok(PreparedMacroWrite {
+        slot: parse_slot(slot)?,
+        index: parse_macro_index(index)?,
+        file: read_macro_file(file)?,
+        trigger: trigger.map(parse_trigger).transpose()?,
+    })
+}
+
+/// Resolve the mandatory pre-write backup directory.
+///
+/// The session REPL has no `--backup-dir` option, so it always gets the
+/// timestamped default.
+fn resolve_write_backup_dir(backup_dir: Option<&Path>) -> PathBuf {
+    backup_dir.map_or_else(
+        || default_backup_dir("macro-backup"),
+        std::path::Path::to_path_buf,
+    )
+}
+
+/// Run one macro write on an existing session.
+///
+/// Shared by the top-level `macro write` command and the `session` REPL. The
+/// caller owns the connection; the REPL wrapper [`run_session_macro_write`]
+/// owns the operation lock for the whole call.
+///
+/// Only the Ctrl-C warning is printed here, before any device I/O. The
+/// pre-write backup path is printed later, after the backup directory has
+/// actually been written, so an early failure never points the operator at a
+/// path that does not exist.
+async fn run_macro_write<T: Transport>(
+    session: &Session<T>,
+    request: &PreparedMacroWrite,
+    backup_dir: &Path,
+    chunk_size: Option<u16>,
+) -> Result<(), Error> {
+    eprintln!(
+        "warning: do not press Ctrl-C during the macro write; a failure can leave a sector \
+         partially updated."
+    );
+    macro_write_session(
+        session,
+        request.slot,
+        request.index,
+        &request.file,
+        request.trigger,
+        backup_dir,
+        chunk_size,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn macro_write(
     options: &BleOptions,
@@ -1247,27 +1374,12 @@ async fn macro_write(
     poll_interval_ms: u64,
     report_enable: bool,
 ) -> Result<(), Error> {
-    let slot = parse_slot(slot)?;
-    let index = parse_macro_index(index)?;
-    let file = read_macro_file(file)?;
-    let trigger = trigger.map(parse_trigger).transpose()?;
+    let request = prepare_macro_write(slot, index, file, trigger)?;
+    let backup_dir = resolve_write_backup_dir(backup_dir);
 
     let transport = BleTransport::connect(options).await?;
     let session = macro_session(transport, poll_interval_ms, report_enable);
-    let backup_dir = backup_dir.map_or_else(
-        || default_backup_dir("macro-backup"),
-        std::path::Path::to_path_buf,
-    );
-    let result = macro_write_session(
-        &session,
-        slot,
-        index,
-        &file,
-        trigger,
-        &backup_dir,
-        chunk_size,
-    )
-    .await;
+    let result = run_macro_write(&session, &request, &backup_dir, chunk_size).await;
     print_poll_stats(options, &session);
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
@@ -1343,6 +1455,14 @@ async fn macro_write_session_inner<T: Transport>(
     let backup = MacroBackup::new(snapshot.clone(), entries)?;
     let config_sha256 = sha256_hex(snapshot.config.as_bytes());
     write_macro_backup(backup_dir, &snapshot, &backup, &config_sha256)?;
+    // Only now is there a real recovery backup to point at. Printing it before
+    // this point would advertise a path when an early failure (empty macro,
+    // MTU too small, config read error) leaves no backup at all.
+    eprintln!(
+        "pre-write backup: {}; recover with: eightbitdo macro restore --dir {}",
+        backup_dir.display(),
+        backup_dir.display()
+    );
 
     if trigger.is_none() && !file.key_map.is_empty() {
         println!(
@@ -1369,13 +1489,6 @@ async fn macro_write_session_inner<T: Transport>(
         macro_id(index),
         plan.steps.len(),
     );
-    eprintln!(
-        "warning: do not press Ctrl-C during the macro write; a failure can leave a sector \
-         partially updated. pre-write backup: {}; recover with: eightbitdo macro restore \
-         --dir {}",
-        backup_dir.display(),
-        backup_dir.display()
-    );
     let outcome = session.write_macro(&backup, slot, index, &plan).await?;
     warn_if_config_crc_invalid(outcome.config_crc_valid);
 
@@ -1400,6 +1513,11 @@ async fn macro_write_session_inner<T: Transport>(
         outcome.record.cycles_num, outcome.record.interval_ms
     );
     println!("  packets sent: {}", outcome.packets_sent);
+    println!(
+        "  config crc: {}",
+        config_crc_label(outcome.config_crc_valid)
+    );
+    println!("  read-back sha256: {}", sha256_hex(outcome.readback.raw()));
     println!("  read-back offsets: {:?}", outcome.readback.read_offsets());
     println!(
         "restore with: eightbitdo macro restore --dir {}",
@@ -1408,12 +1526,22 @@ async fn macro_write_session_inner<T: Transport>(
     Ok(())
 }
 
+/// Human-readable macro write header/ACK CRC state.
+fn config_crc_label(config_crc_valid: bool) -> &'static str {
+    if config_crc_valid {
+        "valid"
+    } else {
+        "invalid (216B partial header write; a full 2768B config write may be required)"
+    }
+}
+
 /// Read and validate `config.bin` / `macros.json` (or `macros.toml`).
 fn read_restore_backup(dir: &Path) -> Result<MacroBackup, Error> {
     if dir.as_os_str().is_empty() || lexical_directory(dir).as_os_str().is_empty() {
         return Err(invalid_input("backup directory must not be empty"));
     }
     let config_path = dir.join("config.bin");
+    ensure_regular_file(&config_path, "backup config")?;
     let config_bytes = std::fs::read(&config_path)?;
     let config = Bt2Config::from_bytes(&config_bytes)?;
     let stored_crc = config.crc16_stored() as u16;
@@ -1436,6 +1564,7 @@ fn read_restore_backup(dir: &Path) -> Result<MacroBackup, Error> {
             dir.display()
         )));
     };
+    ensure_regular_file(&manifest_path, "backup manifest")?;
     let manifest_text = std::fs::read_to_string(&manifest_path)?;
     let manifest: MacroBackupDocument =
         if manifest_path.extension().is_some_and(|ext| ext == "json") {
@@ -1513,6 +1642,7 @@ fn read_restore_backup(dir: &Path) -> Result<MacroBackup, Error> {
                     ))
                 })?;
                 let raw_path = safe_backup_path(dir, raw_file)?;
+                ensure_regular_file(&raw_path, "backup macro raw file")?;
                 let bytes = std::fs::read(&raw_path)?;
                 let expected_len = usize::from(record.max_steps) * 10;
                 if bytes.len() != expected_len {
@@ -1570,6 +1700,21 @@ fn ensure_backup_gamepad_mode(
     Ok(())
 }
 
+/// Run one macro restore on an existing session.
+///
+/// Shared by the top-level `macro restore` command and the `session` REPL.
+/// The pre-restore backup, the gamepad-mode check, the `--force` conflict
+/// rules, the symlink/complete-backup validation and the read-back
+/// verification all stay in [`macro_restore_session`].
+async fn run_macro_restore<T: Transport>(
+    session: &Session<T>,
+    dir: &Path,
+    force: bool,
+    chunk_size: Option<u16>,
+) -> Result<(), Error> {
+    macro_restore_session(session, dir, force, chunk_size).await
+}
+
 async fn macro_restore(
     options: &BleOptions,
     dir: &Path,
@@ -1580,7 +1725,7 @@ async fn macro_restore(
 ) -> Result<(), Error> {
     let transport = BleTransport::connect(options).await?;
     let session = macro_session(transport, poll_interval_ms, report_enable);
-    let result = macro_restore_session(&session, dir, force, chunk_size).await;
+    let result = run_macro_restore(&session, dir, force, chunk_size).await;
     print_poll_stats(options, &session);
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
@@ -1893,7 +2038,23 @@ async fn macro_restore_session_core<T: Transport>(
             plans.len()
         );
         match session.write_macro_slot(&backup, slot, &plans).await {
-            Ok(outcome) => warn_if_config_crc_invalid(outcome.config_crc_valid),
+            Ok(outcome) => {
+                println!(
+                    "  slot {}: packets sent {}, config crc {}",
+                    slot.index(),
+                    outcome.packets_sent,
+                    config_crc_label(outcome.config_crc_valid)
+                );
+                for readback in &outcome.readbacks {
+                    println!(
+                        "    macro {} ({}): read-back sha256 {}",
+                        readback.index().index(),
+                        macro_id(readback.index()),
+                        sha256_hex(readback.raw())
+                    );
+                }
+                warn_if_config_crc_invalid(outcome.config_crc_valid);
+            }
             Err(error) => {
                 eprintln!("restore stopped at slot {}: {error}", slot.index());
                 report_restore_recovery(pre_restore_complete, pre_dir);
@@ -1917,7 +2078,15 @@ async fn macro_restore_session_core<T: Transport>(
             slot.index()
         );
         match session.write_macro_header(&backup, slot).await {
-            Ok(outcome) => warn_if_config_crc_invalid(outcome.config_crc_valid),
+            Ok(outcome) => {
+                println!(
+                    "  slot {}: header packets sent {}, config crc {}",
+                    slot.index(),
+                    outcome.packets_sent,
+                    config_crc_label(outcome.config_crc_valid)
+                );
+                warn_if_config_crc_invalid(outcome.config_crc_valid);
+            }
             Err(error) => {
                 eprintln!("restore header stopped at slot {}: {error}", slot.index());
                 report_restore_recovery(pre_restore_complete, pre_dir);
@@ -1987,6 +2156,15 @@ async fn verify_restored_state<T: Transport>(
     Ok(())
 }
 
+/// Run one macro backup on an existing session.
+///
+/// Shared by the top-level `macro backup` command and the `session` REPL.
+/// Read-only on the controller; the output-directory rules (empty/non-empty
+/// directory, symlink) live in [`macro_backup_session`].
+async fn run_macro_backup<T: Transport>(session: &Session<T>, dir: &Path) -> Result<(), Error> {
+    macro_backup_session(session, dir).await
+}
+
 /// Read the configuration and all 3 slots × 4 macros into `dir`.
 async fn macro_backup(
     options: &BleOptions,
@@ -1996,7 +2174,7 @@ async fn macro_backup(
 ) -> Result<(), Error> {
     let transport = BleTransport::connect(options).await?;
     let session = macro_session(transport, poll_interval_ms, report_enable);
-    let result = macro_backup_session(&session, dir).await;
+    let result = run_macro_backup(&session, dir).await;
     print_poll_stats(options, &session);
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
@@ -2502,6 +2680,20 @@ enum SessionCommand {
         raw: Option<PathBuf>,
         json: Option<PathBuf>,
     },
+    MacroBackup {
+        dir: PathBuf,
+    },
+    MacroWrite {
+        slot: u8,
+        index: u8,
+        file: PathBuf,
+        trigger: Option<String>,
+        chunk_size: Option<u16>,
+    },
+    MacroRestore {
+        dir: PathBuf,
+        force: bool,
+    },
     Monitor {
         count: Option<u64>,
     },
@@ -2578,6 +2770,8 @@ fn parse_session_command(line: &str) -> SessionCommand {
             Some((raw, json)) => SessionCommand::Backup { raw, json },
             None => SessionCommand::Unknown(line.to_string()),
         },
+        "macro" => parse_macro_session_command(parts)
+            .unwrap_or_else(|| SessionCommand::Unknown(line.to_string())),
         "monitor" => match parts.next() {
             None => SessionCommand::Monitor { count: None },
             Some("stop") if parts.next().is_none() => SessionCommand::MonitorStop,
@@ -2596,11 +2790,112 @@ fn parse_session_command(line: &str) -> SessionCommand {
     }
 }
 
-fn print_session_help() {
+/// One positional REPL value; option-looking tokens are rejected so a missing
+/// argument (`macro backup --force`) cannot silently become a path.
+fn session_plain_value<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let value = parts.next()?;
+    (!value.starts_with("--")).then_some(value)
+}
+
+/// Parse the `macro ...` REPL subcommands.
+///
+/// These mirror the top-level `macro backup` / `macro write` / `macro restore`
+/// arguments, but the macro write backup directory is not exposed (the
+/// timestamped default is used). Options are strict: an unknown option, a
+/// repeated option, or a missing value rejects the whole line.
+fn parse_macro_session_command<'a>(
+    mut parts: impl Iterator<Item = &'a str>,
+) -> Option<SessionCommand> {
+    match parts.next()? {
+        "backup" => {
+            let dir = PathBuf::from(session_plain_value(&mut parts)?);
+            parts
+                .next()
+                .is_none()
+                .then_some(SessionCommand::MacroBackup { dir })
+        }
+        "restore" => {
+            let dir = PathBuf::from(session_plain_value(&mut parts)?);
+            let mut force = false;
+            for part in parts {
+                match part {
+                    "--force" if !force => force = true,
+                    _ => return None,
+                }
+            }
+            Some(SessionCommand::MacroRestore { dir, force })
+        }
+        "write" => {
+            let slot: u8 = parts.next()?.parse().ok()?;
+            let index: u8 = parts.next()?.parse().ok()?;
+            let file = PathBuf::from(session_plain_value(&mut parts)?);
+            let mut trigger = None;
+            let mut chunk_size = None;
+            while let Some(part) = parts.next() {
+                match part {
+                    "--trigger" if trigger.is_none() => {
+                        trigger = Some(session_plain_value(&mut parts)?.to_string());
+                    }
+                    "--chunk-size" if chunk_size.is_none() => {
+                        let requested: u16 = session_plain_value(&mut parts)?.parse().ok()?;
+                        if requested != 32 && requested != 64 {
+                            return None;
+                        }
+                        chunk_size = Some(requested);
+                    }
+                    _ => return None,
+                }
+            }
+            Some(SessionCommand::MacroWrite {
+                slot,
+                index,
+                file,
+                trigger,
+                chunk_size,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// True for the two REPL commands that write macro flash.
+///
+/// These are the commands that must not be cancelled by Ctrl-C, and the ones
+/// gated by `--allow-macro-write`.
+fn is_macro_flash_command(command: &SessionCommand) -> bool {
+    matches!(
+        command,
+        SessionCommand::MacroWrite { .. } | SessionCommand::MacroRestore { .. }
+    )
+}
+
+/// The refusal printed when `macro write` / `macro restore` is entered without
+/// `--allow-macro-write`.
+fn macro_write_disabled_message(command: &SessionCommand) -> Option<&'static str> {
+    match command {
+        SessionCommand::MacroWrite { .. } => {
+            Some("macro write is disabled; restart with --allow-macro-write")
+        }
+        SessionCommand::MacroRestore { .. } => {
+            Some("macro restore is disabled; restart with --allow-macro-write")
+        }
+        _ => None,
+    }
+}
+
+fn print_session_help(allow_macro_write: bool) {
     println!("commands:");
     println!("  info");
     println!("  config dump [--raw FILE] [--json FILE]");
     println!("  backup [--raw FILE] [--json FILE]");
+    println!("  macro backup <DIR>");
+    if allow_macro_write {
+        println!("  macro write <SLOT> <INDEX> <FILE> [--trigger <KEY>] [--chunk-size 32|64]");
+        println!("  macro restore <DIR> [--force]");
+    } else {
+        println!("  macro write ... (disabled; restart with --allow-macro-write)");
+        println!("  macro restore ... (disabled; restart with --allow-macro-write)");
+    }
     println!("  monitor [--count N]");
     println!("  monitor stop");
     println!("  status");
@@ -2611,6 +2906,19 @@ fn print_session_help() {
     );
     println!(
         "monitor --count N returns after N reports; without responses it can wait indefinitely."
+    );
+    println!(
+        "macro write/restore hold the operation lock: the keepalive pauses during the operation \
+         and resumes after it; do not press Ctrl-C during a write."
+    );
+    println!(
+        "note: REPL 'macro write' has no --backup-dir; it always uses the timestamped default \
+         pre-write backup directory in the current directory. Use top-level \
+         'eightbitdo macro write --backup-dir DIR' to choose the path."
+    );
+    println!(
+        "note: REPL 'macro restore' has no --chunk-size; the write chunk size is selected from \
+         the MTU. Use top-level 'eightbitdo macro restore --chunk-size 32|64' to force it."
     );
 }
 
@@ -2627,12 +2935,21 @@ fn unknown_command_message(line: &str) -> String {
 /// `session` is the single operation lock: keepalive ticks and REPL commands
 /// all take this mutex, so a command never races a keepalive drain for a
 /// response.
+///
+/// Production goes through [`start_session_keepalive_with_config`] so the
+/// `--no-report-enable` decision is explicit; this default-ON wrapper is kept
+/// for the tests that only need a running keepalive.
+#[cfg(test)]
 async fn start_session_keepalive<T: Transport + 'static>(
     session: Arc<AsyncMutex<Session<T>>>,
     interval: Duration,
 ) -> Result<SessionKeepalive, Error> {
-    start_session_keepalive_with_config(session, SessionKeepaliveConfig::with_interval(interval))
-        .await
+    start_session_keepalive_with_config(
+        session,
+        SessionKeepaliveConfig::with_interval(interval),
+        true,
+    )
+    .await
 }
 
 fn spawn_session_keepalive<T: Transport + 'static>(
@@ -2656,13 +2973,14 @@ fn spawn_session_keepalive<T: Transport + 'static>(
 async fn start_session_keepalive_with_config<T: Transport + 'static>(
     session: Arc<AsyncMutex<Session<T>>>,
     config: SessionKeepaliveConfig,
+    enable_reports: bool,
 ) -> Result<SessionKeepalive, Error> {
     if config.interval.is_zero() {
         return Err(Error::Transport(
             "session interval must be greater than zero".to_string(),
         ));
     }
-    {
+    if enable_reports {
         let guard = session.lock().await;
         guard.set_report_enable(true).await?;
     }
@@ -3177,15 +3495,69 @@ fn status_report(
     out
 }
 
+/// Run `macro backup` while holding the operation lock.
+///
+/// Named wrappers keep the lock inside the production call rather than in the
+/// caller: the REPL arms and the tests execute the same lock-and-run unit.
+async fn run_session_macro_backup<T: Transport>(
+    session: &Arc<AsyncMutex<Session<T>>>,
+    dir: &Path,
+) -> Result<(), Error> {
+    let guard = session.lock().await;
+    run_macro_backup(&guard, dir).await
+}
+
+/// Run `macro write` while holding the operation lock for the whole operation.
+///
+/// The keepalive task takes the same lock on every 20 ms tick, so no `0x0003`
+/// can be sent between the first configuration read and the final Save.
+///
+/// Ctrl-C is deferred for this entire call, including the pre-write backup
+/// reads. That region is bounded by the Session per-frame timeout (5 s) and
+/// the config/macro total timeouts (30 s each), so it can take minutes in a
+/// pathological timeout case even though it is normally seconds. A follow-up
+/// can split the read-only preparation from the flash write to shorten the
+/// deferral window.
+async fn run_session_macro_write<T: Transport>(
+    session: &Arc<AsyncMutex<Session<T>>>,
+    request: &PreparedMacroWrite,
+    backup_dir: &Path,
+    chunk_size: Option<u16>,
+) -> Result<(), Error> {
+    let guard = session.lock().await;
+    run_macro_write(&guard, request, backup_dir, chunk_size).await
+}
+
+/// Run `macro restore` while holding the operation lock for the whole
+/// operation, including the pre-restore backup and the final verification.
+async fn run_session_macro_restore<T: Transport>(
+    session: &Arc<AsyncMutex<Session<T>>>,
+    dir: &Path,
+    force: bool,
+) -> Result<(), Error> {
+    let guard = session.lock().await;
+    run_macro_restore(&guard, dir, force, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn execute_session_command<T: Transport + 'static>(
     session: &Arc<AsyncMutex<Session<T>>>,
     keepalive: &Arc<SessionKeepaliveState>,
     started: Instant,
     mtu: u16,
     interval: Duration,
+    allow_macro_write: bool,
     monitor: &mut Option<SessionMonitor>,
     command: SessionCommand,
 ) -> Result<SessionOutcome, Error> {
+    // The read-only default is enforced before touching the session: a
+    // disabled write/restore must not send even one frame.
+    if !allow_macro_write {
+        if let Some(message) = macro_write_disabled_message(&command) {
+            eprintln!("{message}");
+            return Ok(SessionOutcome::Continue);
+        }
+    }
     let reaped = reap_finished_monitor(monitor).await;
     if let Some(status) = &reaped {
         report_monitor_exit(status)?;
@@ -3228,6 +3600,49 @@ async fn execute_session_command<T: Transport + 'static>(
                 std::future::pending::<()>(),
             )
             .await?;
+            Ok(SessionOutcome::Continue)
+        }
+        SessionCommand::MacroBackup { dir } => {
+            if monitor.is_some() {
+                eprintln!("monitor is running; use 'monitor stop' first");
+                return Ok(SessionOutcome::Continue);
+            }
+            // Read-only on the controller, so no --allow-macro-write needed.
+            run_session_macro_backup(session, &dir).await?;
+            Ok(SessionOutcome::Continue)
+        }
+        SessionCommand::MacroWrite {
+            slot,
+            index,
+            file,
+            trigger,
+            chunk_size,
+        } => {
+            if monitor.is_some() {
+                eprintln!("monitor is running; use 'monitor stop' first");
+                return Ok(SessionOutcome::Continue);
+            }
+            // Parse the file and validate slot/index/trigger before the lock:
+            // a bad request must not stall (or touch) the controller.
+            let request = prepare_macro_write(slot, index, &file, trigger.as_deref())?;
+            let backup_dir = resolve_write_backup_dir(None);
+            // `run_session_macro_write` holds the operation lock from the first
+            // configuration read to the final Save, so the 20 ms keepalive
+            // cannot interleave a 0x0003.
+            run_session_macro_write(session, &request, &backup_dir, chunk_size).await?;
+            Ok(SessionOutcome::Continue)
+        }
+        SessionCommand::MacroRestore { dir, force } => {
+            if monitor.is_some() {
+                eprintln!("monitor is running; use 'monitor stop' first");
+                return Ok(SessionOutcome::Continue);
+            }
+            eprintln!(
+                "warning: do not press Ctrl-C during the macro restore; a failure can leave a \
+                 sector partially updated. A pre-restore backup of the current controller is \
+                 taken before any write."
+            );
+            run_session_macro_restore(session, &dir, force).await?;
             Ok(SessionOutcome::Continue)
         }
         SessionCommand::Monitor { count: Some(count) } => {
@@ -3293,7 +3708,7 @@ async fn execute_session_command<T: Transport + 'static>(
             Ok(SessionOutcome::Continue)
         }
         SessionCommand::Help => {
-            print_session_help();
+            print_session_help(allow_macro_write);
             Ok(SessionOutcome::Continue)
         }
         SessionCommand::Quit => Ok(SessionOutcome::Quit),
@@ -3460,6 +3875,7 @@ async fn session_repl_loop<T: Transport + 'static>(
     started: Instant,
     mtu: u16,
     interval: Duration,
+    allow_macro_write: bool,
 ) -> Result<(), Error> {
     let stdin = tokio::io::stdin();
     let mut reader = tokio::io::BufReader::new(stdin);
@@ -3473,6 +3889,7 @@ async fn session_repl_loop<T: Transport + 'static>(
         started,
         mtu,
         interval,
+        allow_macro_write,
         &mut reader,
         ctrl_c,
         interactive,
@@ -3487,6 +3904,7 @@ async fn session_repl_loop_with_io<T, R, F>(
     started: Instant,
     mtu: u16,
     interval: Duration,
+    allow_macro_write: bool,
     reader: &mut R,
     ctrl_c: F,
     interactive: bool,
@@ -3509,6 +3927,10 @@ where
     tokio::pin!(ctrl_c);
     let mut monitor: Option<SessionMonitor> = None;
     let mut result = Ok(());
+    // `ctrl_c` is polled to completion inside the non-cancellable flash branch.
+    // A future must not be polled again after completion, so the loop exits
+    // right after that command instead of re-entering the outer select.
+    let mut ctrl_c_deferred = false;
 
     loop {
         if interactive {
@@ -3576,27 +3998,59 @@ where
                     }
                 };
                 let command = parse_session_command(text.trim());
-                let outcome = tokio::select! {
-                    biased;
-                    _ = &mut ctrl_c => {
-                        // The command future is dropped, not aborted. Dropping
-                        // a `Session` read marks it for resync via
-                        // `ResyncGuard` (an abandoned input poll does not; a
-                        // protocol error from one is marked by `fail()`), so
-                        // the next read drains only when a response could
-                        // still be in flight. There is no caller-side mark to
-                        // clear; `Session::InFlight` makes that decision.
-                        break;
-                    }
-                    outcome = execute_session_command(
+                // A macro flash write must not be dropped mid-operation: a
+                // Ctrl-C that cancels the future between Erase and Save can
+                // leave a sector partially updated, which is exactly what the
+                // pre-write warning tells the operator to avoid. The signal is
+                // observed once (with a notice) and then serviced after the
+                // command returns by the loop's own Ctrl-C branch.
+                let outcome = if allow_macro_write && is_macro_flash_command(&command) {
+                    let mut command_future = std::pin::pin!(execute_session_command(
                         session,
                         keepalive,
                         started,
                         mtu,
                         interval,
+                        allow_macro_write,
                         &mut monitor,
                         command,
-                    ) => outcome,
+                    ));
+                    tokio::select! {
+                        biased;
+                        outcome = &mut command_future => outcome,
+                        _ = &mut ctrl_c => {
+                            eprintln!(
+                                "note: Ctrl-C received; the macro operation is not cancellable \
+                                 and will finish before the session exits"
+                            );
+                            ctrl_c_deferred = true;
+                            command_future.await
+                        }
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = &mut ctrl_c => {
+                            // The command future is dropped, not aborted. Dropping
+                            // a `Session` read marks it for resync via
+                            // `ResyncGuard` (an abandoned input poll does not; a
+                            // protocol error from one is marked by `fail()`), so
+                            // the next read drains only when a response could
+                            // still be in flight. There is no caller-side mark to
+                            // clear; `Session::InFlight` makes that decision.
+                            break;
+                        }
+                        outcome = execute_session_command(
+                            session,
+                            keepalive,
+                            started,
+                            mtu,
+                            interval,
+                            allow_macro_write,
+                            &mut monitor,
+                            command,
+                        ) => outcome,
+                    }
                 };
                 match outcome {
                     Ok(SessionOutcome::Quit) => break,
@@ -3608,6 +4062,11 @@ where
                         }
                         eprintln!("error: {error}");
                     }
+                }
+                if ctrl_c_deferred {
+                    // Exit only after the flash command finished; the ctrl_c
+                    // future was already driven to completion above.
+                    break;
                 }
             }
         }
@@ -3627,7 +4086,12 @@ where
     finalize_session_result(result, keepalive)
 }
 
-async fn session(options: &BleOptions, interval: Duration) -> Result<ExitCode, Error> {
+async fn session(
+    options: &BleOptions,
+    interval: Duration,
+    allow_macro_write: bool,
+    report_enable: bool,
+) -> Result<ExitCode, Error> {
     if interval.is_zero() {
         eprintln!("session error: --interval-ms must be greater than zero");
         return Ok(ExitCode::FAILURE);
@@ -3644,7 +4108,13 @@ async fn session(options: &BleOptions, interval: Duration) -> Result<ExitCode, E
         let guard = session.lock().await;
         guard.transport().mtu()
     };
-    let keepalive = match start_session_keepalive(Arc::clone(&session), interval).await {
+    let keepalive = match start_session_keepalive_with_config(
+        Arc::clone(&session),
+        SessionKeepaliveConfig::with_interval(interval),
+        report_enable,
+    )
+    .await
+    {
         Ok(keepalive) => keepalive,
         Err(error) => {
             if let Ok(guard) = tokio::time::timeout(CLEANUP_TIMEOUT, session.lock()).await {
@@ -3654,9 +4124,21 @@ async fn session(options: &BleOptions, interval: Duration) -> Result<ExitCode, E
             return Ok(ExitCode::FAILURE);
         }
     };
+    // Make the 0x0007 state explicit: a REPL macro write happens while this
+    // state is active, which differs from the top-level `macro write` default.
+    println!(
+        "report enable (0x0007): {}. REPL `macro write` runs in this state; the top-level \
+         `eightbitdo macro write` default sends no 0x0007 (use --no-report-enable to match it).",
+        if report_enable {
+            "on (official default)"
+        } else {
+            "off (--no-report-enable)"
+        }
+    );
     let state = Arc::clone(&keepalive.state);
     let started = Instant::now();
-    let result = session_repl_loop(&session, &state, started, mtu, interval).await;
+    let result =
+        session_repl_loop(&session, &state, started, mtu, interval, allow_macro_write).await;
     shutdown_session(&session, keepalive).await;
     let result = finalize_session_result(result, &state);
 
@@ -3667,6 +4149,13 @@ async fn session(options: &BleOptions, interval: Duration) -> Result<ExitCode, E
             Ok(ExitCode::FAILURE)
         }
     }
+}
+
+/// Map `--no-report-enable` to the startup `0x0007` decision.
+///
+/// Kept as a pure function so the flag mapping is testable without a device.
+fn session_report_enable(no_report_enable: bool) -> bool {
+    !no_report_enable
 }
 
 fn print_report(report: &InputReport) {
@@ -3729,6 +4218,7 @@ mod tests {
         fail_input: Arc<AtomicBool>,
         fail_recv: Arc<AtomicBool>,
         disconnect_recv: Arc<AtomicBool>,
+        mtu: u16,
     }
 
     impl KeepaliveTestTransport {
@@ -3740,7 +4230,13 @@ mod tests {
                 fail_input: Arc::new(AtomicBool::new(false)),
                 fail_recv: Arc::new(AtomicBool::new(false)),
                 disconnect_recv: Arc::new(AtomicBool::new(false)),
+                mtu: 64,
             }
+        }
+
+        /// Same transport with another negotiated MTU (macro writes need 200).
+        fn with_mtu(mtu: u16) -> Self {
+            Self { mtu, ..Self::new() }
         }
 
         fn queue_input(&self, report: &InputReport) {
@@ -3830,12 +4326,94 @@ mod tests {
         }
 
         fn mtu(&self) -> u16 {
-            64
+            self.mtu
         }
 
         async fn disconnect(&self) -> Result<(), Error> {
             self.disconnected.store(true, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    /// Transport that answers each scripted macro command with the next frame.
+    ///
+    /// Responses are queued at `send` time, not before the operation starts.
+    /// That matters for the concurrency test: a keepalive tick that wins the
+    /// race before the command locks the session drains the notification
+    /// queue, so pre-queued replies would be stolen. Here the queue is empty
+    /// until the command itself sends a request.
+    #[derive(Clone)]
+    struct AutoRespondTransport {
+        inner: KeepaliveTestTransport,
+        script: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        served: Arc<Mutex<Vec<u16>>>,
+    }
+
+    impl AutoRespondTransport {
+        fn new(mtu: u16, script: Vec<Vec<u8>>) -> Self {
+            Self {
+                inner: KeepaliveTestTransport::with_mtu(mtu),
+                script: Arc::new(Mutex::new(script.into())),
+                served: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn sent_frames(&self) -> Vec<Vec<u8>> {
+            self.inner.sent_frames()
+        }
+
+        fn remaining_script_entries(&self) -> usize {
+            self.script.lock().unwrap().len()
+        }
+
+        fn served_commands(&self) -> Vec<u16> {
+            self.served.lock().unwrap().clone()
+        }
+    }
+
+    /// Commands that consume one scripted response in `AutoRespondTransport`.
+    fn consumes_script_entry(command: u16) -> bool {
+        matches!(
+            command,
+            commands::cmd::READ_CONFIG
+                | commands::cmd::READ_MACRO
+                | commands::cmd::WRITE_CONFIG
+                | commands::cmd::SAVE
+                | commands::cmd::ERASE_MACRO
+                | commands::cmd::WRITE_MACRO
+        )
+    }
+
+    #[async_trait]
+    impl Transport for AutoRespondTransport {
+        async fn send(&self, data: &[u8]) -> Result<(), Error> {
+            self.inner.send(data).await?;
+            let header = CustomHeader::parse(&data[1..])
+                .map_err(|error| Error::Transport(format!("malformed request frame: {error}")))?;
+            if consumes_script_entry(header.cmd) {
+                let next = self.script.lock().unwrap().pop_front();
+                let Some(frame) = next else {
+                    return Err(Error::Transport(format!(
+                        "response script exhausted at cmd 0x{:04X}",
+                        header.cmd
+                    )));
+                };
+                self.served.lock().unwrap().push(header.cmd);
+                self.inner.queue_raw(&frame);
+            }
+            Ok(())
+        }
+
+        async fn recv(&self) -> Result<Vec<u8>, Error> {
+            self.inner.recv().await
+        }
+
+        fn mtu(&self) -> u16 {
+            self.inner.mtu()
+        }
+
+        async fn disconnect(&self) -> Result<(), Error> {
+            self.inner.disconnect().await
         }
     }
 
@@ -4023,7 +4601,15 @@ mod tests {
     }
 
     fn queue_config_responses(transport: &KeepaliveTestTransport, config: &Bt2Config) {
+        for frame in config_response_frames(config) {
+            transport.queue_raw(&frame);
+        }
+    }
+
+    /// Build the 20 READ_CONFIG response frames for `config`, in offset order.
+    fn config_response_frames(config: &Bt2Config) -> Vec<Vec<u8>> {
         let bytes = config.as_bytes();
+        let mut frames = Vec::with_capacity(bytes.len() / 142 + 1);
         for (index, chunk) in bytes.chunks(142).enumerate() {
             let offset = (index * 142) as u32;
             let header = CustomHeader::new(
@@ -4033,8 +4619,55 @@ mod tests {
                 offset,
             )
             .with_payload(chunk);
-            transport.queue_response(&header, chunk);
+            let mut frame = header.to_bytes().to_vec();
+            frame.extend_from_slice(chunk);
+            frames.push(frame);
         }
+        frames
+    }
+
+    /// Build one payload-less ACK frame for `command`.
+    fn ack_frame(command: u16) -> Vec<u8> {
+        CustomHeader::new(command, 0, 0, 0).to_bytes().to_vec()
+    }
+
+    /// Build the READ_MACRO response frames for one raw step payload.
+    fn macro_read_frames(raw: &[u8]) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        let mut offset = 0u32;
+        for chunk in raw.chunks(142) {
+            let mut header = CustomHeader::new(
+                commands::cmd::RESPONSE,
+                commands::cmd::READ_MACRO,
+                raw.len() as u32,
+                offset,
+            )
+            .with_chunk_len(chunk.len() as u16);
+            header.crc16 = eightbitdo_protocol::crc::packet_crc16(chunk);
+            let mut frame = header.to_bytes().to_vec();
+            frame.extend_from_slice(chunk);
+            frames.push(frame);
+            offset += chunk.len() as u32;
+        }
+        frames
+    }
+
+    fn commands_of(frames: &[Vec<u8>]) -> Vec<u16> {
+        frames
+            .iter()
+            .map(|frame| CustomHeader::parse(&frame[1..]).unwrap().cmd)
+            .collect()
+    }
+
+    fn sent_commands(transport: &KeepaliveTestTransport) -> Vec<u16> {
+        commands_of(&transport.sent_frames())
+    }
+
+    fn sent_command_count(transport: &KeepaliveTestTransport, command: u16) -> usize {
+        sent_commands(transport)
+            .into_iter()
+            .filter(|sent| *sent == command)
+            .count()
     }
 
     #[tokio::test]
@@ -4148,6 +4781,7 @@ mod tests {
             started,
             64,
             Duration::from_millis(1),
+            false,
             &mut monitor_state,
             SessionCommand::Info,
         )
@@ -4161,6 +4795,7 @@ mod tests {
             started,
             64,
             Duration::from_millis(1),
+            false,
             &mut monitor_state,
             SessionCommand::ConfigDump {
                 raw: None,
@@ -4177,6 +4812,7 @@ mod tests {
             started,
             64,
             Duration::from_millis(1),
+            false,
             &mut monitor_state,
             SessionCommand::Monitor { count: Some(2) },
         )
@@ -4239,6 +4875,426 @@ mod tests {
         assert!(transport.is_disconnected());
     }
 
+    /// Default pre-write backup directories currently visible in the CWD,
+    /// used to find (and remove) the directory a REPL write created.
+    fn default_backup_dirs_in_cwd() -> std::collections::BTreeSet<PathBuf> {
+        std::fs::read_dir(".")
+            .expect("read the CWD")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| PathBuf::from(entry.file_name()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|name| name.starts_with("macro-backup-"))
+            })
+            .collect()
+    }
+
+    /// Remove a directory even when an assertion later in the test panics.
+    struct RemoveDirOnDrop(PathBuf);
+
+    impl Drop for RemoveDirOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// End-to-end session macro write through `execute_session_command`.
+    ///
+    /// The keepalive ticks every 20 ms while the write runs (~450 ms of
+    /// official settle delays), so the handler's operation lock is what keeps
+    /// `0x0003` off the wire between the first configuration read and the
+    /// final read-back. If the lock is missing (or the keepalive ignores it),
+    /// INPUT frames appear inside that frame window and this test fails.
+    #[tokio::test]
+    async fn session_macro_write_pauses_and_resumes_the_keepalive() {
+        let root = scratch_dir("session-macro-keepalive");
+        let fixture_dir = root.join("fixture");
+        let (snapshot, backup) = backup_fixture(&fixture_dir);
+        let macro_file = root.join("edit.json");
+        std::fs::write(&macro_file, serde_json::to_vec(&test_macro_file()).unwrap()).unwrap();
+        let existing = backup.get(Slot::S1, MacroIndex::M1).unwrap().raw();
+
+        // Response script in exact request order: config snapshot, the one
+        // non-empty macro, Header x2, Save, Erase, Write, Save, read-back
+        // config, read-back macro. Responses are served on `send` so a
+        // keepalive tick that races the command cannot steal them.
+        let mut script = config_response_frames(&snapshot.config);
+        script.extend(macro_read_frames(existing));
+        script.extend([
+            ack_frame(commands::cmd::WRITE_CONFIG),
+            ack_frame(commands::cmd::WRITE_CONFIG),
+            ack_frame(commands::cmd::SAVE),
+            ack_frame(commands::cmd::ERASE_MACRO),
+            ack_frame(commands::cmd::WRITE_MACRO),
+            ack_frame(commands::cmd::SAVE),
+        ]);
+        script.extend(config_response_frames(&snapshot.config));
+        script.extend(macro_read_frames(existing));
+
+        let transport = AutoRespondTransport::new(200, script);
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let interval = Duration::from_millis(20);
+        let keepalive = start_session_keepalive_with_config(
+            Arc::clone(&session),
+            SessionKeepaliveConfig::with_interval(interval),
+            true,
+        )
+        .await
+        .unwrap();
+        wait_for_keepalive_send(&keepalive.state).await;
+
+        let dirs_before = default_backup_dirs_in_cwd();
+        let keepalive_before = keepalive.state.sent.load(Ordering::SeqCst);
+        let mut monitor: Option<SessionMonitor> = None;
+        let started = Instant::now();
+        let outcome = execute_session_command(
+            &session,
+            &keepalive.state,
+            started,
+            200,
+            interval,
+            true,
+            &mut monitor,
+            SessionCommand::MacroWrite {
+                slot: 0,
+                index: 0,
+                file: macro_file,
+                trigger: None,
+                chunk_size: None,
+            },
+        )
+        .await
+        .expect("session macro write must succeed");
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, SessionOutcome::Continue);
+
+        // Non-vacuous timing: the write must span many 20 ms keepalive
+        // periods. With the previous 1 s interval this was false and the test
+        // would have passed even with no operation lock.
+        assert!(
+            elapsed > interval * 10,
+            "write took only {elapsed:?}; the keepalive could not have ticked during it"
+        );
+
+        let frames = transport.sent_frames();
+        let commands: Vec<u16> = frames
+            .iter()
+            .map(|frame| CustomHeader::parse(&frame[1..]).unwrap().cmd)
+            .collect();
+        let start = commands
+            .iter()
+            .position(|command| *command == commands::cmd::READ_CONFIG)
+            .expect("the write must send a configuration read");
+        let end = commands
+            .iter()
+            .rposition(|command| *command == commands::cmd::READ_MACRO)
+            .expect("the write must end with a macro read-back");
+        assert!(start < end, "unexpected write frame window {start}..={end}");
+        let input_during: Vec<usize> = (start..=end)
+            .filter(|index| commands[*index] == commands::cmd::INPUT)
+            .collect();
+        assert!(
+            input_during.is_empty(),
+            "0x0003 was sent during the macro write at frame indices {input_during:?}"
+        );
+
+        let count = |command: u16| commands.iter().filter(|sent| **sent == command).count();
+        assert_eq!(count(commands::cmd::WRITE_CONFIG), 2);
+        assert_eq!(count(commands::cmd::SAVE), 2);
+        assert_eq!(count(commands::cmd::ERASE_MACRO), 1);
+        assert_eq!(count(commands::cmd::WRITE_MACRO), 1);
+        assert_eq!(count(commands::cmd::READ_CONFIG), 40);
+        assert_eq!(count(commands::cmd::READ_MACRO), 2);
+        assert_eq!(transport.remaining_script_entries(), 0);
+        assert_eq!(transport.served_commands().len(), 48);
+
+        // The handler resolved the default backup path and wrote a real backup.
+        let dirs_after = default_backup_dirs_in_cwd();
+        let created: Vec<PathBuf> = dirs_after.difference(&dirs_before).cloned().collect();
+        assert_eq!(
+            created.len(),
+            1,
+            "expected exactly one new pre-write backup directory, got {created:?}"
+        );
+        let backup_dir = RemoveDirOnDrop(created[0].clone());
+        assert!(backup_dir.0.join("config.bin").is_file());
+        assert!(backup_dir.0.join("macros.json").is_file());
+
+        // The lock is released: the keepalive resumes with a new 0x0003 after
+        // the write frame window.
+        let mut resumed = false;
+        for _ in 0..100 {
+            let commands = commands_of(&transport.sent_frames());
+            if keepalive.state.sent.load(Ordering::SeqCst) > keepalive_before
+                && commands
+                    .iter()
+                    .skip(end + 1)
+                    .any(|command| *command == commands::cmd::INPUT)
+            {
+                resumed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            resumed,
+            "the keepalive did not resume after the macro write: sent={}",
+            keepalive.state.sent.load(Ordering::SeqCst)
+        );
+
+        shutdown_session(&session, keepalive).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The REPL loop must pass its `allow_macro_write` state to the handler.
+    ///
+    /// A valid macro file is used on purpose: if the loop hardcoded `true`, the
+    /// handler would start reading the controller and the transport would
+    /// record frames. The disabled flag must reject before any device I/O.
+    #[tokio::test]
+    async fn session_repl_rejects_macro_write_from_input_without_the_opt_in_flag() {
+        let root = scratch_dir("session-gate-repl");
+        let macro_file = root.join("edit.json");
+        std::fs::write(&macro_file, serde_json::to_vec(&test_macro_file()).unwrap()).unwrap();
+
+        // An empty response script: if the loop wrongly allowed the command,
+        // the first configuration read would be recorded and then fail.
+        let transport = AutoRespondTransport::new(200, Vec::new());
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let state = Arc::new(SessionKeepaliveState::new());
+        let input = format!("macro write 0 0 {}\nquit\n", macro_file.display());
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes()));
+        let result = session_repl_loop_with_io(
+            &session,
+            &state,
+            Instant::now(),
+            200,
+            Duration::from_millis(20),
+            false,
+            &mut reader,
+            std::future::pending::<()>(),
+            false,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a disabled macro write must not end the session: {result:?}"
+        );
+        assert!(
+            transport.sent_frames().is_empty(),
+            "the loop must forward allow_macro_write=false; a device read was sent"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Ctrl-C during `macro restore` is deferred until the command finishes.
+    ///
+    /// The ctrl_c future resolves as soon as the restore has sent its first
+    /// Erase, i.e. deep inside the write. If the loop cancelled the command
+    /// future (the behaviour for read-only commands), the final verification
+    /// reads would be missing and the pre-restore backup would be incomplete.
+    #[tokio::test]
+    async fn session_ctrl_c_during_macro_restore_is_deferred_until_completion() {
+        let root = scratch_dir("session-ctrl-c-restore");
+        let fixture_dir = root.join("fixture");
+        let (snapshot, backup) = backup_fixture(&fixture_dir);
+
+        // Same response script as `restore_verifies_non_empty_macro_raw`.
+        let transport = KeepaliveTestTransport::with_mtu(200);
+        for frame in config_response_frames(&snapshot.config) {
+            transport.queue_raw(&frame);
+        }
+        for frame in macro_read_frames(backup.get(Slot::S1, MacroIndex::M1).unwrap().raw()) {
+            transport.queue_raw(&frame);
+        }
+        for frame in [
+            ack_frame(commands::cmd::WRITE_CONFIG),
+            ack_frame(commands::cmd::WRITE_CONFIG),
+            ack_frame(commands::cmd::SAVE),
+            ack_frame(commands::cmd::ERASE_MACRO),
+            ack_frame(commands::cmd::WRITE_MACRO),
+            ack_frame(commands::cmd::SAVE),
+        ] {
+            transport.queue_raw(&frame);
+        }
+        for frame in config_response_frames(&snapshot.config) {
+            transport.queue_raw(&frame);
+        }
+        for frame in macro_read_frames(backup.get(Slot::S1, MacroIndex::M1).unwrap().raw()) {
+            transport.queue_raw(&frame);
+        }
+        for frame in config_response_frames(&snapshot.config) {
+            transport.queue_raw(&frame);
+        }
+        for frame in macro_read_frames(backup.get(Slot::S1, MacroIndex::M1).unwrap().raw()) {
+            transport.queue_raw(&frame);
+        }
+
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let state = Arc::new(SessionKeepaliveState::new());
+
+        // The ctrl_c future completes only once the restore is writing.
+        let watched = transport.clone();
+        let notify = Arc::new(Notify::new());
+        let watcher_notify = Arc::clone(&notify);
+        let watcher = tokio::spawn(async move {
+            loop {
+                let writing = watched.sent_frames().iter().any(|frame| {
+                    CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::ERASE_MACRO
+                });
+                if writing {
+                    watcher_notify.notify_one();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        let ctrl_c = async move { notify.notified().await };
+
+        let input = format!("macro restore {}\n", fixture_dir.display());
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes()));
+        let started = Instant::now();
+        let result = session_repl_loop_with_io(
+            &session,
+            &state,
+            started,
+            200,
+            Duration::from_millis(20),
+            true,
+            &mut reader,
+            ctrl_c,
+            false,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        watcher.await.unwrap();
+
+        assert!(
+            result.is_ok(),
+            "the session must exit cleanly after the deferred Ctrl-C: {result:?}"
+        );
+        // The command completed: initial config/pre-restore read, batch
+        // verification and the final whole-backup verification.
+        let commands = sent_commands(&transport);
+        let count = |command: u16| commands.iter().filter(|sent| **sent == command).count();
+        assert_eq!(count(commands::cmd::READ_CONFIG), 60);
+        assert_eq!(count(commands::cmd::READ_MACRO), 3);
+        assert_eq!(count(commands::cmd::SAVE), 2);
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "restore finished too fast ({elapsed:?}) for the Ctrl-C injection to be meaningful"
+        );
+        // The pre-restore backup was fully written before the deferred exit.
+        let pre_restore_written = std::fs::read_dir(&root).unwrap().any(|entry| {
+            entry.is_ok_and(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("-pre-restore-")
+            })
+        });
+        assert!(
+            pre_restore_written,
+            "the deferred restore must have written its pre-restore backup"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_report_enable_flag_maps_to_the_startup_0007_decision() {
+        assert!(session_report_enable(false));
+        assert!(!session_report_enable(true));
+    }
+
+    #[tokio::test]
+    async fn session_keepalive_can_skip_the_0007_enable() {
+        let transport = KeepaliveTestTransport::new();
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let keepalive = start_session_keepalive_with_config(
+            Arc::clone(&session),
+            SessionKeepaliveConfig::with_interval(Duration::from_millis(1)),
+            false,
+        )
+        .await
+        .unwrap();
+        wait_for_keepalive_send(&keepalive.state).await;
+
+        let enable_true_count = || {
+            transport
+                .sent_frames()
+                .iter()
+                .filter(|frame| {
+                    let header = CustomHeader::parse(&frame[1..]).unwrap();
+                    header.cmd == commands::cmd::REPORT_ENABLE && header.subcmd == 1
+                })
+                .count()
+        };
+        assert_eq!(enable_true_count(), 0, "0x0007 enable must be skipped");
+        assert!(
+            sent_command_count(&transport, commands::cmd::INPUT) >= 1,
+            "the keepalive must still poll 0x0003"
+        );
+
+        shutdown_session(&session, keepalive).await;
+        // Shutdown still sends a best-effort disable (subcmd 0), never enable 1.
+        assert_eq!(enable_true_count(), 0);
+    }
+
+    #[test]
+    fn macro_file_rejects_directories_and_sockets() {
+        let root = scratch_dir("macro-file-nonregular");
+        let directory = root.join("a-directory");
+        std::fs::create_dir(&directory).unwrap();
+        let error = read_macro_file(&directory).unwrap_err();
+        assert!(is_invalid_input(&error), "unexpected error: {error:?}");
+        assert!(error.to_string().contains("not a regular file"));
+
+        #[cfg(unix)]
+        {
+            let socket = root.join("a.sock");
+            let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let error = read_macro_file(&socket).unwrap_err();
+            assert!(is_invalid_input(&error), "unexpected error: {error:?}");
+            assert!(error.to_string().contains("not a regular file"));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_backup_rejects_non_regular_files() {
+        let root = scratch_dir("restore-nonregular");
+
+        // config.bin as a directory: rejected before the blocking read.
+        let config_dir = root.join("config-dir");
+        std::fs::create_dir_all(config_dir.join("config.bin")).unwrap();
+        let error = read_restore_backup(&config_dir).unwrap_err();
+        assert!(is_invalid_input(&error), "unexpected error: {error:?}");
+        assert!(error.to_string().contains("not a regular file"));
+
+        // A raw macro file replaced by a directory.
+        let fixture = root.join("fixture");
+        backup_fixture(&fixture);
+        std::fs::remove_file(fixture.join("slot0-macro0.bin")).unwrap();
+        std::fs::create_dir(fixture.join("slot0-macro0.bin")).unwrap();
+        let error = read_restore_backup(&fixture).unwrap_err();
+        assert!(is_invalid_input(&error), "unexpected error: {error:?}");
+        assert!(error.to_string().contains("not a regular file"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generated_backup_directories_are_unique() {
+        // Two writes started in the same second/process must not share a path.
+        assert_ne!(
+            default_backup_dir("macro-backup"),
+            default_backup_dir("macro-backup")
+        );
+        let base = PathBuf::from("/tmp/backup");
+        assert_ne!(pre_restore_dir(&base), pre_restore_dir(&base));
+    }
+
     #[test]
     fn parse_session_commands_covers_empty_unknown_and_options() {
         assert_eq!(parse_session_command(""), SessionCommand::Empty);
@@ -4288,6 +5344,208 @@ mod tests {
     }
 
     #[test]
+    fn parse_session_macro_commands_matches_the_documented_syntax() {
+        assert_eq!(
+            parse_session_command("macro backup out"),
+            SessionCommand::MacroBackup {
+                dir: PathBuf::from("out")
+            }
+        );
+        assert_eq!(
+            parse_session_command("macro write 0 1 file.toml"),
+            SessionCommand::MacroWrite {
+                slot: 0,
+                index: 1,
+                file: PathBuf::from("file.toml"),
+                trigger: None,
+                chunk_size: None,
+            }
+        );
+        assert_eq!(
+            parse_session_command("macro write 2 3 file.json --trigger 0x00000008 --chunk-size 32"),
+            SessionCommand::MacroWrite {
+                slot: 2,
+                index: 3,
+                file: PathBuf::from("file.json"),
+                trigger: Some("0x00000008".to_string()),
+                chunk_size: Some(32),
+            }
+        );
+        assert_eq!(
+            parse_session_command("macro write 0 1 file.toml --chunk-size 64"),
+            SessionCommand::MacroWrite {
+                slot: 0,
+                index: 1,
+                file: PathBuf::from("file.toml"),
+                trigger: None,
+                chunk_size: Some(64),
+            }
+        );
+        assert_eq!(
+            parse_session_command("macro restore backup"),
+            SessionCommand::MacroRestore {
+                dir: PathBuf::from("backup"),
+                force: false,
+            }
+        );
+        assert_eq!(
+            parse_session_command("macro restore backup --force"),
+            SessionCommand::MacroRestore {
+                dir: PathBuf::from("backup"),
+                force: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_session_macro_commands_rejects_ambiguous_or_incomplete_lines() {
+        for line in [
+            "macro",
+            "macro backup",
+            "macro backup a b",
+            "macro backup --force",
+            "macro write",
+            "macro write 0",
+            "macro write 0 1",
+            "macro write 0 1 file.toml --trigger",
+            "macro write 0 1 file.toml --trigger a --trigger b",
+            "macro write 0 1 file.toml --chunk-size",
+            "macro write 0 1 file.toml --chunk-size 48",
+            "macro write 0 1 file.toml --bogus x",
+            "macro write 256 1 file.toml",
+            "macro restore",
+            "macro restore --force",
+            "macro restore a --force --force",
+            "macro restore a --bogus",
+        ] {
+            assert!(
+                matches!(parse_session_command(line), SessionCommand::Unknown(_)),
+                "must be rejected: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn macro_write_disabled_message_names_the_opt_in_flag() {
+        assert_eq!(
+            macro_write_disabled_message(&SessionCommand::MacroWrite {
+                slot: 0,
+                index: 1,
+                file: PathBuf::from("f.toml"),
+                trigger: None,
+                chunk_size: None,
+            }),
+            Some("macro write is disabled; restart with --allow-macro-write")
+        );
+        assert_eq!(
+            macro_write_disabled_message(&SessionCommand::MacroRestore {
+                dir: PathBuf::from("backup"),
+                force: false,
+            }),
+            Some("macro restore is disabled; restart with --allow-macro-write")
+        );
+        // Read-only commands, including `macro backup`, are never gated.
+        assert_eq!(
+            macro_write_disabled_message(&SessionCommand::MacroBackup {
+                dir: PathBuf::from("out")
+            }),
+            None
+        );
+        assert_eq!(macro_write_disabled_message(&SessionCommand::Info), None);
+        assert!(is_macro_flash_command(&SessionCommand::MacroWrite {
+            slot: 0,
+            index: 0,
+            file: PathBuf::from("f"),
+            trigger: None,
+            chunk_size: None,
+        }));
+        assert!(is_macro_flash_command(&SessionCommand::MacroRestore {
+            dir: PathBuf::from("b"),
+            force: false,
+        }));
+        assert!(!is_macro_flash_command(&SessionCommand::MacroBackup {
+            dir: PathBuf::from("b")
+        }));
+    }
+
+    #[tokio::test]
+    async fn session_rejects_macro_write_and_restore_without_the_opt_in_flag() {
+        let transport = KeepaliveTestTransport::new();
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let state = Arc::new(SessionKeepaliveState::new());
+        let mut monitor: Option<SessionMonitor> = None;
+
+        // The paths do not exist on purpose: the refusal must happen before
+        // the file is read, the operation lock is taken, or any frame is sent.
+        for command in [
+            SessionCommand::MacroWrite {
+                slot: 0,
+                index: 0,
+                file: PathBuf::from("/nonexistent/macro.toml"),
+                trigger: None,
+                chunk_size: None,
+            },
+            SessionCommand::MacroRestore {
+                dir: PathBuf::from("/nonexistent/backup"),
+                force: false,
+            },
+        ] {
+            let outcome = execute_session_command(
+                &session,
+                &state,
+                Instant::now(),
+                200,
+                Duration::from_millis(20),
+                false,
+                &mut monitor,
+                command,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, SessionOutcome::Continue);
+        }
+        assert!(
+            transport.sent_frames().is_empty(),
+            "a disabled macro write/restore must not send a single frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_macro_backup_runs_without_the_opt_in_flag() {
+        let root = scratch_dir("session-macro-backup");
+        let dir = root.join("backup");
+        let config = Bt2Config::zeroed();
+        let transport = KeepaliveTestTransport::with_mtu(200);
+        queue_config_responses(&transport, &config);
+
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let state = Arc::new(SessionKeepaliveState::new());
+        let mut monitor: Option<SessionMonitor> = None;
+        let outcome = execute_session_command(
+            &session,
+            &state,
+            Instant::now(),
+            200,
+            Duration::from_millis(20),
+            false,
+            &mut monitor,
+            SessionCommand::MacroBackup { dir: dir.clone() },
+        )
+        .await
+        .unwrap();
+
+        // `macro backup` is read-only on the controller, so it is not gated.
+        assert_eq!(outcome, SessionOutcome::Continue);
+        assert!(dir.join("config.bin").is_file());
+        assert!(dir.join("macros.json").is_file());
+        assert_eq!(
+            sent_command_count(&transport, commands::cmd::READ_CONFIG),
+            20
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn unknown_command_message_escapes_terminal_control_bytes() {
         let message = unknown_command_message("bogus\u{1b}[31m\nforged\u{7}");
         assert!(
@@ -4333,6 +5591,7 @@ mod tests {
             started,
             64,
             Duration::from_millis(1),
+            false,
             &mut monitor_state,
             SessionCommand::Monitor { count: None },
         )
@@ -4374,6 +5633,7 @@ mod tests {
             started,
             64,
             Duration::from_millis(1),
+            false,
             &mut monitor_state,
             SessionCommand::MonitorStop,
         )
@@ -4558,6 +5818,7 @@ mod tests {
             started,
             64,
             Duration::from_millis(1),
+            false,
             &mut monitor_state,
             SessionCommand::Monitor { count: None },
         )
@@ -4596,6 +5857,7 @@ mod tests {
             started,
             64,
             Duration::from_millis(1),
+            false,
             &mut monitor_state,
             SessionCommand::Info,
         )
@@ -4802,7 +6064,7 @@ mod tests {
             interval: Duration::from_millis(1),
             max_consecutive_failures: 1,
         };
-        let keepalive = start_session_keepalive_with_config(Arc::clone(&session), config)
+        let keepalive = start_session_keepalive_with_config(Arc::clone(&session), config, true)
             .await
             .unwrap();
 
@@ -4857,6 +6119,7 @@ mod tests {
             started,
             64,
             Duration::from_millis(1),
+            false,
             &mut monitor_state,
             SessionCommand::Monitor { count: None },
         )
@@ -4877,6 +6140,7 @@ mod tests {
             started,
             64,
             Duration::from_millis(1),
+            false,
             &mut monitor_state,
             SessionCommand::MonitorStop,
         )
@@ -4892,6 +6156,7 @@ mod tests {
             started,
             64,
             Duration::from_millis(1),
+            false,
             &mut monitor_state,
             SessionCommand::Monitor { count: None },
         )
@@ -4912,6 +6177,7 @@ mod tests {
             started,
             64,
             Duration::from_millis(1),
+            false,
             &mut monitor_state,
             SessionCommand::MonitorStop,
         )
@@ -4947,6 +6213,7 @@ mod tests {
             started,
             64,
             Duration::from_millis(20),
+            false,
             &mut monitor_state,
             SessionCommand::Monitor { count: None },
         )
@@ -5010,6 +6277,7 @@ mod tests {
                 Instant::now(),
                 64,
                 Duration::from_millis(1),
+                false,
                 &mut buf_reader,
                 std::future::pending::<()>(),
                 false,
@@ -5099,6 +6367,7 @@ mod tests {
             Instant::now(),
             64,
             Duration::from_millis(10),
+            false,
             &mut eof_reader,
             std::future::pending::<()>(),
             false,
@@ -5122,6 +6391,7 @@ mod tests {
             Instant::now(),
             64,
             Duration::from_millis(10),
+            false,
             &mut quit_reader,
             std::future::pending::<()>(),
             false,
@@ -5194,6 +6464,7 @@ mod tests {
                 Instant::now(),
                 64,
                 Duration::from_millis(10),
+                false,
                 &mut monitor,
                 cmd,
             )
@@ -6112,6 +7383,7 @@ mod tests {
             started,
             64,
             Duration::from_millis(20),
+            false,
             &mut monitor,
             SessionCommand::Monitor { count: None },
         )
@@ -6126,6 +7398,7 @@ mod tests {
             started,
             64,
             Duration::from_millis(20),
+            false,
             &mut monitor,
             SessionCommand::Status,
         )
@@ -6210,6 +7483,7 @@ mod tests {
                 Instant::now(),
                 64,
                 Duration::from_millis(20),
+                false,
                 &mut monitor,
                 SessionCommand::Monitor { count: Some(1000) },
             ),
@@ -6225,6 +7499,7 @@ mod tests {
             Instant::now(),
             64,
             Duration::from_millis(20),
+            false,
             &mut monitor,
             SessionCommand::Info,
         )
