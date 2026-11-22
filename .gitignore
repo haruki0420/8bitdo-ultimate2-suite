@@ -7,6 +7,32 @@
 *.so
 *.dylib
 8BitDo_Ultimate_Software_V2_*/
+# 公式ソフトの配布ディレクトリ（バージョン違いをまとめて除外）
+8BitDo_Ultimate_Software_*/
+
+# Official installers and archives (DO NOT COMMIT)
+*.zip
+*.7z
+*.rar
+
+# Official firmware images and device backups (DO NOT COMMIT)
+# 公式ファームウェアは .dat / .bin / .hex / .uf2 / .img で配布され、
+# バックアップはユーザーデータを含み得る。
+*.dat
+*.bin
+*.hex
+*.uf2
+*.img
+/firmware/
+macro-backup-*/
+config-backup-*/
+
+# Test fixtures may legitimately contain .dat / .bin files.
+# 規約: fixture は tests/fixtures/ または crates/<crate>/tests/fixtures/ に置く。
+!tests/fixtures/**/*.dat
+!tests/fixtures/**/*.bin
+!crates/**/tests/fixtures/**/*.dat
+!crates/**/tests/fixtures/**/*.bin
 
 # Build artifacts & dependencies
 target/

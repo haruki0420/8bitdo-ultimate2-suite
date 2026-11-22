@@ -6,6 +6,8 @@
 
 Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続したまま、**Linux / macOS / Windows / Android / iOS** から **BLE GATT（アドバタイズ名 `"80ND"`）** 経由で同時接続し、リアルタイムにマクロやプロファイルを編集・適用することを目指しています。
 
+> **非公式プロジェクト**: 本プロジェクトは 8BitDo（Shenzhen Bestodo Tech Co., Ltd.）と提携・承認・後援関係にない、独立した非公式オープンソースプロジェクトです。公式のバイナリ・ファームウェア・ロゴは含みません。商標と非提携の扱いは [TRADEMARKS.md](TRADEMARKS.md) を参照してください。
+
 ---
 
 ## 主な特徴（設計目標）
@@ -55,6 +57,9 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 | **[CONTRIBUTING.md](CONTRIBUTING.md)** | ブランチ運用、必須 CI、独立レビュー（Tier 1〜3 / SHA 紐づきの `review-gate` 成功）の手順 |
 | **[docs/BRANCH_PROTECTION.md](docs/BRANCH_PROTECTION.md)** | `main` の canonical ruleset、`review-gate` の付け方・監査とゲートの限界 |
 | **[docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)** | リスクに応じた独立レビューの Tier 1〜3、レビュアーの役割、故障リストの書き方 |
+| **[LICENSE-MIT](LICENSE-MIT)** / **[LICENSE-APACHE](LICENSE-APACHE)** | コードのライセンス全文（MIT / Apache-2.0） |
+| **[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)** | 依存ライブラリのライセンス一覧、帰属表示、同梱フォント（OFL）の扱い |
+| **[TRADEMARKS.md](TRADEMARKS.md)** | 第三者の商標、非公式・非提携、ロゴ不使用の方針 |
 
 ---
 
@@ -79,3 +84,19 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 
 - 本プロジェクトは非公式のオープンソースプロジェクトであり、8BitDo とは一切関係ありません。
 - 著作権保護された公式ソフトウェアのバイナリ・ファームウェアファイル自体は本リポジトリに含まれていません。
+
+---
+
+## ライセンス
+
+- **コード**（`crates/` 以下）: [MIT](LICENSE-MIT) または [Apache-2.0](LICENSE-APACHE) のいずれかを選択できます（`MIT OR Apache-2.0`）。
+- **ドキュメント**（`docs/` 以下と `README.md` など）: 特記がない限り、コードと同じ `MIT OR Apache-2.0` です。将来 CC BY 4.0 などの別ライセンスへ変更する場合は、変更時に本文へ明記します。ただし、第三者に由来する部分（同梱フォントの OFL、第三者コードの BSD / Unicode 表示、引用・出典）は、それぞれの権利者のライセンス条件に従います。
+- **同梱フォント**（GUI を取り込む時点で同梱）: SIL Open Font License 1.1。`crates/eightbitdo-gui/assets/fonts/OFL.txt` を同梱し、GUI の About > Open Source Licenses などのライセンス画面から全文を参照できるようにします。
+- 依存ソフトウェアのライセンスは [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) を参照してください。同ファイルは要約と参照であり、全クレートの著作権表示・ライセンス本文を網羅しません。バイナリ配布時は `cargo-about` 等で完全な第三者通知を生成して同梱してください。
+- 商標・非公式に関する方針は [TRADEMARKS.md](TRADEMARKS.md) を参照してください。
+
+## 免責
+
+本プロジェクトは**非公式**の独立したオープンソースプロジェクトであり、8BitDo（Shenzhen Bestodo Tech Co., Ltd.）とは提携・承認・後援関係にありません。"8BitDo" は同社の登録商標です。"Ultimate 2" は同社の製品名です（単独の商標登録の有無は未確認）。本リポジトリは公式のバイナリ・ファームウェア・ロゴ等を含みません。
+
+本ソフトウェアは無保証（"AS IS"）で提供されます。コントローラへの設定・ファームウェア書き込み・マクロ書き込みは、文鎮化・保証喪失・データ損失のリスクを伴います。自己責任で使用してください。
