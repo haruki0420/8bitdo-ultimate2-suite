@@ -149,6 +149,18 @@ enum MacroCommand {
         /// macros.toml and the per-macro raw .bin files.
         #[arg(long, value_name = "DIR")]
         dir: PathBuf,
+
+        /// Input poll interval in milliseconds while the operation runs.
+        /// Experimental: the official app does not poll during a macro write,
+        /// so the default is 0 (disabled).
+        #[arg(long, default_value_t = 0, value_name = "MS")]
+        poll_interval_ms: u64,
+
+        /// Experimental: send `0x0007` ReportEnable before the operation
+        /// (independent of --poll-interval-ms). Not a full reproduction of the
+        /// official sequence: no connect-time ReportEnable(0) is sent.
+        #[arg(long)]
+        report_enable: bool,
     },
 
     /// Write one macro from a JSON/TOML macro file.
@@ -178,6 +190,18 @@ enum MacroCommand {
         /// Force 32- or 64-byte write chunks. Omit to select from the MTU.
         #[arg(long, value_name = "32|64")]
         chunk_size: Option<u16>,
+
+        /// Input poll interval in milliseconds while the operation runs.
+        /// Experimental: the official app does not poll during a macro write,
+        /// so the default is 0 (disabled).
+        #[arg(long, default_value_t = 0, value_name = "MS")]
+        poll_interval_ms: u64,
+
+        /// Experimental: send `0x0007` ReportEnable before the operation
+        /// (independent of --poll-interval-ms). Not a full reproduction of the
+        /// official sequence: no connect-time ReportEnable(0) is sent.
+        #[arg(long)]
+        report_enable: bool,
     },
 
     /// Restore all non-empty macros from a backup directory.
@@ -196,6 +220,18 @@ enum MacroCommand {
         /// Force 32- or 64-byte write chunks. Omit to select from the MTU.
         #[arg(long, value_name = "32|64")]
         chunk_size: Option<u16>,
+
+        /// Input poll interval in milliseconds while the operation runs.
+        /// Experimental: the official app does not poll during a macro write,
+        /// so the default is 0 (disabled).
+        #[arg(long, default_value_t = 0, value_name = "MS")]
+        poll_interval_ms: u64,
+
+        /// Experimental: send `0x0007` ReportEnable before the operation
+        /// (independent of --poll-interval-ms). Not a full reproduction of the
+        /// official sequence: no connect-time ReportEnable(0) is sent.
+        #[arg(long)]
+        report_enable: bool,
     },
 }
 
@@ -229,8 +265,12 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
             }
         },
         Command::Macro { command } => match command {
-            MacroCommand::Backup { dir } => {
-                macro_backup(&options, &dir).await?;
+            MacroCommand::Backup {
+                dir,
+                poll_interval_ms,
+                report_enable,
+            } => {
+                macro_backup(&options, &dir, poll_interval_ms, report_enable).await?;
             }
             MacroCommand::Write {
                 slot,
@@ -239,6 +279,8 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                 trigger,
                 backup_dir,
                 chunk_size,
+                poll_interval_ms,
+                report_enable,
             } => {
                 macro_write(
                     &options,
@@ -248,6 +290,8 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                     trigger.as_deref(),
                     backup_dir.as_deref(),
                     chunk_size,
+                    poll_interval_ms,
+                    report_enable,
                 )
                 .await?;
             }
@@ -255,8 +299,18 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                 dir,
                 force,
                 chunk_size,
+                poll_interval_ms,
+                report_enable,
             } => {
-                macro_restore(&options, &dir, force, chunk_size).await?;
+                macro_restore(
+                    &options,
+                    &dir,
+                    force,
+                    chunk_size,
+                    poll_interval_ms,
+                    report_enable,
+                )
+                .await?;
             }
         },
         Command::Backup { raw, json, hold } => {
@@ -324,6 +378,51 @@ async fn best_effort_disable_reports<T: Transport>(session: &Session<T>, timeout
 
 async fn best_effort_disconnect<T: Transport>(transport: &T, timeout: Duration) {
     let _ = tokio::time::timeout(timeout, transport.disconnect()).await;
+}
+
+/// Convert `--poll-interval-ms` into the session keepalive interval.
+///
+/// `0` disables the keepalive, which is the default for the macro commands:
+/// the adjudicated official behaviour does not poll `0x0003` during a macro
+/// write, so polling is an opt-in experiment.
+fn poll_interval(ms: u64) -> Option<Duration> {
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
+/// Print keepalive counters under `--verbose`, and always warn when the
+/// explicitly requested `0x0007` enable failed.
+fn print_poll_stats<T: Transport>(options: &BleOptions, session: &Session<T>) {
+    let enable_errors = session.report_enable_errors();
+    if enable_errors > 0 {
+        eprintln!(
+            "warning: 0x0007 ReportEnable failed {enable_errors} time(s); the operation continued"
+        );
+    }
+    // Show the poll line when polling ran, or when the enable was explicitly
+    // requested (then it reports `0 sent, M errors`).
+    if !options.verbose || (session.poll_interval().is_none() && !session.report_enable()) {
+        return;
+    }
+    let errors = session.input_poll_errors();
+    eprintln!(
+        "input polls: {} sent, {} errors",
+        session.input_polls_sent(),
+        errors
+    );
+    if errors > 0 {
+        eprintln!("warning: keepalive polling reported {errors} errors; the operation continued");
+    }
+}
+
+/// Build the macro-command session from the two experimental keepalive flags.
+fn macro_session<T: Transport>(
+    transport: T,
+    poll_interval_ms: u64,
+    report_enable: bool,
+) -> Session<T> {
+    Session::new(transport)
+        .with_poll_interval(poll_interval(poll_interval_ms))
+        .with_report_enable(report_enable)
 }
 
 fn validate_output_paths(raw_path: Option<&Path>, json_path: Option<&Path>) -> Result<(), Error> {
@@ -1136,6 +1235,7 @@ fn build_macro_write_plan(
     Ok(plan)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn macro_write(
     options: &BleOptions,
     slot: u8,
@@ -1144,6 +1244,8 @@ async fn macro_write(
     trigger: Option<&str>,
     backup_dir: Option<&Path>,
     chunk_size: Option<u16>,
+    poll_interval_ms: u64,
+    report_enable: bool,
 ) -> Result<(), Error> {
     let slot = parse_slot(slot)?;
     let index = parse_macro_index(index)?;
@@ -1151,7 +1253,7 @@ async fn macro_write(
     let trigger = trigger.map(parse_trigger).transpose()?;
 
     let transport = BleTransport::connect(options).await?;
-    let session = Session::new(transport);
+    let session = macro_session(transport, poll_interval_ms, report_enable);
     let backup_dir = backup_dir.map_or_else(
         || default_backup_dir("macro-backup"),
         std::path::Path::to_path_buf,
@@ -1166,6 +1268,7 @@ async fn macro_write(
         chunk_size,
     )
     .await;
+    print_poll_stats(options, &session);
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
 }
@@ -1472,10 +1575,13 @@ async fn macro_restore(
     dir: &Path,
     force: bool,
     chunk_size: Option<u16>,
+    poll_interval_ms: u64,
+    report_enable: bool,
 ) -> Result<(), Error> {
     let transport = BleTransport::connect(options).await?;
-    let session = Session::new(transport);
+    let session = macro_session(transport, poll_interval_ms, report_enable);
     let result = macro_restore_session(&session, dir, force, chunk_size).await;
+    print_poll_stats(options, &session);
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
 }
@@ -1882,10 +1988,16 @@ async fn verify_restored_state<T: Transport>(
 }
 
 /// Read the configuration and all 3 slots × 4 macros into `dir`.
-async fn macro_backup(options: &BleOptions, dir: &Path) -> Result<(), Error> {
+async fn macro_backup(
+    options: &BleOptions,
+    dir: &Path,
+    poll_interval_ms: u64,
+    report_enable: bool,
+) -> Result<(), Error> {
     let transport = BleTransport::connect(options).await?;
-    let session = Session::new(transport);
+    let session = macro_session(transport, poll_interval_ms, report_enable);
     let result = macro_backup_session(&session, dir).await;
+    print_poll_stats(options, &session);
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     result
 }
@@ -3583,6 +3695,29 @@ mod tests {
     use eightbitdo_protocol::header::CustomHeader;
 
     use super::*;
+
+    #[test]
+    fn poll_interval_maps_milliseconds_to_session_interval() {
+        // `--poll-interval-ms 0` disables the keepalive; a positive value is
+        // passed through as-is.
+        assert_eq!(poll_interval(0), None);
+        assert_eq!(poll_interval(20), Some(Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn macro_session_maps_poll_and_report_enable_flags() {
+        let defaults = macro_session(MockTransport::new(), 0, false);
+        assert_eq!(defaults.poll_interval(), None);
+        assert!(!defaults.report_enable());
+
+        let both = macro_session(MockTransport::new(), 20, true);
+        assert_eq!(both.poll_interval(), Some(Duration::from_millis(20)));
+        assert!(both.report_enable());
+
+        let enable_only = macro_session(MockTransport::new(), 0, true);
+        assert_eq!(enable_only.poll_interval(), None);
+        assert!(enable_only.report_enable());
+    }
 
     /// Transport that records writes and replays a finite queue of input
     /// notifications, then stays pending instead of reporting a disconnect.

@@ -587,6 +587,7 @@ impl<T: Transport> Session<T> {
         slot: Slot,
         index: MacroIndex,
     ) -> Result<MacroEntry, Error> {
+        self.start_input_keepalive().await;
         self.prepare_read().await?;
         self.run_read(self.read_macro_with_config(&snapshot.config, slot, index))
             .await
@@ -658,6 +659,9 @@ impl<T: Transport> Session<T> {
 
         while chunk_offset < expected_len {
             let request = commands::read_macro_from(mode, slot, index, steps, chunk_offset as u32)?;
+            // Keep the controller in configuration mode during a multi-chunk
+            // macro read (best effort; disabled by default).
+            self.maybe_poll().await;
             self.transport()
                 .send(&request.encode_ble_payloadless(PacketKind::App)?)
                 .await?;
@@ -807,6 +811,7 @@ impl<T: Transport> Session<T> {
             None => macro_write_chunk_len(mtu)?,
         };
 
+        self.start_input_keepalive().await;
         self.prepare_read().await?;
         let batch = self
             .run_write(self.write_macro_slot_inner(
@@ -872,6 +877,7 @@ impl<T: Transport> Session<T> {
             None => macro_write_chunk_len(mtu)?,
         };
 
+        self.start_input_keepalive().await;
         self.prepare_read().await?;
         self.run_write(self.write_macro_slot_inner(
             backup,
@@ -984,7 +990,7 @@ impl<T: Transport> Session<T> {
             })?;
             packets_sent += 1;
 
-            tokio::time::sleep(MACRO_ERASE_SETTLE_DELAY).await;
+            self.settle_with_polling(MACRO_ERASE_SETTLE_DELAY).await;
 
             for request in writes {
                 self.send_and_await_ack(
@@ -1012,7 +1018,7 @@ impl<T: Transport> Session<T> {
             }
         }
 
-        tokio::time::sleep(MACRO_WRITE_SETTLE_DELAY).await;
+        self.settle_with_polling(MACRO_WRITE_SETTLE_DELAY).await;
 
         self.send_and_await_ack(
             &save,
@@ -1034,7 +1040,7 @@ impl<T: Transport> Session<T> {
         })?;
         packets_sent += 1;
 
-        tokio::time::sleep(MACRO_VERIFY_DELAY).await;
+        self.settle_with_polling(MACRO_VERIFY_DELAY).await;
         let config_crc_valid = self
             .verify_config_header(header_offset, &header_bytes)
             .await
@@ -1123,6 +1129,7 @@ impl<T: Transport> Session<T> {
 
         let mtu = self.transport().mtu();
         let header_chunk_size = macro_header_chunk_len(mtu)?;
+        self.start_input_keepalive().await;
         self.prepare_read().await?;
         self.run_write(self.write_macro_header_inner(backup, slot, header_chunk_size))
             .await
@@ -1189,7 +1196,7 @@ impl<T: Transport> Session<T> {
         })?;
         packets_sent += 1;
 
-        tokio::time::sleep(MACRO_VERIFY_DELAY).await;
+        self.settle_with_polling(MACRO_VERIFY_DELAY).await;
         let config_crc_valid = self
             .verify_config_header(header_offset, &header_bytes)
             .await
@@ -1271,6 +1278,9 @@ impl<T: Transport> Session<T> {
         } else {
             request.encode_ble(PacketKind::App)?
         };
+        // Keep the controller in configuration mode; the poll report is
+        // drained inside `maybe_poll`, so it cannot be read as this ACK.
+        self.maybe_poll().await;
         self.transport().send(&frame).await?;
 
         let deadline = deadline_after(timeout)?;
@@ -2050,6 +2060,7 @@ mod tests {
 #[cfg(test)]
 mod write_tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -2161,6 +2172,296 @@ mod write_tests {
             mock.push_response(&header, chunk);
             offset += chunk.len() as u32;
         }
+    }
+
+    /// Same frames as [`push_readback`], as a standalone script vector.
+    fn readback_frames(steps: &[MacroStep]) -> Vec<Vec<u8>> {
+        let raw = raw_steps(steps);
+        let mut frames = Vec::new();
+        let mut offset = 0u32;
+        for chunk in raw.chunks(142) {
+            let mut header =
+                CustomHeader::new(cmd::RESPONSE, cmd::READ_MACRO, raw.len() as u32, offset)
+                    .with_chunk_len(chunk.len() as u16);
+            header.crc16 = packet_crc16(chunk);
+            frames.push(ScriptedTransport::response(header, chunk));
+            offset += chunk.len() as u32;
+        }
+        frames
+    }
+
+    /// One 12-byte input report: direct (`cmd=0x0003`) or `0x600F` envelope
+    /// (`cmd=0x0004, subcmd=0x0003`).
+    fn input_report_frame(envelope: bool) -> Vec<u8> {
+        let header = if envelope {
+            CustomHeader::new(cmd::RESPONSE, cmd::INPUT, 0, 0)
+        } else {
+            CustomHeader::new(cmd::INPUT, 0, 0, 0)
+        }
+        .with_chunk_len(12);
+        ScriptedTransport::response(header, &[0u8; 12])
+    }
+
+    /// Script for one successful 10-step S1/M1 `write_macro` at MTU 200:
+    /// two header chunks, header Save, Erase, two Write chunks, final Save,
+    /// then the config read-back and one macro read-back chunk.
+    fn macro_write_script(steps: &[MacroStep]) -> Vec<Vec<u8>> {
+        let backup = backup_from(config_with_existing_macro());
+        let plan = MacroWritePlan::new(steps.to_vec());
+        let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
+        let mut script = vec![
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::WRITE_CONFIG, true),
+            ack_frame(cmd::SAVE, true),
+            ack_frame(cmd::ERASE_MACRO, true),
+            ack_frame(cmd::WRITE_MACRO, true),
+            ack_frame(cmd::WRITE_MACRO, true),
+            ack_frame(cmd::SAVE, true),
+        ];
+        script.extend(config_frames(&expected));
+        script.extend(readback_frames(steps));
+        script
+    }
+
+    #[tokio::test]
+    async fn polling_sends_input_requests_between_macro_commands_and_settles() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(10);
+        let plan = MacroWritePlan::new(steps.clone());
+        let transport = PollAwareTransport::new(macro_write_script(&steps), PollResponse::Direct);
+        let session = Session::new(&transport)
+            .with_poll_interval(Some(Duration::ZERO))
+            .with_report_enable(true);
+
+        let outcome = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await
+            .unwrap();
+        assert_eq!(outcome.readback.steps(), steps);
+
+        let sent = transport.sent();
+        assert_eq!(frame_cmd(&sent[0]), cmd::REPORT_ENABLE);
+        assert_eq!(frame_cmd(&sent[1]), cmd::INPUT);
+        assert_eq!(frame_cmd(&sent[2]), cmd::WRITE_CONFIG);
+        assert_eq!(count_cmd(&sent, cmd::REPORT_ENABLE), 1);
+        // 7 macro commands + 20 config chunks + 1 macro read chunk + 3 settles.
+        assert_eq!(count_cmd(&sent, cmd::INPUT), 31);
+        assert_eq!(session.input_poll_errors(), 0);
+
+        // Every ACK-waiting macro command is directly preceded by a poll,
+        // including the ones separated by a settle delay.
+        for (position, frame) in sent.iter().enumerate() {
+            if matches!(
+                frame_cmd(frame),
+                cmd::WRITE_CONFIG | cmd::SAVE | cmd::ERASE_MACRO | cmd::WRITE_MACRO
+            ) {
+                assert!(position > 0, "macro command without a preceding frame");
+                assert_eq!(
+                    frame_cmd(&sent[position - 1]),
+                    cmd::INPUT,
+                    "macro command at {position} is not preceded by a 0x0003 poll"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn default_macro_write_sends_no_input_polls_or_report_enable() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(10);
+        let plan = MacroWritePlan::new(steps.clone());
+        let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
+
+        let mock = MockTransport::with_mtu(200);
+        push_official_acks(&mock, 2, 2);
+        push_config(&mock, &expected);
+        push_readback(&mock, &steps);
+
+        let session = Session::new(&mock);
+        session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await
+            .unwrap();
+        let sent = mock.sent_frames();
+        assert_eq!(count_cmd(&sent, cmd::INPUT), 0);
+        assert_eq!(count_cmd(&sent, cmd::REPORT_ENABLE), 0);
+        // Default frame sequence, identical to the pre-keepalive
+        // (f00b84a) write: Header x2, Save, Erase, Write x2, Save.
+        let commands: Vec<u16> = sent
+            .iter()
+            .map(|frame| frame_cmd(frame))
+            .filter(|command| {
+                matches!(
+                    *command,
+                    cmd::WRITE_CONFIG | cmd::SAVE | cmd::ERASE_MACRO | cmd::WRITE_MACRO
+                )
+            })
+            .collect();
+        assert_eq!(
+            commands,
+            vec![
+                cmd::WRITE_CONFIG,
+                cmd::WRITE_CONFIG,
+                cmd::SAVE,
+                cmd::ERASE_MACRO,
+                cmd::WRITE_MACRO,
+                cmd::WRITE_MACRO,
+                cmd::SAVE,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_without_report_enable_sends_polls_but_no_enable() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(10);
+        let plan = MacroWritePlan::new(steps.clone());
+        let transport = PollAwareTransport::new(macro_write_script(&steps), PollResponse::Direct);
+        // ReportEnable is opt-in; polling alone must not send 0x0007.
+        let session = Session::new(&transport).with_poll_interval(Some(Duration::ZERO));
+
+        let outcome = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await
+            .unwrap();
+        assert_eq!(outcome.readback.steps(), steps);
+        let sent = transport.sent();
+        assert_eq!(count_cmd(&sent, cmd::REPORT_ENABLE), 0);
+        assert_eq!(frame_cmd(&sent[0]), cmd::INPUT);
+        assert_eq!(count_cmd(&sent, cmd::INPUT), 31);
+    }
+
+    #[tokio::test]
+    async fn report_enable_without_polling_sends_no_input_frames() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(10);
+        let plan = MacroWritePlan::new(steps.clone());
+        let transport = PollAwareTransport::new(macro_write_script(&steps), PollResponse::Direct);
+        // ReportEnable is independent of polling: polling off still sends one
+        // 0x0007, and no 0x0003 at all.
+        let session = Session::new(&transport).with_report_enable(true);
+
+        let outcome = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await
+            .unwrap();
+        assert_eq!(outcome.readback.steps(), steps);
+        let sent = transport.sent();
+        assert_eq!(count_cmd(&sent, cmd::REPORT_ENABLE), 1);
+        assert_eq!(count_cmd(&sent, cmd::INPUT), 0);
+        // The write command sequence is unchanged apart from the enable.
+        let commands: Vec<u16> = sent
+            .iter()
+            .map(|frame| frame_cmd(frame))
+            .filter(|command| {
+                matches!(
+                    *command,
+                    cmd::WRITE_CONFIG | cmd::SAVE | cmd::ERASE_MACRO | cmd::WRITE_MACRO
+                )
+            })
+            .collect();
+        assert_eq!(
+            commands,
+            vec![
+                cmd::WRITE_CONFIG,
+                cmd::WRITE_CONFIG,
+                cmd::SAVE,
+                cmd::ERASE_MACRO,
+                cmd::WRITE_MACRO,
+                cmd::WRITE_MACRO,
+                cmd::SAVE,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn report_enable_failure_is_counted_even_without_polling() {
+        // The enable is independent of polling, so its failure must be
+        // recorded (and surfaced by the CLI) even when no 0x0003 is sent.
+        let transport = ScriptedTransport::new(Vec::new(), false, 200);
+        let session = Session::new(&transport).with_report_enable(true);
+
+        session.start_input_keepalive().await;
+
+        assert_eq!(session.report_enable_errors(), 1);
+        assert_eq!(session.input_polls_sent(), 0);
+        assert_eq!(count_cmd(&transport.sent(), cmd::REPORT_ENABLE), 1);
+    }
+
+    #[tokio::test]
+    async fn polling_envelope_reports_do_not_break_ack_or_readback() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(10);
+        let plan = MacroWritePlan::new(steps.clone());
+        let mut script = macro_write_script(&steps);
+        // A stray input-report envelope in the ACK stream must be skipped by
+        // the ACK matcher, in addition to the poll responses.
+        script.insert(5, input_report_frame(true));
+        let transport = PollAwareTransport::new(script, PollResponse::Envelope);
+        let session = Session::new(&transport).with_poll_interval(Some(Duration::ZERO));
+
+        let outcome = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await
+            .unwrap();
+        assert_eq!(outcome.readback.steps(), steps);
+        assert_eq!(session.input_poll_errors(), 0);
+        let sent = transport.sent();
+        assert_eq!(count_cmd(&sent, cmd::SAVE), 2);
+        assert_eq!(count_cmd(&sent, cmd::WRITE_MACRO), 2);
+    }
+
+    #[tokio::test]
+    async fn polling_errors_do_not_abort_macro_write() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(10);
+        let plan = MacroWritePlan::new(steps.clone());
+        let transport = PollAwareTransport::new(macro_write_script(&steps), PollResponse::Error);
+        let session = Session::new(&transport).with_poll_interval(Some(Duration::ZERO));
+
+        let outcome = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await
+            .unwrap();
+        assert_eq!(outcome.readback.steps(), steps);
+        let sent = transport.sent();
+        assert_eq!(count_cmd(&sent, cmd::INPUT), 31);
+        assert_eq!(session.input_polls_sent(), 31);
+        assert_eq!(session.input_poll_errors(), 31);
+    }
+
+    #[tokio::test]
+    async fn polling_does_not_run_while_waiting_for_header_or_save_ack() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(10);
+        let plan = MacroWritePlan::new(steps.clone());
+        // Slow macro ACKs widen the window in which a foreground timer would
+        // send 0x0003. The official gate forbids polling while cmd
+        // 0x0001/0x0002/0x0006 is in flight; commands here are serial, so no
+        // poll may be sent while a Header/Save ACK is awaited.
+        let transport = PollAwareTransport::new(macro_write_script(&steps), PollResponse::Direct)
+            .with_ack_delay(Duration::from_millis(20));
+        let session = Session::new(&transport).with_poll_interval(Some(Duration::from_millis(20)));
+
+        let outcome = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await
+            .unwrap();
+        assert_eq!(outcome.readback.steps(), steps);
+        // Non-vacuous: the keepalive really ran (polls were sent outside the
+        // ACK waits), and none of them landed inside an ACK wait window.
+        assert!(session.input_polls_sent() > 0);
+        assert_eq!(transport.polls_during_macro_ack(), 0);
+    }
+
+    #[tokio::test]
+    async fn poll_throttles_to_one_per_interval() {
+        let transport = PollAwareTransport::new(Vec::new(), PollResponse::Direct);
+        let session = Session::new(&transport).with_poll_interval(Some(Duration::from_secs(3600)));
+        session.maybe_poll().await;
+        session.maybe_poll().await;
+        assert_eq!(session.input_polls_sent(), 1);
+        assert_eq!(count_cmd(&transport.sent(), cmd::INPUT), 1);
     }
 
     fn config_frames(config: &Bt2Config) -> Vec<Vec<u8>> {
@@ -2682,6 +2983,147 @@ mod write_tests {
 
         fn mtu(&self) -> u16 {
             self.mtu
+        }
+
+        async fn disconnect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// How [`PollAwareTransport`] answers a `0x0003` poll.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PollResponse {
+        /// Direct `cmd=0x0003` input report.
+        Direct,
+        /// `cmd=0x0004, subcmd=0x0003` envelope report.
+        Envelope,
+        /// The poll's receive fails, as on a flaky link.
+        Error,
+    }
+
+    /// Transport that answers each `0x0003` poll itself, leaving the scripted
+    /// response queue untouched.
+    ///
+    /// This makes the keepalive deterministic: a poll always consumes its own
+    /// report (or fails) and never steals a scripted ACK/config/read-back
+    /// frame, so a test can assert both the polling frames and the unchanged
+    /// macro protocol.
+    struct PollAwareTransport {
+        incoming: Mutex<VecDeque<Vec<u8>>>,
+        sent: Mutex<Vec<Vec<u8>>>,
+        pending_poll: AtomicBool,
+        pending_report_enable: AtomicBool,
+        poll_response: PollResponse,
+        /// Delay applied to macro ACKs, to model a slow controller and prove
+        /// that no poll is sent while such an ACK is awaited.
+        ack_delay: Duration,
+        /// True from the send of a macro command until its ACK is returned.
+        ///
+        /// Set on send (not on recv) so a poll sent *immediately* after a
+        /// command is detected; otherwise the slow-ACK window would only open
+        /// after the transport already handed the ACK to the session.
+        awaiting_macro_ack: AtomicBool,
+        /// Polls that were sent while a macro ACK was being awaited.
+        polls_during_macro_ack: AtomicU64,
+    }
+
+    impl PollAwareTransport {
+        fn new(frames: Vec<Vec<u8>>, poll_response: PollResponse) -> Self {
+            Self {
+                incoming: Mutex::new(frames.into()),
+                sent: Mutex::new(Vec::new()),
+                pending_poll: AtomicBool::new(false),
+                pending_report_enable: AtomicBool::new(false),
+                poll_response,
+                ack_delay: Duration::ZERO,
+                awaiting_macro_ack: AtomicBool::new(false),
+                polls_during_macro_ack: AtomicU64::new(0),
+            }
+        }
+
+        fn with_ack_delay(mut self, ack_delay: Duration) -> Self {
+            self.ack_delay = ack_delay;
+            self
+        }
+
+        fn sent(&self) -> Vec<Vec<u8>> {
+            self.sent.lock().unwrap().clone()
+        }
+
+        fn polls_during_macro_ack(&self) -> u64 {
+            self.polls_during_macro_ack.load(Ordering::SeqCst)
+        }
+    }
+
+    /// True for a macro ACK frame (Header / Save / Erase / Write).
+    fn is_macro_ack(frame: &[u8]) -> bool {
+        CustomHeader::parse(frame).is_ok_and(|header| {
+            matches!(
+                header.cmd,
+                cmd::WRITE_CONFIG | cmd::SAVE | cmd::ERASE_MACRO | cmd::WRITE_MACRO
+            )
+        })
+    }
+
+    #[async_trait]
+    impl Transport for PollAwareTransport {
+        async fn send(&self, data: &[u8]) -> Result<(), Error> {
+            self.sent.lock().unwrap().push(data.to_vec());
+            if let Some(header_bytes) = data.get(1..) {
+                if let Ok(header) = CustomHeader::parse(header_bytes) {
+                    match header.cmd {
+                        cmd::INPUT => {
+                            if self.awaiting_macro_ack.load(Ordering::SeqCst) {
+                                self.polls_during_macro_ack.fetch_add(1, Ordering::SeqCst);
+                            }
+                            self.pending_poll.store(true, Ordering::SeqCst);
+                        }
+                        cmd::REPORT_ENABLE => {
+                            self.pending_report_enable.store(true, Ordering::SeqCst);
+                        }
+                        cmd::WRITE_CONFIG | cmd::SAVE | cmd::ERASE_MACRO | cmd::WRITE_MACRO => {
+                            self.awaiting_macro_ack.store(true, Ordering::SeqCst);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        async fn recv(&self) -> Result<Vec<u8>, Error> {
+            if self.pending_report_enable.swap(false, Ordering::SeqCst) {
+                let header = CustomHeader::new(cmd::RESPONSE, cmd::REPORT_ENABLE, 0, 0);
+                return Ok(ScriptedTransport::response(header, &[]));
+            }
+            if self.pending_poll.swap(false, Ordering::SeqCst) {
+                return match self.poll_response {
+                    PollResponse::Direct => Ok(input_report_frame(false)),
+                    PollResponse::Envelope => Ok(input_report_frame(true)),
+                    PollResponse::Error => Err(Error::Disconnected),
+                };
+            }
+            let frame = self
+                .incoming
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or(Error::Disconnected)?;
+            // The ACK is still "awaited" during the slow-ACK sleep, so a poll
+            // sent inside that window is detected. Clear only when handing the
+            // frame to the session, as a real controller's ACK ends the wait.
+            if self.awaiting_macro_ack.load(Ordering::SeqCst)
+                && !self.ack_delay.is_zero()
+                && is_macro_ack(&frame)
+            {
+                tokio::time::sleep(self.ack_delay).await;
+            }
+            self.awaiting_macro_ack.store(false, Ordering::SeqCst);
+            Ok(frame)
+        }
+
+        fn mtu(&self) -> u16 {
+            200
         }
 
         async fn disconnect(&self) -> Result<(), Error> {
