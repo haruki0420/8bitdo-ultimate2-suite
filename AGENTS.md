@@ -117,7 +117,7 @@
 - マクロ書込: slot S1・`macro_idx=0/1 (M1/M2)`。Write `0x0103` の `total_len` は **絶対終端** `(macro_idx << 12) + align32(steps * 10)` が必須（相対値は ACK のみで永続化されない）
 - マクロ復元: `macro restore` 後に config SHA-256 が元の `1dca47fa...59c600` に一致。**Switch 側でのマクロ発動は未確認**
 - 設定書込: full 2768B write（**38 write + 1 Save = 合計 39 packets**、74B chunk）→ read-back SHA 一致。device は送信した CRC を保持（`stored` 一致、`in_place` 解釈とは不一致）。`config remap` の A→B→A を同一接続で確認。**実機確認範囲は full write / remap のみ**
-- **既知の不整合（別 PR で修正予定）**: 実機の `map_key.flag` は slot 0/1 = `0x20200911`、slot 2 = `0xFFFFFFFF` で意味は未確定（opaque）。現行コードの raw 検証は `0/1` のみ許可するため、実機 dump の書き戻しには `--force-raw` が必要
+- **既知の不整合（別 PR で修正予定）**: 実機の `map_key.flag` は slot 0/1 = `0x20200911`、slot 2 = `0xFFFFFFFF` で意味は未確定（opaque）。現行コードの raw 検証は `0/1` のみ許可するため、実機 dump の書き戻しには `--force-raw` が必要。実バイト証跡は [docs/DEVICE_CONFIG_EVIDENCE.md](docs/DEVICE_CONFIG_EVIDENCE.md)
 - **未検証**: slot S2/S3 と `macro_idx=2/3 (M3/M4)`、MTU 200 以外、USB HID の config / macro write、REPL 内からの書き込み、GUI 書き込み、OTA の wire / ACK / アドレス / MTU、macOS / Windows / Android / iOS 実機
 
 ### 6.2 次に着手すべき作業（優先順）

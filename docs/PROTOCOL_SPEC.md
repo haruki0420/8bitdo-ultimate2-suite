@@ -480,7 +480,7 @@ sequenceDiagram
 > 無効値は `KeyMap_N = 0`。`KeyMap_My_NUll = 227` は書込・表示経路から参照されず用途未確認のため書かない。1 ボタン = 1 つの 32-bit `KeyMap` 値で、ビット合成は確認されていない。
 > **raw 2768B 書込経路も同じ検証を行う**: `config write --file` は 22 個の `key[]` と `gyro[].key_map` を documented single `KeyMap` ホワイトリストで検証し、227・未知ビット・複合値を拒否する（mapKey のビット合成は未確認のため単一値のみ許可）。全レコードの flag は 0/1、マクロ `max_steps` は 0/0xFFFF/1..=200、`total_cnt <= 4` も検証する。**マクロ `key_map` だけは `macro write --trigger` と同じ任意 KeyMap を受理**する（複合トリガーの dump / 復旧を拒否しないため）。数値範囲（joy/hotwheel/gyro/rumble）は flag==1 のときのみ検証し、key_map / flag は常時検証する。未文書値の復旧用に `--force-raw`（検証を警告に降格、予約領域ガードは維持）がある。
 >
-> **実機の `map_key.flag` は 0/1 ではない（2026-11-23）**: 実機バックアップでは **slot 0/1 = `0x20200911`、slot 2 = `0xFFFFFFFF`**。flag の意味は未確定（opaque）であり、`0` = 無効という解釈も未確認である。現行コードの raw 検証は `flag = 0/1` のみ許可するため、実機 dump の書き戻しには **`--force-raw` が必要**（実機値と不整合。コード側の修正は別 PR 予定）。`config remap` は flag を変更しない。
+> **実機の `map_key.flag` は 0/1 ではない（2026-11-23）**: 実機バックアップでは **slot 0/1 = `0x20200911`、slot 2 = `0xFFFFFFFF`**。flag の意味は未確定（opaque）であり、`0` = 無効という解釈も未確認である。現行コードの raw 検証は `flag = 0/1` のみ許可するため、実機 dump の書き戻しには **`--force-raw` が必要**（実機値と不整合。コード側の修正は別 PR 予定）。`config remap` は flag を変更しない。実バイト証跡（`slot_flags` / 全レコードの flag / remap の差分 / `--force-raw` エラー）は [DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) を参照。
 
 - **マクロ詳細ステップ (`MacroDatas`, 1 ステップ = 10 バイト)**:
   - `S_UltimateBT2Advance.setMacroStruct` より、1 ステップは以下の `5 x u16` (Little-Endian, 計 10 バイト) で構成される:

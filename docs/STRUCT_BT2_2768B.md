@@ -75,7 +75,7 @@
 >
 > **部分書込と Save（RE 確定・2026-11-22）**: `getBT2_Write*` の部分書込も、完了時に共通 onfinished から **`0x0006/0x0067` Save が必ず 1 回**送られる（部分書込専用の Save 関数は無い）。
 >
-> **実機確認（2026-11-23、BLE・MTU 200・74B chunk）**: full 2768B `config write`（**38 write + 1 Save = 合計 39 packets**、74B chunk）で送信され、Save 後の read-back SHA-256 が送信内容と一致した。device は送信した CRC を `stored` として保持し、`in_place` 再計算値とは一致しない。変更は `+0x00C`（CRC）と対象フィールドのみで、予約領域は保持される。実機の `map_key.flag` は `0x20200911` / `0xFFFFFFFF` で意味は未確定（opaque）だが、現行コードの raw 検証は `0/1` のみ許可するため、実機 dump の再書込には `--force-raw` が必要（別 PR で修正予定）。MTU 200 以外の実機挙動は未確認。
+> **実機確認（2026-11-23、BLE・MTU 200・74B chunk）**: full 2768B `config write`（**38 write + 1 Save = 合計 39 packets**、74B chunk）で送信され、Save 後の read-back SHA-256 が送信内容と一致した。device は送信した CRC を `stored` として保持し、`in_place` 再計算値とは一致しない。変更は `+0x00C`（CRC）と対象フィールドのみで、予約領域は保持される。実機の `map_key.flag` は `0x20200911` / `0xFFFFFFFF` で意味は未確定（opaque）だが、現行コードの raw 検証は `0/1` のみ許可するため、実機 dump の再書込には `--force-raw` が必要（別 PR で修正予定）。実バイトの証跡は [DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) を参照。MTU 200 以外の実機挙動は未確認。
 
 ### 1.3 `+0x1F4..+0x68B` (3 × 392B) および `+0x914..+0x92B` (3 × 8B) の解析結果
 
@@ -279,7 +279,7 @@ struct Bt2Header {
 
 - 部分書込 `getBT2_WriteMapKey(slot, key_idx)` は `flag` を除く **`key[key_idx]` 単体（4B）** を `offset = 0x0E4 + slot * 0x5C + key_idx * 4`, `len = 4`, `total_len = 0x0AD0` で書き込む。
 - **書込経路（RE 確定・2026-11-22）**: Android `HIDChannel.writeBT2MAPkEY` は `ANSI_CRC_16_sh(record, 0xAD0)` → `getBT2_WriteMapKey` → 共通 onfinished から **`0x0006/0x0067` Save**。Windows は `_writeUltimateBT2MapKey@2776`（VA `0x10438ED0`）が `offset = 0xE4 + slot*0x5C + idx*4`, `len = 4`, `total_len = 0xAD0` を送り、Save `0x0006/0x0123`（3 秒）。**変更するのは 4B の 1 エントリのみで `flag` は変更しない**。`flag`（`+0xE0 + slot*0x5C`、静的解析では `0`=無効。実機値は 0/1 ではない）を 1 にするのは `setMapKey` の全 22 要素 + flag 一括コピー経由。全体 2768B 書込で同じ領域を更新する経路も有効（本実装はこちらを使用）。`0 = KeyMap_N`（未割当）が実値。`KeyMap_My_NUll = 227` はマッピング書込経路から参照されず、用途未確認のため書かない。
-- **実機確認（2026-11-23、BLE・MTU 200・74B chunk）**: `eightbitdo config remap A B` で `key[0]`（`+0x0E4`）が `0x00002000` (A) → `0x00001000` (B) に変わり、read-back で A→B を確認した。続けて B→A に戻して復帰も確認。`flag` は変更されない。実機バックアップの `map_key.flag` は **slot 0/1 = `0x20200911`、slot 2 = `0xFFFFFFFF`** で、**flag の意味は未確定（opaque）**。現行コードの raw 検証は `0/1` のみ許可するため、実機 dump の書き戻しには **`--force-raw` が必要**（実機値と不整合。別 PR で修正予定）。書込は full 2768B（38 write + 1 Save = 合計 39 packets）経由で、read-back SHA-256 が送信内容と一致した。MTU 200 以外は未確認。
+- **実機確認（2026-11-23、BLE・MTU 200・74B chunk）**: `eightbitdo config remap A B` で `key[0]`（`+0x0E4`）が `0x00002000` (A) → `0x00001000` (B) に変わり、read-back で A→B を確認した。続けて B→A に戻して復帰も確認。`flag` は変更されない。実機バックアップの `map_key.flag` は **slot 0/1 = `0x20200911`、slot 2 = `0xFFFFFFFF`** で、**flag の意味は未確定（opaque）**。現行コードの raw 検証は `0/1` のみ許可するため、実機 dump の書き戻しには **`--force-raw` が必要**（実機値と不整合。別 PR で修正予定）。書込は full 2768B（38 write + 1 Save = 合計 39 packets）経由で、read-back SHA-256 が送信内容と一致した。実バイトの証跡は [DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) を参照。MTU 200 以外は未確認。
 
 ### 5.2 `key[22]` 配列インデックス対応表（Ultimate 2 / Non-3E レイアウト）
 

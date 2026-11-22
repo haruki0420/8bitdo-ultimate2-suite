@@ -277,7 +277,7 @@ Track C: モバイル
   - raw `config write --file` も同じ検証を行う: 22 `key[]` と `gyro[].key_map` は documented single `KeyMap`、全レコード（joy/trigger/rumble/gyro/special/mapKey/LED/macro）の flag は 0/1、マクロ `max_steps` は 0/0xFFFF/1..=200・`total_cnt <= 4`。**マクロ `key_map` は `macro write --trigger` と同じ任意 KeyMap を受理**する（複合トリガーの復旧経路を塞がないため）。数値範囲（joy/hotwheel/gyro/rumble）は **flag==1 のときのみ**検証し、key_map / flag は常時検証する（disabled レコードは保持）。不明な `cur_slot`（実機観測 6 など）は警告して保持する。
   - 未文書値の復旧用に `config write --force-raw`（whitelist/range/enum を警告に降格。予約領域ガードは維持）を提供する。
   - **未実装 / 未確認**: USB HID config write（BLE のみ）、`config set` の各フィールド実機確認、`--force-raw` / `--accept-reserved-drift` の実機確認、MTU 200 以外の実機挙動、`config set` の joy/trigger flag=1・LED color flag=1 の副作用（help に明記）、公式 BLE Save の 2000ms / 2 再送との差（本実装は 3 秒 / リトライなし。`PROTOCOL_SPEC` §6.4 に記録）、device の予約バイト正規化（drift）の実例。
-  - **既知の不整合（別 PR で修正予定）**: 実機の `map_key.flag` は slot 0/1 = `0x20200911`、slot 2 = `0xFFFFFFFF` で意味は未確定（opaque）。現行コードの raw 検証は `flag = 0/1` のみ許可するため、実機 dump の書き戻しには `--force-raw` が必要。
+  - **既知の不整合（別 PR で修正予定）**: 実機の `map_key.flag` は slot 0/1 = `0x20200911`、slot 2 = `0xFFFFFFFF` で意味は未確定（opaque）。現行コードの raw 検証は `flag = 0/1` のみ許可するため、実機 dump の書き戻しには `--force-raw` が必要。実バイト証跡は [DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md)。
 - **完了条件**: 各セクションの書き込み → 読み戻し一致（**実機確認は full 2768B write と remap のみ。`config set` の各フィールドは未確認**）。
 - **Tier**: **3**。
 - **状態**: **完了（実機確認範囲: full 2768B write / remap。BLE・MTU 200・74B chunk）**。
