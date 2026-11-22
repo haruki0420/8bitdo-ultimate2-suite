@@ -76,6 +76,33 @@ pub fn macro_write_chunk_len(mtu: u16) -> Result<usize, Error> {
     }
 }
 
+/// Validate an explicitly requested 32- or 64-byte chunk against the MTU.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] with `UnsupportedChunkSize` for values other
+/// than 32/64, or [`Error::MtuTooSmall`] when the requested chunk does not fit.
+pub fn macro_write_chunk_len_requested(mtu: u16, requested: u16) -> Result<usize, Error> {
+    if requested != 32 && requested != 64 {
+        return Err(Error::Protocol(
+            eightbitdo_protocol::Error::UnsupportedChunkSize {
+                actual: usize::from(requested),
+            },
+        ));
+    }
+    let max_payload = max_protocol_payload(mtu);
+    if max_payload < usize::from(requested) {
+        return Err(Error::MtuTooSmall {
+            mtu,
+            reason: format!(
+                "requested {requested}-byte chunk does not fit: only {max_payload} bytes \
+                 remain after the 1-byte prefix, 16-byte header and 3-byte ATT overhead"
+            ),
+        });
+    }
+    Ok(usize::from(requested))
+}
+
 /// Overall deadline for assembling one macro read.
 ///
 /// A full 200-step macro is 2000 bytes and may arrive in several
@@ -171,6 +198,12 @@ pub struct MacroWritePlan {
     pub flag: Option<u32>,
     /// Registered macro count (`0..=4`); `None` preserves the existing value.
     pub total_cnt: Option<u8>,
+    /// Optional 32- or 64-byte write chunk size.
+    ///
+    /// `None` selects 64 or 32 from the negotiated MTU. `Some(32)` forces
+    /// uniform 32-byte chunks (including the final chunk); `Some(64)` forces
+    /// 64-byte chunks. Other values are rejected.
+    pub chunk_size: Option<u16>,
     /// Save sub-command variant.
     ///
     /// Only [`SaveTransport::Ble`] is implemented; the USB path is rejected
@@ -181,7 +214,7 @@ pub struct MacroWritePlan {
 }
 
 impl MacroWritePlan {
-    /// A plan with 64-byte chunks, BLE Save and default timeouts.
+    /// A plan with MTU-selected chunks, BLE Save and default timeouts.
     #[must_use]
     pub fn new(steps: Vec<MacroStep>) -> Self {
         Self {
@@ -192,6 +225,7 @@ impl MacroWritePlan {
             interval_ms: None,
             flag: None,
             total_cnt: None,
+            chunk_size: None,
             save_transport: SaveTransport::Ble,
             timeouts: MacroTimeouts::default(),
         }
@@ -237,6 +271,13 @@ impl MacroWritePlan {
     #[must_use]
     pub fn with_save_transport(mut self, save_transport: SaveTransport) -> Self {
         self.save_transport = save_transport;
+        self
+    }
+
+    /// Force a 32- or 64-byte write chunk size.
+    #[must_use]
+    pub fn with_chunk_size(mut self, chunk_size: u16) -> Self {
+        self.chunk_size = Some(chunk_size);
         self
     }
 
@@ -747,7 +788,10 @@ impl<T: Transport> Session<T> {
 
         let mtu = self.transport().mtu();
         let header_chunk_size = macro_header_chunk_len(mtu)?;
-        let write_chunk_size = macro_write_chunk_len(mtu)?;
+        let write_chunk_size = match plan.chunk_size {
+            Some(requested) => macro_write_chunk_len_requested(mtu, requested)?,
+            None => macro_write_chunk_len(mtu)?,
+        };
 
         self.prepare_read().await?;
         self.run_write(self.write_macro_inner(
@@ -1868,7 +1912,9 @@ mod write_tests {
     async fn write_macro_sends_erase_write_chunks_header_save_and_verifies() {
         let backup = backup_from(config_with_existing_macro());
         let steps = sample_steps(20);
-        let mut plan = MacroWritePlan::new(steps.clone()).with_name("Edited");
+        let mut plan = MacroWritePlan::new(steps.clone())
+            .with_name("Edited")
+            .with_chunk_size(64);
         plan.key_map = Some(KeyMap::M3);
         plan.cycles_num = Some(5);
         plan.interval_ms = Some(30);
@@ -2000,6 +2046,77 @@ mod write_tests {
         assert_eq!(outcome.readback.read_offsets(), &[0, 142]);
         assert_eq!(outcome.flag, 0);
         assert_eq!(outcome.total_cnt, 0);
+    }
+
+    #[tokio::test]
+    async fn write_macro_rejects_unsupported_or_too_large_requested_chunks() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(10);
+
+        let invalid = MacroWritePlan::new(steps.clone()).with_chunk_size(48);
+        let transport = ScriptedTransport::new(Vec::new(), true, 200);
+        let session = Session::new(&transport);
+        let result = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &invalid)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::Protocol(
+                eightbitdo_protocol::Error::UnsupportedChunkSize { actual: 48 }
+            ))
+        ));
+        assert!(transport.sent().is_empty());
+
+        let too_large = MacroWritePlan::new(steps).with_chunk_size(64);
+        let transport = ScriptedTransport::new(Vec::new(), true, 64);
+        let session = Session::new(&transport);
+        let result = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &too_large)
+            .await;
+        assert!(matches!(result, Err(Error::MtuTooSmall { mtu: 64, .. })));
+        assert!(transport.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_macro_460_bytes_with_requested_32_byte_chunks() {
+        let backup = backup_from(config_with_existing_macro());
+        let steps = sample_steps(46);
+        let plan = MacroWritePlan::new(steps.clone()).with_chunk_size(32);
+
+        let mock = MockTransport::with_mtu(200);
+        push_ack(&mock, cmd::ERASE_MACRO, true);
+        for _ in 0..15 {
+            push_ack(&mock, cmd::WRITE_MACRO, true);
+        }
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        push_ack(&mock, cmd::WRITE_CONFIG, true);
+        push_ack(&mock, cmd::SAVE, true);
+        let expected = expected_config(&backup, Slot::S1, MacroIndex::M1, &plan);
+        push_config(&mock, &expected);
+        push_readback(&mock, &steps);
+
+        let session = Session::new(&mock);
+        let outcome = session
+            .write_macro(&backup, Slot::S1, MacroIndex::M1, &plan)
+            .await
+            .unwrap();
+
+        let writes: Vec<_> = mock
+            .sent_frames()
+            .into_iter()
+            .filter(|frame| frame_cmd(frame) == cmd::WRITE_MACRO)
+            .collect();
+        assert_eq!(writes.len(), 15);
+        for (index, frame) in writes.iter().enumerate() {
+            let header = CustomHeader::parse(&frame[1..]).unwrap();
+            assert_eq!(header.total_len, 480);
+            assert_eq!(header.chunk_len, 32);
+            assert_eq!(header.offset, (index * 32) as u32);
+            assert_eq!(frame.len(), 17 + 32);
+            assert_eq!(header.crc16, packet_crc16(&frame[17..]));
+        }
+        assert_eq!(outcome.record.max_steps, 46);
+        assert_eq!(outcome.readback.steps(), steps);
     }
 
     #[tokio::test]
