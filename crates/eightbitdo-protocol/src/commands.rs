@@ -792,7 +792,8 @@ pub fn write_macro_payload(
 /// [`write_macro_payload`] with experimental [`MacroWriteLayout`] framing.
 ///
 /// The validation is identical to [`write_macro_payload`]; only `total_len`
-/// and the chunk offsets depend on `layout`.
+/// depends on `layout`. Write offsets are always sector-based
+/// (`macro_idx << 12`).
 pub fn write_macro_payload_with_layout(
     gamepad_mode: u16,
     slot: Slot,
