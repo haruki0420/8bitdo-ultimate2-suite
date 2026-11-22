@@ -374,16 +374,19 @@ EOF
         b)
             cat <<'EOF'
 --- BLE OTA capture (Phase B: flash) ---------------------------------------
-Do this now (docs/OTA_VERIFICATION_PLAN.md §4):
+Do this now (docs/OTA_VERIFICATION_PLAN.md §4 and §8.3). Phase B has TWO
+sessions, each with its own stop point:
 
-  1. Connect the controller in App Mode ("80ND").
-  2. Send EnterBoot (0x000C) and wait for the "8bt" reconnect.
-  3. readPID (0x0008) -> readVersionInBoot (0x0005).
-  4. Erase / Write / WriteVersion / WriteFirmwareVersion / Jump.
-  5. After Jump, wait for the "80ND" reconnect and read the version, then stop.
+  Session 1 (AfterFirstErase): connect App Mode ("80ND") -> EnterBoot
+  (0x000C) -> "8bt" reconnect -> readPID -> run the checkpoint. STOP right
+  after the FIRST Erase ACK, then verify offset / total_len / ACK shape
+  before deciding whether to continue (plan §8.3).
 
-HUMAN CHECKPOINT: stop after the FIRST Erase ACK and verify offset, total_len
-and the ACK shape in btmon before continuing to Write (plan §8.3).
+  Session 2 (full run): scan for "8bt" (do NOT use `scan --check`; it is
+  for "80ND"; do NOT send EnterBoot) -> new OtaUpdate -> prepare_boot ->
+  write_firmware -> all writes, WriteVersion, WriteFirmwareVersion, Jump.
+  STOP after the "80ND" reconnect and version read (plan §8.3).
+
 Ctrl-C also stops; this script always shuts btmon down.
 ---------------------------------------------------------------------------
 EOF
@@ -397,9 +400,10 @@ Do this now (docs/OTA_VERIFICATION_PLAN.md §4):
   1-2 seconds and stop. Phase A does NOT return to App Mode; do not wait for
   "80ND" (recover with a power cycle, plan §8.2).
 
-  Phase B (flash): add Erase / Write / WriteVersion / WriteFirmwareVersion /
-  Jump, then wait for the "80ND" reconnect and version read. Stop after the
-  FIRST Erase ACK once for the human checkpoint (plan §8.3).
+  Phase B (flash): two sessions. Session 1 stops right after the FIRST Erase
+  ACK (human checkpoint, plan §8.3). Session 2 connects to "8bt" directly
+  (no EnterBoot), completes the full run, then stops after the "80ND"
+  reconnect and version read.
 
 Pass -p a or -p b for phase-specific instructions.
 Ctrl-C also stops; this script always shuts btmon down.
@@ -414,7 +418,7 @@ print_instructions
 if [[ -t 0 ]]; then
     case "$PHASE" in
         a) printf 'Press Enter to stop the capture (1-2 s after readVersionInBoot): ' ;;
-        b) printf 'Press Enter to stop the capture (after the 80ND reconnect): ' ;;
+        b) printf 'Press Enter to stop the capture (Phase B: after the session-1 Erase ACK, or after the session-2 80ND reconnect): ' ;;
         *) printf 'Press Enter to stop the capture: ' ;;
     esac
     read -r _ || true

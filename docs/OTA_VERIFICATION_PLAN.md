@@ -228,8 +228,9 @@ btsnoop を取るには、実際に wire を流す駆動側が必要になる。
 
 ### 4.1 タイムライン
 
-**開始は enterBoot より前**（可能なら BLE 接続前）。接続前から取ることで、サービス探索
-（handle → UUID）と MTU 交換も同じファイルに残り、Wireshark が characteristic を解決できる。
+**開始は最初の BLE 操作より前**（Phase A / セッション 1 は enterBoot より前、セッション 2 は
+`"8bt"` の scan / 接続より前）。接続前から取ることで、サービス探索（handle → UUID）と MTU
+交換も同じファイルに残り、Wireshark が characteristic を解決できる。
 
 **停止点は Phase で異なる**:
 
@@ -254,6 +255,9 @@ btsnoop を取るには、実際に wire を流す駆動側が必要になる。
 | 9 | **btmon 停止** | — | **Phase A: 手順 6 の後 1〜2 秒 / Phase B: 手順 8 の後 5〜10 秒** |
 
 - 各操作の壁時計時刻を 1 秒単位で記録する（`date -u +%Y-%m-%dT%H:%M:%SZ`）。
+- **Phase B は §8.3 の 2 セッション構成**で行う。セッション 1 は最初の Erase で停止し、
+  セッション 2 は `"8bt"` へ直接接続して full run を行う（`enterBoot` は送らない）。上の表の
+  手順 7〜8 は**セッション 2 の完走時**の流れである。
 - 採取中は他の BLE 接続（Switch / 2.4G レシーバ等）を切っておくと切り分けやすい（必須ではない）。
 - コントローラの自動電源断・スリープに注意し、採取中は操作を継続する。
 
@@ -275,6 +279,9 @@ scripts/ota/capture-btsnoop.sh -o .tmp/ota-capture -p b
   切り出す。
 - スクリプトは `btmon -w` を起動し、停止時に `SIGINT` → `SIGTERM` → `SIGKILL` の順で
   **確実に btmon を終了**させる。`umask 077` でファイルを作る（BD_ADDR を含むため）。
+- **Phase B はセッション 1/2 で停止点が異なる**（`-p b` は両方を案内する）。セッション 1 は
+  **最初の Erase ACK 後**、セッション 2 は **Jump 後の `"80ND"` 復帰と version 読み出し後**に
+  停止する。
 - **複数アダプタがある場合は `-i hciX` を必ず指定**する（スクリプトは複数検出時に `-i` 無しを
   拒否する）。使用アダプタ名を操作ログと EVIDENCE に記録する。`btmon` は全アダプタを購読する
   ため、指定しないと他アダプタの他機器の通信が混入する（§7.4）。
@@ -460,6 +467,7 @@ capture は証跡にしない）。
 ### 13.1 環境
 | 項目 | 値 |
 | --- | --- |
+| session（capture ごと） | 1 / 2 |
 | ホスト / kernel / BlueZ | ... |
 | 使用アダプタ（`-i hciX`） | ... |
 | コントローラ FW version（App Mode `0x000B`） | ... |
@@ -489,14 +497,14 @@ capture は証跡にしない）。
 （送信 / 応答の 16 進とヘッダ分解。必要最小限）
 
 ### 13.5 capture の完全性
-| 項目 | 値 |
-| --- | --- |
-| btmon の終了状態 | 正常終了 / 強制終了（SIGKILL） |
-| btsnoop magic | OK / NG |
-| 最終フレーム（Jump link close / 80ND 再広告 / readVersion 応答） | ... |
-| Erase 数 / Write 数 / WriteVersion / WriteFirmwareVersion / Jump の有無 | ... |
-| 期待値との一致（`image_len/64` 等） | ... |
-| 切り出し範囲（フレーム番号） | ... |
+| session | 項目 | 値 |
+| --- | --- | --- |
+| 1 / 2 | btmon の終了状態 | 正常終了 / 強制終了（SIGKILL） |
+| 1 / 2 | btsnoop magic | OK / NG |
+| 1 / 2 | 最終フレーム（Jump link close / 80ND 再広告 / readVersion 応答） | ... |
+| 1 / 2 | Erase 数 / Write 数 / WriteVersion / WriteFirmwareVersion / Jump の有無 | ... |
+| 1 / 2 | 期待値との一致（`image_len/64` 等） | ... |
+| 1 / 2 | 切り出し範囲（フレーム番号） | ... |
 
 ### 13.6 チェックポイント判定
 | セッション | checkpoint | ACK 形状（payload-less / envelope / 直エコー） | `offset` / `total_len` | 続行可否 | 判断者・根拠 |
@@ -681,7 +689,10 @@ Phase B は **未確定 wire に対する最初のフラッシュ書込**であ�
 
 **実行手順（セッション最小構成は 2 セッション）**
 
-1. **セッション 1: `AfterFirstErase`**
+1. **セッション 1: `AfterFirstErase`（App Mode から開始）**
+   - btmon は **App Mode 接続前（可能なら scan 前）から開始**する。
+   - App Mode `"80ND"` に接続（`scan --check`）→ enterBoot `0x000C` → `"8bt"` 再接続 →
+     `prepare_boot`（readPID）の順で入る。
    - `OtaUpdate::write_firmware_with_checkpoint(.., OtaCheckpoint::AfterFirstErase)`。
      **最初の 1 セクタの Erase のみ**を行い、ACK 後に `OtaPhase::BenchStopped` で停止する
      （**全消去ではない**）。
@@ -702,11 +713,17 @@ Phase B は **未確定 wire に対する最初のフラッシュ書込**であ�
      しか吸収できない**（§8.4 (i)）。
    - 停止時点で **先頭 1 セクタだけが消去された状態**になる。電源断・放置で App 領域が
      部分的に消えた状態が残るリスクを認識し、次セッションまで時間を置かない。
-2. **セッション 2: 通常の full run**
-   - 新しい `OtaUpdate`（`Idle`）で、**`"80ND"` 接続 → enterBoot `0x000C` → `"8bt"` 再接続 →
-     `prepare_boot` → 通常の `write_firmware`** の順で実行し完走する。**先頭から全消去 →
-     全チャンク書込 → `WriteVersion` → `WriteFirmwareVersion` → `JumpApp`**。これで残りの
-     全 wire が記録でき、`"80ND"` 復帰と version で成功確認する。
+2. **セッション 2: 通常の full run（`"8bt"` へ直接接続）**
+   - **セッション 1 で先頭セクタを消去した時点で App 領域は無効**であり、電源投入後も
+     Bootloader `"8bt"` のままになる。**`"80ND"` は広告されない**ため、`"80ND"` 復帰待ち・
+     `scan --check`・Profile 押下は行わない。
+   - `eightbitdo scan`（`--check` は `80ND` 専用なので使わない）で `"8bt"` を確認する。
+     電源再投入は任意（`"8bt"` 起動確認のみ）。
+   - 新しい `OtaUpdate`（`Idle`）で **`"8bt"` に直接接続 → `prepare_boot`（readPID）→
+     `allow_unverified_wire=true` の通常 `write_firmware`** を実行し、**先頭から全消去 →
+     全チャンク書込 → `WriteVersion` → `WriteFirmwareVersion` → `JumpApp`** まで完走する。
+     **`enterBoot 0x000C` は送らない。** これで残りの全 wire が記録でき、Jump 後の
+     `"80ND"` 復帰と version で成功確認する。
    - **セッション 2 の最初の Erase も未確定 wire で実行される**（セッション 1 は形状確認だけ
      でアドレス規約を確定しない）。セッション 2 の Erase ACK も同様に監視し、異常なら即中止
      する（§8.4 (i)）。
@@ -715,8 +732,10 @@ Phase B は **未確定 wire に対する最初のフラッシュ書込**であ�
      `AfterWriteVersion` は WriteVersion ACK / payload を切り分ける必要がある場合。どちらも
      1 セッション = 全消去・再書込が増えるため、バッテリー・時間・書込回数のコストを許容できる
      場合に限る。
-3. **各セッションの前に**バッテリー残量（**50% 未満なら中止**）と `"8bt"` の広告を再確認する。
-   **セッション 1 以外は先頭から全消去・再書込**であり、**レジュームできない**（API doc
+3. **各セッションの前に**バッテリー残量（**50% 未満なら中止**）を確認する。
+   **セッション 1 前**は App Mode `"80ND"` の広告を `scan --check` で、**セッション 2 前**は
+   `"8bt"` の広告を `eightbitdo scan`（`--check` は `80ND` 専用なので使わない）で確認する。
+   **セッション 2 は先頭から全消去・再書込**であり、**レジュームできない**（API doc
    どおり停止後は新しい `OtaUpdate` + full erase/rewrite）。
 
 **2 セッションの capture 運用**
@@ -724,11 +743,13 @@ Phase B は **未確定 wire に対する最初のフラッシュ書込**であ�
 - セッション 1 は **`AfterFirstErase` の ACK を確認したら btmon を停止**する。ファイルは
   **形状確認専用**（完了証跡にしない）とし、btsnoop magic / enterBoot / readPID /
   readVersion / Erase 要求 1 件 + ACK / Write が無いこと / SHA-256 / フレーム番号を記録する。
-- セッション 1 と 2 の間は**コントローラを電源再投入して App Mode に戻す**。`"80ND"` が
-  広告されるまで `scan --check` で待つ（**最大 5 分**）。5 分待っても出ない場合は
-  [SESSION_OPERATIONS.md](SESSION_OPERATIONS.md) §2 の手順（scan 確認 → Profile 約 3 秒押し）に
-  従い、それでも戻らなければ中止する（推測で操作を繰り返さない）。
-- **セッション 2 の btmon は enterBoot より前（可能なら App Mode 接続前）から開始**する。
+- セッション 1 と 2 の間は、**コントローラを電源再投入してもよい（任意。`"8bt"` 起動確認の
+  ため）**。セッション 1 で先頭セクタを消去した時点で App 領域は無効であり、電源投入後も
+  Bootloader `"8bt"` のままになる（**`"80ND"` は広告されない**）。したがって **`"80ND"` 復帰
+  待ち・`scan --check`・Profile 押下は行わない**。`eightbitdo scan`（`--check` は `80ND` 専用
+  なので使わない）で `"8bt"` が見えることを確認する。見えない場合は §8.4 (i) のベンダ復旧へ
+  移る（自前の全消去・再書込はしない）。
+- **セッション 2 の btmon は `"8bt"` 接続前（できれば scan 前）から開始**する。
 - **完全性検証（§6.4）はセッション 2 の capture を対象**にする。セッション 1 は形状確認用
   として SHA-256 / フレーム番号のみを記録する。
 - EVIDENCE 13.1 / 13.5 は **capture ごとに複数行**で記録する（session 1 / 2 を区別）。
@@ -785,6 +806,8 @@ Write / WriteVersion / WriteFirmwareVersion / Jump の**全 wire が記録済み
 
 **(iii) App Mode が正常（`"80ND"` が広告され、`ReadVersion` が返る）**
 
+- セッション 1 で先頭セクタを消去した後は App 領域が無効なので、この分岐にはならない
+  （電源投入後も `"8bt"` のまま）。
 - **原則そのまま**にする。バージョン・config・マクロを確認し、**更新が必要な場合だけ**再更新する。
 - 更新前と同じバージョンなら書込は未確定なので、「必要なら」enterBoot からやり直す。
   不要なら触らない（中途半端な再書込を増やさない）。
@@ -821,21 +844,24 @@ Write / WriteVersion / WriteFirmwareVersion / Jump の**全 wire が記録済み
       `OtaBenchOutcome` ログを満たす
 - [ ] Phase B の場合: ハーネスを `tmux` / `setsid` 等で端末から切り離して実行する
 - [ ] Phase B の場合: ユーザーの承認がある
-- [ ] Phase B の場合: **各セッション前に**バッテリー残量（**50% 未満なら中止**）と
-      `"8bt"` 広告を再確認した
-- [ ] Phase B の場合: セッション 1 は `AfterFirstErase` で**最初の 1 セクタ Erase のみ**
-      （全消去ではない）を行い、**初回合格条件**（cmd/subcmd・エラーなし・要求
-      `offset`/`total_len`・追加フレームなし・リンク維持）で人間が**続行可否**を判断し、
-      13.6 に記録した
+- [ ] Phase B の場合: **各セッション前に**バッテリー残量（**50% 未満なら中止**）を確認した
+- [ ] Phase B の場合: セッション 1 は App Mode `"80ND"` → enterBoot → `"8bt"` 再接続 →
+      `prepare_boot` の順で入り、`AfterFirstErase` で**最初の 1 セクタ Erase のみ**
+      （全消去ではない）を行った
+- [ ] Phase B の場合: セッション 1 の**初回合格条件**（cmd/subcmd・エラーなし・要求
+      `offset`/`total_len`・追加フレームなし・リンク維持）を確認し、人間が**続行可否**を
+      判断して 13.6 に記録した
 - [ ] Phase B の場合: セッション 1 の btmon を停止し、capture は**形状確認専用**として
       SHA-256 / フレーム番号だけを記録した（完全性検証の対象にしない）
-- [ ] Phase B の場合: セッション 1→2 の間に電源再投入し、`scan --check` で `"80ND"` 復帰を
-      待った（**最大 5 分**。戻らなければ SESSION_OPERATIONS §2 → それでも不可なら中止）
-- [ ] Phase B の場合: セッション 2 の btmon を **enterBoot 前（可能なら App 接続前）**から
+- [ ] Phase B の場合: セッション 2 は **`"8bt"` へ直接接続**した（`scan` で `"8bt"` を確認。
+      `scan --check` は `80ND` 専用なので使わない。`enterBoot` は送らない。電源再投入は任意）
+- [ ] Phase B の場合: セッション 2 の btmon を **`"8bt"` 接続前（できれば scan 前）**から
       開始した
-- [ ] Phase B の場合: セッション 2 は `"80ND"` 接続 → enterBoot → `"8bt"` 再接続 →
-      `prepare_boot` → 通常の `write_firmware` を完走した（**2 セッション最小**。
-      `AfterWrites` / `AfterWriteVersion` は切り分け条件を満たす場合のみ）
+- [ ] Phase B の場合: セッション 2 は新しい `OtaUpdate`(Idle) → `prepare_boot` → 通常の
+      `write_firmware` を完走した（**2 セッション最小**。`AfterWrites` / `AfterWriteVersion`
+      は切り分け条件を満たす場合のみ）
+- [ ] Phase B の場合: セッション 1 の後に**続行しない場合**、端末は Bootloader のままなので
+      §8.4 (i) のベンダ復旧へ移る（自前の全消去・再書込をしない）
 - [ ] Phase B の場合: セッション 2 の最初の Erase も**未確定 wire**として監視し、異常なら
       即中止した
 - [ ] Phase B の場合: **完全性検証（§6.4）はセッション 2 の capture を対象**にした
