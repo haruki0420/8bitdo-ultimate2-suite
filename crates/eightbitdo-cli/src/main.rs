@@ -6909,16 +6909,17 @@ mod tests {
         let mock = MockTransport::with_mtu(200);
         push_config_responses(&mock, &snapshot.config);
         push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M1);
+        mock.push_response(
+            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
+            &[],
+        );
+        mock.push_response(
+            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
+            &[],
+        );
+        mock.push_response(&CustomHeader::new(commands::cmd::SAVE, 0, 0, 0), &[]);
         mock.push_response(&CustomHeader::new(commands::cmd::ERASE_MACRO, 0, 0, 0), &[]);
         mock.push_response(&CustomHeader::new(commands::cmd::WRITE_MACRO, 0, 0, 0), &[]);
-        mock.push_response(
-            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
-            &[],
-        );
-        mock.push_response(
-            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
-            &[],
-        );
         mock.push_response(&CustomHeader::new(commands::cmd::SAVE, 0, 0, 0), &[]);
         push_config_responses(&mock, &snapshot.config);
         push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M1);
@@ -7074,16 +7075,17 @@ mod tests {
         let mock = MockTransport::with_mtu(200);
         push_config_responses(&mock, &snapshot.config);
         push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M1);
+        mock.push_response(
+            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
+            &[],
+        );
+        mock.push_response(
+            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
+            &[],
+        );
+        mock.push_response(&CustomHeader::new(commands::cmd::SAVE, 0, 0, 0), &[]);
         mock.push_response(&CustomHeader::new(commands::cmd::ERASE_MACRO, 0, 0, 0), &[]);
         mock.push_response(&CustomHeader::new(commands::cmd::WRITE_MACRO, 0, 0, 0), &[]);
-        mock.push_response(
-            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
-            &[],
-        );
-        mock.push_response(
-            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
-            &[],
-        );
         mock.push_response(&CustomHeader::new(commands::cmd::SAVE, 0, 0, 0), &[]);
         push_config_responses(&mock, &snapshot.config);
         push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M1);
@@ -7336,16 +7338,17 @@ mod tests {
         let mock = MockTransport::with_mtu(200);
         push_config_responses(&mock, &snapshot.config);
         push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M1);
+        mock.push_response(
+            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
+            &[],
+        );
+        mock.push_response(
+            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
+            &[],
+        );
+        mock.push_response(&CustomHeader::new(commands::cmd::SAVE, 0, 0, 0), &[]);
         mock.push_response(&CustomHeader::new(commands::cmd::ERASE_MACRO, 0, 0, 0), &[]);
         mock.push_response(&CustomHeader::new(commands::cmd::WRITE_MACRO, 0, 0, 0), &[]);
-        mock.push_response(
-            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
-            &[],
-        );
-        mock.push_response(
-            &CustomHeader::new(commands::cmd::WRITE_CONFIG, 0, 0, 0),
-            &[],
-        );
         mock.push_response(&CustomHeader::new(commands::cmd::SAVE, 0, 0, 0), &[]);
         push_config_responses(&mock, &snapshot.config);
         push_backup_macro_read(&mock, &backup, Slot::S1, MacroIndex::M1);
@@ -7413,7 +7416,7 @@ mod tests {
         assert_eq!(count(commands::cmd::ERASE_MACRO), 1);
         assert_eq!(count(commands::cmd::WRITE_MACRO), 1);
         assert_eq!(count(commands::cmd::WRITE_CONFIG), 2);
-        assert_eq!(count(commands::cmd::SAVE), 1);
+        assert_eq!(count(commands::cmd::SAVE), 2);
 
         let write = sent
             .iter()
