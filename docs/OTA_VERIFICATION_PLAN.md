@@ -516,9 +516,10 @@ capture は証跡にしない）。
 | セッション | checkpoint | ACK 形状（payload-less / envelope / 直エコー） | `offset` / `total_len` | 続行可否 | 判断者・根拠 |
 | --- | --- | --- | --- | --- | --- |
 | 1 | AfterFirstErase | ... | ... | 可 / 不可 | ... |
-| 2 | full run の最初の Erase | ... | ... | 可 / 不可 | ... |
+| 2（3 セッション構成時のみ） | AfterFirstErase / AfterWrites | ... | ... | 可 / 不可 | ... |
 
-（セッション 2 の最初の Erase も未確定 wire なので判定対象に含める。）
+（セッション 2 の full run は非キャンセルで途中判断できないため、判断点は checkpoint
+セッションだけで記録する。3 セッション構成にする場合のみ行 2 を使う。）
 ```
 
 ### 7.2 追記時のルール
