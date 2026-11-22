@@ -2304,6 +2304,7 @@ fn warn_if_mode_or_slot_changes(snapshot: &ConfigSnapshot, expected: &Bt2Config)
 }
 
 /// A configuration write whose mandatory pre-write backup already exists.
+#[derive(Debug)]
 struct PreparedSessionConfigWrite {
     snapshot: ConfigSnapshot,
     prepared: PreparedConfigWrite,
@@ -2327,17 +2328,8 @@ async fn prepare_config_prepared<T: Transport>(
     let before_sha = sha256_hex(snapshot.config.as_bytes());
     println!("config size: {CONFIG_SIZE} bytes");
     println!("before sha256: {before_sha}");
-    if prepared.is_noop() {
-        println!("no changes; nothing was written");
-        return Ok(None);
-    }
-    println!(
-        "after  sha256 (planned): {}",
-        sha256_hex(prepared.expected_bytes())
-    );
-    print_changed_regions(prepared.changed());
-    // Validate an explicit chunk before the backup and prompt so a bad value
-    // cannot leave a backup directory behind or bother the operator.
+    // Validate an explicit chunk before the no-op check, the backup and the
+    // prompt so a bad value is always reported (even for a no-op plan).
     if let Some(chunk) = write_chunk {
         let limit = max_protocol_payload(session.transport().mtu());
         if chunk == 0 || usize::from(chunk) > limit {
@@ -2347,6 +2339,15 @@ async fn prepare_config_prepared<T: Transport>(
             )));
         }
     }
+    if prepared.is_noop() {
+        println!("no changes; nothing was written");
+        return Ok(None);
+    }
+    println!(
+        "after  sha256 (planned): {}",
+        sha256_hex(prepared.expected_bytes())
+    );
+    print_changed_regions(prepared.changed());
     warn_if_macro_header_changes(prepared.changed());
     warn_if_mode_or_slot_changes(snapshot, prepared.expected());
 
@@ -2359,9 +2360,8 @@ async fn prepare_config_prepared<T: Transport>(
     )?;
     let backup_file = backup.join("config.bin");
     let recover = format!(
-        "eightbitdo config write --file {} --yes (inside the session REPL: config write --file {}          --yes)",
-        backup_file.display(),
-        backup_file.display()
+        "eightbitdo config write --file {file} --yes (inside the session REPL: config write --file {file} --yes)",
+        file = backup_file.display()
     );
     eprintln!(
         "pre-write backup: {} (config.bin sha256 {backup_sha})",
@@ -2400,7 +2400,8 @@ async fn finish_config_prepared<T: Transport>(
     if current.config != state.snapshot.config {
         return Err(Error::InvalidRequest(format!(
             "configuration changed while waiting for confirmation (before sha256 {}, now {}); \
-             aborted without sending a write. The pre-write backup is at {}. Re-run the command.",
+             aborted without sending a write. The pre-write backup at {} is the plan-time snapshot \
+             taken before the prompt (not the current device state). Re-run the command.",
             sha256_hex(state.snapshot.config.as_bytes()),
             sha256_hex(current.config.as_bytes()),
             state.backup.display()
@@ -2657,6 +2658,137 @@ async fn run_session_config_remap<T: Transport>(
     }
     let guard = session.lock().await;
     finish_config_prepared(&guard, &state).await
+}
+
+/// A REPL config write whose preparation (snapshot, plan, backup) is done.
+struct PendingReplConfigWrite {
+    state: PreparedSessionConfigWrite,
+    needs_confirmation: bool,
+}
+
+/// Phase 1 of a REPL config write: parse, validate and prepare (including the
+/// pre-write backup) while holding the operation lock only for that work.
+///
+/// The caller runs this in a Ctrl-C-cancellable select; the prompt and the
+/// flash write are separate phases.
+async fn prepare_repl_config_command<T: Transport>(
+    session: &Arc<AsyncMutex<Session<T>>>,
+    command: &SessionCommand,
+) -> Result<Option<PendingReplConfigWrite>, Error> {
+    match command {
+        SessionCommand::ConfigSet {
+            field,
+            value,
+            slot,
+            backup_dir,
+            yes,
+            write_chunk,
+        } => {
+            let slot = parse_slot(*slot)?;
+            let set = parse_config_set(field, value, slot)?;
+            validate_write_chunk_preconnect(*write_chunk)?;
+            let state = {
+                let guard = session.lock().await;
+                let snapshot = guard.read_config_snapshot().await?;
+                let plan = set.plan(&snapshot)?;
+                let prepared = plan.prepare(&snapshot)?;
+                prepare_config_prepared(
+                    &guard,
+                    &snapshot,
+                    &prepared,
+                    backup_dir.as_deref(),
+                    *write_chunk,
+                )
+                .await?
+            };
+            Ok(state.map(|state| PendingReplConfigWrite {
+                state,
+                needs_confirmation: !*yes,
+            }))
+        }
+        SessionCommand::ConfigRemap {
+            from,
+            to,
+            slot,
+            backup_dir,
+            yes,
+            write_chunk,
+        } => {
+            let slot = parse_slot(*slot)?;
+            let button = parse_physical_button(from)?;
+            let target = parse_remap_target(to)?;
+            validate_write_chunk_preconnect(*write_chunk)?;
+            let state = {
+                let guard = session.lock().await;
+                let snapshot = guard.read_config_snapshot().await?;
+                let prepared = ConfigWritePlan::new()
+                    .with(ConfigEdit::ButtonRemap {
+                        slot,
+                        button,
+                        to: target,
+                    })
+                    .prepare(&snapshot)?;
+                prepare_config_prepared(
+                    &guard,
+                    &snapshot,
+                    &prepared,
+                    backup_dir.as_deref(),
+                    *write_chunk,
+                )
+                .await?
+            };
+            Ok(state.map(|state| PendingReplConfigWrite {
+                state,
+                needs_confirmation: !*yes,
+            }))
+        }
+        SessionCommand::ConfigWrite {
+            file,
+            backup_dir,
+            accept_reserved_drift,
+            force_raw,
+            yes,
+            write_chunk,
+        } => {
+            validate_write_chunk_preconnect(*write_chunk)?;
+            let edited = read_and_validate_config_file(file, *force_raw)?;
+            let state = {
+                let guard = session.lock().await;
+                let snapshot = guard.read_config_snapshot().await?;
+                let mut edited = edited.clone();
+                if *accept_reserved_drift {
+                    copy_device_reserved(&snapshot.config, &mut edited);
+                    eprintln!("--accept-reserved-drift: using the device's current reserved bytes");
+                }
+                let prepared = PreparedConfigWrite::from_buffer(&snapshot, edited)?;
+                prepare_config_prepared(
+                    &guard,
+                    &snapshot,
+                    &prepared,
+                    backup_dir.as_deref(),
+                    *write_chunk,
+                )
+                .await?
+            };
+            Ok(state.map(|state| PendingReplConfigWrite {
+                state,
+                needs_confirmation: !*yes,
+            }))
+        }
+        _ => Err(Error::InvalidRequest(
+            "not a config write command".to_string(),
+        )),
+    }
+}
+
+/// Phase 3 of a REPL config write: the non-cancellable TOCTOU + write + Save +
+/// read-back section (caller keeps the command out of the Ctrl-C branch).
+async fn finish_repl_config_command<T: Transport>(
+    session: &Arc<AsyncMutex<Session<T>>>,
+    state: &PreparedSessionConfigWrite,
+) -> Result<(), Error> {
+    let guard = session.lock().await;
+    finish_config_prepared(&guard, state).await
 }
 
 async fn config_write(
@@ -6302,6 +6434,107 @@ where
                     }
                 };
                 let command = parse_session_command(text.trim());
+                // Config writes are two-phase: preparation + prompt are
+                // Ctrl-C-cancellable (the keepalive continues while the prompt
+                // waits), and only the actual 0x0001/Save/read-back section is
+                // non-cancellable.
+                if allow_config_write && is_config_write_command(&command) {
+                    if monitor.is_some() {
+                        eprintln!("monitor is running; use 'monitor stop' first");
+                        continue;
+                    }
+                    let prepared = tokio::select! {
+                        biased;
+                        _ = &mut ctrl_c => {
+                            eprintln!(
+                                "note: Ctrl-C received; configuration preparation was cancelled \
+                                 before any 0x0001/Save. If a pre-write backup was created it remains."
+                            );
+                            break;
+                        }
+                        result = prepare_repl_config_command(session, &command) => result,
+                    };
+                    let pending = match prepared {
+                        Ok(Some(pending)) => pending,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            if matches!(error, Error::Disconnected) {
+                                result = Err(error);
+                                break;
+                            }
+                            eprintln!("error: {error}");
+                            continue;
+                        }
+                    };
+                    if pending.needs_confirmation {
+                        let answer = tokio::select! {
+                            biased;
+                            _ = &mut ctrl_c => {
+                                eprintln!(
+                                    "note: Ctrl-C received; configuration write cancelled before \
+                                     any 0x0001/Save. Pre-write backup: {} (plan-time snapshot); \
+                                     recover with: {}",
+                                    pending.state.backup.display(),
+                                    pending.state.recover
+                                );
+                                break;
+                            }
+                            answer = confirm_config_write_async(&mut *reader, &mut line_state) => answer,
+                        };
+                        match answer {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                println!("aborted; no configuration was written");
+                                continue;
+                            }
+                            Err(error) => {
+                                if matches!(error, Error::Disconnected) {
+                                    result = Err(error);
+                                    break;
+                                }
+                                eprintln!("error: {error}");
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Non-cancellable flash section: TOCTOU re-read, 0x0001
+                    // chunks, Save and read-back.
+                    let mut finish =
+                        std::pin::pin!(finish_repl_config_command(session, &pending.state));
+                    let outcome = tokio::select! {
+                        biased;
+                        result = &mut finish => result,
+                        _ = &mut ctrl_c => {
+                            eprintln!(
+                                "note: Ctrl-C received; the configuration flash write \
+                                 (0x0001/Save) is not cancellable and will finish before the \
+                                 session exits"
+                            );
+                            ctrl_c_deferred = true;
+                            finish.await
+                        }
+                    };
+                    match outcome {
+                        Ok(()) => {
+                            if ctrl_c_deferred {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(error) => {
+                            if matches!(error, Error::Disconnected) {
+                                result = Err(error);
+                                break;
+                            }
+                            eprintln!("error: {error}");
+                            if ctrl_c_deferred {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
                 // A flash write must not be dropped mid-operation: a Ctrl-C
                 // that cancels the future between chunks / Erase and Save can
                 // leave a sector or configuration partially updated, which is
@@ -9989,6 +10222,10 @@ mod tests {
             error.to_string().contains(&backup.display().to_string()),
             "the abort message must name the pre-write backup: {error}"
         );
+        assert!(
+            error.to_string().contains("plan-time snapshot"),
+            "the abort message must say the backup is not the current state: {error}"
+        );
         assert_eq!(transport.config().as_bytes(), changed.as_bytes());
         let wrote = transport.sent().iter().any(|frame| {
             let cmd = CustomHeader::parse(&frame[1..]).unwrap().cmd;
@@ -10744,6 +10981,142 @@ mod tests {
         });
         assert!(!wrote, "an overlong confirmation line must abort");
         assert!(backup.join("config.bin").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn session_repl_config_prompt_ctrl_c_aborts_without_writing() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let dir = scratch_dir("session-config-prompt-cancel");
+        let initial = config_write_fixture();
+        let transport = ConfigDeviceTransport::new(initial.clone()).stalling();
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+
+        let notify = Arc::new(Notify::new());
+        let ctrl_c = {
+            let notify = Arc::clone(&notify);
+            async move { notify.notified().await }
+        };
+
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let mut buf_reader = tokio::io::BufReader::new(reader);
+        let repl_session = Arc::clone(&session);
+        let repl_state = Arc::new(SessionKeepaliveState::new());
+        let repl_task = tokio::spawn(async move {
+            session_repl_loop_with_io(
+                &repl_session,
+                &repl_state,
+                Instant::now(),
+                200,
+                Duration::from_millis(20),
+                false,
+                true,
+                &mut buf_reader,
+                ctrl_c,
+                false,
+            )
+            .await
+        });
+
+        let backup = dir.join("backup");
+        let command = format!(
+            "config set joy.left_start 42 --slot 1 --backup-dir {}\n",
+            backup.display()
+        );
+        writer.write_all(command.as_bytes()).await.unwrap();
+        let mut prepared = false;
+        for _ in 0..500 {
+            if backup.join("config.bin").is_file() {
+                prepared = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(prepared, "pre-write backup was not created");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Ctrl-C while the confirmation prompt is open.
+        notify.notify_one();
+        let result = repl_task.await.unwrap();
+        assert!(result.is_ok(), "{result:?}");
+
+        let wrote = transport.sent().iter().any(|frame| {
+            let cmd = CustomHeader::parse(&frame[1..]).unwrap().cmd;
+            cmd == commands::cmd::WRITE_CONFIG || cmd == commands::cmd::SAVE
+        });
+        assert!(!wrote, "prompt Ctrl-C must not send a write or Save");
+        assert!(backup.join("config.bin").is_file(), "backup must remain");
+        assert_eq!(transport.config().as_bytes(), initial.as_bytes());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn noop_config_write_still_validates_the_chunk_override() {
+        let initial = config_write_fixture();
+        let snapshot = config_snapshot(initial.clone());
+        let prepared = ConfigWritePlan::new().prepare(&snapshot).unwrap();
+        assert!(prepared.is_noop());
+        let transport = ConfigDeviceTransport::new(initial);
+        let session = Session::new(&transport);
+
+        let error = prepare_config_prepared(&session, &snapshot, &prepared, None, Some(181))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidRequest(_)), "{error:?}");
+        // A valid chunk is accepted and reports the no-op.
+        let state = prepare_config_prepared(&session, &snapshot, &prepared, None, Some(74))
+            .await
+            .unwrap();
+        assert!(state.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_repl_config_write_file_executes_the_wired_flow() {
+        let dir = scratch_dir("session-config-write-file");
+        let initial = config_write_fixture();
+        let mut edited = initial.clone();
+        edited.set_profile_name(Slot::S2, "ReplFile").unwrap();
+        let file = dir.join("edited.bin");
+        std::fs::write(&file, edited.as_bytes()).unwrap();
+
+        let transport = ConfigDeviceTransport::new(initial.clone());
+        let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
+        let state = Arc::new(SessionKeepaliveState::new());
+        let backup = dir.join("backup");
+        let input = format!(
+            "config write --file {} --backup-dir {} --yes\nquit\n",
+            file.display(),
+            backup.display()
+        );
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes()));
+        let result = session_repl_loop_with_io(
+            &session,
+            &state,
+            Instant::now(),
+            200,
+            Duration::from_millis(20),
+            false,
+            true,
+            &mut reader,
+            std::future::pending::<()>(),
+            false,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+
+        assert_eq!(transport.config().profile_name(Slot::S2), "ReplFile");
+        assert!(backup.join("config.bin").is_file());
+        assert_eq!(
+            transport
+                .sent()
+                .iter()
+                .filter(|frame| {
+                    CustomHeader::parse(&frame[1..]).unwrap().cmd == commands::cmd::SAVE
+                })
+                .count(),
+            1
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
