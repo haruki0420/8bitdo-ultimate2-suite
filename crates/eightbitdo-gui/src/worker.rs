@@ -483,6 +483,7 @@ async fn connect(address: Option<String>, link: &mut Option<Link>, events: &Send
         scan_timeout: CONNECT_SCAN_TIMEOUT,
         connect_timeout: CONNECT_TIMEOUT,
         verbose: false,
+        lock_path: None,
     };
 
     match BleTransport::connect(&options).await {
