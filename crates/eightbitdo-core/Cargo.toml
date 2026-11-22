@@ -15,6 +15,9 @@ ble = ["dep:btleplug", "dep:futures-util", "dep:fs2", "dep:rustix", "dep:nix"]
 # `eightbitdo-uniffi`; the desktop default build does not contain the adapter
 # type at all.
 mobile-boot = []
+# Bench-only staged OTA API (default OFF). Requires allow_unverified_wire and
+# must never be used outside a documented capture experiment.
+ota-bench = []
 
 [dependencies]
 eightbitdo-protocol = { path = "../eightbitdo-protocol" }

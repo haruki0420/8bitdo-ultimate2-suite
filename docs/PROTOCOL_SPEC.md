@@ -766,6 +766,21 @@ payload-less の ready ACK が完了 ACK より先に届く場合、Erase 完了
 - **payload-less direct echo の扱い**: EraseFlash の要求 `cmd` は `0x0004`（応答 envelope と同値）なので、`cmd=0x0004, subcmd=0` の直接 echo は envelope と区別できず、completion モードでは ready ACK としてもスキップされる。その他のコマンドでは直接 echo の `cmd` が `0x0004` ではないため、即座に完了 ACK として扱う。この非対称性は実 wire 形状が未確認であることによる。
 - 実機 btsnoop で ACK 形状が確定するまで、CLI / GUI / UniFFI の OTA 配線は保留する。
 
+#### bench 用 段階実行 API（`ota-bench` feature、既定 OFF）
+
+実機 btsnoop 採取のために、モノリシックな `write_firmware` を変更せずに段階停止できる API を追加した。**既定ビルドには存在しない**。
+
+- feature: `eightbitdo-core/ota-bench`（既定 OFF）。`eightbitdo-uniffi` や通常 CLI は有効化しない。
+- `OtaUpdate::write_firmware_with_checkpoint(ready, image, progress, checkpoint) -> OtaBenchOutcome`
+  - `OtaCheckpoint::AfterFirstErase`: 最初の `EraseFlash 0x0004` ACK 直後、WriteFirmware の前に停止（最初の Erase ACK 採取用）
+  - `OtaCheckpoint::AfterWrites`: 全 WriteFirmware ACK 後、WriteVersion の前に停止
+  - `OtaCheckpoint::AfterWriteVersion`: `WriteVersion 0x00C4` ACK 後、WriteFirmwareVersion / JumpApp の前に停止
+- `OtaBenchOutcome`: `checkpoint` / `sectors_erased` / `chunks_written` / `bytes_written` / `packets_sent` / `jump: Option<JumpOutcome>`
+- 停止時は `OtaPhase::BenchStopped`（`is_terminal() == true`）。デバイスは Bootloader に残るため、復旧は新しい `OtaUpdate` で `prepare_boot` → 全消去・再書込。
+- **安全ゲートは迂回不可**: `OtaConfig::allow_unverified_wire = true` が必須で、PID / `gamepad_type` / `expected_load_base` / `load_base + image_len` / MTU の検証は通常経路と同一。`allow_unverified_wire = false` では flash フレームを 1 つも送らず `InvalidRequest`。
+- feature 無効ビルドでは `OtaCheckpoint` / `OtaBenchOutcome` / `write_firmware_with_checkpoint` / `OtaPhase::BenchStopped` は存在しない（外部 crate のコンパイルで確認）。
+- `docs-ota-capture` の採取計画は、上記 API 名（`write_firmware_with_checkpoint` / `OtaCheckpoint::AfterFirstErase` 等）を参照する。
+
 #### N/A（実装しない）
 
 - **USB OTA**: `N/A + 理由（USB Boot TX フレーミング未文書化）`。`[0x00,0x05]` は RX 専用であり、BLE の `"8bt"` / prefix `0x05` を流用しない。USB の復旧は再列挙 / 再接続。`OtaTransport` マーカーも USB transport には実装しない。
@@ -802,4 +817,4 @@ payload-less の ready ACK が完了 ACK より先に届く場合、Erase 完了
 
 #### テスト
 
-MockTransport による **55 テスト**（`mobile-boot` 有効時。既定ビルドは 52）: 正常系の全パケット列・CRC・チャンク境界・セクタ境界・複数セクタ進捗・部分セクタ、Erase/Write/WriteVersion/WriteFirmwareVersion/Jump の失敗、送信失敗、ACK タイムアウト（リトライなし）、PID 不一致、ready/completion ACK ガード（スキップ成功・単独 ACK タイムアウト）、MTU 不足、type 1 ウィンドウ外・`base + image_len` 上限超過・境界ちょうど、transport 不一致（ガード）、未確認 wire ゲート、`0x000E` 応答、キャンセル、マルチセクション拒否メッセージ、`load_base + image_len` の 2^32 境界、WriteVersion の ready ACK 単独タイムアウト、`MobileBootLink` アダプタ（成功・受信エラー・into_inner）、`enter_boot_and_release`（App リンク切断・ACK 後の `Error::Ble` teardown・phase 不正で Session 非消費）、`BleLockSlot` の drop によるロック解放。
+MockTransport による **52 テスト**（既定）/ **55**（`mobile-boot`）/ **57**（`ota-bench`）/ **60**（`--all-features`）: 正常系の全パケット列・CRC・チャンク境界・セクタ境界・複数セクタ進捗・部分セクタ、Erase/Write/WriteVersion/WriteFirmwareVersion/Jump の失敗、送信失敗、ACK タイムアウト（リトライなし）、PID 不一致、ready/completion ACK ガード（スキップ成功・単独 ACK タイムアウト）、MTU 不足、type 1 ウィンドウ外・`base + image_len` 上限超過・境界ちょうど、transport 不一致（ガード）、未確認 wire ゲート、`0x000E` 応答、キャンセル、マルチセクション拒否メッセージ、`load_base + image_len` の 2^32 境界、WriteVersion の ready ACK 単独タイムアウト、`MobileBootLink` アダプタ（成功・受信エラー・into_inner）、`enter_boot_and_release`（App リンク切断・ACK 後の `Error::Ble` teardown・phase 不正で Session 非消費）、`BleLockSlot` の drop によるロック解放、`ota-bench` の 3 checkpoint 停止・`allow_unverified_wire` 必須・MTU ゲート維持。

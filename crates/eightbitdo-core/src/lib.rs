@@ -61,6 +61,9 @@ pub use ota::{
     OTA_VERSION_TIMEOUT, OTA_WRITE_TIMEOUT, OTA_WRITE_VERSION_TIMEOUT, UT2_BOOT_PID,
     UT2_TYPE1_APP_BASE_MIN, UT2_TYPE1_APP_FLASH_END,
 };
+#[cfg(feature = "ota-bench")]
+#[cfg(feature = "ota-bench")]
+pub use ota::{OtaBenchOutcome, OtaCheckpoint};
 pub use session::{
     ConfigSnapshot, Session, VersionInfo, CONFIG_TOTAL_TIMEOUT, DEFAULT_TIMEOUT,
     MAX_CONSECUTIVE_DECODE_FAILURES,
