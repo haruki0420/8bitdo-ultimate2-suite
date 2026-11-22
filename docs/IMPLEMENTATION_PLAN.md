@@ -98,7 +98,7 @@ graph TD
 │   │       ├── mock.rs         # MockTransport
 │   │       └── error.rs
 │   ├── eightbitdo-cli/             # CLI ツール（実機検証・自動化・I/O。`src/main.rs` 単一）
-│   ├── eightbitdo-gui/             # デスクトップ GUI (egui / eframe、3a は読み取り専用)
+│   ├── eightbitdo-gui/             # デスクトップ GUI (egui / eframe。3a 読み取り + 3b/3d 書込 UI)
 │   └── eightbitdo-uniffi/          # Swift / Kotlin 向け UniFFI 公開レイヤー
 ├── mobile/                     # モバイルアプリ（iOS / Android）
 │   ├── ios/                    # SwiftUI アプリ (CoreBluetooth Transport 実装)
@@ -150,7 +150,7 @@ graph TD
 
 ## 5. フェーズ別実装ロードマップ
 
-> **2026-11-23 改訂（現状反映）**: Phase 1 / 2a / 2b / 2d / 3a は main にマージ済み。Phase 2c は core のみマージ済みで、実機 wire 未確定のため CLI / GUI / UniFFI に未配線。Phase 5 は UniFFI と iOS / Android の雛形まで。USB OTA（Phase 4）は USB Boot TX フレーミングが未文書化のため保留を継続する。詳細な残課題は §5.4。
+> **2026-11-23 改訂（現状反映）**: Phase 1 / 2a / 2b / 2d / 3a は main にマージ済み。PR #16（`feat/gui-write`）で Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）の GUI 書込を実装（実機未検証・Tier 3）。Phase 2c は core のみマージ済みで、実機 wire 未確定のため CLI / GUI / UniFFI に未配線。Phase 3c（OTA 画面）は未着手。Phase 5 は UniFFI と iOS / Android の雛形まで。USB OTA（Phase 4）は USB Boot TX フレーミングが未文書化のため保留を継続する。詳細な残課題は §5.4。
 
 ### 5.1 トラック構成（2026-11-23）
 
@@ -165,15 +165,15 @@ Track A: コア / CLI（Linux・デスクトップ）
 
 Track B: GUI（egui / Pure Rust）
   Phase 3a read-only GUI            完了（PR #9）
-  Phase 3b macro editor             別ブランチ feat/gui-write で進行中（未マージ）
-  Phase 3c OTA screen               2c の wire 確定後
-  Phase 3d settings tabs            書き込み UI と同時に進行
+  Phase 3b macro editor             実装済み（PR #16。実機未検証・Tier 3）
+  Phase 3c OTA screen               2c の wire 確定後（未着手）
+  Phase 3d settings tabs            実装済み（PR #16。実機未検証・Tier 3）
 
 Track C: モバイル
   Phase 5  UniFFI + iOS / Android   雛形完了（PR #12）。JNI 同梱 APK・実機・配布は未着手
 ```
 
-### 5.2 現状（2026-11-23、main `6b39e23`）
+### 5.2 現状（2026-11-23、main `4004757`）
 
 | 項目 | 状態 |
 | --- | --- |
@@ -182,8 +182,10 @@ Track C: モバイル
 | Phase 2b | 完了（PR #6）。実機（BLE・slot S1）でマクロ書込・読み戻し・restore を確認。Write `0x0103` の `total_len` は絶対終端が必須。**Switch 側でのマクロ発動は未確認**。M3/M4・S2/S3・USB HID は未確認 |
 | Phase 2c | core 実装済み（PR #11）。Mock 55 テスト（既定 52）。**実機 btsnoop 未取得、CLI / GUI / UniFFI 未配線、実機書込未検証**。マルチセクション `.dat` 非対応が公式ファーム対応の blocker |
 | Phase 2d | 完了（PR #7）。実機（BLE・MTU 200・74B chunk）で full 2768B write → Save → read-back 一致、`config remap` A→B→A を同一接続で確認。**実機確認は full write / remap のみ**で、`config set` 各フィールド・`--force-raw`・MTU 200 以外は未確認。USB config write は未実装 |
-| Phase 3a | 完了（PR #9）。読み取り専用 GUI、日本語、燻しスレート。デバイス / ライブ入力 / 設定値 / ログの 4 タブ。書き込みは行わない |
-| Phase 3b〜3d | 未マージ。`feat/gui-write` で GUI 書き込み UI を進行中 |
+| Phase 3a | 完了（PR #9）。読み取り専用 GUI、日本語、燻しスレート。デバイス / ライブ入力 / 設定値 / ログの 4 タブ。 |
+| Phase 3b | **実装（PR #16）**。マクロエディタ／20ms 録音／ステップ編集／既存非空マクロへの書込。pre-write backup・read-back・TOCTOU・録音中書込不可。**実機未検証・Tier 3** |
+| Phase 3c | 未着手。Phase 2c の実機 wire 確定後に OTA 画面を実装 |
+| Phase 3d | **実装（PR #16）**。設定タブ／22 ボタンリマップ／振動／スティック・トリガー／ジャイロ／LED。確認ダイアログ・pre-write backup・read-back。**実機未検証・Tier 3** |
 | Phase 4 | 保留（USB Boot TX 未文書化） |
 | Phase 5 | 雛形完了（PR #12）。UniFFI 公開 API、iOS unsigned IPA、Android Kotlin-only APK まで。Android JNI 同梱 APK・実機確認・App Store 配布は未着手。書き込み・OTA は意図的に未公開 |
 | ライセンス | 完了（PR #13）。LICENSE-MIT / LICENSE-APACHE / NOTICE / THIRD_PARTY_LICENSES / TRADEMARKS |
@@ -289,9 +291,9 @@ Track C: モバイル
 ### Phase 3: `eightbitdo-gui`（デスクトップ ネイティブ GUI：Linux / macOS / Windows）
 - **技術**: `egui` (`eframe`)、Pure Rust。Node.js / WebView / Electron / Tauri は使わない。
 - **Phase 3a（read-only GUI、完了）**: 接続パネル、デバイス情報、ライブ入力、設定ビューア、マクロ一覧、バックアップ、ログの読み取り専用 GUI。日本語 UI・燻しスレートのテーマ・同梱 Noto Sans JP（OFL）。デバイス書込は行わない。**2026-11-22 に PR #9 で main にマージ済み**。既定は **Tier 2**、ただし `crates/eightbitdo-core/**`（`session` / transport / mock を含む）の変更を伴う場合は **Tier 3**。GUI 側だけで完結する場合も、`session` の読み取り契約（ドレインの fail-closed、応答 `total_len` / `crc16` 照合、`Instant` 上限）を検証するテストを変えるなら Tier 3。
-- **Phase 3b（マクロエディタ、Phase 2b 後）**: タイムライン / テーブル、リアルタイム録音、1ms、8bit スティック、トリガー、JSON/TOML。Tier 3。**現状: 別ブランチ `feat/gui-write` で GUI 書き込み UI と合わせて進行中（未マージ）**。
+- **Phase 3b（マクロエディタ、Phase 2b 後）**: タイムライン / テーブル、リアルタイム録音、1ms、8bit スティック、トリガー、JSON/TOML。Tier 3。**現状: PR #16 で実装済み（未マージ時点）。** 20ms ライブ録音、ステップ編集（削除・待ち時間挿入・値変更）、既存非空マクロへの Header → Save → Erase → Write → Save、read-back 検証、pre-write macro backup、TOCTOU（expected SHA-256 不一致で中止）。空マクロ作成は拒否。録音中は書込不可（確認ダイアログは非モーダルだが確定時に再検証、録音中のロードは停止通知）。**実機未検証。JSON/TOML 入出力は未実装。**
 - **Phase 3c（OTA 画面、Phase 2c 後）**: バージョン確認、進捗、復旧モード。Tier 3。**Phase 2c の実機 wire 確定まで着手しない**。
-- **Phase 3d（設定タブ、Phase 2d 後）**: プロファイル、リマップ、デッドゾーン、振動、6 軸、RGB。Tier 3。書き込み UI は `feat/gui-write` の範囲。
+- **Phase 3d（設定タブ、Phase 2d 後）**: プロファイル、リマップ、デッドゾーン、振動、6 軸、RGB。Tier 3。**現状: PR #16 で実装済み（未マージ時点）。** プロファイル名、`gamepad_mode`、有効プロファイル、22 ボタンリマップ（未変更の unsupported 値は保持、新規選択は単一文書化キーのみ）、振動、スティック / トリガー、特殊機能、ジャイロ、LED。確認ダイアログ、pre-write backup、read-back 検証、TOCTOU 付き。**実機未検証。**
 - **完了条件**: Linux / macOS / Windows でビルド・起動し、実機と同期すること（現状の確認は Linux のみ）。
 
 ### Phase 4: USB OTA（保留）
@@ -319,7 +321,7 @@ Track C: モバイル
 2. ~~Phase 2b マクロ書き込み → Tier 3 レビュー → マージ~~ **完了（実機確認済み）**
 3. **Phase 2c BLE OTA: 実機 btsnoop で wire / ACK を確定 → ACK `offset` / `total_len` 照合とマルチセクション `.dat` 対応 → Tier 3 → CLI / GUI / UniFFI 配線 → 実機書込**
 4. ~~Phase 2d 設定書き込み → Tier 3 レビュー → マージ~~ **完了（実機確認済み）**
-5. ~~Phase 3a GUI 読み取り専用~~ **完了** → Phase 3b〜3d（`feat/gui-write` の書き込み UI）を Tier 3 で統合
+5. ~~Phase 3a GUI 読み取り専用~~ **完了** / ~~Phase 3b / 3d GUI 書き込み UI~~ **PR #16 で実装済み（実機未検証）**。次に着手するのは **Phase 3c OTA 画面**（Phase 2c の実機 wire 確定後）と、GUI 書込の実機確認（Tier 3）
 6. Phase 5 モバイル: Android JNI 同梱 APK → 実機確認 → 配布（書き込み・OTA は後続）
 7. Phase 2e / 4（USB / 2.4G）: 実機証跡と USB Boot TX フレーミングが揃うまで保留
 
@@ -331,7 +333,7 @@ Track C: モバイル
 | 2 | OTA ACK の `offset` / `total_len` 照合（現状は cmd/subcmd のみ。遅延・重複 ACK を誤帰属し得る） | フラッシュ破損リスク | 3 |
 | 3 | マルチセクション `.dat` 対応（公式 `.dat` がマルチセクションなら現実装は拒否する） | 公式ファーム更新の blocker | 3 |
 | 4 | OTA の CLI / GUI / UniFFI 配線、バッテリー警告、バージョン / ダウングレード判定、SHA-256 検証 | OTA 未提供 | 3 |
-| 5 | GUI 書き込み UI（`feat/gui-write`）の統合と実機確認 | GUI から書込不可 | 3 |
+| 5 | GUI 書込み UI（PR #16）の実機確認と、Phase 3c OTA 画面。backup 復元 UI・JSON/TOML 入出力 | GUI 書込が実機未検証 | 3 |
 | 6 | Android NDK + cargo-ndk による Rust JNI 同梱 APK | Android 実機でコア不可 | 2–3 |
 | 7 | iOS / Android 実機での BLE 読み取り確認、App Store 配布（macOS 必須） | モバイル未実証 | 3 |
 | 8 | macOS / Windows の BLE 実機確認（現状は Linux のみ） | クロスプラットフォーム未実証 | 2–3 |

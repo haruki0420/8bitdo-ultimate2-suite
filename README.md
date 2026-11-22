@@ -17,14 +17,14 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 - **BLE 設定モード（`80ND`）への接続と読み取り**: Switch に接続したまま Profile ボタン約 3 秒で設定モードに入り、version / 2768B 設定 / マクロ 3 slot × 4 / リアルタイム入力 / keepalive を取得。20ms `0x0003` keepalive、per-user BLE 単一所有ロック、degraded 時の終了コード 3。
 - **設定の書き込みとボタンリマップ（BLE）**: `config write` / `config set` / `config remap` / `config map show`。予約バイト保持、CRC 再計算、必須 pre-write backup、前後 SHA-256、TOCTOU 再読込、read-back 検証。**実機確認済み**（full write / remap のみ。`config set` 各フィールドは未確認）。
 - **マクロのバックアップ・書き込み・復元（BLE）**: `macro backup` / `macro write` / `macro restore`。公式順序（Header `0xD8` → Save → Erase → Write → Save）と Write `total_len` の**絶対終端**。**実機確認済み**（slot S1 の M1/M2。**Switch 側の発動は未確認**）。
-- **読み取り専用 GUI**: egui / Pure Rust。日本語 UI、燻しスレートのテーマ、Noto Sans JP 同梱。デバイス / ライブ入力 / 設定値 / ログの 4 タブ。設定・マクロ・ファームウェアの書き込みは行わない。
+- **GUI**: egui / Pure Rust。日本語 UI、燻しスレートのテーマ、Noto Sans JP 同梱。読み取り 4 タブ（デバイス / ライブ入力 / 設定値 / ログ）に加え、PR #16 で設定・ボタンリマップ・マクロの書き込み UI を追加（確認ダイアログ、pre-write backup、read-back 検証）。**GUI 書込は実機未検証**。
 - **セッション REPL**: 1 接続で `info` / `config dump` / `backup` / `monitor` / `macro backup` / `config map show` などを実行。書込系は `--allow-macro-write` / `--allow-config-write` と確認が必須。
 - **マクロ・設定の JSON / TOML I/O**: `MacroFile` のインポート / エクスポート。1ms 解像度・8-bit スティック / トリガー値を保持。
 - **モバイル雛形**: `eightbitdo-uniffi` 経由の読み取り API、iOS SwiftUI + CoreBluetooth、Android Compose + BluetoothGatt。iOS は unsigned IPA、Android は Kotlin-only APK を生成可能。
 
 ### 計画中・未提供
 
-- **GUI からの書き込み**: 別ブランチ `feat/gui-write` で進行中（未マージ）。
+- **GUI からの書き込み**: PR #16 で設定 2768B・リマップ・マクロを実装。確認ダイアログ、pre-write backup、read-back 検証、TOCTOU 検出付き。**実機未検証・Tier 3**。
 - **ファームウェア更新（BLE OTA）**: core の状態機械のみ実装済み。実機 wire 未確定・CLI / GUI / UniFFI 未配線。USB OTA は USB Boot TX フレーミング未文書化のため保留。
 - **モバイルの書き込み・OTA**: バックアップ UI と Tier 3 レビュー待ちで未公開。Android の Rust JNI 同梱 APK、iOS / Android 実機確認、App Store 配布も未着手。
 - **USB HID / 2.4G transport**: 未実装・保留。
@@ -33,7 +33,7 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 
 ## 実装状況
 
-main は `6b39e23`（2026-11-23）時点。フェーズの詳細・残課題は [AGENTS.md](AGENTS.md) §6 と [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) §5。
+main は `4004757`（2026-11-23）時点。フェーズの詳細・残課題は [AGENTS.md](AGENTS.md) §6 と [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) §5。
 
 | Phase | 内容 | 状態 |
 | --- | --- | --- |
@@ -43,19 +43,21 @@ main は `6b39e23`（2026-11-23）時点。フェーズの詳細・残課題は 
 | 2c | BLE OTA 状態機械 | **core のみ**。Mock 55（`mobile-boot` 有効時）/ 52（既定）テスト。実機未検証・CLI/GUI/UniFFI 未配線 |
 | 2d | 設定 write / set / remap（BLE） | 完了・実機確認済み（full write / remap のみ。`config set` 各フィールドは未確認） |
 | 3a | 読み取り専用 GUI | 完了（PR #9） |
-| 3b〜3d | GUI 書き込み UI / マクロエディタ / OTA 画面 | `feat/gui-write` で進行中（未マージ） |
+| 3b | GUI マクロエディタ（録音・ステップ編集・既存マクロ書込） | **実装（PR #16）。実機未検証・Tier 3** |
+| 3c | OTA 画面 | 未着手（Phase 2c の wire 確定後） |
+| 3d | GUI 設定タブ / 22 ボタンリマップ | **実装（PR #16）。実機未検証・Tier 3** |
 | 4 | USB OTA | 保留（USB Boot TX 未文書化） |
 | 5 | UniFFI + iOS / Android | 雛形完了。実機・JNI 同梱 APK・配布は未着手 |
 
 **実機で確認済み（Linux・BLE・MTU 200、2026-11-21〜23）**: version / 2768B dump / マクロ backup、マクロ書込（絶対終端 `total_len`）と復元、設定 full write（38 write + 1 Save = 合計 39 packets・74B chunk・read-back SHA 一致）、remap A→B→A。**設定の実機確認範囲は full write / remap のみ**（`config set` 各フィールド・`--force-raw`・MTU 200 以外は未確認）。
 
-**未確認**: slot S2/S3・`macro_idx=2/3 (M3/M4)`、MTU 200 以外、USB HID の config / macro write、`config set` の各フィールド実機確認、`--force-raw` / `--accept-reserved-drift`、GUI / REPL からの書込、OTA の wire / ACK / アドレス / MTU、macOS / Windows / Android / iOS 実機。
+**未確認**: slot S2/S3・`macro_idx=2/3 (M3/M4)`、MTU 200 以外、USB HID の config / macro write、`config set` の各フィールド実機確認、`--force-raw` / `--accept-reserved-drift`、GUI 書込（PR #16）と REPL からの書込、OTA の wire / ACK / アドレス / MTU、macOS / Windows / Android / iOS 実機。
 
 ---
 
 ## ビルドと実行
 
-**前提**: Rust **1.85 以上**（workspace の MSRV）。Linux では btleplug 用に `libdbus-1-dev` と `pkg-config`（CI と同じ）、BLE には BlueZ が必要です。
+**前提**: Rust **1.85 以上**（workspace の MSRV）。Linux では btleplug 用に `libdbus-1-dev` と `pkg-config`（CI と同じ）、BLE には BlueZ が必要です。**Windows をビルドする場合は Rust 1.88 以上**が必要です（`btleplug` の Windows バックエンドが let チェーンを使うため、1.85〜1.87 では `E0658` で失敗します。詳細と確認済みの範囲は [docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)）。macOS / Windows の実機検証は未実施です。
 
 ```bash
 # ワークスペースのビルド
@@ -109,13 +111,13 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 
 ---
 
-## GUI（読み取り専用）
+## GUI
 
 `eightbitdo-gui` は egui / eframe のネイティブ GUI です。Node.js / WebView / Electron / Tauri は使いません。
 
-- **4 タブ**: デバイス（接続・情報）、ライブ入力、設定値（2768B の要約）、ログ。
+- **6 タブ**: デバイス（接続・情報）、ライブ入力、設定値（2768B の要約）、設定（書き込み）、マクロ（録音・編集・書き込み）、ログ。
 - 日本語 UI と英語表示の切り替え、燻しスレートのテーマ、Noto Sans JP（OFL）を同梱。
-- **設定・マクロ・バックアップ復元・ファームウェア更新は行いません**（読み取り専用ビルド）。書き込み UI は別ブランチ `feat/gui-write` で進行中です。
+- **書き込み**: 設定 2768B（プロファイル・リマップ・振動・スティック / トリガー・ジャイロ・LED）と既存マクロの書き込みに対応。必ず確認ダイアログを経て、直前に設定 / マクロの pre-write backup を作成し、書込後に read-back 検証します。録音中は書込不可。確認後にデバイス設定が変わっていた場合は expected SHA-256 不一致で中止します。**実機未検証（Tier 3）**。バックアップ復元とファームウェア更新は未実装です。
 - 起動: `cargo run --release -p eightbitdo-gui`（または `./target/release/eightbitdo-gui`）。
 
 ## モバイル（iOS / Android）
@@ -147,6 +149,8 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 | **[docs/DEVICE_CONFIG_EVIDENCE.md](docs/DEVICE_CONFIG_EVIDENCE.md)** | 実機 2768B ダンプ（SHA-256 `1dca47fa…`）の実バイト証跡: `slot_flags` / `map_key.flag` の非 0/1 値、`config remap` の差分、raw 検証エラーと再現コマンド |
 | **[docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)** | Rust + SwiftUI + Jetpack Compose のアーキテクチャ設計、ワークスペース構成、Phase 1〜5 ロードマップ、現在の状態・残課題、安全検証手順 |
 | **[docs/OTA_BLE_EVIDENCE.md](docs/OTA_BLE_EVIDENCE.md)** | BLE OTA の解析証跡（確定した順序・タイムアウト・`.dat` ヘッダ）と未確認事項の優先順 |
+| **[docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)** | クロスプラットフォームのビルド確認状況（Windows クロス `check` の結果と警告 4 件、MSRV 1.85 が Windows で通らない理由、iOS target check、macOS 未確認の理由、CI 追加提案） |
+| **[docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)** | BLE OTA 実機検証の準備: btsnoop 採取（Linux `btmon` / Android HCI snoop）、確認項目と判定、EVIDENCE への追記、Phase A / B の安全手順 |
 | **[mobile/README.md](mobile/README.md)** | iOS / Android のビルド手順、UniFFI 公開 API、到達点と制約（unsigned IPA / Kotlin-only APK / 未公開の書込） |
 | **[docs/SESSION_OPERATIONS.md](docs/SESSION_OPERATIONS.md)** | 常駐 `session` の運用（per-user BLE 単一所有者ロック、degraded 終了コード 3、SIGINT 範囲、押下依頼前の `scan` 確認手順、`scripts/session-loop.sh` の scan 契約と backoff） |
 | **[AGENTS.md](AGENTS.md)** | AI エージェント／開発者向け引き継ぎガイド（[CLAUDE.md](CLAUDE.md) からも参照） |
@@ -165,13 +169,15 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 - [x] 公式アプリ（Android v2.01 / Windows v1.38）の通信プロトコル・バイナリ構造・OTA シーケンスの解析完了
 - [x] 完全仕様書・実装計画書・AI 引き継ぎドキュメント作成
 - [x] Phase 1: `eightbitdo-protocol`（Rust プロトコル・構造体・CRC・マクロ、単体テスト 100 件 + doc test 4 件）
-- [ ] Phase 2: `eightbitdo-core` + `eightbitdo-cli`（BLE 実機通信＆検証。**2a / 2b / 2d は完了、2c BLE OTA は core 実装のみで未完了**）
+- [ ] Phase 2: `eightbitdo-core` + `eightbitdo-cli`（BLE 実機通信＆検証。**Phase 2 一部完了（2c 未完了）**。2a / 2b / 2d は実機確認済み、2c BLE OTA は core 実装のみ）
   - [x] Phase 2a: 読み取り専用 core / CLI / `session`（`eightbitdo session [--interval-ms 20] [--allow-macro-write] [--allow-config-write] [--no-report-enable]` の REPL は `info` / `config dump` / `backup` / `monitor` / `monitor stop` / `status` / `help` / `quit`。REPL には `macro backup <DIR>`（読み取りのみ、常に利用可）/ `macro write <SLOT> <INDEX> <FILE> [--trigger <KEY>] [--chunk-size <32|64>]` / `macro restore <DIR> [--force]` もあり、書込系は `--allow-macro-write`（既定 OFF）が必要。`session` は既定で起動時に `0x0007 enable(1)` を送る（公式相当）ため REPL の `macro write` は enable 状態で動き（トップレベル `macro write` の既定とは条件が異なる）、`--no-report-enable` 指定時は起動時の enable(1) を送らず `0x0003` keepalive のみを継続する（終了時の disable(0) は best-effort。トップレベル既定と同じ書込条件で A/B するため）。`--allow-macro-write` 時の `macro write` / `macro restore` は、ファイル読込・pre-write/pre-restore backup を含むコマンド全体で Ctrl-C を遅延する（非通常ファイルは読取前に拒否し、デバイス I/O は timeout で有界。SIGKILL・電源断は防げない）。REPL の `macro write` は `--backup-dir`（既定名 `macro-backup-<unix-nanos>-<pid>-<sequence>`）、`macro restore` は `--chunk-size` を指定できず、REPL 経由の実機書込は未検証。設定バックアップは `--raw` / `--json` を同一ディレクトリの一時ファイル経由でアトミックに書き、同一ファイルを指す 2 つの出力パスは拒否する。ただし hard link の同一性検出は Unix のみで、Windows は file identity 未実装のため hard link alias を事前拒否せず、raw 書き込み後の再検証と `rename` semantics で保護する。この再検証は偶発的な alias 用であり、出力ディレクトリに write 権限を持つ攻撃者による TOCTOU / 並行 rename は非保証である）
   - [x] Phase 2b: マクロ読み書き（実機確認済み。BLE・slot S1 の M1/M2。M3/M4・S2/S3 は外挿）
   - [ ] Phase 2c: BLE OTA（Linux。core 実装済み・Mock 55 テスト（`mobile-boot` 有効時。既定 52）。**単一セクション `.dat` のみ対応**で公式 `.dat` がマルチセクションの場合は未対応（公式ファーム対応の blocker）、未確認 wire ゲート既定 OFF、boot 専用 `BleBootTransport` のみ許可（App Session を切断してから `8bt` に接続。同一 BLE ロック）、type 1 application ウィンドウを暫定検証、CLI/GUI 未配線、実機書込は保留。マルチセクション対応と実機 wire 確定は次 PR の必須項目）
   - [x] Phase 2d: 設定書き込み（BLE のみ実機確認済み。`config write` / `set` / `remap` / `map show`、pre-write backup、確認、前後 SHA-256、read-back 検証。USB config write は未実装）
 - [x] Phase 3a: `eightbitdo-gui` 読み取り専用 GUI（日本語・燻しスレート。PR #9）
-- [ ] Phase 3b〜3d: GUI 書き込み UI / マクロエディタ / OTA 画面（別ブランチ `feat/gui-write` で進行中）
+- [x] Phase 3b: GUI マクロエディタ（20ms 録音・ステップ編集・既存非空マクロへの書込。PR #16。**実機未検証・Tier 3**）
+- [ ] Phase 3c: GUI OTA 画面（Phase 2c の実機 wire 確定後）
+- [x] Phase 3d: GUI 設定タブ / 22 ボタンリマップ（PR #16。**実機未検証・Tier 3**）
 - [ ] Phase 4: USB OTA（保留）
 - [ ] Phase 5: `eightbitdo-uniffi` + iOS (SwiftUI) / Android (Jetpack Compose) アプリ（雛形完了・PR #12。Rust JNI 同梱 APK・実機確認・App Store 配布は未着手）
 
