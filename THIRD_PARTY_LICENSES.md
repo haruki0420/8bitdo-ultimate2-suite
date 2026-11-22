@@ -1,34 +1,56 @@
 # 第三者ライセンス（Third-Party Licenses）
 
-本プロジェクトが利用する第三者ソフトウェアと、同梱予定フォントのライセンス条件をまとめます。
+本プロジェクトが利用する第三者ソフトウェアと、同梱フォントのライセンス条件をまとめます。
 
 > 本ドキュメントは**法的助言ではありません**。記載は公開情報・パッケージメタデータ・各ライセンス原文に基づく整理であり、法的結論ではありません。ライセンスの解釈・配布条件の充足・商標の扱いは、公開・配布・ストア申請の前に知的財産権を扱う弁護士に確認してください。
 >
 > また、依存バージョンと各プロジェクトのライセンスは将来変更され得ます。**依存を追加・更新するたびに再生成・再確認**してください。
 
-> 本ファイルは**要約と参照**です。131 クレート全件の著作権表示・ライセンス本文を網羅するものではありません。現時点で全文を収録しているのは、追加義務のある BSD-3-Clause（btleplug）、Unicode-3.0（unicode-ident）、SIL OFL 1.1（同梱予定フォント）です。バイナリとして配布する場合は、`cargo-about` 等で依存グラフ全体の著作権表示とライセンス本文を生成し、配布物へ同梱してください（§4）。
+> 本ファイルは**要約と参照**です。497 クレート全件の著作権表示・ライセンス本文を網羅するものではありません。現時点で全文を収録しているのは、追加義務のある BSD-3-Clause（btleplug）、Unicode-3.0、SIL OFL 1.1（同梱フォント）です。MPL-2.0（uniffi）・Apache-2.0（Gradle wrapper）・Ubuntu Font Licence（egui 既定フォント）の全文は各クレート／資産に同梱されたライセンスファイルを参照し、配布物には生成した通知を含めてください。バイナリとして配布する場合は、`cargo-about` 等で依存グラフ全体の著作権表示とライセンス本文を生成し、配布物へ同梱してください（§4）。
 
 ## 1. サマリ
 
-- 基準: base commit `80f8d66`（2026-11-23）の `cargo metadata --offline --format-version 1 --all-features`。
-- パッケージ総数 134（workspace メンバー 3 を除く**第三者クレート 131**）。`license` フィールドが空のクレートは **0**。
-- **GPL / AGPL / SSPL / EUPL / CDDL / EPL は 0 件。** すべてのクレートが MIT または Apache-2.0 を選択可能です（BSD-3-Clause / Zlib / Unlicense などとの選択を含む）。ただし `unicode-ident` は `(MIT OR Apache-2.0) AND Unicode-3.0` のため、MIT / Apache に加えて **Unicode-3.0 の帰属義務**があります。
-- 直接依存もすべて MIT または Apache-2.0 を選択可能（`btleplug` は BSD-3-Clause を含む三択、`uuid` は Apache-2.0/MIT）で、本プロジェクトの `license = "MIT OR Apache-2.0"` と整合します。
+- 基準: main `6b39e23`（2026-11-23、ブランチ `docs/licensing-refresh` の base）の `cargo metadata --locked --all-features`（cargo 1.100.0）。
+- パッケージ総数 **502**（workspace メンバー 5 を除く**第三者クレート 497**）。`license` フィールドが空のクレートは **0**（`license_file` 指定も 0）。497 件はすべて crates.io 由来で、git / path 依存はありません。
+- 前版（base `80f8d66`、第三者 131）からの差は **+366 クレート**。主因は GUI（`eframe`/`egui` 0.29.1）とモバイル（`uniffi` 0.31.2）、BLE 単一所有者ロック（`fs2`/`rustix`/`nix`）の追加です。
+- **GPL / AGPL / SSPL / EUPL / CDDL / EPL は 0 件。** ライセンス式に MIT を含むクレート（MIT を選択可能）は **444**、Apache-2.0 を含むクレート（Apache-2.0 を選択可能）は **345**。どちらも選択できない **37 クレート**は §3.5 に列挙します（`MPL-2.0` 9、`Unicode-3.0` 単独 18、`Zlib` 3、`BSD-3-Clause` 2、`BSL-1.0` 2、`BSD-2-Clause` / `ISC` / `CC0-1.0` 各 1 など）。
+- 直接依存のうち **`uniffi` 0.31.2 だけが MPL-2.0**（唯一の非 MIT/Apache 直接依存）。ほかは MIT または Apache-2.0 を選択可能です（`btleplug` は BSD-3-Clause を含む三択、`uuid` は Apache-2.0/MIT、`nix` は MIT、`fs2` は MIT/Apache-2.0、`rustix` は Apache-2.0 WITH LLVM-exception / Apache-2.0 / MIT）。
+- Cargo 管理外の同梱資産も本ファイルで扱います: GUI 同梱の **Noto Sans JP**（OFL-1.1、§5）、**egui 既定フォント**（OFL-1.1 / Ubuntu Font Licence 1.0、§3.6.1）、**Gradle wrapper**（Apache-2.0、§3.6.3）。
+- 参考: Linux x86_64 ホストで実際にビルドされる第三者クレートは `cargo tree --locked --workspace --all-features` のユニーク **315**（dev 依存を含む。既定 feature では **298**）。`cargo metadata` の 497 は Cargo.lock 全体＝全ターゲット・全 feature・optional 依存を含む集合です。
 
 | SPDX 式 | 件数 |
 | --- | ---: |
-| `MIT OR Apache-2.0` | 93 |
-| `MIT` | 20 |
-| `Apache-2.0 OR MIT` | 6 |
-| `Apache-2.0/MIT` | 3 |
-| `Unlicense OR MIT` | 2 |
+| `MIT OR Apache-2.0` | 237 |
+| `MIT` | 109 |
+| `Apache-2.0 OR MIT` | 36 |
+| `MIT/Apache-2.0` | 18 |
+| `Unicode-3.0` | 18 |
+| `Apache-2.0` | 14 |
+| `MPL-2.0` | 9 |
+| `Zlib OR Apache-2.0 OR MIT` | 8 |
+| `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | 7 |
+| `MIT OR Apache-2.0 OR Zlib` | 5 |
+| `Apache-2.0/MIT` | 4 |
+| `Unlicense OR MIT` | 4 |
+| `Zlib` | 3 |
+| `BSD-2-Clause OR Apache-2.0 OR MIT` | 2 |
+| `BSD-3-Clause` | 2 |
+| `BSD-3-Clause OR Apache-2.0` | 2 |
+| `BSD-3-Clause OR MIT OR Apache-2.0` | 2 |
+| `BSL-1.0` | 2 |
+| `MIT OR Apache-2.0 OR LGPL-2.1-or-later` | 2 |
+| `MIT OR Zlib OR Apache-2.0` | 2 |
 | `Unlicense/MIT` | 2 |
+| `(MIT OR Apache-2.0) AND OFL-1.1 AND LicenseRef-UFL-1.0` | 1 |
 | `(MIT OR Apache-2.0) AND Unicode-3.0` | 1 |
-| `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | 1 |
-| `MIT/Apache-2.0` | 1 |
+| `0BSD OR MIT OR Apache-2.0` | 1 |
+| `Apache-2.0 AND MIT` | 1 |
+| `BSD-2-Clause` | 1 |
+| `CC0-1.0` | 1 |
+| `ISC` | 1 |
+| `MIT / Apache-2.0` | 1 |
 | `MIT/Apache-2.0/BSD-3-Clause` | 1 |
-| `Zlib OR Apache-2.0 OR MIT` | 1 |
-| **合計** | **131** |
+| **合計** | **497** |
 
 ## 2. 直接依存（workspace）
 
@@ -36,35 +58,47 @@
 
 | クレート | バージョン | SPDX | 利用箇所 | 備考 |
 | --- | --- | --- | --- | --- |
-| `btleplug` | 0.13.5 | `MIT/Apache-2.0/BSD-3-Clause` | `eightbitdo-core`（既定 feature `ble`） | 三択。本プロジェクトは MIT / Apache-2.0 を選択。Linux では D-Bus / BlueZ 経由 |
-| `tokio` | 1.54.1 | `MIT` | `eightbitdo-core`, `eightbitdo-cli` | — |
+| `btleplug` | 0.13.5 | `MIT/Apache-2.0/BSD-3-Clause` | `eightbitdo-core`（既定 feature `ble`） | 三択。本プロジェクトは MIT / Apache-2.0 を選択。Linux では D-Bus / BlueZ 経由（§3.1） |
+| `eframe` | 0.29.1 | `MIT OR Apache-2.0` | `eightbitdo-gui` | 既定 feature（glow / default_fonts / x11 / wayland）。egui 既定フォントの帰属は §3.6.1 |
+| `uniffi` | 0.31.2 | `MPL-2.0` | `eightbitdo-uniffi` | 唯一の非 MIT/Apache 直接依存。ファイル単位コピーレフト（§3.3） |
+| `fs2` | 0.4.3 | `MIT/Apache-2.0` | `eightbitdo-core`（任意 feature `ble`） | BLE 単一所有者ロックの file lock。MIT を選択 |
+| `rustix` | 1.1.6 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `eightbitdo-core`（`cfg(unix)`、任意 feature `ble`） | Unix のみ。Apache-2.0 を選択。推移的に `rustix` 0.38.44（winit 経由）も入る |
+| `nix` | 0.29.0 | `MIT` | `eightbitdo-core`（`cfg(unix)`、任意 feature `ble`） | Unix のみ。`user` feature で `getpwuid_r` |
+| `tokio` | 1.54.1 | `MIT` | `eightbitdo-core`, `eightbitdo-cli`, `eightbitdo-gui`, `eightbitdo-uniffi` | — |
 | `tokio-util` | 0.7.20 | `MIT` | `eightbitdo-cli` | — |
-| `serde` | 1.0.229 | `MIT OR Apache-2.0` | `eightbitdo-protocol`（任意 feature `serde`）, `eightbitdo-cli` | — |
-| `serde_json` | 1.0.154 | `MIT OR Apache-2.0` | `eightbitdo-cli` | — |
+| `serde` | 1.0.229 | `MIT OR Apache-2.0` | `eightbitdo-protocol`（任意 feature `serde`）, `eightbitdo-cli`, `eightbitdo-uniffi` | — |
+| `serde_json` | 1.0.154 | `MIT OR Apache-2.0` | `eightbitdo-cli`, `eightbitdo-gui`, `eightbitdo-uniffi` | — |
 | `clap` | 4.6.9 | `MIT OR Apache-2.0` | `eightbitdo-cli` | — |
-| `thiserror` | 2.0.21 | `MIT OR Apache-2.0` | `eightbitdo-core` | — |
-| `sha2` | 0.10.9 | `MIT OR Apache-2.0` | `eightbitdo-cli` | — |
+| `thiserror` | 2.0.21 | `MIT OR Apache-2.0` | `eightbitdo-core`, `eightbitdo-uniffi` | 推移的に `thiserror` 1.0.69 も入る |
+| `sha2` | 0.10.9 | `MIT OR Apache-2.0` | `eightbitdo-cli`, `eightbitdo-gui` | — |
 | `toml` | 0.8.23 | `MIT OR Apache-2.0` | `eightbitdo-cli` | — |
 | `uuid` | 1.26.1 | `Apache-2.0 OR MIT` | `eightbitdo-core` | — |
-| `async-trait` | 0.1.92 | `MIT OR Apache-2.0` | `eightbitdo-core`, `eightbitdo-cli`（dev） | — |
+| `async-trait` | 0.1.92 | `MIT OR Apache-2.0` | `eightbitdo-core`, `eightbitdo-uniffi`, `eightbitdo-cli`（dev） | — |
 | `futures-util` | 0.3.34 | `MIT OR Apache-2.0` | `eightbitdo-core`（任意 feature `ble`） | — |
-| `hex` | 0.4.3 | `MIT OR Apache-2.0` | `eightbitdo-cli` | — |
+| `hex` | 0.4.3 | `MIT OR Apache-2.0` | `eightbitdo-cli`, `eightbitdo-gui` | — |
+| `chrono` | 0.4.45 | `MIT OR Apache-2.0` | `eightbitdo-gui` | 時刻表示 |
+| `dirs` | 5.0.1 | `MIT OR Apache-2.0` | `eightbitdo-gui` | 推移的に `dirs-sys` → `option-ext`（MPL-2.0、§3.3） |
 | `unicode-ident` | 1.0.27 | `(MIT OR Apache-2.0) AND Unicode-3.0` | 推移的（`proc-macro2` 経由） | 本プロジェクトのコードから直接使用していない。**Unicode-3.0 の帰属義務が加算される**（§3.2） |
 
-> Linux で実際にビルドされる集合は `--all-features` より小さくなります。macOS / Windows / Android 向けのクレート（`objc2*` / `windows*` / `jni*`）も同梱物に応じて帰属表示が必要です。
+> 利用箇所は workspace メンバーの `Cargo.toml` に基づきます。Linux で実際にビルドされる集合は全ターゲット集計より小さくなります（§1 の参考値を参照）。macOS / Windows / Android / iOS 向けのクレート（`objc2*` / `windows*` / `jni*` など）は同梱物に応じて帰属表示が必要です。
 
 ## 3. 帰属・ライセンス全文の扱い
 
-本プロジェクトのコードは `MIT OR Apache-2.0` で提供され、全文は [LICENSE-MIT](LICENSE-MIT) / [LICENSE-APACHE](LICENSE-APACHE) にあります。`LICENSE-APACHE` は Apache-2.0 の公式原文で、APPENDIX の `[yyyy] [name of copyright owner]` を `2026 haruki0420` に置換した以外は改変していません。依存側の選択式ライセンス（`OR`）は、本プロジェクトでは **MIT または Apache-2.0** を選択します。以下は追加で注意が必要なものです。
+本プロジェクトのコードは `MIT OR Apache-2.0` で提供され、全文は [LICENSE-MIT](LICENSE-MIT) / [LICENSE-APACHE](LICENSE-APACHE) にあります。`LICENSE-APACHE` は Apache-2.0 の公式原文で、APPENDIX の `[yyyy] [name of copyright owner]` を `2026 haruki0420` に置換した以外は改変していません。依存側の選択式ライセンス（`OR`）は、本プロジェクトでは **MIT または Apache-2.0** を選択します（`uniffi` の MPL-2.0 と単一ライセンスのクレートは選択式ではありません。§3.3・§3.5）。以下は追加で注意が必要なものです。
 
-### 3.1 BSD-3-Clause（btleplug）
+### 3.1 BSD-3-Clause（btleplug / tiny-skia）
 
 `btleplug` は `MIT/Apache-2.0/BSD-3-Clause` の三択のため、MIT / Apache-2.0 を選択する限り BSD の帰属義務は生じません。ただし安全側に倒し、参考として BSD-3-Clause の著作権表示を記載します。
 
 - Copyright (c) 2020-2021, Nonpolynomial
 - blurmac 由来部分: Copyright (c) 2017 Akos Kiss
 
-BSD-3-Clause 全文:
+GUI が同梱する `tiny-skia` / `tiny-skia-path`（`sctk-adwaita` → `winit` → `eframe` 経由）は **BSD-3-Clause のみ**で選択の余地がなく、帰属義務があります。
+
+- tiny-skia: Copyright (c) 2011 Google Inc. All rights reserved. / Copyright (c) 2020 Yevhenii Reizner All rights reserved.
+- tiny-skia-path: 著作権表示はクレート同梱の `LICENSE` に従います（BSD-3-Clause の同一条文）。
+
+BSD-3-Clause 全文（条文は共通で、著作権表示のみ上記のとおり読み替え）:
 
 ```text
 Copyright (c) 2020-2021, Nonpolynomial
@@ -98,9 +132,14 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 3.2 Unicode-3.0（unicode-ident）
+### 3.2 Unicode-3.0（ICU 系を含む 19 クレート）
 
-`unicode-ident` は `proc-macro2` 経由で入る推移的依存で、`(MIT OR Apache-2.0) AND Unicode-3.0` のため、MIT / Apache-2.0 に**加えて** Unicode ライセンスの著作権表示と許可通知を同梱する必要があります。
+前版では `unicode-ident` のみでしたが、GUI の追加で `eframe` → `webbrowser` → `url` → `idna` → `idna_adapter` → ICU4X 系が入り、Unicode-3.0 のクレートは **19** になりました。MIT / Apache-2.0 に**加えて** Unicode ライセンスの著作権表示と許可通知を同梱する必要があります。
+
+- `Unicode-3.0` 単独（18）: `icu_collections`, `icu_locale_core`, `icu_normalizer`, `icu_normalizer_data`, `icu_properties`, `icu_properties_data`, `icu_provider`, `litemap`, `potential_utf`, `tinystr`, `writeable`, `yoke`, `yoke-derive`, `zerofrom`, `zerofrom-derive`, `zerotrie`, `zerovec`, `zerovec-derive`
+- `(MIT OR Apache-2.0) AND Unicode-3.0`（1）: `unicode-ident` 1.0.27（`proc-macro2` 経由）
+
+以下は共通のライセンス本文です。各クレートの著作権年は同一ではないため、配布物では `cargo-about` 等の生成物に含まれる個別の著作権表示を用いてください。
 
 ```text
 UNICODE LICENSE V3
@@ -144,24 +183,102 @@ dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
 ```
 
-### 3.3 選択式ライセンスの扱い
+### 3.3 MPL-2.0（uniffi / option-ext）
 
-- `Unlicense OR MIT` / `Unlicense/MIT`（`memchr`, `same-file`, `walkdir`, `winapi-util`）: 本プロジェクトは **MIT** を選択します。MIT の著作権表示は各クレートの `LICENSE` に従います。
-- `Zlib OR Apache-2.0 OR MIT`（`objc2-core-bluetooth`）: **MIT または Apache-2.0** を選択します。Zlib の帰属義務は生じません。
-- `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`（`wasi`）: Apache-2.0 を選択します。
-- Apache-2.0 の依存に `NOTICE` ファイルがある場合は、その NOTICE を保持する必要があります（Apache-2.0 §4(d)）。現行ツリーに NOTICE を持つ依存は**確認されていません**。GUI / モバイル依存の追加時に再確認してください。
+MPL-2.0 は **ファイル単位の弱コピーレフト**です。本プロジェクトの唯一の非 MIT/Apache 直接依存で、crates.io の未改変版を使用しています。
 
-### 3.4 予定依存（未追加）の注意
-
-| クレート / 資産 | ライセンス | 注意 |
+| クレート | バージョン | 経路 |
 | --- | --- | --- |
-| `egui` / `eframe` | `MIT OR Apache-2.0` | `default_fonts` に同梱フォント（Ubuntu-Light / Hack / NotoEmoji 等）が含まれ、それぞれ別ライセンス。GUI 追加時に帰属を本ファイルへ追記 |
-| `hidapi` | Rust ラッパーは `MIT` | **上流 C 実装は GPL-3.0 / BSD-3-Clause / original の三択**。BSD または original を選択し、上流 `LICENSE.txt` を本ファイルへ追加。`linux-static-hidraw` を推奨（libudev 非依存） |
-| `uniffi` | `MPL-2.0` | 唯一の弱コピーレフト。ファイル単位の義務。未改変で依存する限りアプリ全体の再ライセンスは不要。生成バインディング（Kotlin / Swift）のヘッダに MPL 表記が付くかは追加時に確認 |
-| `dirs` | `MIT OR Apache-2.0` | — |
-| Noto Sans JP | `SIL OFL 1.1` | §5 |
+| `uniffi` | 0.31.2 | `eightbitdo-uniffi` の直接依存 |
+| `uniffi_bindgen`, `uniffi_core`, `uniffi_internal_macros`, `uniffi_macros`, `uniffi_meta`, `uniffi_pipeline`, `uniffi_udl` | 0.31.2 | `uniffi` の内部クレート（feature `cli` で bindgen も入る） |
+| `option-ext` | 0.2.0 | `eightbitdo-gui` → `dirs` → `dirs-sys` |
 
-### 3.5 システムライブラリ（Cargo の外）
+義務と扱い:
+
+- クレートを**改変しない限り**、本プロジェクトのコード（MIT / Apache-2.0）へ MPL は及びません。アプリ全体の再ライセンスや全ソース開示は不要です。
+- 改変したファイルのみ MPL-2.0 となり、そのソースを MPL-2.0 で提供する必要があります。`Cargo.toml` に `[patch]` は無く、現時点で改変はありません。改変する場合は本節と配布物のソース提供を更新してください。
+- バイナリ配布時は、MPL-2.0 の対象であることと、ソースの入手先（crates.io の該当バージョン）を通知してください（MPL-2.0 §3.2 Executable Form）。
+- MPL-2.0 はアプリ全体へのコピーレフトを及ぼさず、追加の利用制限も課さないため、App Store / Google Play などのストア配布と両立し得ます（一般論であり法的助言ではありません）。
+- UniFFI が生成する Kotlin / Swift バインディングに MPL 表記が付くかは生成物で確認してください（生成物は `.gitignore` 済みで、リポジトリには含まれません）。
+
+### 3.4 選択式ライセンス（OR）の扱い
+
+- `Unlicense OR MIT` / `Unlicense/MIT`（`memchr`, `same-file`, `walkdir`, `winapi-util` など 6）: 本プロジェクトは **MIT** を選択します。MIT の著作権表示は各クレートの `LICENSE` に従います。
+- `Zlib OR Apache-2.0 OR MIT`（`bytemuck`, `objc2-*` など 8）: **MIT または Apache-2.0** を選択します。Zlib の帰属義務は生じません。
+- `MIT OR Apache-2.0 OR Zlib` / `MIT OR Zlib OR Apache-2.0`（`glow`, `raw-window-handle`, `miniz_oxide` など 7）: MIT または Apache-2.0 を選択します。
+- `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`（`rustix` 2 バージョン, `wasi` など 7）: Apache-2.0 を選択します。
+- `BSD-3-Clause OR Apache-2.0`（`moxcms`, `pxfm`）、`BSD-3-Clause OR MIT OR Apache-2.0`（`num_enum`, `num_enum_derive`）、`BSD-2-Clause OR Apache-2.0 OR MIT`（`zerocopy`, `zerocopy-derive`）: MIT または Apache-2.0 を選択します。
+- `MIT OR Apache-2.0 OR LGPL-2.1-or-later`（`r-efi` 2）: MIT または Apache-2.0 を選択し、**LGPL の義務は生じません**。
+- `0BSD OR MIT OR Apache-2.0`（`adler2`）、`Apache-2.0/MIT`（4）、`MIT/Apache-2.0`（18）: MIT または Apache-2.0 を選択します。
+- `Apache-2.0 AND MIT`（`dpi`）: 両方の条件を満たす必要があります（Apache-2.0 の NOTICE 義務を含む）。
+- `MIT/Apache-2.0/BSD-3-Clause`（`btleplug`）: §3.1。
+
+### 3.5 単一ライセンスのクレート（選択不可・帰属必須）
+
+| ライセンス | クレート | 件数 | 義務 |
+| --- | --- | ---: | --- |
+| `Zlib` | `foldhash`, `slotmap`, `zlib-rs` | 3 | 著作権表示と「This notice may not be removed or altered from any source distribution」を保持 |
+| `BSD-3-Clause` | `tiny-skia`, `tiny-skia-path` | 2 | §3.1 |
+| `BSD-2-Clause` | `arrayref` | 1 | 著作権表示・条件の保持 |
+| `ISC` | `libloading` | 1 | 著作権表示・許可通知の保持 |
+| `BSL-1.0` | `clipboard-win`, `error-code` | 2 | 著作権表示と Boost ライセンス全文を同梱 |
+| `CC0-1.0` | `hexf-parse` | 1 | 表示義務なし（帰属は任意） |
+| `MPL-2.0` | `uniffi` 系 8 + `option-ext`（§3.3） | 9 | ファイル単位コピーレフト |
+| `Unicode-3.0` | `icu_*` / `zerovec` など 18（§3.2） | 18 | Unicode ライセンスの表示 |
+| `(MIT OR Apache-2.0) AND OFL-1.1 AND LicenseRef-UFL-1.0` | `epaint_default_fonts` | 1 | §3.6.1 |
+
+### 3.6 帰属が必要な同梱資産
+
+#### 3.6.1 egui の既定フォント（`epaint_default_fonts` 0.29.1）
+
+GUI は `eframe` を既定 feature で使うため、`egui` の `default_fonts` が有効になり、`epaint_default_fonts` がバイナリに含まれます。ライセンス式は `(MIT OR Apache-2.0) AND OFL-1.1 AND LicenseRef-UFL-1.0` で、同梱フォントごとに条件が異なります。
+
+| ファイル | フォント | ライセンス |
+| --- | --- | --- |
+| `Hack-Regular.ttf` | Hack | MIT（+ DejaVu public domain、Bitstream Vera License） |
+| `NotoEmoji-Regular.ttf` | Noto Emoji | SIL OFL 1.1 |
+| `Ubuntu-Light.ttf` | Ubuntu Light | Ubuntu Font Licence 1.0（**非 SPDX**） |
+| `emoji-icon-font.ttf` | emoji-icon-font | MIT |
+
+- クレートには `fonts/OFL.txt` / `fonts/UFL.txt` / `fonts/Hack-Regular.txt` / `fonts/emoji-icon-font-mit-license.txt` が同梱されています。**バイナリ配布物にはこれら 4 ファイルを含めてください。**
+- `LicenseRef-UFL-1.0` は SPDX 標準識別子ではありません。`cargo-deny` を導入する場合は例外扱いを検討してください（付録 B）。
+- これらはシステムフォントではありません。日本語表示自体は GUI 同梱の Noto Sans JP（§5）を使います。
+
+#### 3.6.2 Noto Sans JP（同梱済み）
+
+`crates/eightbitdo-gui/assets/fonts/` に `NotoSansJP-{Regular,Medium,Bold}.otf` と `OFL.txt` がコミットされています。詳細と義務は §5 を参照してください。
+
+#### 3.6.3 Gradle wrapper（Apache-2.0、コミット済み jar）
+
+`mobile/android/` の Gradle wrapper はビルド再現性のためリポジトリにコミットしています（Gradle 9.8.2）。
+
+- 対象: `mobile/android/gradlew`, `mobile/android/gradlew.bat`, `mobile/android/gradle/wrapper/gradle-wrapper.jar`, `mobile/android/gradle/wrapper/gradle-wrapper.properties`
+- `gradle-wrapper.jar` の `META-INF/MANIFEST.MF` に `SPDX-License-Identifier: Apache-2.0`、jar 内に `META-INF/LICENSE`（Apache-2.0 全文）が含まれます。帰属: Gradle, Inc.（The Gradle Authors）。
+- 再配布時は Apache-2.0 の全文（[LICENSE-APACHE](LICENSE-APACHE) と同一）と著作権表示を保持してください。jar には NOTICE が含まれていないため、追加の NOTICE 要件はありません（Apache-2.0 §4(d)）。jar を改変する場合は改変の明示が必要です（§4(b)）。
+- Gradle 本体（配布 zip）や依存はコミットしていません。`gradle-wrapper.properties` の `distributionSha256Sum` で取得物を固定しています。
+- wrapper を更新する場合は、生成元 Gradle バージョン・SHA-256・jar 内のライセンス表示を再確認してください。
+
+### 3.7 追加された直接依存の注意
+
+| クレート | バージョン | SPDX | 注意 |
+| --- | --- | --- | --- |
+| `eframe` / `egui` | 0.29.1 | `MIT OR Apache-2.0` | 既定 feature（glow / default_fonts / x11 / wayland）で GUI に組み込み。wgpu 系は既定では有効化していません。同梱フォントは §3.6.1 |
+| `fs2` | 0.4.3 | `MIT/Apache-2.0` | BLE 単一所有者ロックの file lock。MIT を選択 |
+| `rustix` | 1.1.6（直接）/ 0.38.44（winit 経由） | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | Unix のみ。Apache-2.0 を選択 |
+| `nix` | 0.29.0 | `MIT` | Unix のみ。`user` feature で `getpwuid_r` |
+| `chrono` | 0.4.45 | `MIT OR Apache-2.0` | GUI の時刻表示 |
+| `dirs` | 5.0.1 | `MIT OR Apache-2.0` | GUI のバックアップ先。`dirs-sys` → `option-ext`（MPL-2.0、§3.3） |
+| `uniffi` | 0.31.2 | `MPL-2.0` | §3.3 |
+
+> USB HID（`hidapi`）はまだ追加されていません。追加時は、Rust ラッパーは `MIT` ですが**上流 C 実装が GPL-3.0 / BSD-3-Clause / original の三択**のため、BSD または original を選択し、上流 `LICENSE.txt` を本ファイルへ追加してください（`linux-static-hidraw` を推奨。§3.9 の libudev 項も参照）。
+
+### 3.8 NOTICE ファイルを持つ依存
+
+- `cfg_aliases` 0.1.1 / 0.2.2 が `NOTICES.md` を持ちます（`tectonic_cfg_support::target_cfg!` 由来の MIT コード。Apache-2.0 の NOTICE ではありません）。`cargo-about` の生成物には含めてください。
+- それ以外に、展開済みの依存ソースを走査した限り `NOTICE` ファイルは確認されていません（2026-11-23 時点）。Apache-2.0 の依存に NOTICE がある場合は保持が必要です（Apache-2.0 §4(d)）。依存更新時に再確認してください。
+- 自プロジェクトの [NOTICE](NOTICE) は依存側 NOTICE とは別物です。
+
+### 3.9 システムライブラリ（Cargo の外）
 
 `cargo deny` は Cargo 依存しか検査しません。配布物に `.so` を同梱する場合（AppImage / Flatpak / インストーラ）は `ldd` で洗い出し、追加の帰属表示を行ってください。
 
@@ -170,36 +287,49 @@ authorization of the copyright holder.
 | libdbus | **AFL-2.1 または GPL-2.0+ のデュアル** | `btleplug` → `bluez-async` → `dbus`（Linux） | **AFL-2.1 を選択**。同梱する場合は AFL の帰属を追加。通常の Linux 配布（システム提供）なら同梱不要 |
 | libudev | LGPL-2.1+ | `hidapi` の `linux-native` feature 使用時のみ | 既定の `linux-static-hidraw` なら不要。使う場合は動的リンクと LGPL 条件を確認 |
 | BlueZ | GPL-2.0 | OS の D-Bus サービスとして利用 | リンク・同梱しない |
+| OpenGL / EGL / GLX（Mesa 等） | MIT 系 | GUI（`glow` / `glutin`） | 通常はシステム提供。AppImage / Flatpak で同梱する場合は Mesa 等の帰属を追加 |
+| X11 / xcb / libxkbcommon / Wayland client | MIT 系 | GUI（`winit` / `glutin`、x11 / wayland feature） | 通常はシステム提供。同梱する場合は各ライブラリの帰属を追加 |
 | GPU ドライバ（OpenGL / Vulkan / Metal） | 各ベンダ | GUI 描画 | 通常は同梱しない |
+| Android SDK / NDK / Gradle / Kotlin ツールチェーン | Apache-2.0 等 | モバイルのビルド時にのみ使用 | 配布物に同梱しない（Gradle wrapper は §3.6.3） |
 
 ## 4. 生成・更新方法
 
-本ファイルは `cargo metadata` の集計結果を初期版としています。依存の追加・更新時に次を実行して差分を確認してください。**未マージのブランチが追加する依存は本一覧に未反映です。** 例えば GUI / モバイル / OTA 系ブランチで追加される `eframe` / `egui`、`fs2`、`rustix` などが main にマージされた時点で、本ファイルを再生成し、直接依存の表と帰属義務（NOTICE / ライセンス全文の要否）を更新してください。
+本ファイルは `cargo metadata` の集計結果を正としています。依存の追加・更新時に次を実行し、SPDX 集計表・件数・直接依存表を更新してください。基準コミット（現在は main `6b39e23`）も併せて更新します。
 
 ```sh
-cargo metadata --format-version 1 --all-features > /tmp/meta.json
-# ライセンス式の集計例
+# 対象コミットの Cargo.lock を固定して集計する（--locked を必須にする）
+cargo metadata --locked --all-features --format-version 1 > /tmp/meta.json
 python3 - <<'PY'
 import json, collections
 m = json.load(open('/tmp/meta.json'))
 third = [p for p in m['packages'] if p['source'] is not None]
-for lic, n in collections.Counter(p.get('license') for p in third).items():
+print('packages', len(m['packages']), 'workspace', len(m['workspace_members']), 'third', len(third))
+print('license 空', sum(1 for p in third if not p.get('license')))
+for lic, n in collections.Counter(p.get('license') for p in third).most_common():
     print(n, '|', lic)
 PY
 ```
 
+- `cargo metadata` の件数は Cargo.lock 全体（全ターゲット・全 feature・optional 依存を含む）です。Linux ホストで実際にビルドされる範囲は `cargo tree --locked --workspace --all-features` で確認できます。
+- 旧版との差分は `git diff <旧 base>..<新 base> -- Cargo.lock` と本ファイルの件数で確認します。
+- 未マージのブランチが追加する依存は本一覧に反映されません。依存を追加する PR では、その PR 内で本ファイルの該当行（§2 の直接依存表、§3 の特殊ライセンス）を更新してください。
+
 本格運用では次のいずれかを推奨します。
 
-- **`cargo-deny`**: 許可リストで GPL 系の混入を機械的に拒否（§付録 B）。
+- **`cargo-deny`**: 許可リストで GPL 系の混入を機械的に拒否（付録 B）。
 - **`cargo-about`**: `cargo about generate` で帰属一覧を自動生成し、本ファイルの表を置き換える。
-- CI で生成物の差分（drift）を検出する（§付録 C）。
+- CI で生成物の差分（drift）を検出する（付録 C）。
 
 ## 5. 同梱フォント: Noto Sans JP（SIL OFL 1.1）
 
 ### 5.1 現状
 
-- **本コミット（main 系の `docs/licensing`）にはフォント資産はありません。** GUI crate（`crates/eightbitdo-gui`）はまだ main に存在しません。
-- GUI ブランチ（`feat/gui-redesign-jp`）には `crates/eightbitdo-gui/assets/fonts/` に `NotoSansJP-*.otf` と `OFL.txt` が追加されています。GUI を main に取り込む時点で、以下を満たしてください。
+- **main `6b39e23` の時点で GUI（`crates/eightbitdo-gui`）が存在し、フォント資産もコミット済みです。** `crates/eightbitdo-gui/assets/fonts/` に次のファイルがあります。
+  - `NotoSansJP-Regular.otf`（7461 グリフ、JIS X 0208 第 1・2 水準 + UI 文字列）
+  - `NotoSansJP-Medium.otf` / `NotoSansJP-Bold.otf`（各 1054 グリフ、UI 文字列のみ）
+  - `OFL.txt`（上流の OFL 全文、改変なし）
+  - `README.md`（サブセット手順・上流バージョン）、`build_fonts.py`（再生成スクリプト）
+- 上流は Noto Sans CJK JP 2.004 で、サブセット化（グリフ削減・縦組みテーブル等の削除）は Modified Version 扱いです。詳細は `crates/eightbitdo-gui/assets/fonts/README.md` を参照してください。
 - フォントの著作権表示（上流 OFL.txt の冒頭）:
 
 ```text
@@ -216,12 +346,12 @@ Copyright 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Sour
 
 ### 5.3 同梱時の要件
 
-- `crates/eightbitdo-gui/assets/fonts/OFL.txt` に**上流の OFL.txt を改変せず**配置する。
+- `crates/eightbitdo-gui/assets/fonts/OFL.txt` に**上流の OFL.txt を改変せず**配置する（現状は配置済み）。
 - **サブセット化は可能**（Modified Version 扱い）。サブセット版も OFL で配布し、`Source` を名前に使わず、Adobe / Google の著作権表示を保持し、単体販売しない。アプリ内では「サブセット版である」旨を明記する。
 - `Noto` は Google のブランドです。OFL は商標権を許諾しないため、公式 Noto と誤認させない（例: `Noto Sans JP (subset)` と表示）。
-- GUI の **About > Open Source Licenses** 等に、OFL 全文と著作権表示、サブセットである旨を表示する。バイナリへの `include_bytes!` だけでは「easily viewed」を満たさない可能性があるため、UTF-8 のテキストも配布物に含める。
+- **未対応（残課題）**: GUI の **About > Open Source Licenses** 等のライセンス画面は未実装です。現状 `OFL.txt` はリポジトリにあるだけで、バイナリには `include_bytes!` していません。バイナリ配布前に、OFL 全文と著作権表示、サブセットである旨を閲覧できる形で同梱してください（standalone のテキストファイル、またはライセンス画面）。
 - アプリのライセンス（MIT / Apache-2.0）とフォントの OFL は独立です。アプリのライセンス条項で OFL の義務を制限しないでください。
-- `egui` の `default_fonts` を使う場合、egui 同梱フォントの帰属も本ファイルとライセンス画面に追加する（§3.4）。
+- `egui` の `default_fonts` も有効なため、egui 同梱フォントの帰属（OFL / UFL / MIT / Bitstream Vera）も本ファイルとライセンス画面に追加する（§3.6.1）。
 
 ## 付録 A: SIL Open Font License 1.1 全文
 
@@ -339,13 +469,17 @@ allow = [
   "BSD-3-Clause",
   "ISC",
   "Zlib",
+  "0BSD",
+  "BSL-1.0",
   "Unicode-3.0",
   "Unlicense",
   "CC0-1.0",
   "MPL-2.0",
+  "OFL-1.1",
 ]
 
-# GPL / AGPL / SSPL は allow に無いため拒否される
+# GPL / AGPL / SSPL / LGPL（単独選択）は allow に無いため拒否される。
+# `r-efi` の LGPL-2.1-or-later は MIT / Apache-2.0 を選択できるため、式として許可される。
 
 [bans]
 multiple-versions = "warn"
@@ -357,7 +491,8 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 ```
 
-> `MPL-2.0` を allow するのは `uniffi`（予定）のためです。`exceptions` は原則使わず、使う場合は理由と期限を PR に記録してください。
+> - `MPL-2.0` を allow するのは `uniffi`（直接依存）と `option-ext` のためです。`exceptions` は原則使わず、使う場合は理由と期限を PR に記録してください。
+> - `epaint_default_fonts` の `LicenseRef-UFL-1.0` は SPDX 標準識別子ではないため、この allow リストだけでは通らない可能性があります。導入時に `[licenses] private` / `exceptions` のどちらで扱うかを決め、判断理由を記録してください。
 
 ## 付録 C: CI 追加案（未適用）
 

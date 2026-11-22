@@ -65,7 +65,7 @@ slot2 keys:
 
 ### 3.1 `flag` の意味は未確定（opaque）
 
-実機の `map_key.flag` は **`0x20200911`（slot 0/1）と `0xFFFFFFFF`（slot 2）** であり、静的解析が示す `0/1`（`1` = リマップ有効 / `0` = デフォルト）ではない。`0x20200911` が有効フラグの一種なのか、別のメタデータ（バージョン / タイムスタンプ等）を含むのかは**未確定**である。CLI の `config map show` は 0/1 以外の値を `0x… (observed on hardware; meaning unconfirmed/opaque)` と表示し、デバイスの確定仕様として解釈しない。`config set map_key.flag` の typed 入力だけが 0/1 を扱う。
+実機の `map_key.flag` は **`0x20200911`（slot 0/1）と `0xFFFFFFFF`（slot 2）** であり、静的解析が示す `0/1`（`1` = リマップ有効 / `0` = デフォルト）ではない。`0x20200911` が有効フラグの一種なのか、別のメタデータ（バージョン / タイムスタンプ等）を含むのかは**未確定**である。CLI の `config map show` が表示する「disabled/default」は現行実装の解釈であり、デバイスの確定仕様ではない。
 
 ---
 
@@ -109,9 +109,9 @@ slot2 keys:
 
 ---
 
-## 6. raw 検証との不整合（修正済み: `fix/mapkey-flag`）
+## 6. raw 検証との不整合（`--force-raw` が必要）
 
-以前は raw 検証が各レコードの `flag` を `0/1` に制限していたため、この実機ダンプの書き戻しが拒否された。`fix/mapkey-flag` で raw 経路の flag 検証を opaque 化し、実機値（`0x20200911` / `0xFFFFFFFF` / `0x20190000`）を **`--force-raw` なしで** 受理する。typed `config set` の flag フィールドは 0/1 制限を維持する。slot 2 の `key[22]` に残る `0xFFFFFFFF` 消去 sentinel も raw では受理し、typed remap では拒否する。修正前のエラー記録:
+この実機ダンプを `config write --file` でそのまま書き戻そうとすると、現行の raw 検証（各レコードの `flag` は `0/1` のみ許可）が実機値と衝突して拒否される。`.tmp/sess.err` の実際のエラー:
 
 ```text
 error: I/O error: configuration file has invalid known fields; refusing to write (use --force-raw only to restore an undocumented device backup):
