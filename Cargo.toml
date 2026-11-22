@@ -4,6 +4,7 @@ members = [
     "crates/eightbitdo-protocol",
     "crates/eightbitdo-core",
     "crates/eightbitdo-cli",
+    "crates/eightbitdo-uniffi",
 ]
 
 [workspace.package]
