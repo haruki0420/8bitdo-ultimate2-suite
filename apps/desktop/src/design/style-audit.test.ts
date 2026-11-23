@@ -142,8 +142,10 @@ describe("自己監査: 値の許可リスト", () => {
     // Tailwind のバリアント（data-[state=open] など）はデザイントークンの
     // 任意値ではないため許可する（任意値の混入検査から除外する）。
     const allowedVariant = /^(?:data|aria|group|peer|has|not|supports|nth)-\[/;
+    // バリアント接頭辞（`md:` / `hover:` / `sm:` …）の区切り `:` も開始位置として
+    // 扱い、`md:p-[13px]` のようなバリアント付きの任意値も検出する。
     const matches = [
-      ...ALL_TEXT.matchAll(/(?:^|[\s"'`])([a-z][a-z0-9]*(?:-[a-z0-9]+)*)-\[/g),
+      ...ALL_TEXT.matchAll(/(?:^|[\s"'`:])([a-z][a-z0-9]*(?:-[a-z0-9]+)*)-\[/g),
     ]
       .map((match) => `${match[1] ?? ""}-[`)
       .filter((token) => !allowedVariant.test(token));

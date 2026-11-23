@@ -9,7 +9,7 @@
 
 `apps/desktop` の Tauri 移行 PR で、Android の `namespace` / `applicationId` と iOS の `bundleID` / 内部名（`xtool.yml` の `product`、SwiftPM の product）を `io.github.haruki0420.padbench` / `Padbench` に変更しました。同一ホストで再ビルドした結果です。
 
-- **ビルド元**: 作業ツリー（`feat/tauri-gui`。モバイルの Kotlin / Swift / Rust 入力を含む差分はコミット `ba515cf` になった）
+- **ビルド元**: 作業ツリー（`feat/tauri-gui`）。Android の `namespace` / `applicationId` と iOS の `bundleID` などの識別子変更は `5d9c75c`、iOS の内部名（`Package.swift` / `xtool.yml`）と README は `ba515cf`。Rust コードは両コミットで不変
 - **ビルド日時**: 2026-11-23 15:02 JST（Android / iOS とも）
 - **ホスト**: Arch Linux x86_64、rustc/cargo 1.100.0、JDK 21.0.13、Android SDK `/opt/android-sdk`（NDK 29.0.14206865）、xtool `/usr/bin/xtool`
 

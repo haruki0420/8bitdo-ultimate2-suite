@@ -135,7 +135,7 @@ apps/desktop/
   object-src 'none'; base-uri 'none'`。
   ローカル資産だけで動かし、外部 URL は読み込みません（`style-src 'unsafe-inline'` は
   React のインライン `style` 属性、`ipc:` / `http://ipc.localhost` は Tauri v2 の IPC 用）。
-  外部リンクを開く処理は未実装です（P5 で OS のブラウザに渡す形で実装し、WebView 内では遷移しません）。
+  外部リンクを開く処理は未実装です（必要になった時点で、OS のブラウザに渡す形で実装します。WebView 内では遷移しません）。
 - **capability は `core:default` だけ**で、現時点では広めです（`core:default` は Tauri の
   基本 API をまとめて許可する）。P2 以降で用途別 capability に分割し、`fs` / `shell` /
   `http` プラグインは追加しません（[docs/TAURI_PLAN.md](../../docs/TAURI_PLAN.md) §3.2・§5）。

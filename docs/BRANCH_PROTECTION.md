@@ -99,19 +99,7 @@ scripts/post-review-status.sh <PR> <reviewed-sha> <1|2|3> failure
 
 スクリプトは Tier 引数（1/2/3）を検証します。PR の宣言 Tier と quorum は検証しないため（手続き）、呼び出し側が PR の宣言 Tier を渡してください。投稿直前に head SHA を固定し、`success` の投稿前には `gh pr view --json reviewDecision` で `CHANGES_REQUESTED` を確認します（best-effort）。投稿後に `gh api --paginate --slurp ... | jq` で全 status と check run（`filter=all`）を監査します（**jq 必須**。gh 2.105.0 は `--slurp` と `--jq` / `--template` を併用できません）。`STATE=success` は最新 check run（`id` で選択）が `success` / `skipped` / `neutral` / なし、`STATE=failure` は gate-satisfying な check run が残っていないことを要求します。最新 status / check run が期待状態でない、または監査 API が失敗した場合、スクリプトは `review-gate=failure` を投稿して非 0 で終了します。
 
-> ### desktop ワークフロー（advisory）
-
-`Desktop` ワークフロー（`.github/workflows/desktop.yml` の `desktop-web` / `desktop-rust`）は、
-`apps/desktop` とその path 依存だけを検証する **advisory（必須ではない）** check です。現行の
-required status checks は上表の 5 つ（`fmt` / `clippy` / `test` / `msrv` / `review-gate`）だけで、
-desktop の 2 ジョブは ruleset に含めていません。
-
-- required に昇格する場合は **ruleset を変更する別 PR**（`.github/rulesets/main-protection.json`
-  の `required_status_checks` と live ruleset の更新）で行います。この PR では変えません。
-- そのため desktop ジョブが失敗しても、`review-gate` と上記 5 つが揃えば GitHub の必須条件は
-  満たされます。**マージ判断では desktop ジョブの結果も確認してください**（手続き上の必須）。
-
-`review-gate` は **required status check** です。commit status（`scripts/post-review-status.sh`）または同じ context の check run で満たされます。ruleset に `integration_id` が無いため、どちらも gate-satisfying です。
+> `review-gate` は **required status check** です。commit status（`scripts/post-review-status.sh`）または同じ context の check run で満たされます。ruleset に `integration_id` が無いため、どちらも gate-satisfying です。
 
 ## status / check run の監査
 
