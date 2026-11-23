@@ -159,6 +159,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 | **[docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)** | クロスプラットフォームのビルド確認状況（Windows クロス `check` の結果と警告 4 件、MSRV 1.85 が Windows で通らない理由、iOS target check、macOS 未確認の理由、CI 追加提案） |
 | **[docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)** | BLE OTA 実機検証の準備: btsnoop 採取（Linux `btmon` / Android HCI snoop）、確認項目と判定、EVIDENCE への追記、Phase A / B の安全手順 |
 | **[mobile/README.md](mobile/README.md)** | iOS / Android のビルド手順、UniFFI 公開 API、到達点と制約（unsigned IPA / JNI 同梱 APK / 未公開の書込） |
+| **[docs/MOBILE_NATIVE_PLAN.md](docs/MOBILE_NATIVE_PLAN.md)** | モバイルネイティブ（iOS / Android）のフル機能ギャップ監査と実装計画: 現状サマリ（§1.2 不足一覧）、UniFFI 追加 API 案（§2.3）、画面一覧・工数・実装順序・リスク |
 | **[docs/SESSION_OPERATIONS.md](docs/SESSION_OPERATIONS.md)** | 常駐 `session` の運用（per-user BLE 単一所有者ロック、degraded 終了コード 3、SIGINT 範囲、押下依頼前の `scan` 確認手順、`scripts/session-loop.sh` の scan 契約と backoff） |
 | **[AGENTS.md](AGENTS.md)** | AI エージェント／開発者向け引き継ぎガイド（[CLAUDE.md](CLAUDE.md) からも参照） |
 | **[CONTRIBUTING.md](CONTRIBUTING.md)** | ブランチ運用、必須 CI、独立レビュー（Tier 1〜3 / SHA 紐づきの `review-gate` 成功）の手順 |
