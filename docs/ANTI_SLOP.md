@@ -2,9 +2,10 @@
 
 - 作成: 2026-11-23
 - 目的: 「量産的」「AI が作った感じ」を**主観で争わず**、判断と検証の手順に落とす
-- 位置づけ: 本ドキュメントは**方法論の推奨（非規範）**。レビュー checklist・Tier 判定の正本は [docs/REVIEW_TIERS.md](REVIEW_TIERS.md) です。本文書は差し戻し条件を定義しません（§4 の 3 項）。
-- 適用対象: 本リポジトリのデスクトップ GUI（**Tauri v2 / Web UI で再構築中（決定済み）**）と、今後追加する画面。モバイル（Kotlin / Swift）はネイティブ UI のため、§2.1 の CSS / DOM 前提の検出手段はそのままは使えません（色定数・フォントサイズ定数の静的検査と目視で代替します）。
-- GUI の現状: **GUI は Tauri v2 で再構築中（決定済み）。egui 版は凍結保存。** Tauri 版の計画・デザイン決定・実装は `feat/tauri-gui` ブランチ（`docs/TAURI_PLAN.md` / `docs/DESIGN_TAURI.md` / `docs/design/mockup.html` / `apps/desktop`）で進行中で、**main にはまだありません**。したがって本文書ではこれらをリンクせず、パス名の言及にとどめます（マージ後に参照してください）。GUI の技術スタックは Tauri v2 が決定事項であり、「egui を明示的に不使用」という意味ではありません。
+- 位置づけ: 本文書は**方法論の推奨（非規範）**。レビュー checklist・Tier 判定の正本は [docs/REVIEW_TIERS.md](REVIEW_TIERS.md) です。本文書は差し戻し条件を定義しません（§4 の 3 項）。
+- 適用対象: 本リポジトリのデスクトップ GUI（**Tauri v2 / Web UI で再構築中。決定は `feat/tauri-gui` ブランチで、main 未反映**）と、今後追加する画面。モバイル（Kotlin / Swift）はネイティブ UI のため、§2.1 の CSS / DOM 前提の検出手段はそのままは使えません（色定数・フォントサイズ定数の静的検査と目視で代替します）。
+- GUI の現状: **GUI は `feat/tauri-gui` ブランチで Tauri v2 へ再構築中。egui 版は凍結保存。** Tauri 版の計画・デザイン決定・実装は同ブランチ（`docs/TAURI_PLAN.md` / `docs/DESIGN_TAURI.md` / `docs/design/mockup.html` / `apps/desktop`）で進行中で、**main にはまだありません**。したがって本文書ではこれらをリンクせず、パス名の言及にとどめます（マージ後に参照してください）。GUI の技術スタックは同ブランチで Tauri v2 と決定されており、「egui を明示的に不使用」という意味ではありません。
+- main との関係: main の `AGENTS.md` §3・`README.md` の GUI 節・`crates/eightbitdo-gui/README.md`・`docs/IMPLEMENTATION_PLAN.md` は **egui 前提の記述のまま**（「Tauri を使わない」と明記）です。Tauri v2 の許可と GUI 再構築の反映は `feat/tauri-gui` ブランチで行う予定で、**本文書（本 PR）は main の技術スタック記述を変更しません**。
 - 正本の関係: 色・タイポ・レイアウト・方向（Direction 5 行）・用語集の正本は `docs/DESIGN_TAURI.md`（`feat/tauri-gui`）。本文書は方法論のみを扱い、具体値や方向を再定義しません（§5）。
 
 ---
@@ -39,20 +40,22 @@
 | 兆候 | 検出方法（Tauri v2 / Web UI） | 検出方法（egui 版・凍結コード） | 合格条件 |
 | --- | --- | --- | --- |
 | 色相グラデーション（面・文字・光彩） | `gradient` の grep、`tokens.ts` と `tokens.css` の変数検査 | `Painter` のグラデ呼び出しと多段色定数の grep（`theme.rs`） | 0 件（同一色相内の微小な明度差のみ許可） |
-| アクセント色の乱立 | 色トークンの列挙（`COLORS` / `ACCENT`）と CSS 変数の一致テスト | 色定数（`pub const ... Color32`）の列挙と、テーマトークン単一性テスト（`theme.rs` 以外に色を作らない） | クロームのアクセントは 1 色のみ |
+| アクセント色の乱立 | 色トークンの列挙（`COLORS` / `ACCENT`）と CSS 変数の一致テスト | 色定数（`pub const ... Color32`）の列挙と、`theme.rs` 以外に色を作らないことの grep（トークン単一性テストは未整備） | クロームのアクセントは 1 色のみ |
 | 絵文字をアイコン代わりに使用 | 絵文字コードポイントの検査（`terminology.test.ts`） | ソース文字列の絵文字スキャン（`i18n.rs` と画面コード） | 0 件（16px・1.5 stroke の線画 SVG のみ） |
 | 紫・ネオンの使用 | 色相の検査 | 色定数の色相検査 | 使用しない |
 | 過剰な影・グロー・カラーブラー | `box-shadow` / `filter: blur` の検査 | `Shadow` / `Stroke` の使用箇所の検査 | 影は `--shadow-pop` の 1 種のみ（ポップオーバー・ダイアログ・トースト） |
-| 4px グリッド外の余白 | 任意値（`[...px]`）の grep | `SPACE_*` の 4px 倍数テストと直書きの grep | 0 件 |
-| 角丸の量産（`rounded-full` の多用） | クラス集計（**Tauri 版では**）と `RADIUS` トークン外の値の grep | `RADIUS_*` の種類数テスト（4 種まで） | スイッチ等の形状に限定 |
+| 4px グリッド外の余白 | 任意値（`[...px]`）の grep | `SPACE_*` 定数と直書きの grep（4px 倍数のテストは未整備） | 0 件 |
+| 角丸の量産（`rounded-full` の多用） | クラス集計と `RADIUS` トークン外の値の grep | `RADIUS_*` の 4 種を `geometry_fits_the_minimum_window_with_one_content_column` が検査 | スイッチ等の形状に限定 |
 | 12px 未満の文字 | サイズトークン検査 | フォントサイズ定数（`FONT_*`）の grep と 11px 未満の検出 | 最小 11px（データ補助のみ） |
 | コントラスト不足 | 実測計算（`contrastRatio`） | 実測計算（`theme.rs` の `contrast_ratio` テスト） | AA: 本文 4.5:1、大文字 3:1、操作輪郭 3:1 |
-| 用語の不統一・禁止語 | 用語集テスト（`VOCAB` / `terminology.test.ts`） | 用語集テスト（`i18n.rs` の文字列と用語集の突き合わせ） | 録音/ライブ入力/設定値 等の旧語 0 件 |
+| 用語の不統一・禁止語 | 用語集テスト（`VOCAB` / `terminology.test.ts`） | `i18n.rs` の文字列と**対象 UI の用語集**の突き合わせ（egui 用の用語集テストは未整備） | 対象 UI の用語集に照らして旧語 0 件 |
 | 未検証の主張 | コピーのレビュー + grep | コピーのレビュー + grep | 「完全」「絶対」「10x」等の断定なし |
 
-> **導入予定**: Tauri 版の実装時に、`apps/desktop/src/**/*.test.ts` へ、グラデ禁止・絵文字禁止・単一アクセント・コントラスト・用語集の同じテスト群を追加する（現在は未実装）。`apps/desktop` のテストは root の CI では走らない（フロントエンドは手動で `pnpm test`）。**画面を追加したら同じテスト群に項目を足す**。egui 版は凍結済みのため、既存の `cargo test -p eightbitdo-gui` を回帰確認に使う。
+> **導入予定（main では未実装）**: `feat/tauri-gui` ブランチでは `apps/desktop` に `tokens.test.ts` / `terminology.test.ts` 等を**追加中**で、main には Tauri 版のコードもテストもありません。実装後は `apps/desktop/src/**/*.test.ts(x)` の同じテスト群へ画面追加分を足す。`apps/desktop` のテストは root の CI では走らない（フロントエンドは手動で `pnpm test`）。egui 版は凍結済みで、自動テストは文字スケール・コントラスト（`contrast_ratio`）・幾何・フォント同梱のみ（`cargo test -p eightbitdo-gui`）。
 
-モバイル（Kotlin / Swift）のネイティブ UI は CSS・DOM 検査ができないため、同じ兆候を**色定数・フォントサイズ定数の静的検査、絵文字スキャン、コントラストの計算、テーマトークンの単一性テスト**で検出する（検査基盤はモバイル実装時に用意する。§5 の対象外）。
+> egui 版の UI 文言は当時の語（「ライブ入力」「設定値」等）が現行であり、Tauri 版の用語集を遡って適用しない（合格条件は「対象 UI の用語集」に対して判定する）。Tauri 版の用語集は `docs/DESIGN_TAURI.md` §6.3（`feat/tauri-gui`）。
+
+モバイル（Kotlin / Swift）のネイティブ UI は CSS・DOM 検査ができないため、同じ兆候を**色定数・フォントサイズ定数の静的検査、絵文字スキャン、コントラストの計算、テーマトークンの単一性テスト**で検出する（検査基盤はモバイル実装時に用意する。冒頭の「適用対象」のとおり、本文書が扱うのはデスクトップ GUI）。
 
 ### 2.2 目視・レビューで見る（機械化が難しい）
 
@@ -113,7 +116,7 @@
 
 ## 5. 本リポジトリの GUI への適用（正本を参照）
 
-本リポジトリのデスクトップ GUI は **Tauri v2 で再構築中（決定済み）**。表示名 **Padbench**（2026-11-23 決定）と実装は `feat/tauri-gui` ブランチで進行中で、**main にはまだ無い**（main の GUI は egui 版で、凍結保存）。方向（Direction 5 行）・トークン・コンポーネント・用語集の決定記録は `docs/DESIGN_TAURI.md` が正本。
+本リポジトリのデスクトップ GUI は **`feat/tauri-gui` ブランチで Tauri v2 へ再構築中（main 未反映）**。表示名 **Padbench**（2026-11-23 に同ブランチで決定）と実装は同ブランチで進行中で、**main にはまだ無い**（main の GUI は egui 版で、凍結保存）。方向（Direction 5 行）・トークン・コンポーネント・用語集の決定記録は `docs/DESIGN_TAURI.md` が正本。main の egui 前提の記述（§3・README・`docs/IMPLEMENTATION_PLAN.md`）の更新は同ブランチで行う。
 
 - **方向 5 行**: 正本 `docs/DESIGN_TAURI.md` §4 をそのまま参照する（Product / Character / World / Moments / Signature）。**本文書では再定義しない**（二重定義を避ける）。
 - **見せ場**: 正本の Moments だけに置く（入力モニターの暗いステージ、書き込み前の確認）。明るい作業面には光を足さない。
@@ -126,7 +129,7 @@
 
 ## 6. 参考
 
-- [unslop（作者 Damir Sokolovsky、CC BY 4.0）](https://github.com/heydamir/unslop) — 方向 5 行・9 パス・チェックリスト。本ドキュメントの骨格。原典は https://heydamir.design/unslop 。本文書は原典の考え方を**翻案して作成**した（CC BY 4.0 の条件に従い、作者名・ライセンス・出典を表示）。
+- [unslop（作者 Damir Sokolovsky、CC BY 4.0）](https://github.com/heydamir/unslop) — 方向 5 行・9 パス・チェックリスト。本文書の骨格。原典は https://heydamir.design/unslop 。本文書は原典の考え方を**翻案して作成**した（CC BY 4.0 の条件に従い、作者名・ライセンス・出典を表示）。
 - [AI Slop Design: Why AI-Generated UI Looks Generic](https://vibecodekit.dev/ai-slop-design) — 原因は判断の不在。
 - [AI Slop and UI Homogenization: Measuring Design Convergence](https://design-agent.dev/blog/2026-10-15-ai-slop-measuring-design-homogenization/) — 生成的均質性の測定。
 - [How to Fix a Vibe-Coded UI: The AI-Slop Checklist](https://standoutmcp.io/guides/fix-vibe-coded-ui-checklist) — 兆候別チェックリスト。
