@@ -171,6 +171,8 @@ A の規律（罫線・余白・装飾の削除）と、B の「値は打刻（�
 
 ## 5. トークン仕様
 
+> **2026-11-23 更新（Imported style: Hyperstudio）**: この §5 の案 C「昼の作業台と夜のステージ」のライト面トークン（`#F4F6F7` 等）と `--shadow-pop` は廃止し、Hyperstudio の暗色トークンに**置換済み**です。色・タイポグラフィ・コンポーネントの正本は [docs/design/IMPORTED_STYLE_HYPERSTUDIO.md](design/IMPORTED_STYLE_HYPERSTUDIO.md) です（§12）。以下の §5 は経緯として残します。実装は `apps/desktop/src/styles/tokens.css` と `apps/desktop/src/index.css` を参照してください。
+
 ### 5.1 色
 
 #### 5.1.1 ルール（先に決める）
@@ -843,3 +845,50 @@ y_screen = cy − ny * r        // ny が +1 のとき画面の上端
 - [docs/design/mockup.html](design/mockup.html) — 2 状態の静的モックアップ
 - [docs/design/README.md](design/README.md) — モックアップの開き方とトークンの対応
 - [docs/REVIEW_TIERS.md](REVIEW_TIERS.md) — この文書を変更するときのレビュー Tier（docs のみのため Tier 1。ただし P1 の決定を変える場合は実装 PR と分ける）
+
+---
+
+## 12. Imported style (Hyperstudio) — 色・タイポ・コンポーネントの正本
+
+2026-11-23 に、`apps/desktop` のデザインを **Hyperstudio スタイル**（Refero Styles からインポート）へ置換しました。**色・タイポグラフィ・余白・角丸・コンポーネントの正本は [docs/design/IMPORTED_STYLE_HYPERSTUDIO.md](design/IMPORTED_STYLE_HYPERSTUDIO.md)** です。この節は、§3〜§5 の案 C から何を置き換えたかの記録です。
+
+- 出典: [Hyperstudio — Refero Styles](https://styles.refero.design/style/8eb9c53e-d69c-497a-b640-610856cf3a60)
+- コンセプト: **「黒曜石に刻んだ青写真」**。near-black の canvas、1px ヘアライン、白 1 色のピル、`compass-gold` のアイコン線、weight 400 の大きな文字と負のトラッキング。影・グラデーション・写真・色付きの塗りを使わない
+- Refero / Hyperstudio は**参考**であり、Padbench は両者と提携・推奨・後援の関係にありません。名称・ロゴ・固有アートワークは使用していません
+
+### 12.1 §5 から置換したもの
+
+| 旧（案 C） | 新（Hyperstudio） |
+| --- | --- |
+| ライト面 `#F4F6F7` / `#FFFFFF` / `#EDF0F2` | `obsidian #101010` / `carbon #080808` / `paper-ink #1a1a1a` |
+| `--line` / `--line-strong` の 2 段 | `graphite #212121`（構造）/ `iron #474747`（二次） |
+| `--text` / `--text-2` / `--text-muted` | `chalk #f3f3f3` / `ash #c1c1c1` / `smoke #9c9c9c` |
+| 青緑アクセント `#0B6A63` + soft 地 | 廃止。主アクションは `signal-white` の白ピル 1 つだけ |
+| 状態色の soft 地（warning / danger / success） | 廃止。danger は 1px `#b42318` 枠 + `chalk` 文字 |
+| ダークステージ `[data-surface="stage"]` | 廃止。全体が暗いため、ステージは `carbon` 地 + 1px `graphite` のパネル |
+| `--shadow-pop` | **削除**。影は一切使わない（フォーカスは 1px chalk の outline） |
+| Noto Sans JP / Hack | **Inter**（+ Noto Sans JP）/ **JetBrains Mono**・**IBM Plex Mono**（OS フォールバック、woff2 同梱は TODO） |
+| 見出し 700 / UI 500 | **すべて 400**。階層はサイズとトラッキングだけ |
+| スケール 24 / 18 / 15 / 14 / 13 / 12 / 11 | 63 / 44 / 34 / 23 / 21 / 18 / 17 / 16 / 14 / 13 / 12（12 は mono メタ） |
+| 角丸 4 / 6 / 8 / 12 / 9999 | 4 / 8 / 99 / 9999（9999 は白ピルだけ） |
+| 主キー = 墨の塗りボタン | **白ピル**（`signal-white` + `obsidian` 文字、9999px、14px、12×24） |
+| コンテンツ最大幅 880px | **1200px** |
+| 表 = ヘッダーに `--surface-sunken` の地 | 罫線のみ（1px `graphite`）。選択行だけ `paper-ink` |
+
+### 12.2 実装の参照先
+
+- トークン: `apps/desktop/src/styles/tokens.css`（値の正本）、`apps/desktop/src/index.css`（Tailwind `@theme` 写像）、`apps/desktop/src/design/tokens.ts`（テスト用の写し）
+- コンポーネント: `apps/desktop/src/components/`（Button / StatusPill / Field / Select / Switch / Tabs / Table / Dialog / Toast / Banner / EmptyState / icons）
+- 画面: `apps/desktop/src/screens/`（Devices / InputMonitor / Placeholder）、シェル: `apps/desktop/src/shell/`
+- テスト: `apps/desktop/src/design/tokens.test.ts`（トークン一致・コントラスト・タイポ）、`apps/desktop/src/design/style-audit.test.ts`（影・グラデ・塗り・角丸・アイコン色・weight の自己監査）
+- 実測コントラスト: 上記 IMPORTED_STYLE_HYPERSTUDIO.md §8
+
+### 12.3 検証
+
+- `pnpm --dir apps/desktop build` / `pnpm --dir apps/desktop test`（全件）
+- X11 で起動し、1280×800 と 900×620 のスクリーンショットを取得
+- 自己監査: グラデ 0 / 絵文字 0 / 影 0 / 色付きの塗りは白ピルと pulse-green ドットのみ / アイコン色は chalk か compass-gold のみ / 角丸は 4・8・99・9999 のみ / 見出し weight 400 / 本文・UI 文字は AA
+
+### 12.4 用語
+
+用語集（§6.3）は維持します。「入力モニター」「現在値」「記録」「書き込み対応版」「次にすること」は変更ありません。

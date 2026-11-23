@@ -1,5 +1,7 @@
 # デザインモックアップ
 
+> **2026-11-23 更新**: 現在の実装は **Imported style: Hyperstudio** に置換済みです。色・タイポグラフィ・コンポーネントの正本は [IMPORTED_STYLE_HYPERSTUDIO.md](IMPORTED_STYLE_HYPERSTUDIO.md) と [../DESIGN_TAURI.md](../DESIGN_TAURI.md) §12 です。この README と `mockup.html` は案 C「昼の作業台と夜のステージ」時代の**経緯資料**で、現在の実装とは一致しません。
+
 `mockup.html` は Tauri v2 + Web UI 版 GUI のデザイン確認用の**静的モックアップ**です。デザインの正本は [../DESIGN_TAURI.md](../DESIGN_TAURI.md) で、このファイルはその見た目を 1 枚で確認するための資料です。
 
 ## 開き方

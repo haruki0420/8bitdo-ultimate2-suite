@@ -64,6 +64,8 @@ describe("App", () => {
     const version = await screen.findByTestId("app-version");
     expect(version).toHaveTextContent("v0.1.0");
     expect(invokeMock).toHaveBeenCalledWith("app_info");
+    expect(screen.getByTestId("status-pill")).toHaveTextContent("未接続");
+    expect(screen.queryByTestId("status-pill-dot")).toBeNull();
 
     expect(
       screen.getByRole("complementary", { name: "書き込み前の確認" }),
@@ -127,14 +129,18 @@ describe("App", () => {
     const stage = document.querySelector('[data-surface="stage"]');
     expect(stage).not.toBeNull();
     expect(stage).toHaveAttribute("data-surface", "stage");
+    // 全体が暗いため、ステージは carbon 地 + 1px graphite のパネルで表す。
+    expect(stage?.className).toContain("bg-carbon");
+    expect(stage?.className).toContain("border-graphite");
 
     // コントローラの線画は置かず、スティック図 2 つだけを描く。
     expect(document.querySelector('[aria-label*="コントローラの見本"]')).toBeNull();
     const pads = screen.getAllByTestId("stick-pad");
     expect(pads).toHaveLength(2);
     for (const pad of pads) {
+      // 外周 + 現在位置ドットの 2 円、軌跡は 1px の線 3 本（不透明度だけ変化）。
       expect(pad.querySelectorAll("circle")).toHaveLength(2);
-      expect(pad.querySelector("polyline")).not.toBeNull();
+      expect(pad.querySelectorAll("line")).toHaveLength(3);
     }
 
     expect(screen.getByText("見本の値です")).toBeInTheDocument();

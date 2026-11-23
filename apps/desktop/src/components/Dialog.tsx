@@ -8,13 +8,13 @@ export interface DialogProps {
   onClose: () => void;
   children: ReactNode;
   footer?: ReactNode;
-  /** 幅 480（md） / 確認用 560（lg）（§5.5.7） */
+  /** 幅 480（md） / 確認用 560（lg） */
   size?: "md" | "lg";
 }
 
 /**
- * ネイティブ `<dialog>` + `showModal()` を使う（§5.5.7）。
- * トップレイヤー・Esc・フォーカスの閉じ込めはブラウザに任せ、追加依存を増やさない。
+ * ネイティブ `<dialog>` + `showModal()` を使う。
+ * パネルは carbon 地 + 1px graphite 枠 + 8px 角丸。影は使わない。
  */
 export function Dialog({
   open,
@@ -78,25 +78,25 @@ export function Dialog({
       data-size={size}
       aria-labelledby={titleId}
     >
-      <div className="dialog-enter flex max-h-full flex-col overflow-hidden rounded-lg border border-line bg-panel shadow-pop">
-        <header className="flex items-start justify-between gap-4 px-6 pt-6 pb-2">
-          <h2 id={titleId} className="text-title font-bold text-ink">
+      <div className="dialog-enter flex max-h-full flex-col overflow-hidden rounded-md border border-graphite bg-carbon">
+        <header className="flex items-start justify-between gap-4 px-6 pt-6 pb-3">
+          <h2 id={titleId} className="text-heading text-chalk">
             {title}
           </h2>
           <button
             type="button"
             onClick={onClose}
             aria-label="閉じる"
-            className="inline-flex size-8 shrink-0 items-center justify-center rounded-sm text-muted transition-colors duration-90 ease-standard hover:bg-hover hover:text-ink focus-visible:shadow-focus focus-visible:outline-hidden"
+            className="inline-flex size-8 shrink-0 items-center justify-center rounded-icon text-chalk transition-colors duration-90 ease-standard hover:bg-paper-ink"
           >
             <CloseIcon />
           </button>
         </header>
-        <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-4 text-body text-ink-2">
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-5 text-body text-smoke">
           {children}
         </div>
         {footer !== undefined && (
-          <footer className="flex justify-end gap-2 px-6 py-4">
+          <footer className="flex justify-end gap-2 px-6 py-5">
             {footer}
           </footer>
         )}

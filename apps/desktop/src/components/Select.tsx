@@ -17,8 +17,8 @@ export interface SelectProps
 }
 
 /**
- * ネイティブ `<select>` を使い、矢印だけをインライン SVG にする（§5.5.4）。
- * 開いた一覧は OS のポップアップに任せ、自作リストボックスは作らない。
+ * ネイティブ `<select>`。透明地 + 1px graphite 枠 + 8px 角丸、focus で 1px chalk。
+ * 開いた一覧は OS のポップアップに任せ、色は明示して文字が消えないようにする。
  */
 export function Select({
   id,
@@ -30,7 +30,10 @@ export function Select({
 }: SelectProps) {
   return (
     <div className="flex min-w-0 flex-col gap-1">
-      <label htmlFor={id} className="text-meta text-muted">
+      <label
+        htmlFor={id}
+        className="font-mono text-micro tracking-meta text-smoke uppercase"
+      >
         {label}
       </label>
       <div className="relative">
@@ -38,7 +41,7 @@ export function Select({
           id={id}
           aria-describedby={hint === undefined ? undefined : `${id}-hint`}
           className={cn(
-            "h-control w-full appearance-none rounded-sm border border-line-strong bg-panel pr-7 pl-2.5 text-ui text-ink transition-colors duration-90 ease-standard hover:bg-hover focus-visible:border-accent focus-visible:shadow-focus focus-visible:outline-hidden disabled:bg-sunken disabled:text-disabled",
+            "h-control w-full appearance-none rounded-md border border-graphite bg-carbon pr-9 pl-4 text-ui text-chalk transition-colors duration-90 ease-standard hover:border-iron focus:border-chalk focus:outline-hidden disabled:cursor-not-allowed disabled:text-smoke",
             className,
           )}
           {...rest}
@@ -49,10 +52,10 @@ export function Select({
             </option>
           ))}
         </select>
-        <ChevronDownIcon className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 text-muted" />
+        <ChevronDownIcon className="pointer-events-none absolute top-1/2 right-3 -translate-y-1/2 text-chalk" />
       </div>
       {hint !== undefined && (
-        <p id={`${id}-hint`} className="text-meta text-muted">
+        <p id={`${id}-hint`} className="text-meta text-smoke">
           {hint}
         </p>
       )}

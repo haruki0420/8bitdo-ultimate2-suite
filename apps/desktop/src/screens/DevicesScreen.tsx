@@ -25,18 +25,20 @@ export interface DevicesScreenProps {
 
 /**
  * デバイス画面（未接続）。空状態 + スキャン / 接続の操作 + 接続情報の表。
- * 実接続は次のフェーズなので、スキャンと接続は無効の理由をボタン直下に添える。
+ * 主アクション（白ピル）は 1 画面に 1 つだけ置く。
  */
 export function DevicesScreen({ ipcError }: DevicesScreenProps) {
   return (
     <div>
-      <h1 className="text-display font-bold text-balance text-ink">デバイス</h1>
-      <p className="mt-2 mb-5 max-w-prose text-body text-ink-2 text-pretty">
+      <h1 className="text-display tracking-display text-balance text-chalk">
+        デバイス
+      </h1>
+      <p className="mt-3 mb-6 max-w-prose text-body text-smoke text-pretty">
         コントローラを設定モードにして接続します。接続すると現在値を読み込みます。
       </p>
 
       {ipcError !== null && (
-        <div className="mb-5">
+        <div className="mb-6">
           <Banner tone="danger" title="Rust バックエンドに接続できませんでした。">
             {ipcError}
           </Banner>
@@ -56,12 +58,9 @@ export function DevicesScreen({ ipcError }: DevicesScreenProps) {
         }
       />
 
-      <section className="mt-8" aria-labelledby="connection-info-title">
-        <div className="mb-2 flex flex-wrap items-start justify-between gap-3">
-          <h2
-            id="connection-info-title"
-            className="text-heading font-medium text-ink"
-          >
+      <section className="mt-10" aria-labelledby="connection-info-title">
+        <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+          <h2 id="connection-info-title" className="text-subheading text-chalk">
             接続情報
           </h2>
           <Button
@@ -85,14 +84,14 @@ export function DevicesScreen({ ipcError }: DevicesScreenProps) {
             key: row.key,
             cells: {
               item: row.label,
-              value: <span className="text-muted">{NO_VALUE}</span>,
-              note: <span className="text-meta text-muted">{row.note}</span>,
+              value: <span className="font-mono text-meta text-ash">{NO_VALUE}</span>,
+              note: <span className="font-mono text-micro text-smoke">{row.note}</span>,
             },
           }))}
           empty={<span>接続すると値が入ります。</span>}
         />
 
-        <p className="mt-2 text-meta text-muted">
+        <p className="mt-3 text-meta text-smoke">
           接続すると現在値（設定 2768 バイト）を読み込みます。
         </p>
       </section>

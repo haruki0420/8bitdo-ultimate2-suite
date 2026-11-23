@@ -14,17 +14,17 @@ export function PlaceholderScreen({
 }: PlaceholderScreenProps) {
   return (
     <div>
-      <h1 className="text-display font-bold text-balance text-ink">{title}</h1>
-      <p className="mt-2 mb-5 max-w-prose text-body text-ink-2 text-pretty">
+      <h1 className="text-display tracking-display text-balance text-chalk">
+        {title}
+      </h1>
+      <p className="mt-3 mb-6 max-w-prose text-body text-smoke text-pretty">
         {description}
       </p>
       <EmptyState
         message="この画面はまだ準備中です。"
         instruction="次のフェーズで追加します。いまは「デバイス」で接続状態を確認できます。"
         action={
-          <Button variant="secondary" onClick={onOpenDevices}>
-            デバイスを開く
-          </Button>
+          <Button onClick={onOpenDevices}>デバイスを開く</Button>
         }
       />
     </div>

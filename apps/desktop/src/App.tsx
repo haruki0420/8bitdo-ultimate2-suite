@@ -99,10 +99,10 @@ export default function App() {
   }, []);
 
   return (
-    <div className="relative flex h-dvh flex-col overflow-hidden bg-bg text-ink">
+    <div className="relative flex h-dvh flex-col overflow-hidden bg-obsidian text-smoke">
       <a
         href="#main-content"
-        className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:rounded-sm focus:bg-panel focus:px-3 focus:py-2 focus:text-ui focus:font-medium focus:text-ink focus:shadow-focus"
+        className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:rounded-md focus:border focus:border-chalk focus:bg-carbon focus:px-4 focus:py-2 focus:text-ui focus:text-chalk"
       >
         本文へスキップ
       </a>
@@ -118,7 +118,7 @@ export default function App() {
           connection={null}
         />
 
-        {/* 1180px 未満では右レールをコンテンツの下へ回す（§5.4.2） */}
+        {/* 1180px 未満では右レールをコンテンツの下へ回す */}
         <div className="flex min-w-0 flex-1 flex-col overflow-y-auto rail:flex-row rail:overflow-hidden">
           <main
             id="main-content"
@@ -136,7 +136,7 @@ export default function App() {
 
           <aside
             aria-label="書き込み前の確認"
-            className="shrink-0 border-t border-line px-6 py-6 rail:w-rail rail:border-t-0 rail:border-l rail:overflow-y-auto"
+            className="shrink-0 border-t border-graphite px-6 py-6 rail:w-rail rail:border-t-0 rail:border-l rail:overflow-y-auto"
           >
             <SafetyRail />
           </aside>
@@ -148,18 +148,14 @@ export default function App() {
         onClose={closeLicenses}
         title="ライセンス"
         footer={
-          <Button variant="secondary" onClick={closeLicenses}>
-            閉じる
-          </Button>
+          <Button onClick={closeLicenses}>閉じる</Button>
         }
       >
         <p>アプリのライセンスは MIT または Apache-2.0 です。</p>
         <p className="mt-2">
           同梱フォントのライセンス全文の表示は次のフェーズで追加します。
         </p>
-        <p className="mt-3 font-mono text-data tracking-data text-muted">
-          MIT OR Apache-2.0
-        </p>
+        <p className="mt-3 font-mono text-meta text-smoke">MIT OR Apache-2.0</p>
       </Dialog>
     </div>
   );

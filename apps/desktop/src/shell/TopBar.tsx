@@ -1,4 +1,4 @@
-import { BrandRing } from "../components";
+import { BrandRing, StatusPill } from "../components";
 import type { AppInfo } from "../lib/app-info";
 
 export interface TopBarProps {
@@ -6,32 +6,25 @@ export interface TopBarProps {
 }
 
 /**
- * 上部バー 52px（§5.4.1）。状態はここに 1 つだけ置き、ナビや本文で繰り返さない。
+ * 上部バー 52px。背景は obsidian 一色、境界は 1px graphite。
+ * 状態はここに 1 つだけ置き、ナビや本文で繰り返さない。
  */
 export function TopBar({ appInfo }: TopBarProps) {
   return (
-    <header className="flex h-topbar shrink-0 items-center justify-between gap-4 border-b border-line bg-panel px-5">
-      <div className="flex min-w-0 items-baseline gap-2.5">
-        <BrandRing className="self-center text-accent" />
-        <span className="text-ui font-medium whitespace-nowrap text-ink">
-          Padbench
-        </span>
-        <span className="text-meta whitespace-nowrap text-muted">
+    <header className="flex h-topbar shrink-0 items-center justify-between gap-4 border-b border-graphite bg-obsidian px-6">
+      <div className="flex min-w-0 items-baseline gap-3">
+        <BrandRing className="self-center text-compass-gold" />
+        <span className="text-body whitespace-nowrap text-chalk">Padbench</span>
+        <span className="font-mono text-micro tracking-meta whitespace-nowrap text-smoke">
           書き込み対応版
         </span>
       </div>
 
       <div className="flex min-w-0 items-center gap-4">
-        <span className="inline-flex items-center gap-1.5 text-ui font-medium whitespace-nowrap text-ink">
-          <span
-            aria-hidden="true"
-            className="size-2 rounded-full border border-muted"
-          />
-          未接続
-        </span>
+        <StatusPill label="未接続" />
         <span
           data-testid="app-version"
-          className="font-mono text-data tracking-data whitespace-nowrap text-muted"
+          className="font-mono text-micro tracking-meta whitespace-nowrap text-smoke"
         >
           {appInfo === null ? "v—" : `v${appInfo.version}`}
         </span>

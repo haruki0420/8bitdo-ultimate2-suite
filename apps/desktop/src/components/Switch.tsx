@@ -9,8 +9,8 @@ export interface SwitchProps {
 }
 
 /**
- * スイッチ 36×20・つまみ 16（§5.5.3）。
- * 色だけで状態を伝えないよう、右に「オン」「オフ」を文字で出す。
+ * スイッチ 36×20・つまみ 16。塗りは使わず、1px 枠とつまみの位置で状態を表す。
+ * 色だけに頼らないよう、右に「オン」「オフ」を mono で出す。
  */
 export function Switch({
   id,
@@ -22,7 +22,7 @@ export function Switch({
   const labelId = `${id}-label`;
 
   return (
-    <div className="flex min-h-control items-center gap-2">
+    <div className="flex min-h-control items-center gap-3">
       <button
         id={id}
         type="button"
@@ -32,24 +32,24 @@ export function Switch({
         disabled={disabled}
         onClick={() => onCheckedChange(!checked)}
         className={cn(
-          "relative h-5 w-9 shrink-0 rounded-full border transition-colors duration-160 ease-standard focus-visible:shadow-focus focus-visible:outline-hidden disabled:cursor-not-allowed",
-          checked
-            ? "border-accent bg-accent"
-            : "border-line-strong bg-sunken",
+          "relative h-5 w-9 shrink-0 rounded-full border transition-colors duration-160 ease-standard disabled:cursor-not-allowed",
+          checked ? "border-chalk" : "border-iron",
         )}
       >
         <span
           aria-hidden="true"
           className={cn(
-            "absolute top-px left-px size-4 rounded-full border border-line bg-panel transition-transform duration-160 ease-standard",
-            checked && "translate-x-4",
+            "absolute top-0.5 left-0.5 size-4 rounded-full transition-transform duration-160 ease-standard",
+            checked ? "translate-x-4 bg-chalk" : "bg-iron",
           )}
         />
       </button>
-      <span id={labelId} className="text-ui text-ink-2">
+      <span id={labelId} className="text-ui text-smoke">
         {label}
       </span>
-      <span className="text-meta text-muted">{checked ? "オン" : "オフ"}</span>
+      <span className="font-mono text-micro tracking-meta text-smoke uppercase">
+        {checked ? "オン" : "オフ"}
+      </span>
     </div>
   );
 }

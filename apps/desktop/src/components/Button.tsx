@@ -3,24 +3,28 @@ import { useId, type ButtonHTMLAttributes, type ReactNode } from "react";
 import { cn } from "../lib/cn";
 import { Spinner } from "./icons";
 
-export type ButtonVariant = "primary" | "secondary" | "danger" | "danger-solid";
+/**
+ * ボタンは 3 種だけ（Imported style）。
+ * - primary: signal-white の白ピル（9999px）。1 画面に 1 つまで。
+ * - secondary: 透明地 + 1px signal-white のゴースト。8px 角丸。
+ * - danger: ゴースト + 1px danger の枠。文字は AA を満たす chalk
+ *   （danger #B42318 は obsidian 上で 2.89:1 のため文字には使わない）。
+ */
+export type ButtonVariant = "primary" | "secondary" | "danger";
 export type ButtonSize = "md" | "sm";
 
-/** 主キーは墨の塗り。danger-solid は確認ダイアログの最終ボタンだけに使う（§5.5.1）。 */
 const VARIANT_CLASS: Record<ButtonVariant, string> = {
   primary:
-    "border-transparent bg-ink-fill text-on-ink hover:bg-ink-hover active:bg-ink-active",
+    "border-transparent rounded-full bg-signal-white px-6 text-obsidian hover:bg-chalk active:bg-ash disabled:border-graphite disabled:bg-signal-white/10 disabled:text-smoke",
   secondary:
-    "border-line-strong bg-panel text-ink hover:bg-hover active:bg-active",
+    "rounded-md border-signal-white bg-transparent px-5 text-signal-white hover:border-chalk hover:text-chalk active:bg-paper-ink disabled:border-graphite disabled:text-smoke",
   danger:
-    "border-danger bg-panel text-danger hover:bg-danger-soft active:bg-danger-soft",
-  "danger-solid":
-    "border-danger-fill bg-danger-fill text-on-ink hover:bg-danger-fill-hover",
+    "rounded-md border-danger bg-transparent px-5 text-chalk hover:border-chalk active:bg-paper-ink disabled:border-graphite disabled:text-smoke",
 };
 
 const SIZE_CLASS: Record<ButtonSize, string> = {
-  md: "h-control px-3.5",
-  sm: "h-control-sm px-2.5 text-meta",
+  md: "h-control",
+  sm: "h-control-sm text-meta",
 };
 
 export interface ButtonProps
@@ -29,7 +33,7 @@ export interface ButtonProps
   size?: ButtonSize;
   /** 処理中はラベルを変えず、スピナーと aria-busy だけを足す。 */
   loading?: boolean;
-  /** 無効の理由をボタンの直下に 1 行で出す。押せると誤読させない（§5.5.1）。 */
+  /** 無効の理由をボタンの直下に 1 行で出す。押せると誤読させない。 */
   disabledReason?: string;
   children: ReactNode;
 }
@@ -55,7 +59,7 @@ export function Button({
       aria-busy={loading || undefined}
       aria-describedby={disabledReason === undefined ? undefined : reasonId}
       className={cn(
-        "inline-flex items-center justify-center gap-1.5 rounded-sm border font-medium whitespace-nowrap transition-colors duration-90 ease-standard focus-visible:shadow-focus focus-visible:outline-hidden disabled:cursor-not-allowed disabled:border-transparent disabled:bg-sunken disabled:text-disabled",
+        "inline-flex items-center justify-center gap-2 border text-ui font-normal whitespace-nowrap transition-colors duration-90 ease-standard disabled:cursor-not-allowed",
         VARIANT_CLASS[variant],
         SIZE_CLASS[size],
         className,
@@ -74,7 +78,7 @@ export function Button({
   return (
     <span className="inline-flex flex-col items-start gap-1">
       {button}
-      <span id={reasonId} className="text-meta text-muted">
+      <span id={reasonId} className="text-meta text-smoke">
         {disabledReason}
       </span>
     </span>

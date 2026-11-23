@@ -17,7 +17,7 @@ export interface TabsProps {
 }
 
 /**
- * タブ（§5.5.5）。選択下線は 2px の要素で表現し、レイアウトを動かさない。
+ * タブ（Imported style）: 下線 1px だけ。選択時 chalk、非選択 transparent。塗りなし。
  * ← → Home End で移動する（roving tabindex）。
  */
 export function Tabs({ ariaLabel, items, selectedId, onChange }: TabsProps) {
@@ -58,7 +58,7 @@ export function Tabs({ ariaLabel, items, selectedId, onChange }: TabsProps) {
       role="tablist"
       aria-label={ariaLabel}
       onKeyDown={move}
-      className="flex gap-1 border-b border-line"
+      className="flex gap-1 border-b border-graphite"
     >
       {items.map((item) => {
         const selected = item.id === selectedId;
@@ -75,10 +75,10 @@ export function Tabs({ ariaLabel, items, selectedId, onChange }: TabsProps) {
             tabIndex={selected ? 0 : -1}
             onClick={() => onChange(item.id)}
             className={cn(
-              "relative h-tab rounded-t-sm px-3 text-ui font-medium transition-colors duration-90 ease-standard hover:bg-hover hover:text-ink-2 focus-visible:shadow-focus focus-visible:outline-hidden",
+              "relative h-tab px-4 text-ui transition-colors duration-90 ease-standard",
               selected
-                ? "text-ink after:absolute after:inset-x-0 after:-bottom-px after:h-0.5 after:bg-accent"
-                : "text-muted",
+                ? "text-chalk after:absolute after:inset-x-0 after:-bottom-px after:h-px after:bg-chalk"
+                : "text-smoke hover:text-chalk",
             )}
           >
             {item.label}
@@ -102,7 +102,7 @@ export function TabPanel({ id, labelledBy, children }: TabPanelProps) {
       role="tabpanel"
       aria-labelledby={labelledBy}
       tabIndex={0}
-      className="pt-4"
+      className="pt-6"
     >
       {children}
     </div>

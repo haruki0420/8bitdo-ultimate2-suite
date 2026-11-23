@@ -10,19 +10,19 @@ export interface ToastProps {
   title: string;
   meta?: string;
   onClose: () => void;
-  /** 表示時間。既定は 4 秒、危険は 8 秒（§5.5.8） */
+  /** 表示時間。既定は 4 秒、危険は 8 秒 */
   duration?: number;
 }
 
-const BAR_CLASS: Record<ToastTone, string> = {
-  success: "bg-success",
-  warning: "bg-warning",
-  danger: "bg-danger",
+const TONE_LABEL: Record<ToastTone, string> = {
+  success: "完了",
+  warning: "注意",
+  danger: "失敗",
 };
 
 /**
- * トースト（§5.5.8）。句点は付けない 1 文の通知。
- * hover / focus 中は自動で閉じない。
+ * トースト（Imported style）: carbon 地 + 1px graphite 枠 + 8px 角丸。影なし。
+ * 状態は mono のラベルと文言で表し、色付きの塗りは使わない。
  */
 export function Toast({
   tone,
@@ -50,23 +50,24 @@ export function Toast({
       onMouseLeave={() => setPaused(false)}
       onFocus={() => setPaused(true)}
       onBlur={() => setPaused(false)}
-      className="toast-enter pointer-events-auto flex w-80 items-stretch gap-2 rounded-md border border-line bg-panel px-3 py-2.5 shadow-pop"
+      className="toast-enter pointer-events-auto flex w-80 items-start gap-3 rounded-md border border-graphite bg-carbon px-4 py-3"
     >
-      <span
-        aria-hidden="true"
-        className={cn("w-bar shrink-0 rounded-full", BAR_CLASS[tone])}
-      />
       <div className="min-w-0 flex-1">
-        <p className="text-ui font-medium text-ink">{title}</p>
+        <p className="font-mono text-micro tracking-meta text-smoke uppercase">
+          {TONE_LABEL[tone]}
+        </p>
+        <p className="mt-1 text-ui text-chalk">{title}</p>
         {meta !== undefined && (
-          <p className="mt-0.5 text-meta text-muted">{meta}</p>
+          <p className="mt-0.5 font-mono text-micro text-smoke">{meta}</p>
         )}
       </div>
       <button
         type="button"
         onClick={onClose}
         aria-label="通知を閉じる"
-        className="inline-flex size-8 shrink-0 items-center justify-center rounded-sm text-muted transition-colors duration-90 ease-standard hover:bg-hover hover:text-ink focus-visible:shadow-focus focus-visible:outline-hidden"
+        className={cn(
+          "inline-flex size-8 shrink-0 items-center justify-center rounded-icon text-chalk transition-colors duration-90 ease-standard hover:bg-paper-ink",
+        )}
       >
         <CloseIcon />
       </button>

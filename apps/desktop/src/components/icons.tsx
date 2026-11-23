@@ -4,8 +4,9 @@ import { cn } from "../lib/cn";
 
 /*
  * アイコンはインライン SVG の線画だけを使う（絵文字・アイコンフォントは使わない）。
- * 16px・1.5 stroke に統一し、色は currentColor（文字の色）を継承する。
- * ライセンス表記を増やさないため、アイコンセットは導入しない（§5.2.1）。
+ * 16px・1.5 stroke に統一し、色は chalk か compass-gold だけを使う
+ * （currentColor を継承し、smoke などの副次色はアイコンに使わない）。
+ * ライセンス表記を増やさないため、アイコンセットは導入しない。
  */
 
 const iconProps = {
@@ -63,18 +64,14 @@ export function CheckIcon({ className, ...props }: SVGProps<SVGSVGElement>) {
   );
 }
 
-/** 製品マーク: 実機のリング LED を 1 本の輪で表す。 */
+/** 製品マーク: 実機のリング LED を 1 本の輪で表す。色は compass-gold 専用。 */
 export function BrandRing({ className, ...props }: SVGProps<SVGSVGElement>) {
   return (
     <svg
-      viewBox="0 0 16 16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={2}
-      aria-hidden="true"
-      width={14}
-      height={14}
-      className={cn("size-3.5", className)}
+      {...iconProps}
+      width={16}
+      height={16}
+      className={cn("size-4", className)}
       {...props}
     >
       <circle cx="8" cy="8" r="6" />
@@ -100,12 +97,12 @@ export function Spinner({ className, ...props }: SVGProps<SVGSVGElement>) {
         r="6"
         stroke="currentColor"
         strokeOpacity={0.25}
-        strokeWidth={2}
+        strokeWidth={1.5}
       />
       <path
         d="M8 2a6 6 0 0 1 6 6"
         stroke="currentColor"
-        strokeWidth={2}
+        strokeWidth={1.5}
         strokeLinecap="round"
       />
     </svg>

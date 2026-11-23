@@ -8,35 +8,32 @@ export interface BannerProps {
   tone: BannerTone;
   title: string;
   children?: ReactNode;
-  /** 行動ボタンは 1 つだけ（§5.5.9） */
+  /** 行動ボタンは 1 つだけ */
   action?: ReactNode;
 }
 
-const TONE_CLASS: Record<BannerTone, { box: string; bar: string }> = {
-  warning: { box: "bg-warning-soft text-warning", bar: "bg-warning" },
-  danger: { box: "bg-danger-soft text-danger", bar: "bg-danger" },
+const TONE_CLASS: Record<BannerTone, string> = {
+  warning: "border-graphite",
+  danger: "border-danger",
 };
 
-/** バナー（§5.5.9）。左 3px の状態バー + soft の地 + 状態色の文字。 */
+/**
+ * バナー（Imported style）: 透明地 + 1px 枠。soft の塗りは使わない。
+ * 文字は chalk / smoke で AA を満たし、危険の区別は 1px danger 枠と文言で行う。
+ */
 export function Banner({ tone, title, children, action }: BannerProps) {
-  const toneClass = TONE_CLASS[tone];
-
   return (
     <div
       role={tone === "danger" ? "alert" : "status"}
       className={cn(
-        "flex items-stretch gap-2 rounded-sm px-3 py-2.5",
-        toneClass.box,
+        "flex items-start justify-between gap-4 rounded-md border px-5 py-4",
+        TONE_CLASS[tone],
       )}
     >
-      <span
-        aria-hidden="true"
-        className={cn("w-bar shrink-0 rounded-full", toneClass.bar)}
-      />
       <div className="min-w-0 flex-1">
-        <p className="text-ui font-medium">{title}</p>
+        <p className="text-ui text-chalk">{title}</p>
         {children !== undefined && (
-          <div className="mt-0.5 text-meta">{children}</div>
+          <div className="mt-1 text-meta text-smoke">{children}</div>
         )}
       </div>
       {action}

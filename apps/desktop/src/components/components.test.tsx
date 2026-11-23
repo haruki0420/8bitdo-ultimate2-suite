@@ -9,6 +9,7 @@ import {
   EmptyState,
   Field,
   Select,
+  StatusPill,
   Switch,
   TabPanel,
   Table,
@@ -41,22 +42,29 @@ describe("Button", () => {
     expect(button).toBeDisabled();
   });
 
-  it("variant と size を切り替えられる", () => {
-    render(
-      <>
-        <Button variant="secondary" size="sm">
-          再試行
-        </Button>
-        <Button variant="danger">復元する</Button>
-        <Button variant="danger-solid">初期化する</Button>
-      </>,
-    );
+  it("primary は signal-white の白ピル（9999px）", () => {
+    render(<Button>接続する</Button>);
+    const button = screen.getByRole("button", { name: "接続する" });
+    expect(button.className).toContain("bg-signal-white");
+    expect(button.className).toContain("text-obsidian");
+    expect(button.className).toContain("rounded-full");
+  });
 
-    expect(screen.getByRole("button", { name: "再試行" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "復元する" })).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "初期化する" }),
-    ).toBeInTheDocument();
+  it("secondary は透明地 + 1px signal-white のゴースト（8px）", () => {
+    render(<Button variant="secondary">再試行</Button>);
+    const button = screen.getByRole("button", { name: "再試行" });
+    expect(button.className).toContain("border-signal-white");
+    expect(button.className).toContain("bg-transparent");
+    expect(button.className).toContain("rounded-md");
+    expect(button.className).not.toContain("rounded-full");
+  });
+
+  it("danger は 1px danger のゴーストで、文字は chalk（AA 優先）", () => {
+    render(<Button variant="danger">復元する</Button>);
+    const button = screen.getByRole("button", { name: "復元する" });
+    expect(button.className).toContain("border-danger");
+    expect(button.className).toContain("text-chalk");
+    expect(button.className).not.toContain("text-danger");
   });
 
   it("押下で onClick を呼ぶ", () => {
@@ -64,6 +72,27 @@ describe("Button", () => {
     render(<Button onClick={onClick}>読み込む</Button>);
     fireEvent.click(screen.getByRole("button", { name: "読み込む" }));
     expect(onClick).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("StatusPill", () => {
+  it("未接続はドットを出さず、mono のステータスピルで表す", () => {
+    const { container } = render(<StatusPill label="未接続" />);
+    const pill = screen.getByTestId("status-pill");
+    expect(pill).toHaveTextContent("未接続");
+    expect(pill.className).toContain("bg-paper-ink");
+    expect(pill.className).toContain("border-graphite");
+    expect(pill.className).toContain("rounded-xs");
+    expect(container.querySelector('[data-testid="status-pill-dot"]')).toBeNull();
+  });
+
+  it("ライブ/接続中だけ pulse-green の 6px ドットを出す", () => {
+    render(<StatusPill label="接続中" live />);
+    const pill = screen.getByTestId("status-pill");
+    expect(pill).toHaveAttribute("data-live", "true");
+    const dot = screen.getByTestId("status-pill-dot");
+    expect(dot.className).toContain("bg-pulse-green");
+    expect(dot.className).toContain("size-1.5");
   });
 });
 
@@ -86,6 +115,9 @@ describe("Field", () => {
       "id",
       "deadzone-hint",
     );
+    expect(input.className).toContain("border-graphite");
+    expect(input.className).toContain("rounded-md");
+    expect(input.className).toContain("focus:border-chalk");
   });
 
   it("error は aria-invalid と直下の文言で示す", () => {
@@ -99,6 +131,7 @@ describe("Field", () => {
 
     const input = screen.getByLabelText("トリガー（0〜1.0）");
     expect(input).toHaveAttribute("aria-invalid", "true");
+    expect(input.className).toContain("aria-invalid:border-danger");
     expect(screen.getByRole("alert")).toHaveTextContent(
       "0〜1.0 の範囲で入力します。",
     );
@@ -125,6 +158,7 @@ describe("Select", () => {
     expect(
       within(select).getByRole("option", { name: "English" }),
     ).toBeInTheDocument();
+    expect(select.className).toContain("bg-carbon");
   });
 });
 
@@ -176,6 +210,8 @@ describe("Tabs", () => {
     const basic = within(tablist).getByRole("tab", { name: "基本" });
     expect(basic).toHaveAttribute("aria-selected", "true");
     expect(basic).toHaveAttribute("tabindex", "0");
+    expect(basic.className).toContain("text-chalk");
+    expect(basic.className).toContain("after:bg-chalk");
 
     fireEvent.keyDown(basic, { key: "ArrowRight" });
     expect(onChange).toHaveBeenCalledWith("buttons");
@@ -196,7 +232,7 @@ describe("Tabs", () => {
 });
 
 describe("Table", () => {
-  it("ヘッダーと行を描画する", () => {
+  it("ヘッダーと行を描画する（罫線のみ・行の塗りなし）", () => {
     render(
       <Table
         ariaLabel="接続情報"
@@ -209,10 +245,11 @@ describe("Table", () => {
       />,
     );
 
-    expect(screen.getByRole("table", { name: "接続情報" })).toBeInTheDocument();
+    const table = screen.getByRole("table", { name: "接続情報" });
+    expect(table).toBeInTheDocument();
     expect(
-      screen.getByRole("columnheader", { name: "項目" }),
-    ).toBeInTheDocument();
+      screen.getByRole("columnheader", { name: "項目" }).className,
+    ).toContain("font-mono");
     expect(screen.getByRole("cell", { name: "MTU" })).toBeInTheDocument();
     expect(screen.getByRole("cell", { name: "200" })).toBeInTheDocument();
   });
@@ -315,6 +352,8 @@ describe("Toast", () => {
     const status = screen.getByRole("status");
     expect(status).toHaveAttribute("aria-live", "polite");
     expect(status).toHaveTextContent("書き込みました");
+    expect(status.className).toContain("bg-carbon");
+    expect(status.className).toContain("border-graphite");
 
     fireEvent.click(
       within(status).getByRole("button", { name: "通知を閉じる" }),
@@ -324,26 +363,31 @@ describe("Toast", () => {
 });
 
 describe("Banner", () => {
-  it("注意は status、危険は alert で出す", () => {
+  it("注意は status、危険は alert で出す（soft の塗りなし）", () => {
     const { rerender } = render(
       <Banner tone="warning" title="入力が止まっています">
         接続を確認してください。
       </Banner>,
     );
 
-    expect(screen.getByRole("status")).toHaveTextContent("入力が止まっています");
+    const warning = screen.getByRole("status");
+    expect(warning).toHaveTextContent("入力が止まっています");
+    expect(warning.className).toContain("border-graphite");
+    expect(warning.className).not.toContain("bg-warning-soft");
 
     rerender(
       <Banner tone="danger" title="接続が切れました。">
         再接続してください。
       </Banner>,
     );
-    expect(screen.getByRole("alert")).toHaveTextContent("接続が切れました。");
+    const danger = screen.getByRole("alert");
+    expect(danger).toHaveTextContent("接続が切れました。");
+    expect(danger.className).toContain("border-danger");
   });
 });
 
 describe("EmptyState", () => {
-  it("状態・次にすること・行動 1 つを出す", () => {
+  it("状態・次にすること・行動 1 つを出す（左寄せ・見出し 23px）", () => {
     render(
       <EmptyState
         message="まだ接続していません。"
@@ -352,7 +396,9 @@ describe("EmptyState", () => {
       />,
     );
 
-    expect(screen.getByText("まだ接続していません。")).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { level: 2, name: "まだ接続していません。" }),
+    ).toHaveClass("text-heading");
     expect(screen.getByText("次にすること")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "スキャン" }),

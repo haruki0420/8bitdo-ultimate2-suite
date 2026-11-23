@@ -10,9 +10,12 @@ export interface SideNavProps {
   connection: ConnectionInfo | null;
 }
 
+const NAV_ROW =
+  "relative flex min-h-nav-row w-full items-center px-3 text-left text-ui transition-colors duration-90 ease-standard";
+
 /**
- * 左ナビ 216px（§5.4.1）。現在の画面は `--accent-soft` の地 + 左 2px のアクセント。
- * ナビ行は 34px、行間 2px。
+ * 左ナビ 216px（比率は現行維持）。背景は obsidian 一色、右境界は 1px graphite。
+ * 現在の画面は文字色 chalk + 左 1px chalk のヘアラインで表す（塗りは使わない）。
  */
 export function SideNav({
   activeView,
@@ -23,7 +26,7 @@ export function SideNav({
   return (
     <nav
       aria-label="画面"
-      className="flex w-nav shrink-0 flex-col overflow-y-auto border-r border-line bg-sunken px-3 py-4"
+      className="flex w-nav shrink-0 flex-col overflow-y-auto border-r border-graphite bg-obsidian px-3 py-4"
     >
       <ul className="flex flex-col gap-0.5">
         {VIEWS.map((view) => {
@@ -36,10 +39,10 @@ export function SideNav({
                 onClick={() => onSelect(view.id)}
                 aria-current={active ? "page" : undefined}
                 className={cn(
-                  "flex min-h-nav-row w-full items-center rounded-sm px-2.5 text-left text-ui font-medium transition-colors duration-90 ease-standard focus-visible:shadow-focus focus-visible:outline-hidden",
+                  NAV_ROW,
                   active
-                    ? "bg-accent-soft text-ink shadow-nav-current"
-                    : "text-ink-2 hover:bg-hover hover:text-ink",
+                    ? "text-chalk after:absolute after:top-2 after:bottom-2 after:left-0 after:w-px after:bg-chalk"
+                    : "text-smoke hover:text-chalk",
                 )}
               >
                 {view.label}
@@ -49,22 +52,22 @@ export function SideNav({
         })}
       </ul>
 
-      <div aria-hidden="true" className="mx-1.5 my-4 h-px bg-line" />
+      <div aria-hidden="true" className="mx-1.5 my-4 h-px bg-graphite" />
 
-      {/* 接続状態は上部バーに 1 つだけ置く（§5.4.1）。ここは接続先の要約だけ。
+      {/* 接続状態は上部バーに 1 つだけ置く。ここは接続先の要約だけ。
        * 未接続ではデバイス名・アドレス・MTU を出さない。接続後は Rust が返す値だけを出す。 */}
-      <p className="mb-1 px-2.5 text-meta font-medium text-muted">接続先</p>
+      <p className="mb-1 px-3 font-mono text-micro tracking-meta text-smoke uppercase">
+        接続先
+      </p>
       {connection === null ? (
-        <p className="px-2.5 text-ui font-medium text-muted">未接続</p>
+        <p className="px-3 text-ui text-smoke">未接続</p>
       ) : (
         <>
-          <p className="truncate px-2.5 text-ui font-medium text-ink">
-            {connection.name}
-          </p>
-          <p className="mt-0.5 truncate px-2.5 font-mono text-data tracking-data text-muted">
+          <p className="truncate px-3 text-ui text-chalk">{connection.name}</p>
+          <p className="mt-0.5 truncate px-3 font-mono text-meta text-smoke">
             {connection.address}
           </p>
-          <p className="mt-0.5 px-2.5 text-meta text-muted">
+          <p className="mt-0.5 px-3 font-mono text-meta text-smoke">
             MTU {connection.mtu}
           </p>
         </>
@@ -74,7 +77,7 @@ export function SideNav({
         <button
           type="button"
           onClick={onOpenLicenses}
-          className="flex min-h-nav-row w-full items-center rounded-sm px-2.5 text-left text-ui font-medium text-muted transition-colors duration-90 ease-standard hover:bg-hover hover:text-ink-2 focus-visible:shadow-focus focus-visible:outline-hidden"
+          className={cn(NAV_ROW, "text-smoke hover:text-chalk")}
         >
           ライセンス
         </button>
