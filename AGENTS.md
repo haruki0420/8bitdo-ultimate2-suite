@@ -99,7 +99,7 @@
 
 最終更新: **2026-11-23（main `0582e9a`、PR #16 と #17〜#23 反映）**。フェーズの詳細・レビュー Tier・残課題は [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) §5 を正本とする。
 
-### 6.1 マージ済みの機能
+### 6.1 機能の実装状況
 
 | Phase | 内容 | 状態 |
 | --- | --- | --- |
@@ -107,7 +107,7 @@
 | 2a | `eightbitdo-core` + CLI 読み取り専用 + `session` REPL（per-user BLE 単一所有、keepalive、degraded 終了コード 3） | 完了。実機で version / config dump / backup / monitor / keepalive を確認 |
 | 2b | BLE マクロ読み書き（3 slot × 4 macro、backup / write / restore） | 完了。実機で slot S1 の M1/M2 の書込・読み戻し・復元を確認（M3/M4・S2/S3 は外挿）。**Switch 側でのマクロ発動は未確認** |
 | 2c | BLE OTA 状態機械（`crates/eightbitdo-core/src/ota.rs`） | **core 実装済み・Mock 52 テスト（既定）/ 55（`mobile-boot`）/ 58（`ota-bench`）/ 61（`--all-features`）。#20 で実機採取用の `ota-bench` 段階実行 API（既定 OFF、`write_firmware_with_checkpoint` / `OtaCheckpoint::AfterFirstErase` 等、`OtaBenchOutcome.write_state` / `phase`）を追加。実機 btsnoop の採取計画は [docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)（#19）。CLI / GUI / UniFFI 未配線、実機 btsnoop 未取得・実機書込未検証** |
-| 2d | 2768B 設定書き込み / `config set` / `config remap`（BLE のみ） | 完了。実機（BLE・MTU 200・74B chunk）で full write → Save → read-back 一致、remap A→B→A を確認。**実機確認は full write / remap のみ（`config set` 各フィールド・`--force-raw`・MTU 200 以外は未確認）**。#17 で実機 flag を opaque 値として扱う検証に修正（`slot_flags` の観測値 allowlist、gyro key_map の erasure sentinel 例外を削除（flag の `0x20190000` は raw allowlist で受理継続）、実 dump を使う `#[ignore]` E2E、docs 整合） |
+| 2d | 2768B 設定書き込み / `config set` / `config remap`（BLE のみ） | 完了。実機（BLE・MTU 200・74B chunk）で full write → Save → read-back 一致、remap A→B→A を確認。**実機確認は full write / remap のみ（`config set` 各フィールド・`--force-raw`・MTU 200 以外は未確認）**。#17 で実機 flag を opaque 値として扱う検証に修正。`slot_flags` の観測値 allowlist を追加し、gyro key_map の erasure sentinel 例外を削除したうえで flag の `0x20190000` は raw allowlist で受理を継続し、実 dump を使う `#[ignore]` E2E を追加して docs を整合させた |
 | 3a | 読み取り専用 GUI（egui、日本語、燻しスレート、デバイス / ライブ入力 / 設定値 / ログ） | 完了（PR #9）。読み取り専用の 4 タブ |
 | 3b / 3d | GUI 書込 UI（設定タブ / 22 ボタンリマップ / マクロエディタ・録音） | 実装済み・main にマージ（PR #16）。確認ダイアログ、pre-write backup、read-back、TOCTOU 付き。**実機未検証・Tier 3** |
 | 3c | GUI OTA 画面 | 未着手（Phase 2c の実機 wire 確定後） |

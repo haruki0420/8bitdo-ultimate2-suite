@@ -195,7 +195,7 @@ Track C: モバイル
 | クロスプラットフォーム | ビルド確認のみ（#18、[docs/CROSS_PLATFORM.md](CROSS_PLATFORM.md)）。Linux ホスト / Windows `cargo check` / iOS target check は成功、macOS は本ホストで確認不能、Windows の実効 MSRV は 1.88 以上。**実機は Linux のみ** |
 | 機能カバレッジ | 公式 Windows / Android ソフトとの比較表 [docs/FEATURE_MATRIX.md](FEATURE_MATRIX.md)（#23） |
 | GUI ライセンス画面 | **PR #24 でレビュー中・未マージ**。現 main の GUI にライセンス画面は無い（実装予定） |
-| プロファイル切替 API | **PR #26 でレビュー中・未マージ**。core `Session::switch_profile` + CLI `config profile <N>` + REPL `profile switch <N>`。FEATURE_MATRIX の残作業「`0x0015` 切替のセッション API 化」に対応 |
+| プロファイル切替 API | **PR #26 でレビュー中・未マージ**。core `Session::switch_profile` + CLI `config profile <N>` + REPL `profile switch <N>`。FEATURE_MATRIX の残作業「`0x0015` 切替のセッション API 化」に対応。実機未検証（ACK 形状・Save 要否・永続性は未確認） |
 | レビュー | 2a / 2b / 2c / 2d と書き込み系 GUI は **Tier 3**（3 セッション）。3a の表示のみの変更は Tier 2、`eightbitdo-core/**` に触れる場合は Tier 3 |
 
 ### Phase 1: `eightbitdo-protocol`（純粋プロトコル＆バイナリ層）
