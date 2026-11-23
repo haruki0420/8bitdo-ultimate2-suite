@@ -443,7 +443,7 @@ sequenceDiagram
 | **`0x0011`** | `state` (`int`) | `total_len=0, offset=0` | Host → Ctrl | **`SetConfigState`**。設定状態の遷移通知（`Channel+0x31 = 0x0A`） |
 | **`0x0012`** | `0x0000` | — | Ctrl → Host | **`AllowConfigDone`**。コントローラが設定受付可能になった際の非同期通知 |
 | **`0x0013`** | `0x0000` | `total_len=0, offset=0` (Windows `StartConfig` flag=`1`) | Host → Ctrl | **Windows USB HID 用 `StartConfig`**（最大 30 回リトライし `cmd=0x13` ACK を待機） |
-| **`0x0015`** | `slot` (`0..2`) | `total_len=0, offset=0` | Host → Ctrl | **`WriteSLOT`**。アクティブプロファイルスロット切替。アプリ側は `Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>` に配線済み（Save は送らない）。ACK 形状・Save 要否・永続性は**実機未確認** |
+| **`0x0015`** | `slot` (`0..2`) | `total_len=0, offset=0` | Host → Ctrl | **`WriteSLOT`**。アクティブプロファイルスロット切替。アプリ側は `Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>` に配線済み（Save は送らない）。**実機確認済み（2026-11-23、Linux BLE・MTU 200、下記注記）**: 要求は 17B（`cmd=0x0015, subcmd=slot, total_len=0, offset=0`）、ACK は `cmd=0x0004/subcmd=0x0015` の 16B 封筒を **1 回**観測。`Save` を送らなくても直後の read-back で `cur_slot`（`+0x12`）が 6→1 に変化。**未確認**: 再接続/電源断を跨ぐ永続性、プロファイル実効、`crc16` の意味、直接 `cmd=0x0015` ACK の有無 |
 | **`0x0102`** | `(mode << 8) \| slot` | `total_len = chunk_len = steps * 10`, `offset = macro_idx << 12` (`macro_idx * 0x1000`) | Host → Ctrl | **`ReadBT2Macro`**。指定スロット・マクロ番号のステップ列を読み出し（1 ステップ = 10B）。ペイロードなしだが `chunk_len` に要求長を宣言する（§4.1.1） |
 | **`0x0103`** | `(mode << 8) \| slot` | `total_len = (macro_idx << 12) + align32(steps * 10)`（絶対終端。`align32(x) = (x + 0x1F) & ~0x1F`。**BLE・slot S1・`macro_idx=0/1 (M1/M2)` で実機確認**。`macro_idx=2/3` と他 slot は外挿、USB HID は未実装・未検証）, `offset = (macro_idx << 12) + chunk_index * chunk_size`（`chunk_index` はパケットごとに進む。プロトコル上限は BLE `0x40` / USB HID `0x20`。本クレートの API は 32B / 64B のみで、46B などは `UnsupportedChunkSize`。64B 超は 64B にクランプ） | Host → Ctrl | **`WriteBT2Macro`**。BLE 最大 **`0x40` (64B)** / USB HID 最大 **`0x20` (32B)** 分割でマクロを書き込み、完了後に `0x0006` (Save) を実行。API の chunk サイズは 32B / 64B のみ（32B アライン保証） |
 | **`0x0104`** | `(mode << 8) \| slot` | `total_len = 0x1000`, `chunk_len = 0x1000`（wire header `+0x04`。公式実装のチャネル設定値。ペイロードなし `len = 0`）, `crc16 = 0xFFFF`（空ペイロードの CRC-16/MODBUS）, `offset = macro_idx << 12` | Host → Ctrl | **`EraseBT2Macro`**。指定スロット・マクロ領域（4KB 単位）を消去 |
@@ -453,6 +453,14 @@ sequenceDiagram
 > **実機ソースでの再確認（x86_64 `libadvancelib.so`）**: 設定読み出しは **`cmd=0x0002` / `subcmd=0x0000`**、設定書き込みは **`cmd=0x0001` / `subcmd=0x0000`**。`STRUCT_BT2_2768B.md` 旧版にあった `subcmd=0x0101` / `0x0102` は誤記であり、`getUT2_ReadCofigChannel` / `getBT2_WriteCofigChannel` のチャネル構造体 `+0x4E` はどちらも `0` である。
 >
 > **`EraseBT2Macro` の CRC 証跡**: 公式 `getBT2_EraseMacro` (x86_64 `libadvancelib.so` 0x2bb70) は `total_len = chunk_len = 0x1000`、ペイロードなしでチャネルを初期化する。`Generate_CustomDataCmd` (0x27620) は `gamepad_type == 1` で空ペイロードに対しても `crc16` を計算してヘッダ `+0x06` に格納し、`crc16` (0x28540) は入力長 `<= 0` で `0xFFFF` を返す。したがって `0x0104` のワイヤ `crc16` は `0` ではなく **`0xFFFF`** である。
+>
+> **`WriteSLOT` (`0x0015`) の実機 wire（2026-11-23、Linux BLE・MTU 200、Ultimate 2、1 回の観測）**:
+> - **要求（`-v` の生ログ、17B）**: `04 15 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00`。`04` は BLE App Mode の prefix で、続く 16B ヘッダは `cmd=0x0015` / `subcmd=0x0001`（slot 1）/ `chunk_len=0` / `crc16=0x0000` / `total_len=0` / `offset=0`。RE で確定していた wire と一致する。
+> - **ACK（16B、prefix なし）**: `04 00 15 00 00 00 00 81 00 00 00 00 00 00 00 00`。`cmd=0x0004`（RESPONSE 封筒）/ `subcmd=0x0015`。**直接 `cmd=0x0015` の応答は観測されず、封筒 `cmd=0x0004/subcmd=0x0015` のみ**だった（1 回の観測であり、常にこの形で返るとは限らない）。
+> - 残り 12B は `00 00 00 81 00 00 00 00 00 00 00 00`。§4.1 のヘッダ定義（`+0x04` `chunk_len` / `+0x06` `crc16` / `+0x08` `total_len` / `+0x0C` `offset`）に当てはめると `chunk_len=0`、`crc16` 位置の 2B は `00 81`（LE で `0x8100`）、`total_len=0`、`offset=0` になる。payload が無いため payload CRC としては意味を持たず、この 2B を `crc16=0x0081` と読む解釈もあるが、**フィールド位置・バイト順・意味はいずれも解釈であり未確定**である（断定しない）。
+> - **`Save` (`0x0006`) なしで `cur_slot` が更新された**: 送信ログに `0x0006` は無いが、直後の `config dump` で `cur_slot`（`+0x12`）が **6 → 1** に変化し、同一接続内の read-back に反映された（read-back SHA-256 `7a9838e8…` → `e3a84da2…`）。**Save が不要と断定はしない**。再接続・電源断を跨ぐ永続性は未確認。
+> - **復元**: `config dump --raw` したファイルの `+0x12` を 6 に戻して `config write --file ... --yes` で書き戻した（39 packets = 38 write + 1 Save）。read-back で `cur_slot=6` を確認（read-back SHA-256 `af897618…`。切替前の `7a9838e8…` とは一致せず、理由は未確認）。
+> - 詳細な環境・hex・未確認事項は [DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) §7 を参照。**プロファイルの実効（Switch 側の振る舞いが変わるか）は未確認**。
 
 ### 6.3 Ultimate 2 Bluetooth 設定データ構造体 (`record_ultimatebt2`, `0x0AD0` = 2768 バイト) 部分書き込みオフセット一覧
 
