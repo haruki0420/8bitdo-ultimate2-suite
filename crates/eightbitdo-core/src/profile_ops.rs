@@ -47,17 +47,27 @@ impl<T: Transport> Session<T> {
     /// per-frame timeout, [`Error::UnexpectedResponse`] for a malformed frame or
     /// a controller `0x000E` error, or a transport error (for example
     /// [`Error::Disconnected`]).
-    pub async fn switch_profile(&mut self, slot: Slot) -> Result<(), Error> {
+    pub async fn switch_profile(&self, slot: Slot) -> Result<(), Error> {
         self.start_input_keepalive().await;
         self.prepare_read().await?;
-        self.run_write(self.switch_profile_inner(slot)).await
+        let result = self.run_write(self.switch_profile_inner(slot)).await;
+        if result.is_ok() {
+            // The 0x0015 acknowledgement shape is unconfirmed. A second
+            // response (or a late one) must not be taken as the answer of a
+            // later operation, so the next read drains first.
+            self.note_possible_stale_frame();
+        }
+        result
     }
 
     async fn switch_profile_inner(&self, slot: Slot) -> Result<(), Error> {
         let request = commands::switch_slot(slot);
-        // No Save-style subcmd exists for `0x0015`, so the last argument is
-        // unused by `ack_matches`; a guessed `subcmd = slot` echo is not
-        // accepted because it is not one of the verified shapes.
+        // `ack_matches` accepts a direct `cmd = 0x0015` frame and the
+        // `cmd = 0x0004, subcmd = 0x0015` envelope. A bare `0x0004` envelope
+        // with another subcmd is not accepted (see `ack_matches`); the direct
+        // frame's subcmd is not compared because the 0x0015 ack shape is
+        // unconfirmed and rejecting a legitimate echo would be a false
+        // negative.
         self.send_and_await_ack(
             &request,
             false,
@@ -157,11 +167,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sends_the_verified_0x0015_shape_for_every_slot_and_no_save() {
+    async fn sends_the_0x0015_shape_for_every_slot_and_no_save() {
         for slot in Slot::ALL {
             let mock = MockTransport::new();
             mock.push_incoming(&direct_ack(slot));
-            let mut session = Session::new(&mock).with_timeout(Duration::from_millis(50));
+            let session = Session::new(&mock).with_timeout(Duration::from_millis(50));
 
             session
                 .switch_profile(slot)
@@ -187,7 +197,15 @@ mod tests {
             assert_eq!(header.total_len, 0, "total_len = 0");
             assert_eq!(header.offset, 0, "offset = 0");
             assert_eq!(header.chunk_len, 0, "no payload declared");
-            assert_eq!(header.crc16, 0, "empty payload leaves crc16 unused");
+            // `crc16 = 0` is what `commands::switch_slot` emits for an empty
+            // payload (the encoder's default). The 0x0015 wire CRC is **not**
+            // confirmed on hardware: PROTOCOL_SPEC §4.1 documents that some
+            // empty-payload commands (EraseMacro 0x0104) use `0xFFFF` instead.
+            // This asserts the current encoder output, not a verified value.
+            assert_eq!(
+                header.crc16, 0,
+                "the encoder emits crc16 = 0 for a payload-less request (unverified)"
+            );
             assert_eq!(sent[0].len(), 1 + HEADER_SIZE, "header only, no payload");
             assert!(
                 !sent.iter().any(|frame| sent_header(frame).cmd == cmd::SAVE),
@@ -200,7 +218,7 @@ mod tests {
     async fn accepts_the_response_envelope_ack() {
         let mock = MockTransport::new();
         mock.push_incoming(&envelope_ack());
-        let mut session = Session::new(&mock).with_timeout(Duration::from_millis(50));
+        let session = Session::new(&mock).with_timeout(Duration::from_millis(50));
 
         session
             .switch_profile(Slot::S2)
@@ -210,11 +228,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_a_bare_response_envelope_with_subcmd_zero() {
+        // `ack_matches` has a specific guard against accepting a bare
+        // `cmd=0x0004, subcmd=0` envelope as an Erase/Write ACK for slot 0.
+        // The 0x0015 wait passes `ack_subcmd = 0`, so the same guard is the
+        // only thing that stops a bare envelope from confirming the switch.
+        let mock = MockTransport::new();
+        mock.push_incoming(&CustomHeader::new(cmd::RESPONSE, 0, 0, 0).to_bytes());
+        let session = Session::new(&mock).with_timeout(Duration::from_millis(50));
+
+        let result = session.switch_profile(Slot::S1).await;
+        assert!(
+            matches!(result, Err(Error::Timeout { .. } | Error::Disconnected)),
+            "a bare 0x0004/subcmd=0 envelope must not confirm the switch, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sends_a_golden_0x0015_frame() {
+        // Golden bytes, independent of `commands::switch_slot`: BLE App Mode
+        // prefix 0x04, then the 16-byte header with little-endian fields.
+        let mock = MockTransport::new();
+        mock.push_incoming(&direct_ack(Slot::S2));
+        let session = Session::new(&mock).with_timeout(Duration::from_millis(50));
+
+        session
+            .switch_profile(Slot::S2)
+            .await
+            .expect("a direct ACK succeeds");
+
+        let sent = mock.take_sent();
+        let frame = &sent[0];
+        assert_eq!(frame.len(), 1 + HEADER_SIZE, "header only, no payload");
+        assert_eq!(
+            &frame[..6],
+            &[0x04, 0x15, 0x00, 0x01, 0x00, 0x00],
+            "prefix, cmd 0x0015 and subcmd 1 (slot 2, zero-based)"
+        );
+        let header = sent_header(frame);
+        assert_eq!(header.total_len, 0, "total_len = 0");
+        assert_eq!(header.offset, 0, "offset = 0");
+        assert_eq!(header.chunk_len, 0, "chunk_len = 0");
+    }
+
+    #[tokio::test]
     async fn skips_an_input_report_before_the_ack() {
         let mock = MockTransport::new();
         mock.push_incoming(&input_report());
         mock.push_incoming(&direct_ack(Slot::S3));
-        let mut session = Session::new(&mock).with_timeout(Duration::from_millis(50));
+        let session = Session::new(&mock).with_timeout(Duration::from_millis(50));
 
         session
             .switch_profile(Slot::S3)
@@ -225,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn times_out_without_an_ack() {
         let transport = StallingTransport::new();
-        let mut session = Session::new(&transport).with_timeout(Duration::from_millis(20));
+        let session = Session::new(&transport).with_timeout(Duration::from_millis(20));
 
         let result = session.switch_profile(Slot::S1).await;
         assert!(
@@ -243,7 +305,7 @@ mod tests {
     #[tokio::test]
     async fn propagates_an_empty_queue_as_disconnect() {
         let mock = MockTransport::new();
-        let mut session = Session::new(&mock).with_timeout(Duration::from_millis(20));
+        let session = Session::new(&mock).with_timeout(Duration::from_millis(20));
 
         let result = session.switch_profile(Slot::S1).await;
         // The mock queue is empty: `recv` reports `Disconnected` immediately,
@@ -260,7 +322,7 @@ mod tests {
         let mock = MockTransport::new();
         // Another command's ACK envelope, then silence.
         mock.push_incoming(&CustomHeader::new(cmd::RESPONSE, cmd::WRITE_CONFIG, 0, 0).to_bytes());
-        let mut session = Session::new(&mock).with_timeout(Duration::from_millis(50));
+        let session = Session::new(&mock).with_timeout(Duration::from_millis(50));
 
         let result = session.switch_profile(Slot::S2).await;
         assert!(
@@ -273,7 +335,7 @@ mod tests {
     async fn propagates_a_missing_link_before_sending() {
         let mock = MockTransport::new();
         mock.disconnect().await.unwrap();
-        let mut session = Session::new(&mock).with_timeout(Duration::from_millis(20));
+        let session = Session::new(&mock).with_timeout(Duration::from_millis(20));
 
         let result = session.switch_profile(Slot::S1).await;
         assert!(
@@ -288,7 +350,7 @@ mod tests {
         let mut header = CustomHeader::new(0x000E, 0, 0, 0);
         header.chunk_len = 1;
         mock.push_response(&header, &[0x01]);
-        let mut session = Session::new(&mock).with_timeout(Duration::from_millis(50));
+        let session = Session::new(&mock).with_timeout(Duration::from_millis(50));
 
         let result = session.switch_profile(Slot::S1).await;
         assert!(

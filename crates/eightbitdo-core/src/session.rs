@@ -622,6 +622,16 @@ impl<T: Transport> Session<T> {
         output
     }
 
+    /// Mark the session as possibly holding a stale frame.
+    ///
+    /// Used by operations whose acknowledgement shape is **unconfirmed**: even
+    /// after a successful wait, the controller may have sent (or may still
+    /// send) a second response, and a later operation must not mistake it for
+    /// its own. The next [`prepare_read`](Self::prepare_read) drains it.
+    pub(crate) fn note_possible_stale_frame(&self) {
+        self.needs_resync.store(true, Ordering::SeqCst);
+    }
+
     /// Clear the resync flag, failing closed when the drain budget runs out.
     ///
     /// If stale frames may still be queued, the flag stays set so the next

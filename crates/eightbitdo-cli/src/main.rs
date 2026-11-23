@@ -2153,21 +2153,32 @@ async fn config_profile_switch(
     assume_yes: bool,
 ) -> Result<(), Error> {
     let transport = BleTransport::connect(options).await?;
-    let mut session = Session::new(transport);
+    let session = Session::new(transport);
     let mut confirmation_io = TopLevelConfirmation::new(assume_yes);
     let mut confirmation = confirmation_io.confirmation();
-    if !confirmation.confirm().await? {
+    if !confirmation.confirm_with(PROFILE_CONFIRM_PROMPT).await? {
         best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
-        return Err(Error::InvalidRequest(
-            "profile switch aborted: no confirmation".to_string(),
-        ));
+        // Answering "no" is not a failure: match the other write commands,
+        // which report the abort and exit successfully.
+        println!("aborted; no profile switch was sent");
+        return Ok(());
     }
     let result = session.switch_profile(slot).await;
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
-    result?;
+    if let Err(error) = result {
+        if matches!(error, Error::Timeout { .. }) {
+            eprintln!(
+                "warning: no WriteSLOT acknowledgement arrived. The 0x0015 ACK shape is \
+                 unconfirmed, so the switch may still have happened; check the active profile \
+                 on the controller."
+            );
+        }
+        return Err(error);
+    }
     println!(
-        "switched the active profile: WriteSLOT slot {} (cmd 0x0015, no Save)",
-        slot.index()
+        "sent WriteSLOT slot {} (profile {}) (cmd 0x0015, no Save); acknowledged but unverified",
+        slot.index(),
+        slot.index() + 1
     );
     println!(
         "note: ACK shape, Save requirement and persistence are unconfirmed on hardware; \
@@ -2238,11 +2249,16 @@ enum ConfigConfirmation<'a> {
 
 impl ConfigConfirmation<'_> {
     async fn confirm(&mut self) -> Result<bool, Error> {
+        self.confirm_with(CONFIG_CONFIRM_PROMPT).await
+    }
+
+    /// Confirm using an operation-specific prompt.
+    async fn confirm_with(&mut self, prompt: &str) -> Result<bool, Error> {
         match self {
             Self::AssumeYes => Ok(true),
-            Self::Reader(prompt) => prompt(),
+            Self::Reader(read) => read(),
             Self::AsyncReader { reader, line_state } => {
-                confirm_config_write_async(*reader, line_state).await
+                confirm_config_write_async_with(*reader, line_state, prompt).await
             }
         }
     }
@@ -2250,6 +2266,12 @@ impl ConfigConfirmation<'_> {
 
 /// The confirmation prompt shared by the sync and async readers.
 const CONFIG_CONFIRM_PROMPT: &str = "Type 'yes' to write the 2768-byte configuration: ";
+
+/// Confirmation prompt for the profile switch (`0x0015`), which does **not**
+/// write the 2768-byte configuration and therefore must not reuse the config
+/// write wording.
+const PROFILE_CONFIRM_PROMPT: &str =
+    "Type 'yes' to switch the controller's active profile (cmd 0x0015, no Save): ";
 
 /// Top-level `yes/no` confirmation that is assembled lazily.
 ///
@@ -2302,7 +2324,16 @@ async fn confirm_config_write_async(
     reader: &mut (dyn tokio::io::AsyncBufRead + Unpin + Send),
     line_state: &mut LineState,
 ) -> Result<bool, Error> {
-    eprint!("{CONFIG_CONFIRM_PROMPT}");
+    confirm_config_write_async_with(reader, line_state, CONFIG_CONFIRM_PROMPT).await
+}
+
+/// Async confirmation with an explicit prompt, used by the profile switch.
+async fn confirm_config_write_async_with(
+    reader: &mut (dyn tokio::io::AsyncBufRead + Unpin + Send),
+    line_state: &mut LineState,
+    prompt: &str,
+) -> Result<bool, Error> {
+    eprint!("{prompt}");
     std::io::stderr().flush()?;
     match read_session_line(reader, line_state).await? {
         LineRead::Line { text, cut } => {
@@ -5664,6 +5695,23 @@ fn is_config_write_command(command: &SessionCommand) -> bool {
     )
 }
 
+/// True for REPL config commands that run the two-phase
+/// prepare (backup / plan / prompt) then TOCTOU-write path.
+///
+/// `profile switch` is deliberately **not** in this set: it sends one
+/// payload-less `0x0015`, takes no pre-write backup and has no plan, so it is
+/// dispatched through the normal single-phase path. It still needs
+/// `--allow-config-write` (see [`is_config_write_command`]) because it changes
+/// controller state.
+fn is_prepared_config_write(command: &SessionCommand) -> bool {
+    matches!(
+        command,
+        SessionCommand::ConfigSet { .. }
+            | SessionCommand::ConfigRemap { .. }
+            | SessionCommand::ConfigWrite { .. }
+    )
+}
+
 /// True for the two REPL commands that write macro flash.
 ///
 /// These are the commands that must not be cancelled by Ctrl-C, and the ones
@@ -6631,15 +6679,17 @@ async fn execute_session_command_with_io<T: Transport + 'static>(
             let slot = parse_slot(slot)?;
             let mut confirmation =
                 config_confirmation_for_session(yes, &mut repl_reader, &mut repl_line_state)?;
-            if !confirmation.confirm().await? {
-                eprintln!("profile switch aborted: no confirmation");
+            if !confirmation.confirm_with(PROFILE_CONFIRM_PROMPT).await? {
+                eprintln!("aborted; no profile switch was sent");
                 return Ok(SessionOutcome::Continue);
             }
-            let mut guard = session.lock().await;
+            let guard = session.lock().await;
             guard.switch_profile(slot).await?;
             println!(
-                "switched the active profile: WriteSLOT slot {} (cmd 0x0015, no Save)",
-                slot.index()
+                "sent WriteSLOT slot {} (profile {}) (cmd 0x0015, no Save); acknowledged but \
+                 unverified",
+                slot.index(),
+                slot.index() + 1
             );
             println!(
                 "note: ACK shape, Save requirement and persistence are unconfirmed on hardware"
@@ -7096,7 +7146,7 @@ where
                 // Ctrl-C-cancellable (the keepalive continues while the prompt
                 // waits), and only the actual 0x0001/Save/read-back section is
                 // non-cancellable.
-                if allow_config_write && is_config_write_command(&command) {
+                if allow_config_write && is_prepared_config_write(&command) {
                     if monitor.is_some() {
                         eprintln!("monitor is running; use 'monitor stop' first");
                         continue;
@@ -7204,7 +7254,7 @@ where
                 // serviced after the command returns by the loop's own Ctrl-C
                 // branch.
                 let flash_command = (allow_macro_write && is_macro_flash_command(&command))
-                    || (allow_config_write && is_config_write_command(&command));
+                    || (allow_config_write && is_prepared_config_write(&command));
                 let outcome = if flash_command {
                     let mut command_future = std::pin::pin!(execute_session_command_with_io(
                         session,
@@ -9547,6 +9597,67 @@ mod tests {
         assert!(
             transport.is_disconnected(),
             "shutdown after a monitor disconnect must disconnect the link"
+        );
+    }
+
+    /// `profile switch` must reach the normal dispatch, not the two-phase
+    /// config-write path (`prepare_repl_config_command`, which rejects it).
+    ///
+    /// This is the regression test for the REPL dead-code bug: the command
+    /// classifies as a config write for the `--allow-config-write` gate but it
+    /// is not a prepared flash write, so it must be executed directly.
+    #[tokio::test]
+    async fn repl_profile_switch_sends_one_0x0015_frame_and_no_save() {
+        let transport = MockTransport::new();
+        // A direct `cmd = 0x0015` ACK for slot 1.
+        let ack = CustomHeader::new(commands::cmd::WRITE_SLOT, 1, 0, 0)
+            .to_bytes()
+            .to_vec();
+        transport.push_incoming(&ack);
+
+        let session = Arc::new(AsyncMutex::new(Session::new(transport)));
+        let state = Arc::new(SessionKeepaliveState::new());
+        let input = b"profile switch 1 --yes\nquit\n";
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input.to_vec()));
+        let result = session_repl_loop_with_io(
+            &session,
+            &state,
+            Instant::now(),
+            64,
+            Duration::from_millis(1),
+            false,
+            true,
+            &mut reader,
+            std::future::pending::<()>(),
+            false,
+        )
+        .await;
+
+        assert!(result.is_ok(), "the REPL must not fail: {result:?}");
+        let sent = session.lock().await.transport().sent_frames();
+        let switches: Vec<_> = sent
+            .iter()
+            .filter(|frame| {
+                frame.len() > 1
+                    && CustomHeader::parse(&frame[1..])
+                        .map(|header| header.cmd == commands::cmd::WRITE_SLOT)
+                        .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(
+            switches.len(),
+            1,
+            "exactly one 0x0015 frame must be sent (a REPL dead-code regression sends none); \
+             frames: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|frame| {
+                frame.len() > 1
+                    && CustomHeader::parse(&frame[1..])
+                        .map(|header| header.cmd == commands::cmd::SAVE)
+                        .unwrap_or(false)
+            }),
+            "no Save may be sent with 0x0015"
         );
     }
 
