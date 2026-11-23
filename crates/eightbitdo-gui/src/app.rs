@@ -2621,16 +2621,16 @@ impl App {
         egui::Window::new(i18n::t(lang, Key::LicensesTitle))
             .id(Id::new("licenses"))
             .collapsible(false)
-            .resizable(true)
+            .resizable(false)
+            .vscroll(false)
+            .max_height(430.0)
+            .max_width(760.0)
             .default_width(720.0)
-            .default_height(560.0)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.add(egui::Label::new(theme::job_meta(i18n::t(lang, Key::LicensesIntro))).wrap());
                 ui.add_space(theme::SPACE_3);
-                ui.horizontal(|ui| {
-                    section_label(ui, lang, Key::LicensesAppHeading);
-                });
+                section_label(ui, lang, Key::LicensesAppHeading);
                 ui.add(
                     egui::Label::new(theme::job_meta(i18n::t(lang, Key::LicensesAppBody))).wrap(),
                 );
@@ -2647,7 +2647,7 @@ impl App {
                 ui.add_space(theme::SPACE_3);
                 egui::ScrollArea::vertical()
                     .id_salt("licenses-scroll")
-                    .max_height(320.0)
+                    .max_height(240.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for license in crate::licenses::ALL {
