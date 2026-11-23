@@ -1,7 +1,7 @@
 # 機種抽象化（Device Model Abstraction）設計
 
 - 対象: 8BitDo Ultimate 2 Bluetooth（`0x600F`）にハードコードされている現行実装を、**将来の別機種**（Ultimate 2C / Pro 2 / Ultimate 3、将来的には他社コントローラ）に拡張できる構造へ移行するための設計。
-- リポジトリ: ブランチ `docs/device-model`、base `81b0ac1`。**本ドキュメントは設計のみで、実装コードは含まない**（diff は docs のみ）。
+- リポジトリ: ブランチ `docs/device-model`、測定 base `81b0ac1`（rebase 前。現在の main は `ef76e27`）。**本ドキュメントは設計のみで、実装コードは含まない**（diff は docs のみ）。
 - 位置づけ: **機種抽象化の実装計画の正本**は本ドキュメント、プロトコル値の正本は [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md)、BT2 構造体の正本は [STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md)、機能の実装/実機状況は [FEATURE_MATRIX.md](FEATURE_MATRIX.md)。**Phase 1〜5 のフェーズ全体の正本は [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) §5** であり、本ドキュメントは機種をまたぐ構造だけを定義してそれらを**置き換えない**。
 - 記載ルール: 断定できない事項は **「要検証」** と明記する。[FEATURE_MATRIX.md](FEATURE_MATRIX.md) §0 のラベル定義（RE 確認済み / 推測 / 未確認、実機確認済み / 未検証）をそのまま使う。
 
@@ -1064,7 +1064,7 @@ core/tests/scripts/<profile_id>/
 
 理由:
 
-- 変更コストが大きい（`Cargo.toml` 5 クレート、`use` 文、UniFFI の namespace / Swift module / Kotlin package、Android Gradle の `libeightbitdo_uniffi.so`、iOS の XCFramework 名、CI、scripts、docs 中の参照。**`docs/*.md` は実測 6,221 行**で、本ドキュメント 1,201 行を含む）。
+- 変更コストが大きい（`Cargo.toml` 5 クレート、`use` 文、UniFFI の namespace / Swift module / Kotlin package、Android Gradle の `libeightbitdo_uniffi.so`、iOS の XCFramework 名、CI、scripts、docs 中の参照。**`docs/*.md` は実測 6,405 行**で、本ドキュメント 1,240 行を含む）。
 - 現時点で **8BitDo 以外の対応機種は 0**。名前だけ先に一般化しても利用者価値が無く、レビューと検証のコストだけ増える。
 - 製品名 `Padbench` は**アプリ / 配布物の名前**であり、クレート名と一致させる必要はない（`ripgrep` のクレート名と `rg` の関係と同じ）。
 
