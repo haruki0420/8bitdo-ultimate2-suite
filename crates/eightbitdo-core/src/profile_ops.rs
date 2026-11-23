@@ -40,6 +40,10 @@ impl<T: Transport> Session<T> {
     ///
     /// The call is recorded as an in-flight write, so a failed or dropped
     /// attempt marks the session for a stale-frame drain before the next read.
+    /// A **successful** call also marks the session: the acknowledgement shape
+    /// is unconfirmed, so a second or late `0x0015` frame must not be taken as
+    /// the answer of a later operation. The next read drains for at most one
+    /// idle tick, so the cost is a best-effort 1 ms wait, not a failure.
     ///
     /// # Errors
     ///

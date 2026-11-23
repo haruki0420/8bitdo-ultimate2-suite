@@ -6684,7 +6684,18 @@ async fn execute_session_command_with_io<T: Transport + 'static>(
                 return Ok(SessionOutcome::Continue);
             }
             let guard = session.lock().await;
-            guard.switch_profile(slot).await?;
+            let result = guard.switch_profile(slot).await;
+            drop(guard);
+            if let Err(error) = result {
+                if matches!(error, Error::Timeout { .. }) {
+                    eprintln!(
+                        "warning: no WriteSLOT acknowledgement arrived. The 0x0015 ACK shape is \
+                         unconfirmed, so the switch may still have happened; check the active \
+                         profile on the controller."
+                    );
+                }
+                return Err(error);
+            }
             println!(
                 "sent WriteSLOT slot {} (profile {}) (cmd 0x0015, no Save); acknowledged but \
                  unverified",
@@ -12257,7 +12268,8 @@ mod tests {
         let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
         let state = Arc::new(SessionKeepaliveState::new());
         let input = format!(
-            "config set joy.left_start 42 --slot 1 --backup-dir {} --yes\nquit\n",
+            "config set joy.left_start 42 --slot 1 --backup-dir {} --yes\n\
+             profile switch 1 --yes\nquit\n",
             dir.join("backup").display()
         );
         let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes()));
@@ -12277,7 +12289,7 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         assert!(
             transport.sent().is_empty(),
-            "gated config write sent frames"
+            "gated config write sent frames (including the gated profile switch)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
