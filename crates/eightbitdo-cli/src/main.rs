@@ -315,6 +315,25 @@ enum ConfigCommand {
         #[command(subcommand)]
         command: MapCommand,
     },
+
+    /// Switch the controller's active profile (`cmd 0x0015`).
+    ///
+    /// Sends one payload-less `WriteSLOT` request (`subcmd = slot`,
+    /// `total_len = 0`, `offset = 0`) and waits for its acknowledgement. No
+    /// `Save (0x0006)` is sent: whether `0x0015` needs one is **unconfirmed on
+    /// hardware** (`docs/PROTOCOL_SPEC.md` §6.2, docs/FEATURE_MATRIX.md).
+    ///
+    /// This changes the controller's active profile immediately. It does not
+    /// rewrite the 2768-byte configuration, so no pre-write backup is taken;
+    /// switch back with another `profile` call if needed.
+    Profile {
+        /// Profile slot (0..=2, matching the protocol and `config map`).
+        slot: u8,
+
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -663,6 +682,10 @@ async fn dispatch_config_command(
                 config_map_show(options, slot).await?;
             }
         },
+        ConfigCommand::Profile { slot, yes } => {
+            let slot = parse_slot(slot)?;
+            config_profile_switch(options, slot, yes).await?;
+        }
     }
     Ok(())
 }
@@ -2115,6 +2138,41 @@ async fn config_map_show(options: &BleOptions, slot: Slot) -> Result<(), Error> 
     for line in mapping_lines(&snapshot.config, slot) {
         println!("{line}");
     }
+    Ok(())
+}
+
+/// Switch the active profile (`cmd 0x0015`).
+///
+/// The wire is RE-confirmed (`docs/PROTOCOL_SPEC.md` §6.2) but the ACK shape,
+/// the need for a Save and the persistence of the selection are **unconfirmed
+/// on hardware**. This sends exactly the official request and reports what the
+/// controller acknowledged; it deliberately does not claim the switch persisted.
+async fn config_profile_switch(
+    options: &BleOptions,
+    slot: Slot,
+    assume_yes: bool,
+) -> Result<(), Error> {
+    let transport = BleTransport::connect(options).await?;
+    let mut session = Session::new(transport);
+    let mut confirmation_io = TopLevelConfirmation::new(assume_yes);
+    let mut confirmation = confirmation_io.confirmation();
+    if !confirmation.confirm().await? {
+        best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
+        return Err(Error::InvalidRequest(
+            "profile switch aborted: no confirmation".to_string(),
+        ));
+    }
+    let result = session.switch_profile(slot).await;
+    best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
+    result?;
+    println!(
+        "switched the active profile: WriteSLOT slot {} (cmd 0x0015, no Save)",
+        slot.index()
+    );
+    println!(
+        "note: ACK shape, Save requirement and persistence are unconfirmed on hardware; \
+         no read-back is claimed"
+    );
     Ok(())
 }
 
@@ -5259,6 +5317,10 @@ enum SessionCommand {
     ConfigMapShow {
         slot: u8,
     },
+    ProfileSwitch {
+        slot: u8,
+        yes: bool,
+    },
     ConfigWrite {
         file: PathBuf,
         backup_dir: Option<PathBuf>,
@@ -5351,6 +5413,8 @@ fn parse_session_command(line: &str) -> SessionCommand {
         "info" if parts.next().is_none() => SessionCommand::Info,
         "config" => parse_config_session_command(parts)
             .unwrap_or_else(|| SessionCommand::Unknown(line.to_string())),
+        "profile" => parse_profile_session_command(parts)
+            .unwrap_or_else(|| SessionCommand::Unknown(line.to_string())),
         "backup" => match parse_file_options(parts) {
             Some((raw, json)) => SessionCommand::Backup { raw, json },
             None => SessionCommand::Unknown(line.to_string()),
@@ -5380,6 +5444,24 @@ fn parse_session_command(line: &str) -> SessionCommand {
 fn session_plain_value<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<&'a str> {
     let value = parts.next()?;
     (!value.starts_with("--")).then_some(value)
+}
+
+/// Parse the `profile ...` REPL subcommand (`profile switch <N> [--yes]`).
+fn parse_profile_session_command<'a>(
+    mut parts: impl Iterator<Item = &'a str>,
+) -> Option<SessionCommand> {
+    if parts.next()? != "switch" {
+        return None;
+    }
+    let slot: u8 = session_plain_value(&mut parts)?.parse().ok()?;
+    let mut yes = false;
+    for part in parts {
+        match part {
+            "--yes" if !yes => yes = true,
+            _ => return None,
+        }
+    }
+    Some(SessionCommand::ProfileSwitch { slot, yes })
 }
 
 /// Parse the `config ...` REPL subcommands.
@@ -5578,6 +5660,7 @@ fn is_config_write_command(command: &SessionCommand) -> bool {
         SessionCommand::ConfigSet { .. }
             | SessionCommand::ConfigRemap { .. }
             | SessionCommand::ConfigWrite { .. }
+            | SessionCommand::ProfileSwitch { .. }
     )
 }
 
@@ -5614,6 +5697,7 @@ fn print_session_help(allow_macro_write: bool, allow_config_write: bool) {
     if allow_config_write {
         println!("  config set <FIELD> <VALUE> [--slot N] [--write-chunk BYTES] [--yes]");
         println!("  config remap <PHYSICAL> <TARGET> [--slot N] [--write-chunk BYTES] [--yes]");
+        println!("  profile switch <0|1|2> [--yes]");
         println!(
             "  config write --file <PATH> [--backup-dir DIR] [--write-chunk BYTES] \
              [--accept-reserved-drift] [--force-raw] [--yes]"
@@ -5621,6 +5705,7 @@ fn print_session_help(allow_macro_write: bool, allow_config_write: bool) {
     } else {
         println!("  config set ... (disabled; restart with --allow-config-write)");
         println!("  config remap ... (disabled; restart with --allow-config-write)");
+        println!("  profile switch ... (disabled; restart with --allow-config-write)");
         println!("  config write ... (disabled; restart with --allow-config-write)");
     }
     println!("  backup [--raw FILE] [--json FILE]");
@@ -6536,6 +6621,29 @@ async fn execute_session_command_with_io<T: Transport + 'static>(
             for line in mapping_lines(&snapshot.config, slot) {
                 println!("{line}");
             }
+            Ok(SessionOutcome::Continue)
+        }
+        SessionCommand::ProfileSwitch { slot, yes } => {
+            if monitor.is_some() {
+                eprintln!("monitor is running; use 'monitor stop' first");
+                return Ok(SessionOutcome::Continue);
+            }
+            let slot = parse_slot(slot)?;
+            let mut confirmation =
+                config_confirmation_for_session(yes, &mut repl_reader, &mut repl_line_state)?;
+            if !confirmation.confirm().await? {
+                eprintln!("profile switch aborted: no confirmation");
+                return Ok(SessionOutcome::Continue);
+            }
+            let mut guard = session.lock().await;
+            guard.switch_profile(slot).await?;
+            println!(
+                "switched the active profile: WriteSLOT slot {} (cmd 0x0015, no Save)",
+                slot.index()
+            );
+            println!(
+                "note: ACK shape, Save requirement and persistence are unconfirmed on hardware"
+            );
             Ok(SessionOutcome::Continue)
         }
         SessionCommand::ConfigWrite {
@@ -11842,6 +11950,17 @@ mod tests {
             SessionCommand::ConfigMapShow { slot: 2 }
         );
         assert_eq!(
+            parse_session_command("profile switch 1"),
+            SessionCommand::ProfileSwitch {
+                slot: 1,
+                yes: false
+            }
+        );
+        assert_eq!(
+            parse_session_command("profile switch 2 --yes"),
+            SessionCommand::ProfileSwitch { slot: 2, yes: true }
+        );
+        assert_eq!(
             parse_session_command(
                 "config write --file /tmp/c.bin --backup-dir /tmp/b --accept-reserved-drift \
                  --force-raw --write-chunk 180 --yes"
@@ -11867,6 +11986,11 @@ mod tests {
             "config set a b --slot 1 --slot 2",
             "config write --file /tmp/c.bin --yes --yes",
             "config unknown",
+            "profile",
+            "profile switch",
+            "profile switch 1 --yes --yes",
+            "profile switch 1 extra",
+            "profile other 1",
         ] {
             assert!(
                 matches!(parse_session_command(line), SessionCommand::Unknown(_)),

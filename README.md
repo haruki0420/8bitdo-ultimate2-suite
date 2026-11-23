@@ -91,7 +91,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 主なサブコマンド:
 
 - `scan [--check]` / `info` / `backup [--raw FILE] [--json FILE] [--hold N]` / `monitor [--count N]` / `keepalive [--interval-ms 20] [--duration 120]`
-- `config dump` / `config write` / `config set` / `config remap` / `config map show`
+- `config dump` / `config write` / `config set` / `config remap` / `config map show` / `config profile`
 - `macro backup --dir DIR` / `macro write --slot N --index N --file FILE [--trigger KEY]` / `macro restore --dir DIR [--force]`
 - `session [--interval-ms 20] [--allow-macro-write] [--allow-config-write] [--no-report-enable]` — 1 接続の REPL
 
@@ -101,6 +101,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 - `config write --file <2768B>` — `config dump --raw` の編集ファイルを書込み。予約バイトの改変は拒否し、復旧時のみ `--accept-reserved-drift` で device の現在値に合わせる。
 - `config set <field> <value>` — プロファイル名、cur_slot、gamepad_mode、rumble / joy / trigger / gyro / LED、`map_key.flag`（typed は 0/1 のみ。raw dump の実機値は opaque で `0x20200911` 等）。範囲外は I/O 前に拒否。joy / trigger はレコード flag=1、LED color はテーマ flag=1 の副作用あり（help に明記）。
 - `config remap <physical> <target>` — 1 ボタンのみ（4B）変更。`config map show` で 22 index を表示。
+- `config profile <0|1|2>` — 公式の `WriteSLOT`（`0x0015`、payload なし、`subcmd=slot`）でアクティブプロファイルを切り替える。**Save は送らない**（`0x0015` に Save が必要かは実機未確認）。ACK 形状・永続性も未確認のため、read-back での検証は行わず、その旨を出力する。REPL では `profile switch <N> [--yes]`。
 - 安全策: **pre-write backup 必須**（`config.bin` + `config.json`）、`--yes` なしの確認、前後 SHA-256、確認後の TOCTOU 再読込、read-back 検証、マクロヘッダ変更警告。書込 chunk は既定 `min(MTU, 74)`（RE: 公式 74B）で、`--write-chunk` は接続前上限 **180**（観測 MTU 200 のペイロード上限）まで指定可能。
 - raw `config write` の検証: 22 個の `button_mappings`、`gyro.key_map`（documented single のみ。`0xFFFFFFFF` は map_key の消去 slot 専用）、マクロ `max_steps`（0/0xFFFF/1..=200）・`total_cnt`、マクロ `key_map`（`macro write --trigger` と同じ任意 KeyMap）を確認。**各レコードの flag は実機観測値集合（`0` / `1` / `0x20200911` / `0xFFFFFFFF`、gyro は `0x20190000` も）のみ受理**し、`slot_flags` も同じ観測値集合のみ受理する。それ以外は `--force-raw` が必要。数値範囲（joy/gyro/hotwheel/rumble）は **flag の値に関係なく常時検証**するが、実機の完全消去 slot（`slot_flags` が `0xFFFFFFFF` + flag `0xFFFFFFFF` + joy 全 255 + rumble NaN + 22 key 全 `0xFFFFFFFF`）は **slot 全体が揃った場合のみ**その実機状態として受理する（joy だけ・rumble だけ・map_key だけの partial state は拒否）。`0xFFFFFFFF` が flag 値として全レコードで許可されるのは「flag 値のみの許可」で、payload の消去扱いにはならない。typed `config set` の flag のみ 0/1。不明な `cur_slot`（実機観測 6 など）は警告して保持。`--force-raw` は未文書値の復旧用（予約領域ガードは維持）。実バイト証跡は [docs/DEVICE_CONFIG_EVIDENCE.md](docs/DEVICE_CONFIG_EVIDENCE.md)。
 - `session --allow-config-write` の REPL からも `config set` / `config remap` / `config write --file` を実行できる（`config map show` と `config dump` はフラグ不要の read-only）。書込は `--yes` で対話確認なし、無い場合は `yes` 入力の確認、pre-write backup、前後 SHA-256、read-back 検証付き。確認待ちの間は operation lock を解放して 20ms keepalive を継続し、確認プロンプトは Ctrl-C で中止できる（pre-write backup は残る）。実書込（最初の `0x0001` 以降）だけが operation lock 下の Ctrl-C 非キャンセル区間で、書込後は keepalive が再開する。

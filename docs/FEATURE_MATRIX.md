@@ -53,7 +53,7 @@ RE の一次証拠（DLL export の RVA、DEX の code_off、構造体オフセ�
 | 振動 | L/R Vibration（0〜5 段階）、振動テスト | **RE 確認済み** | 実装済み（core + CLI + GUI）。振動テスト UI は未実装 | 実機未検証 | 実機での強度確認、テスト UI |
 | ジャイロ / 6 軸 | Motion（Hold/Toggle、有効ボタン、感度、補償、マップ先） | **RE 確認済み**（Windows 経路）。Android は部分書込 JNI 未使用 | 実装済み（core + CLI + GUI） | 実機未検証 | Windows UI が `0x600F` で有効かの確定、実機確認 |
 | LED / RGB | Brightness、RGB Effect、24 LED、Speed、Dynamic Lighting | 3 テーマ・24 LED・Speed は **RE 確認済み**。Brightness・効果名は **未確認 / 推測** | 実装済み（core + CLI + GUI）だが 3 テーマのみ | 実機未検証 | Brightness と効果名の格納先 RE、実機確認 |
-| プロファイル | 3 スロット、名前、切替、Copy / Delete | 名前・`cur_slot`・`0x0015`・copy/delete は **RE 確認済み**。`slot_flags` は **未確認** | 名前・`gamepad_mode`・`cur_slot` は実装済み（core + CLI + GUI）。`0x0015` と copy/delete は **protocol のみ・未配線** | 実機未検証 | `0x0015` の配線・Save 要否、copy/delete UI、`slot_flags` 確定 |
+| プロファイル | 3 スロット、名前、切替、Copy / Delete | 名前・`cur_slot`・`0x0015`・copy/delete は **RE 確認済み**。`slot_flags` は **未確認** | 名前・`gamepad_mode`・`cur_slot` は実装済み（core + CLI + GUI）。`0x0015` は **core + CLI に配線済み**（Save 要否・ACK 形状は未確認）。copy/delete は **protocol のみ・未配線** | `0x0015` は実機未検証（Save 要否・永続性は未確認）。GUI の切替 UI は未実装 | `0x0015` の実機確認、copy/delete UI、`slot_flags` 確定 |
 | ターボ / 連射 | Turbo / AutoTurbo / Turbo_3 の割当 | 定数と書込経路は **RE 確認済み**。速度・段階のセマンティクスは **未確認** | リマップ先として実装済み（core + CLI + GUI）。専用 UI・レート設定は未実装 | 実機未検証 | レート / 3 段階の RE、専用 UI |
 | マクロ | 記録・編集・実行モード・ループ | ヘッダ / ステップは **RE 確認済み**。実行モード / ラウンドモードは **未確認** | 記録・編集・書込・復元を実装（core + CLI + GUI）。空マクロ作成は未実装 | **実機確認済み**（slot S1 の M1/M2 の書込・復元。Switch 側の発動は未確認） | M3/M4・S2/S3、実行モード RE、空マクロ作成 |
 | ファームウェア更新 | バージョン表示、OTA、ベータ版 | コマンドと UI は **RE 確認済み**。wire 詳細は **未確認** | バージョン読取は実装済み。OTA は **core のみ・未配線** | バージョン読取は実機確認済み。OTA は実機評価不能 | 実機 btsnoop で wire 確定、マルチセクション `.dat`、配線 |
@@ -144,7 +144,7 @@ RE の一次証拠（DLL export の RVA、DEX の code_off、構造体オフセ�
 | --- | --- | --- | --- | --- | --- |
 | 3 スロットの名前変更 | `Profile name`、`Rename` | **RE 確認済み**（`file_names` `+0x14 + slot*0x20`、UTF-16BE 32B、`_WriteUltimateBT2Name`） | **実装済み（core + CLI + GUI）**。CLI `config set profile_name`、GUI テキスト入力 | 実機未検証 | 実機確認（名前の UTF-16BE 往復） |
 | 有効プロファイル（`cur_slot`） | `Current Profile`、`Activate` | **RE 確認済み**（`cur_slot` `+0x12`）。実機値は 6 など未文書値も観測 | **実装済み（core + CLI + GUI）**: `ConfigEdit::CurSlot` で 2768B の `cur_slot` フィールドを書く。CLI `config set cur_slot`、GUI の Active Profile コンボ | 実機未検証 | 実機で「フィールド書換だけで切替が起きるか」を確認 |
-| プロファイル切替コマンド `0x0015` | `Load to Profile 1..3` 等 | **RE 確認済み**（`cmd=0x0015, subcmd=slot, total_len=0, offset=0`。実装 `commands::switch_slot` と `PROTOCOL_SPEC` に一致）。Save 要否は **未確認** | **protocol ビルダーのみ・未配線**（`commands::switch_slot` は存在するが core / CLI / GUI から未使用） | 実機評価不能（未配線） | セッション API 化、Save 要否の実機確認、CLI / GUI 露出 |
+| プロファイル切替コマンド `0x0015` | `Load to Profile 1..3` 等 | **RE 確認済み**（`cmd=0x0015, subcmd=slot, total_len=0, offset=0`。実装 `commands::switch_slot` と `PROTOCOL_SPEC` に一致）。Save 要否・ACK 形状は **未確認** | **core + CLI 配線済み**（`Session::switch_profile`、`config profile <N>`。Save は送らない）。GUI の専用 UI は未実装 | 実機未検証（ACK 形状・Save 要否・永続性） | 実機での ACK / 永続性確認、GUI 切替 UI |
 | Copy / Delete | `Copy`、`Delete this profile ?` | **RE 確認済み**（Android JNI `copyConfig` / `deleteCurslot`、UI コンポーネント） | **protocol ヘルパーのみ**（`Bt2Config::copy_slot` / `delete_slot` は存在するが CLI / GUI 未露出。raw `config write` でバイト編集は可能） | 実機未検証 | `ConfigEdit` への追加と CLI / GUI 露出、実機確認 |
 | `slot_flags` の意味 | プロファイルの有効状態に関係するとみられる | **未確認**（実機は `0x20200911` / `0xFFFFFFFF` で opaque） | 読取・保持のみ（書き換えは raw 経路のみ。観測値集合を検証） | 実機値の観測済み（意味は未確定） | 意味の確定（プロファイル作成・削除との対応） |
 | 本体 Profile ボタンでの切替 | `Press the Profile button on the controller...` | **RE 確認済み**（案内文言）。本体 FW の挙動 | 対象外（ファームウェア機能） | 実機未検証 | ソフトからの切替可否（`0x0015`）を実機確認 |
@@ -221,7 +221,7 @@ RE の一次証拠（DLL export の RVA、DEX の code_off、構造体オフセ�
   - **部分書込（公式の 4B remap 等）は使わず、常に全量書込 + Save + read-back**。`ButtonRemap` は該当 4B だけを変える `ConfigEdit` として実装
 - **CLI**: `crates/eightbitdo-cli/src/main.rs`
   - トップレベル: `scan` / `info` / `config dump|write|set|remap|map show` / `macro backup|write|restore` / `backup` / `monitor` / `keepalive` / `session`
-  - `config set` の型付きフィールドは `cur_slot, gamepad_mode, profile_name, rumble.level, joy.*, trigger.*, gyro.*, led.*, map_key.flag`。**`special.*`（軸反転等）と profile copy/delete、`0x0015` 切替は CLI に無い**
+  - `config set` の型付きフィールドは `cur_slot, gamepad_mode, profile_name, rumble.level, joy.*, trigger.*, gyro.*, led.*, map_key.flag`。**`special.*`（軸反転等）と profile copy/delete は CLI に無い。`0x0015` 切替は `config profile <N>` にある**
   - `session` REPL は `--allow-config-write` / `--allow-macro-write` + `--yes` または `yes` 入力が必須
 - **GUI**: `crates/eightbitdo-gui/src/`（egui）
   - 6 タブ: Device / Input / Config（読み取り）/ Settings（書き込み）/ Macro / Log
@@ -242,7 +242,7 @@ RE の一次証拠（DLL export の RVA、DEX の code_off、構造体オフセ�
 
 1. **GUI 書込（設定 / リマップ / マクロ）の実機確認**（Tier 3）。pre-write backup と read-back を前提に、Linux BLE・MTU 200 で確認する。
 2. **BLE OTA の wire 確定と配線**: 実機 btsnoop で [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §8.5 の未検証事項（特に ACK 形状 / アドレス規約 / Bootloader MTU）を確定し、ACK の `offset` / `total_len` 照合とマルチセクション `.dat` 対応を入れてから CLI / GUI / UniFFI に配線する。
-3. **プロファイル管理の完成**: `0x0015` 切替のセッション API 化と Save 要否の実機確認、Copy / Delete の `ConfigEdit` 化と CLI / GUI 露出、`slot_flags` の意味確定。
+3. **プロファイル管理の完成**: `0x0015` 切替（core + CLI 配線済み）の ACK 形状・Save 要否・永続性の実機確認、GUI 切替 UI、Copy / Delete の `ConfigEdit` 化と CLI / GUI 露出、`slot_flags` の意味確定。
 4. **実機確認の拡大**: `config set` の各フィールド（スティック / トリガー / 振動 / ジャイロ / LED / プロファイル名）、MTU 200 以外、REPL 経由の書込、M3/M4・S2/S3、Switch 側でのマクロ発動・リマップ実効。
 5. **追加 RE が必要な項目**: ターボのレート / 3 段階、LED の Brightness と効果名、マクロ実行モード / ラウンドモード、空マクロ作成、キャリブレーション、バッテリースケール / 充電状態、キーボードキー割当の可否。
 6. **GUI の残機能**: restore UI、JSON/TOML 入出力、OTA 画面（2 の後）。

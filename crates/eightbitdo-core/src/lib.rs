@@ -24,6 +24,7 @@ pub mod error;
 pub mod macro_ops;
 pub mod mock;
 pub mod ota;
+pub mod profile_ops;
 pub mod session;
 pub mod transport;
 
