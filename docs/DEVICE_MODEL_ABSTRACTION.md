@@ -2,14 +2,14 @@
 
 - 対象: 8BitDo Ultimate 2 Bluetooth（`0x600F`）にハードコードされている現行実装を、**将来の別機種**（Ultimate 2C / Pro 2 / Ultimate 3、将来的には他社コントローラ）に拡張できる構造へ移行するための設計。
 - リポジトリ: ブランチ `docs/device-model`、base `81b0ac1`。**本ドキュメントは設計のみで、実装コードは含まない**（diff は docs のみ）。
-- 位置づけ: 実装フェーズの正本は本ドキュメント、プロトコル値の正本は [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md)、BT2 構造体の正本は [STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md)、機能の実装/実機状況は [FEATURE_MATRIX.md](FEATURE_MATRIX.md)。本ドキュメントはそれらを**置き換えず**、機種をまたぐ構造だけを定義する。
+- 位置づけ: **機種抽象化の実装計画の正本**は本ドキュメント、プロトコル値の正本は [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md)、BT2 構造体の正本は [STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md)、機能の実装/実機状況は [FEATURE_MATRIX.md](FEATURE_MATRIX.md)。**Phase 1〜5 のフェーズ全体の正本は [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) §5** であり、本ドキュメントは機種をまたぐ構造だけを定義してそれらを**置き換えない**。
 - 記載ルール: 断定できない事項は **「要検証」** と明記する。[FEATURE_MATRIX.md](FEATURE_MATRIX.md) §0 のラベル定義（RE 確認済み / 推測 / 未確認、実機確認済み / 未検証）をそのまま使う。
 
 ---
 
 ## 0. 結論（先に読む要約）
 
-1. **抽象化の単位は「機種（DeviceProfile）」ではなく「機種 × レイアウト × コマンド集合 × 能力」の 4 つのデータ**とする。Rust の trait を機種ごとに実装する方式は採らない（理由は §5.1）。
+1. **抽象化の単位は「機種ごとの trait 実装」ではなく「機種 × レイアウト × コマンド集合 × 能力」の 4 つのデータ**とする。`DeviceProfile` は機種 1 つ分のデータであり、機種をまたぐコードの単位は trait 実装ではなくこのデータ + レジストリである（理由は §5.1）。
 2. 現行のハードコードは **54 行・53 件**（`crates/` 内、テストコードを除く。1 行は参考掲載で機種依存なし）。うち「レイアウト」23 件、「識別」9 件、「コマンド」7 件、「機能集合・件数」7 件、「製品名・UI 文言」5 件、「タイミング」2 件に分類できる（§3）。
 3. 機種差の大半は **定数とオフセット表**であり、アルゴリズム差はごく少ない。したがって `DeviceProfile` は `&'static` の**データ**とし、アルゴリズム差だけを小さな enum / trait に閉じ込める。
 4. 能力は `bool` ではなく **三値（`Supported` / `Unsupported` / `Unverified`）** で表現する。本プロジェクトは「推測実装禁止」を運用ルールにしており、UI が「非対応」と「未確認」を区別できないと、未確認機能を黙って出すか黙って隠すかのどちらかになり、どちらも誤りだから。
@@ -36,7 +36,7 @@
 - USB HID / 2.4G トランスポートの実装（[PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §4.4 の USB Boot TX 未文書化が解消するまで保留。現行方針を維持）。
 - OTA の wire 確定（[OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md)）。
 - 他社コントローラのプロトコル解析（§11.4 の将来論に留める）。
-- GUI の実装方式そのもの（Tauri 移行は進行中であり、本ドキュメントは「Tauri に capability descriptor をどう渡すか」だけを定義する）。
+- GUI の実装方式そのもの（Tauri v2 への移行は**未マージの `feat/tauri-gui` ブランチで進行中**であり、本ドキュメントは「Tauri に capability descriptor をどう渡すか」だけを定義する。根拠と更新対象は §1.3 の注記）。
 
 ### 1.3 前提（現状認識）
 
@@ -44,14 +44,14 @@
 | --- | --- | --- |
 | 対応機種 | Ultimate 2 Bluetooth（`0x600F`）のみ | [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §2 |
 | 設定サイズ | 2768B（`0x0AD0`）固定 | [STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md) §1 |
-| プロファイル数 | 3 slot × 4 macro、22 ボタン、24 LED | 同上 §1.1 |
-| 近い別機種の情報 | **Ultimate 2 Wireless（`0x6012`, 1592B）のレイアウト差分は既に特定済み**（レガシー領域 A 1176B が無いだけ） | [STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md) §10 |
+| 設定スロット数 | 3 slot × 4 macro、22 ボタン、24 LED | 同上 §1.1 |
+| 近い別機種の情報 | **Ultimate 2 Wireless（`0x6012`, 1592B）の `ConfigLayout` 差分は既に特定済み**（レガシー領域 A 1176B が無いだけ）。※ USB Save subcmd の差（BT2 `0x0123` / Wireless `0x0064`）はレイアウト差ではなく**コマンド差**なので、ここには含めない | [STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md) §10 |
 | Ultimate 2C（`0x301A`） | PID と `firmware_type` のみ判明。**設定サイズ・レイアウト・BLE 名は未確認** | [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §2.1 |
-| デスクトップ GUI | Tauri でゼロベース作り直し中（現行 `eightbitdo-gui` は egui） | プロジェクト方針（本設計の前提） |
+| デスクトップ GUI | **main の正本は egui（`crates/eightbitdo-gui`）で「Tauri 不使用」**。Tauri v2 への移行は未マージの `feat/tauri-gui` で進行中 | [AGENTS.md](../AGENTS.md) §3、[README.md](../README.md)、[crates/eightbitdo-gui/README.md](../crates/eightbitdo-gui/README.md) の「Tauri 不使用」。main の [ANTI_SLOP.md](ANTI_SLOP.md)（#31）も同じ整理 |
 | モバイル | iOS SwiftUI / Android Compose + UniFFI（ネイティブ実装） | [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) §2 |
-| 製品名 | `Padbench` へ変更中（クレート名は `eightbitdo-*` を当面維持） | §11 |
+| 製品名 | `Padbench` へ改名（**`feat/tauri-gui` で実施済み・main 未反映**。クレート名は `eightbitdo-*` を当面維持） | `feat/tauri-gui`。main の [ANTI_SLOP.md](ANTI_SLOP.md)（#31）にも同じ記録。§11 |
 
-> **要検証**: `docs/IMPLEMENTATION_PLAN.md` §2 は現在も「Pure Rust + egui」を正本として記述している。Tauri 移行が決定事項なら、同節の更新は別 PR が必要（本ドキュメントは Tauri を前提とするが、その決定自体の正本はここではない）。
+> **根拠と更新対象**: Tauri v2 の許可と **Padbench** への改名は**未マージの `feat/tauri-gui` ブランチで実施済み**で、**main には反映されていない**。main は egui が正本で「Tauri 不使用」を明記しており（[AGENTS.md](../AGENTS.md) §3、[README.md](../README.md)、[crates/eightbitdo-gui/README.md](../crates/eightbitdo-gui/README.md)）、この整理は main の [ANTI_SLOP.md](ANTI_SLOP.md)（#31 でマージ済み）と同じである。したがって本ドキュメントは「Tauri 移行が決定済み」と断定せず、**Tauri 前提の記述は `feat/tauri-gui` のマージ後に有効**になる。マージ時に更新が必要な文書は次の 4 つ: [AGENTS.md](../AGENTS.md) §3、[README.md](../README.md)、[crates/eightbitdo-gui/README.md](../crates/eightbitdo-gui/README.md)、[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) §2（egui 前提の記述）。
 
 ---
 
@@ -60,13 +60,16 @@
 | 用語 | 定義 |
 | --- | --- |
 | **機種 / device model** | PID（と BLE 名）で区別される製品。例: Ultimate 2 Bluetooth（`0x600F`） |
-| **プロファイル / `DeviceProfile`** | 機種 1 つ分の「識別・レイアウト・コマンド集合・能力・証跡」をまとめた不変データ |
+| **機種プロファイル / `DeviceProfile`** | 機種 1 つ分の「識別・レイアウト・コマンド集合・能力・証跡」をまとめた不変データ |
+| **設定スロット / `Slot`** | コントローラ内のユーザー設定 1 個（BT2 は 3 個、`cur_slot` が指す 0〜2）。「プロファイル切替」の対象 |
 | **レイアウト / `ConfigLayout`** | 設定ブロックのサイズ・CRC・セクション表（オフセット / ストライド / 要素型）・件数 |
 | **コマンド集合 / `CommandSet`** | 読み書き・Save・マクロ・スロット切替・入力・OTA の cmd/subcmd とフレーミング規則 |
 | **能力 / capability** | 機能の有無。`Supported` / `Unsupported` / `Unverified` の三値 |
 | **capability descriptor** | 上記を UI / CLI / モバイルへ渡すための直列化形式（JSON / UniFFI record） |
 | **共通層** | 機種に依存しない層（ヘッダ、CRC、`Transport`、`Session`、単一所有者ロック） |
 | **機種層** | 機種固有の層（レイアウト表、構造体デコード、コマンド組み立て、能力、証跡） |
+
+> 本文で単に「プロファイル」と書いた場合は `DeviceProfile`（**機種プロファイル**）を指す。コントローラ内のユーザー設定 1 個（`cur_slot` が指す 0〜2）を指す場合は必ず**設定スロット**と書く（既存 API 名 `switch_profile` / `config profile` などの固有名はそのまま）。
 
 ---
 
@@ -92,19 +95,19 @@
 | # | ファイル:行 | ハードコード内容 | 分類 | 何に依存しているか |
 | --- | --- | --- | --- | --- |
 | 1 | `crates/eightbitdo-protocol/src/config_bt2.rs:18` | `CONFIG_SIZE = 0x0AD0`（2768） | L | BT2 の設定ブロック長 |
-| 2 | `config_bt2.rs:21` | `SLOT_COUNT = 3` | F | BT2 のプロファイル数 |
+| 2 | `config_bt2.rs:21` | `SLOT_COUNT = 3` | F | BT2 の設定スロット数 |
 | 3 | `config_bt2.rs:88` | `BUTTON_COUNT = 22` | F | BT2 の物理ボタン数 |
 | 4 | `config_bt2.rs:90` | `MACROS_PER_SLOT = 4` | F | BT2 のマクロ数 |
 | 5 | `config_bt2.rs:24-56` | `OFF_*` 全 17 個のセクションオフセット | L | BT2 の SoA 配置 |
 | 6 | `config_bt2.rs:59-92` | `PROFILE_NAME_SIZE` / `RUMBLE_SIZE` / … / `SINGLE_LED_COUNT` 等の要素サイズ | L | BT2 の各レコード長 |
-| 7 | `config_bt2.rs:754-775` | `Bt2Config` が `[_; 3]` / `[_; 4]` / `[_; 22]` の固定長配列をフィールドに持つ | L | BT2 の件数が型に埋め込まれている |
+| 7 | `config_bt2.rs:754-775` | `Bt2Config` は `raw: [u8; CONFIG_SIZE]` 1 本。件数は accessor の**戻り型**に現れる（例: `slot_flags() -> [u32; SLOT_COUNT]`、`map_key() -> MapKeyRecord` 内の `key[22]`） | L | BT2 の件数が accessor の型に埋め込まれている |
 | 8 | `config_bt2.rs:714-722` | `macro_slot_offset` / `macro_record_offset`（`0x68C + slot*0xD8 + …`） | L | BT2 のマクロヘッダ配置 |
 | 9 | `macro_data.rs:13-22` | `MACRO_STEP_SIZE = 10`、`MAX_MACRO_STEPS = 200`、`MACRO_SECTOR_SIZE = 0x1000`、`AXIS_NEUTRAL` | L | BT2 のマクロステップ形式・Flash セクタ |
 | 10 | `keymap.rs:233-` | `ButtonIndex` の 22 値と index 順（`A,B,X,Y,L1,…,P4`） | L | BT2 の `key[22]` 順序 |
 | 11 | `commands.rs:80-97` | `VERSION_REQUEST_LEN = 4` / `VERSION_RESPONSE_LEN` / ゼロ 4B ペイロード | C | `gamepad_type == 1` の ReadVersion 形状 |
 | 12 | `commands.rs:489-508` | `read_version()` が `boot::VERSION_ADDR`（`0x01017040`）を offset に使う | C | type 1 の固定アドレス |
 | 13 | `commands.rs:560-562` | `macro_subcmd = (gamepad_mode << 8) \| slot` | C | 8BitDo 世代共通の subcmd 規則（機種横断の確認は無い） |
-| 14 | `commands.rs:103-109` | `MACRO_MAX_CHUNK_SIZE = 0x40` / `MACRO_USB_CHUNK_SIZE = 0x20` / `MACRO_PAYLOAD_ALIGNMENT = 0x20` | T | マクロ書込の BLE/USB 上限と 32B アライン |
+| 14 | `commands.rs:100-106` | `MACRO_MAX_CHUNK_SIZE = 0x40` / `MACRO_USB_CHUNK_SIZE = 0x20` / `MACRO_PAYLOAD_ALIGNMENT = 0x20` | T | マクロ書込の BLE/USB 上限と 32B アライン |
 | 15 | `commands.rs:883-907` | Bootloader の `VERSION_ADDR` / `APPID_ADDR` / `APP_ENTRY_ADDR` / `SECTOR_SIZE` / `CHUNK_SIZE` | C | type 1 の OTA アドレス・サイズ |
 | 16 | `lib.rs:50-51` | `RECORD_ULTIMATEBT2_SIZE = CONFIG_SIZE` | L | BT2 の構造体名を公開 API に固定 |
 | 17 | `lib.rs:1-6` | クレート doc が「Ultimate 2 (`PID 0x600F`)」と宣言 | P | 製品名 |
@@ -229,24 +232,35 @@
 
 ### 4.4 推測実装禁止を型で強制する
 
-`Support::Supported` を名乗るには証跡 ID を必要とする設計にする（§10.3）:
+`Support::Supported` を名乗るには**実機証跡 ID** を必要とし、RE だけの `Unverified` はそれを実機証跡と混ぜない（§10.3）。証跡は **RE 証跡**と**実装 + 実機証跡**の 2 種類に分ける:
 
 ```rust
 pub struct Capability {
     pub support: Support,
-    /// `Supported` のとき必須。docs 内の証跡アンカー（例: "PROTOCOL_SPEC#6.2"）。
+    /// **実装 + 実機**の証跡アンカー。`Supported` のとき必須、それ以外は `None`。
     pub evidence: Option<&'static str>,
+    /// **RE（静的解析）**の証跡アンカー。`Unverified` でも可。
+    /// `Unsupported` のときは「非対応と確定した根拠」を入れる。
+    pub re_evidence: Option<&'static str>,
 }
 ```
 
-`profile_claims_are_evidence_backed` テスト（§10.5）が、`Supported` かつ `evidence == None` のプロファイルを失敗させる。これにより「うっかり推測で有効化」が CI で止まる。
+規則（§5.5 / §10.3 / §10.5 で共通）:
+
+| `support` | `evidence`（実装 + 実機） | `re_evidence`（RE） |
+| --- | --- | --- |
+| `Supported` | **必須**（`Some`） | 任意 |
+| `Unverified` | **`None` 固定**（実機証跡が無い） | RE 済みなら `Some` |
+| `Unsupported` | `None` | **必須**（非対応の確定根拠） |
+
+`capability_evidence_rules` テスト（§10.5）がこの表を機械検査する。これにより「うっかり推測で有効化」と「RE 済みを実機済みと書く」の両方が CI で止まる。
 
 ### 4.5 プロファイルは静的レジストリ、動的登録にしない
 
 `const PROFILES: &[&DeviceProfile]` の静的配列にする。理由:
 
 - レジストリの全走査をテストできる（全プロファイルの整合性検査が 1 テストで書ける）
-- `no_std` 互換の `eightbitdo-protocol` に置ける（`alloc` 不要）
+- `no_std` 互換の `eightbitdo-protocol` に置ける（`std` 不要。ただし既存の `extern crate alloc` は使うため **`alloc` は必要**）
 - 初期化順序・重複登録・実行時失敗が存在しない
 - 追加は「1 ファイル + 1 行」で済み、レビューで差分が読める
 
@@ -258,7 +272,7 @@ Tauri / SwiftUI / Compose は Rust の型を直接使えない（UniFFI は reco
 
 `Bt2Config`（1769 行）を機種ごとに複製しない。理由:
 
-- フィールドの**型と意味**は Ultimate 2 Wireless でも同一（[STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md) §10 の表で全セクションが同一型・同一サイズ、違いはレガシー領域 A の有無だけ）
+- フィールドの**型と意味**は Ultimate 2 Wireless でも同一（[STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md) §10 の表で全セクションが同一型・同一サイズ。**`ConfigLayout` の差分はレガシー領域 A 1176B の有無だけ**。USB Save subcmd の差 `0x0123` / `0x0064` は**レイアウト差ではなくコマンド差**であり、`CommandSet.save` 側で扱う）
 - 型を複製すると 1700 行 × 機種数になり、テストも倍になる
 - 一方でオフセットを完全に動的化（`HashMap<String, Field>`）すると型安全性と既存の 100 テストが失われる
 
@@ -304,6 +318,8 @@ pub struct DeviceProfile {
 }
 ```
 
+**`BleIdentity` と `uuid` の置き場所（確定）**: `BleIdentity` は `Uuid` をフィールドに持つ。`eightbitdo-protocol` は I/O 非依存だが **`uuid` 依存は現状ゼロ**なので、`protocol::device` に `BleIdentity` を置く以上、**`eightbitdo-protocol` に `uuid` を追加する**（`uuid` は 128 bit 識別子のデータ型クレートで、BLE スタックには依存しない。`no_std` + `serde` feature で追加）。したがって **S1 の「触る範囲」に `protocol/Cargo.toml` の `uuid` 追加を含める**（§9.2）。`protocol` の依存を増やさない案として `BleIdentity` だけを `core::device` へ移す選択肢もあるが、`DeviceProfile` が `ble` を持つ設計と両立しないため採らない。
+
 **traits を使わない理由**（`trait Device` 案との比較）:
 
 | 観点 | `trait Device`（機種ごとに impl） | `&'static DeviceProfile`（本案） |
@@ -319,7 +335,7 @@ pub struct DeviceProfile {
 ```rust
 /// 設定ブロックのコーデック。レイアウトごとに 1 実装。
 pub enum ConfigCodec {
-    /// Ultimate 2 系 2768B（BT2 / 2.4G レシーバ共通）
+    /// Ultimate 2 系 2768B（BT2。**2.4G レシーバが同じ設定ブロックを共有するかは要検証**）
     Bt2_2768B,
     /// Ultimate 2 Wireless 1592B（レイアウト差分は特定済み・実機未検証）
     U2Wireless_1592B,
@@ -389,15 +405,15 @@ pub struct ConfigLayout {
     pub size: usize,
     /// 設定ブロックの整合性 CRC。
     pub crc: ConfigCrc,
-    /// プロファイル数（BT2: 3）
+    /// 設定スロット数（BT2: 3）
     pub slots: u8,
-    /// 1 プロファイルあたりのマクロ数（BT2: 4）
+    /// 1 設定スロットあたりのマクロ数（BT2: 4）
     pub macros_per_slot: u8,
     /// 物理ボタン数（BT2: 22）
     pub buttons: u8,
-    /// 1 プロファイルあたりの LED 数（BT2: 24）
+    /// 1 設定スロットあたりの LED 数（BT2: 24）
     pub led_count: u8,
-    /// プロファイル名（UTF-16BE 32B 等）
+    /// 設定スロット名（UTF-16BE 32B 等）
     pub profile_name: ProfileNameSpec,
     /// セクション表。名前で引けるようにする。
     pub sections: &'static [Section],
@@ -445,20 +461,33 @@ pub enum SectionId {
 | 既存テスト | 全面書き換え | 全面書き換え | 無変更（BT2 表が現行値と一致することをテストで固定） |
 | 機種差の表現 | コード diff | データ | データ（差分が読める） |
 
-セクション表の正しさは**重複・隙間・合計長の検査テスト**で担保する:
+セクション表の正しさは**重複・隙間・合計長の検査テスト**で担保する。各セクションの終端は `offset + stride*(count-1) + element_size`（`stride == element_size` なら `stride*count`）で求める（`element_size * count * stride` は次元が合わず、Rumble では 432B になってしまう）。「合計 == size」は区間が `[0, size)` を**隙間なく連続して覆う**ことで検査する:
 
 ```rust
+/// セクションの終端（排他）。`stride == element_size` なら `stride * count`、
+/// そうでなければ最後の要素の終端 `stride * (count - 1) + element_size`。
+fn section_end(s: &Section) -> usize {
+    if s.stride == s.element_size {
+        s.offset + s.stride * s.count as usize
+    } else {
+        s.offset + s.stride * (s.count as usize - 1) + s.element_size
+    }
+}
+
 #[test]
 fn bt2_sections_cover_the_block_without_overlap() {
     let layout = profiles::bt2_2768b().config;
     let mut ranges: Vec<(usize, usize)> = layout.sections.iter()
-        .map(|s| (s.offset, s.offset + s.element_size * s.count as usize * s.stride))
+        .map(|s| (s.offset, section_end(s)))
         .collect();
     ranges.sort();
+    assert_eq!(ranges[0].0, 0, "first section must start at 0");
     for pair in ranges.windows(2) {
-        assert!(pair[0].1 <= pair[1].0, "sections overlap: {pair:?}");
+        // 連続（終端 == 次の先頭）であることを要求する。これで重複も隙間も同時に検出できる。
+        assert_eq!(pair[0].1, pair[1].0, "sections must tile the block: {pair:?}");
     }
-    // 予約領域はセクションとして明示し、合計が size と一致することを検査する。
+    // 予約領域もセクションとして明示し、最後の終端が size と一致することを検査する。
+    assert_eq!(ranges.last().unwrap().1, layout.size);
     assert_eq!(layout.size, CONFIG_SIZE);
 }
 ```
@@ -482,7 +511,7 @@ pub struct CommandSet {
     pub macro_chunk: MacroChunkPolicy,    // BLE 64 / USB 32 / 32B アライン
     pub macro_sector: u32,                // 0x1000
     pub max_macro_steps: u16,             // 200
-    // --- プロファイル / 入力 ---
+    // --- 設定スロット / 入力 ---
     pub switch_slot: Option<u16>,         // 0x0015（未対応機種は None）
     pub read_input: u16,                  // 0x0003
     pub report_enable: u16,               // 0x0007
@@ -535,6 +564,7 @@ pub struct Capabilities {
     pub led: Capability,
     pub profiles: Capability,
     pub profile_switch: Capability,   // 0x0015
+    pub profile_edit: Capability,     // プロファイル名変更・cur_slot 直接書換（未検証）
     pub remap: Capability,
     pub special: Capability,
     pub turbo: Capability,
@@ -549,23 +579,24 @@ pub struct Capabilities {
 
 BT2 の初期値（[FEATURE_MATRIX.md](FEATURE_MATRIX.md) の実機列に合わせる）:
 
-| 機能 | `Support` | 証跡 |
-| --- | --- | --- |
-| `macros` | `Supported` | FEATURE_MATRIX §10、実機 slot S1 の M1/M2 書込・復元 |
-| `gyro` | `Unverified` | RE 済みだが実機未検証（§6） |
-| `led` | `Unverified` | RE 済み・実機未検証（§7） |
-| `profiles` | `Supported` | 名前・`cur_slot` の読み書き（実機は `cur_slot` 切替のみ確認） |
-| `profile_switch` | `Supported` | `0x0015` の ACK と `cur_slot` 6→1（1 回観測。永続性は未確認） |
-| `remap` | `Supported` | `config remap A B` の実機確認（実効は未確認） |
-| `special` | `Unverified` | RE 済み・実機未検証（§2） |
-| `turbo` | `Unverified` | リマップ先として実装・実機未検証 |
-| `rumble` | `Unverified` | RE 済み・実機未検証 |
-| `stick_range` / `trigger_range` | `Unverified` | 同上 |
-| `battery` | `Unverified` | 生値のみ実機確認・スケール未確認 |
-| `ota` | `Unverified` | core のみ・wire 未確定（[OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md)） |
-| `realtime_input` | `Supported` | `monitor` / keepalive を実機確認 |
+| 機能 | `Support` | `evidence`（実装 + 実機） | `re_evidence`（RE） | 備考 |
+| --- | --- | --- | --- | --- |
+| `macros` | `Supported` | `FEATURE_MATRIX#10` | `STRUCT_BT2_2768B#8` | 実機 slot S1 M1/M2 の書込・復元 |
+| `gyro` | `Unverified` | — | `STRUCT_BT2_2768B#6` | RE 済み・実機未検証 |
+| `led` | `Unverified` | — | `STRUCT_BT2_2768B#7` | RE 済み・実機未検証 |
+| `profiles` | `Supported` | `DEVICE_CONFIG_EVIDENCE#7` | `STRUCT_BT2_2768B#3` | **実機で確認したのは読み取りと `0x0015` 切替のみ**。名前変更は `profile_edit` に分離 |
+| `profile_edit` | `Unverified` | — | `STRUCT_BT2_2768B#2.3` | プロファイル名変更・`cur_slot` 直接書換。切替自体は `profile_switch` で `Supported` |
+| `profile_switch` | `Supported` | `DEVICE_CONFIG_EVIDENCE#7` | `PROTOCOL_SPEC#6.2` | `0x0015` の ACK と `cur_slot` 6→1（1 回観測。永続性は未確認） |
+| `remap` | `Supported` | `FEATURE_MATRIX#2` | `STRUCT_BT2_2768B#5` | `config remap A B` の実機確認（実効は未確認） |
+| `special` | `Unverified` | — | `STRUCT_BT2_2768B#4.4` | RE 済み・実機未検証 |
+| `turbo` | `Unverified` | — | `FEATURE_MATRIX#9` | リマップ先として実装・実機未検証 |
+| `rumble` | `Unverified` | — | `STRUCT_BT2_2768B#4.1` | RE 済み・実機未検証 |
+| `stick_range` / `trigger_range` | `Unverified` | — | `STRUCT_BT2_2768B#4.2` / `#4.3` | RE 済み・実機未検証 |
+| `battery` | `Unverified` | — | `FEATURE_MATRIX#13` | 生値のみ実機確認・スケール未確認 |
+| `ota` | `Unverified` | — | `FEATURE_MATRIX#11` / [OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md) | core のみ・wire 未確定 |
+| `realtime_input` | `Supported` | `SESSION_OPERATIONS#4` | `PROTOCOL_SPEC#7` | `monitor` / keepalive を実機確認 |
 
-> ここが本設計の要旨である。**BT2 ですら多くの機能が `Unverified`** であり、「BT2 プロファイル = 全部 `Supported`」にすると現状の証跡と矛盾する。UI のフラグ駆動はこの三値の上に成立する。
+> ここが本設計の要旨である。**BT2 ですら多くの機能が `Unverified`** であり、「BT2 機種プロファイル = 全部 `Supported`」にすると現状の証跡と矛盾する。UI のフラグ駆動はこの三値の上に成立する。`Unverified` は `evidence`（実装 + 実機）を持たず、RE 済みなら `re_evidence` だけを持つ（§4.4 の規則。§10.3 / §10.5 も同じ規則）。
 
 ### 5.6 タイミング・チャンクをプロファイルに置かない理由
 
@@ -605,7 +636,7 @@ flowchart TD
     H --> I{応答 total_len ==<br/>layout.size?}
     I -- 一致 --> J[識別確定:<br/>書き込み可能]
     I -- 不一致 --> K[fail-closed:<br/>読み取りのみ / 接続解除]
-    U --> L[読み取り専用の<br/>unknown プロファイル]
+    U --> L[unknown プロファイル:<br/>info のみ / config read は拒否]
 ```
 
 **なぜ名前一致だけで確定しないか**: BLE App Mode には PID 読み出しコマンドが文書化されておらず（`readPID` は Bootloader 専用）、名前も機種で共有される可能性がある（要検証）。名前だけで「BT2 だ」と決めて 2768B の書き込みをすると、別機種の Flash に別レイアウトを書く事故になる。
@@ -650,7 +681,7 @@ pub fn confirm_layout(
 ```text
 eightbitdo --model bt2_2768b info
 eightbitdo --model u2wireless_1592b config dump
-eightbitdo models                    # 既知プロファイルの一覧（能力サマリ付き）
+eightbitdo models                    # 既知の機種プロファイル一覧（能力サマリ付き）
 eightbitdo capabilities [--json]     # 接続中/指定プロファイルの descriptor
 ```
 
@@ -660,9 +691,9 @@ eightbitdo capabilities [--json]     # 接続中/指定プロファイルの des
 
 ### 6.4 未知デバイスの扱い
 
-- 名前/サービスが一致しない → `unknown` プロファイル（読み取り専用、`Capabilities` 全 `Unverified`、write 系 API は `Error::UnsupportedModel` で拒否）。
+- 名前/サービスが一致しない → `unknown` プロファイル（`info` = ReadVersion のみ。**`config` の読み取りは `size` 未確定のため拒否**し、write 系 API は**新規に追加する** `Error::UnsupportedModel` variant で拒否する。`Capabilities` は全 `Unverified`）。
 - 「未知だから何もしない」ではなく「`scan` と `capabilities` は出す」。ユーザーが情報を持ち帰れることが、次機種対応の入力になる。
-- 未知デバイスへの**書き込みは提供しない**。読み取りすら、どのサイズで読むか決められないため `read_config` は `size` 未確定として拒否する（`info` = ReadVersion のみ許可）。これは現行の「読み取り専用から実機検証」の方針（[AGENTS.md](../AGENTS.md) §4）と一致する。
+- 未知デバイスへの**書き込みは提供しない**。読み取りも、どのサイズで読むか決められないため `read_config` は `size` 未確定として拒否する（`info` = ReadVersion のみ許可）。これは現行の「読み取り専用から実機検証」の方針（[AGENTS.md](../AGENTS.md) §6.4）と一致する。
 
 ---
 
@@ -751,12 +782,14 @@ core/
   "vendor_id": "0x2DC8",
   "product_ids": [
     {"pid": "0x600F", "role": "app"},
-    {"pid": "0x6011", "role": "receiver"}
+    {"pid": "0x6011", "role": "receiver"},
+    {"pid": "0x310B", "role": "os_enumeration"},
+    {"pid": "0x3208", "role": "boot"}
   ],
   "transports": ["ble"],
   "config": {
     "size": 2768,
-    "crc": "mcrf4xx_in_place",
+    "crc": "mcrf4xx",
     "slots": 3,
     "macros_per_slot": 4,
     "buttons": 22,
@@ -764,20 +797,21 @@ core/
     "profile_name_units": 16
   },
   "capabilities": {
-    "macros":             {"support": "supported",   "evidence": "FEATURE_MATRIX#10"},
-    "realtime_input":     {"support": "supported",   "evidence": "SESSION_OPERATIONS"},
-    "remap":              {"support": "supported",   "evidence": "FEATURE_MATRIX#2"},
-    "profiles":           {"support": "supported",   "evidence": "STRUCT_BT2_2768B#3"},
-    "profile_switch":     {"support": "supported",   "evidence": "DEVICE_CONFIG_EVIDENCE#7"},
-    "gyro":               {"support": "unverified",  "evidence": null},
-    "led":                {"support": "unverified",  "evidence": null},
-    "special":            {"support": "unverified",  "evidence": null},
-    "turbo":              {"support": "unverified",  "evidence": null},
-    "rumble":             {"support": "unverified",  "evidence": null},
-    "stick_range":        {"support": "unverified",  "evidence": null},
-    "trigger_range":      {"support": "unverified",  "evidence": null},
-    "battery":            {"support": "unverified",  "evidence": null},
-    "ota":                {"support": "unverified",  "evidence": null}
+    "macros":             {"support": "supported",   "evidence": "FEATURE_MATRIX#10",        "re_evidence": "STRUCT_BT2_2768B#8"},
+    "realtime_input":     {"support": "supported",   "evidence": "SESSION_OPERATIONS#4",     "re_evidence": "PROTOCOL_SPEC#7"},
+    "remap":              {"support": "supported",   "evidence": "FEATURE_MATRIX#2",         "re_evidence": "STRUCT_BT2_2768B#5"},
+    "profiles":           {"support": "supported",   "evidence": "DEVICE_CONFIG_EVIDENCE#7", "re_evidence": "STRUCT_BT2_2768B#3"},
+    "profile_switch":     {"support": "supported",   "evidence": "DEVICE_CONFIG_EVIDENCE#7", "re_evidence": "PROTOCOL_SPEC#6.2"},
+    "profile_edit":       {"support": "unverified",  "evidence": null,                       "re_evidence": "STRUCT_BT2_2768B#2.3"},
+    "gyro":               {"support": "unverified",  "evidence": null,                       "re_evidence": "STRUCT_BT2_2768B#6"},
+    "led":                {"support": "unverified",  "evidence": null,                       "re_evidence": "STRUCT_BT2_2768B#7"},
+    "special":            {"support": "unverified",  "evidence": null,                       "re_evidence": "STRUCT_BT2_2768B#4.4"},
+    "turbo":              {"support": "unverified",  "evidence": null,                       "re_evidence": "FEATURE_MATRIX#9"},
+    "rumble":             {"support": "unverified",  "evidence": null,                       "re_evidence": "STRUCT_BT2_2768B#4.1"},
+    "stick_range":        {"support": "unverified",  "evidence": null,                       "re_evidence": "STRUCT_BT2_2768B#4.2"},
+    "trigger_range":      {"support": "unverified",  "evidence": null,                       "re_evidence": "STRUCT_BT2_2768B#4.3"},
+    "battery":            {"support": "unverified",  "evidence": null,                       "re_evidence": "FEATURE_MATRIX#13"},
+    "ota":                {"support": "unverified",  "evidence": null,                       "re_evidence": "FEATURE_MATRIX#11"}
   },
   "evidence": {
     "protocol": "PROTOCOL_SPEC",
@@ -787,6 +821,8 @@ core/
   }
 }
 ```
+
+**`product_ids` の役割 / `evidence` / `crc` の表現**: `product_ids` は PID 単独でなく**役割付き**で出す（`0x600F`=App、`0x6011`=2.4G レシーバ、`0x310B`=Windows XInput 列挙、`0x3208`=Boot / 更新用。§5.2）。各能力の `evidence` / `re_evidence` は §4.4 の規則に従う（`Supported` は `evidence` 必須、`Unverified` は `evidence` が null で `re_evidence` のみ可、`Unsupported` は `re_evidence` 必須）。`crc` は §4.3 の enum 名（`mcrf4xx` / `modbus` / `none`）を使い、`mcrf4xx_in_place` のような実装詳細名は descriptor に載せない。
 
 **なぜ `schema_version` を持つか**: デスクトップ（Tauri）とモバイル（SwiftUI / Compose）は Rust コアと別々にリリースされ得る（モバイルはストア審査で時間差が出る）。descriptor に未知フィールドが増えても、UI 側が `schema_version` で分岐して壊れないようにする。**フィールドの削除・意味変更は version を上げる**。
 
@@ -800,7 +836,7 @@ core/
 | `product_ids` | `record ProductIdInfo { pid: u32, role: String }` | u16 は UniFFI で `u16` を使えるが、JSON と揃えるなら u32 + 範囲検査。**要検証**: UniFFI の u16 対応は version 依存 |
 | `config` | `record ConfigDescriptor { ... }` | |
 | `capabilities` | `record Capabilities { macros: CapabilityInfo, ... }` | 三値は `enum Support { Supported, Unsupported, Unverified }` |
-| `Capability.evidence` | `Option<String>` | モバイル UI の「未確認」説明に使う |
+| `Capability.evidence` / `Capability.re_evidence` | `Option<String>` × 2 | モバイル UI の「未確認」説明と、RE のみの根拠表示に使う。規則は §4.4 |
 
 既存の UniFFI 公開（`MobileSession::read_config` 等）は BT2 DTO を返している。descriptor を**追加**し、DTO は当面そのまま（破壊的変更をしない）。2 機種目以降で DTO を descriptor 駆動に置き換える。
 
@@ -831,12 +867,12 @@ fn device_capabilities(profile_id: Option<String>) -> Result<String, String> {
 
 **なぜ「未確認は無効」か**: 本プロジェクトの書き込みは pre-write backup・read-back・TOCTOU で守られているが、その安全機構は「レイアウトが正しい」前提で動く。レイアウトが未確認の機種に対して書き込み UI を有効にすると、安全機構ごと意味を失う。
 
-**UI 複雑化への対処（§12 のリスク）**: descriptor から**汎用フォームを自動生成しない**。機能ごとのエディタ（Rumble / Joy / Gyro / LED / Remap / Macro）は既存の実装をモジュールとして残し、**表示するかどうかだけ**をフラグで決める。汎用フォーム生成は工数・検証コストが大きく、本プロジェクトの UI（egui → Tauri 移行中）では再利用できない。
+**UI 複雑化への対処（§12 のリスク）**: descriptor から**汎用フォームを自動生成しない**。機能ごとのエディタ（Rumble / Joy / Gyro / LED / Remap / Macro）は既存の実装をモジュールとして残し、**表示するかどうかだけ**をフラグで決める。汎用フォーム生成は工数・検証コストが大きく、本プロジェクトの UI（main は egui、Tauri 版は未マージの `feat/tauri-gui` で進行中）では再利用できない。
 
 ### 8.5 CLI の出し分け
 
 ```text
-eightbitdo models                 # 既知プロファイルの一覧
+eightbitdo models                 # 既知の機種プロファイル一覧
 eightbitdo capabilities --json    # descriptor をそのまま出力（スクリプト用）
 eightbitdo --model <id> info      # 検出の上書き
 ```
@@ -869,11 +905,11 @@ eightbitdo --model <id> info      # 検出の上書き
 
 | 段階 | 内容 | 触る範囲 | 受け入れ条件 | 想定規模 |
 | --- | --- | --- | --- | --- |
-| **S1** | `device` 語彙の追加（`DeviceProfile` / `ConfigLayout` / `Section` / `CommandSet` / `Capabilities` / `Support` の型定義のみ。`PROFILES` は空） | `protocol/src/device/` 新規 | 既存テスト件数・内容が不変。`cargo doc` の intra-doc link が通る。未使用型への `dead_code` 警告を feature gate か `pub` で回避 | 1〜2 日 |
-| **S2** | BT2 プロファイル定数の追加（`PROFILES` に 1 件）。既存 const と**値が一致すること**のテストを追加（既存 const はまだ移さない） | `protocol/src/models/bt2_2768b/` 新規 + 1 テスト | 新テストが全 `OFF_*` / 件数 / CRC 種別の一致を検証。既存テスト無変更 | 1〜2 日 |
+| **S1** | `device` 語彙の追加（`DeviceProfile` / `ConfigLayout` / `Section` / `CommandSet` / `Capabilities` / `Support` / `BleIdentity` の型定義のみ。`PROFILES` は空） | `protocol/src/device/` 新規 + `protocol/Cargo.toml`（**`uuid` を `no_std` + `serde` feature で追加**。§5.1 の確定） | 既存テスト件数・内容が不変。`cargo doc` の intra-doc link が通る。未使用型への `dead_code` 警告を feature gate か `pub` で回避。追加依存は `uuid` 1 クレートのみで、PR 本文に記録 | 1〜2 日 |
+| **S2** | BT2 機種プロファイル定数の追加（`PROFILES` に 1 件）。既存 const と**値が一致すること**のテストを追加（既存 const はまだ移さない） | `protocol/src/models/bt2_2768b/` 新規 + 1 テスト | 新テストが全 `OFF_*` / 件数 / CRC 種別の一致を検証。既存テスト無変更 | 1〜2 日 |
 | **S3** | 型と定数の移設 + `config_bt2` からの re-export。`OFF_*` の参照元をプロファイル表へ | `protocol` 内部 | `cargo test -p eightbitdo-protocol` が **100 unit + 4 doc** のまま緑。`crates/` 全体で `OFF_` の直接参照が models と re-export 以外に無い | 2 日 |
 | **S4** | `Session` にプロファイルを保持（`Session::new` は BT2 既定、`Session::with_profile` を追加）。`CONFIG_SIZE` 直参照を `profile.config.size` へ。戻り型は `Bt2Config` のまま | `core/src/session.rs`, `config_ops.rs`, `macro_ops.rs` | `cargo test -p eightbitdo-core` が **264 unit + 1 doc**（既定 feature）のまま緑。`total_len` 不一致で fail-closed する新テストが緑 | 2〜3 日 |
-| **S5** | `core::device`（プロファイル解決 / `confirm_layout` / descriptor 生成）+ CLI `models` / `capabilities` + UniFFI descriptor 追加 | `core`, `cli`, `uniffi` | descriptor の snapshot テスト。未知デバイスが読み取り専用で `Error::UnsupportedModel` になるテスト。CLI の既存終了コード不変 | 2〜3 日 |
+| **S5** | `core::device`（プロファイル解決 / `confirm_layout` / descriptor 生成）+ CLI `models` / `capabilities` + UniFFI descriptor 追加 | `core`, `cli`, `uniffi` | descriptor の snapshot テスト。未知デバイスが `info` のみで、`config` 読み取りと write 系が fail-closed になるテスト（write は**新規 variant** `Error::UnsupportedModel`）。CLI の既存終了コード不変 | 2〜3 日 |
 | **S6** | Tauri 側 UI の capability 駆動（ページ / セクション表示、`unverified` の無効化） | Tauri アプリ（別リポジトリ or 別 crate） | descriptor の 3 パターン（全対応 / 一部未確認 / 未知）で表示が変わること。egui GUI は凍結し、この段階では触らない | 3〜4 日 |
 | **S7** | 2 機種目追加手順の文書化 + **test-only ダミープロファイル**での registry / 検出 / ゲーティングの dry-run | `docs/`, `protocol`（`cfg(test)`） | ダミー追加が「`models/` に 1 ディレクトリ + registry 1 行 + 証跡ファイル」で完結することをテストで実証。ダミーが production ビルドに含まれない | 1〜2 日 |
 | **S8** | 2 機種目の実装（Ultimate 2 Wireless 1592B が第一候補） | `models/u2wireless/` 新規 | RE 済みオフセット（[STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md) §10）との一致テスト。**実機証跡が揃うまで `Capabilities` は `Unverified`、書き込み不可** | 別 PR |
@@ -945,23 +981,25 @@ core/tests/scripts/<profile_id>/
 | `wrong_total_len_fails_closed` | レイアウト長と違う `total_len` で `Error::UnexpectedResponse`（または `ModelError::LayoutMismatch`） |
 | `wrong_subcmd_fails_closed` | 別コマンドの応答を受理しない |
 | `wrong_crc_fails_closed` | CRC 不一致で読み取り失敗 |
-| `unknown_profile_refuses_write` | 未知プロファイルで書き込み系が `UnsupportedModel` |
+| `unknown_profile_refuses_write` | 未知プロファイルで書き込み系が**新規 variant** `Error::UnsupportedModel` を返す |
 
 ### 10.3 実機証跡の持ち方
 
 - **ファイル規約**: 機種ごとに `docs/DEVICE_<PROFILE>_EVIDENCE.md` を置く（BT2 は既存の [DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) がこれに相当）。証跡には「環境（OS・経路・MTU）」「実行コマンド」「生 hex」「read-back の有無と SHA-256」「未確認事項」をセットで書く（[FEATURE_MATRIX.md](FEATURE_MATRIX.md) §17 のルールを踏襲）。
-- **能力との結び付け**: `Capability.evidence` には証跡ファイル内のアンカー（例: `"DEVICE_CONFIG_EVIDENCE#7"`）を書く。CI テストが「`Supported` を名乗る能力には evidence がある」「evidence のファイル名が `docs/` に存在する」を検査する。
+- **アンカーの書式（統一）**: `Capability.evidence` / `re_evidence` は **`FILE#<節番号>`** 形式（例: `"DEVICE_CONFIG_EVIDENCE#7"` は `docs/DEVICE_CONFIG_EVIDENCE.md` §7、`"PROTOCOL_SPEC#6.2"` は §6.2）。GitHub の HTML アンカー（`#7-...`）ではなく、**docs 内の見出し番号**を指す。CI テスト（`capability_evidence_rules` ほか、§10.5）が (1) `Supported` は `evidence` が `Some`、(2) `Unverified` は `evidence` が `None` で `re_evidence` は可、(3) `Unsupported` は `evidence` が `None` で `re_evidence`（確定根拠）が `Some`、(4) 参照先のファイルが `docs/` に存在し、その見出し番号が実在する、を検査する。
 - **未確認の明示**: 新しいプロファイルは **全能力 `Unverified` を既定**とし、実機で確認できた項目だけ `Supported` に昇格させる。`Unsupported` は「プロトコル上存在しないと確定した」場合のみ使う（例: `0x600F` の Polling Rate は [FEATURE_MATRIX.md](FEATURE_MATRIX.md) §13 で N/A 確定）。
 
 能力 × 証跡のマトリクス（BT2 の例）:
 
-| 能力 | 状態 | 証跡 | 次の一歩 |
-| --- | --- | --- | --- |
-| `macros` | Supported | FEATURE_MATRIX §10 + 実機書込/復元 | M3/M4・S2/S3 の確認 |
-| `remap` | Supported | device 実機 `A→B→A` | 押下実効の観測 |
-| `profile_switch` | Supported | DEVICE_CONFIG_EVIDENCE §7（1 回観測） | 永続性・ACK 再現性 |
-| `gyro` / `led` / `special` / `turbo` / `rumble` | Unverified | — | 実機確認 → Supported |
-| `ota` | Unverified | — | [OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md) |
+| 能力 | 状態 | `evidence`（実装 + 実機） | `re_evidence`（RE） | 次の一歩 |
+| --- | --- | --- | --- | --- |
+| `macros` | Supported | FEATURE_MATRIX#10 | STRUCT_BT2_2768B#8 | M3/M4・S2/S3 の確認 |
+| `remap` | Supported | FEATURE_MATRIX#2 | STRUCT_BT2_2768B#5 | 押下実効の観測 |
+| `profiles` | Supported | DEVICE_CONFIG_EVIDENCE#7 | STRUCT_BT2_2768B#3 | 名前変更は `profile_edit`（Unverified）として実機確認 |
+| `profile_switch` | Supported | DEVICE_CONFIG_EVIDENCE#7（1 回観測） | PROTOCOL_SPEC#6.2 | 永続性・ACK 再現性 |
+| `profile_edit`（名前変更・`cur_slot` 直接書換） | Unverified | — | STRUCT_BT2_2768B#2.3 | 実機確認 → Supported |
+| `gyro` / `led` / `special` / `turbo` / `rumble` | Unverified | — | STRUCT_BT2_2768B#6 / #7 / #4.4 / FEATURE_MATRIX#9 / STRUCT_BT2_2768B#4.1 | 実機確認 → Supported |
+| `ota` | Unverified | — | FEATURE_MATRIX#11 | [OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md) |
 
 ### 10.4 既存テストを壊さない移行順序（実測値）
 
@@ -986,23 +1024,23 @@ core/tests/scripts/<profile_id>/
 | S6 | Tauri 側の headless テスト（descriptor 3 パターン） |
 | S7 | ダミープロファイルの dry-run テスト |
 
-> **注意**: 本ドキュメント作成時点の実測値であり、#17〜#28 の後の main では件数が増えている可能性がある。**移行 PR では「base 時点の実測値」を PR 本文に記録し、その値との比較で不変を主張する**（絶対値を暗記しない）。
+> **注意**: これは base `81b0ac1`（**#28 までを含む**）時点の実測値であり、**以後の main**（#29 以降、本ドキュメントの追加も含む）では件数が増えている可能性がある。**移行 PR では「base 時点の実測値」を PR 本文に記録し、その値との比較で不変を主張する**（絶対値を暗記しない）。
 
 ### 10.5 追加するテスト（プロファイル横断）
 
-プロファイルが増えても**テストをコピーしない**。`for profile in PROFILES` で回す:
+機種プロファイルが増えても**テストをコピーしない**。`for profile in PROFILES` で回す:
 
 | テスト | 検査内容 |
 | --- | --- |
 | `profile_ids_are_unique` | `DeviceId` の重複なし |
 | `product_ids_are_unique` | PID の重複なし（同じ PID を 2 機種が主張しない） |
-| `bt2_sections_cover_the_block_without_overlap` | セクションの重複・隙間・合計長（§5.3） |
+| `bt2_sections_cover_the_block_without_overlap` | セクションの重複・隙間・終端（§5.3 の `section_end` で `[0, size)` を隙間なく覆う） |
 | `profile_layout_matches_constants` | BT2 の表と既存 `OFF_*` の一致（S2 の核） |
 | `descriptor_roundtrips_schema` | descriptor が JSON → struct → JSON で安定。全能力が現れる |
-| `supported_capabilities_have_evidence` | `Supported` に evidence がある。`Unverified` は evidence が null |
+| `capability_evidence_rules` | §4.4 の規則を機械検査: `Supported` は `evidence` 必須、`Unverified` は `evidence` が null で `re_evidence` は可、`Unsupported` は `re_evidence`（確定根拠）必須。§10.3 のアンカー書式でファイル・見出し番号の実在も検査 |
 | `new_profiles_start_unverified` | 新規プロファイルの能力が既定 `Unverified`（明示的に Supported にしない限り） |
-| `unknown_profile_is_read_only` | 未知プロファイルで write 系が `UnsupportedModel` |
-| `profile_tables_differ_only_by_documented_delta` | BT2 と Wireless の表の差が「レガシー A 1176B の有無」だけ（[STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md) §10） |
+| `unknown_profile_is_info_only` | 未知プロファイルでは `info`（ReadVersion）のみ可。`config` 読み取りと write 系は拒否（write は**新規 variant** `Error::UnsupportedModel`） |
+| `profile_tables_differ_only_by_documented_delta` | BT2 と Wireless の **`ConfigLayout`** の表の差が「レガシー A 1176B の有無」だけ。**USB Save subcmd の差（`0x0123` / `0x0064`）は `CommandSet.save` の比較として別テスト**で固定する（[STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md) §10） |
 
 `profile_tables_differ_only_by_documented_delta` は、2 機種目の表を手で写した際の**転記ミス**を検出するための安価なテストである（表はデータなので、差分の意味をテストで固定できる）。
 
@@ -1014,7 +1052,7 @@ core/tests/scripts/<profile_id>/
 | --- | --- | --- |
 | S1〜S3（型・データ・移設） | **Tier 2**（仕様検収 + 回帰） | 挙動不変だが protocol の公開 API に触れる |
 | S4（`Session` / `config_ops` / `macro_ops`） | **Tier 3** | 書き込み経路・CRC・mock transport に触れる |
-| S5（descriptor / CLI / UniFFI） | **Tier 2** | 新しい境界だが書き込みバイト列は変えない |
+| S5（descriptor / CLI / UniFFI） | **Tier 3** | **UniFFI の公開 API を変更するため**（[AGENTS.md](../AGENTS.md) §6.3: モバイルの UniFFI 公開 API・transport 契約の変更は Tier 3）。descriptor 自体は読み取り専用でも、公開境界の追加は Tier 3 |
 | S6（Tauri UI） | **Tier 2** | 表示のみ。ただし無効化ロジックはレビュー必須 |
 | S8（2 機種目の実装） | **Tier 3** | 新しい書き込み経路 |
 
@@ -1026,7 +1064,7 @@ core/tests/scripts/<profile_id>/
 
 理由:
 
-- 変更コストが大きい（`Cargo.toml` 5 クレート、`use` 文、UniFFI の namespace / Swift module / Kotlin package、Android Gradle の `libeightbitdo_uniffi.so`、iOS の XCFramework 名、CI、scripts、docs 約 6 万行中の参照）。
+- 変更コストが大きい（`Cargo.toml` 5 クレート、`use` 文、UniFFI の namespace / Swift module / Kotlin package、Android Gradle の `libeightbitdo_uniffi.so`、iOS の XCFramework 名、CI、scripts、docs 中の参照。**`docs/*.md` は実測 6,221 行**で、本ドキュメント 1,201 行を含む）。
 - 現時点で **8BitDo 以外の対応機種は 0**。名前だけ先に一般化しても利用者価値が無く、レビューと検証のコストだけ増える。
 - 製品名 `Padbench` は**アプリ / 配布物の名前**であり、クレート名と一致させる必要はない（`ripgrep` のクレート名と `rg` の関係と同じ）。
 
@@ -1074,7 +1112,7 @@ core/tests/scripts/<profile_id>/
 | R1 | **過剰設計（YAGNI）** — 汎用フォーム生成、機種 trait、CRC の enum 化、プラグイン登録 | 実装・レビュー・テストが膨らみ、2 機種目が来る前に保守不能になる | 抽象化は §3.7 の 4 軸 + 件数だけ。アルゴリズム差は「2 つ目の実例が出てから」抽象化。`DeviceProfile` はデータのみ | 2 機種目で想定外の差（レイアウト以外の差）が出た場合に型を足す判断が都度必要 |
 | R2 | **未確認事項の推測実装** — 別機種のオフセット・意味を推定で埋める | 誤書き込み・Flash 破壊 | 能力三値 + evidence 必須テスト + 新規プロファイルは全 `Unverified` 既定 + 書き込みは証跡必須（Tier 3 レビュー） | 「RE で確定」と「実機で確認」の区別が曖昧になると崩れる。§10.3 の証跡規約を守る |
 | R3 | **UI のフラグ駆動の複雑化** — 組み合わせ爆発、条件分岐の散在 | 表示バグ、テスト困難 | descriptor を単一の真実にし、UI は「表示するか / 有効か」の 2 値だけを見る。汎用フォーム生成はしない。テストは 3 パターン（全対応 / 一部未確認 / 未知）に限定 | 機種ごとの「あった方がよい UI」の要望が出た時に、フラグが増える |
-| R4 | **プロファイル誤選択** — BLE 名が同じ別機種を BT2 と誤認 | 誤書き込み | 名前 + サービス + **ReadConfig の `total_len` 照合** + 予約領域 / CRC の整合検査。`--model` は形状検査を免除しない | 同名・同サイズ・同レイアウトの別機種は原理的に区別不能（§6.1 の要検証） |
+| R4 | **機種プロファイル誤選択** — BLE 名が同じ別機種を BT2 と誤認 | 誤書き込み | 名前 + サービス + **ReadConfig の `total_len` 照合** + 予約領域 / CRC の整合検査。`--model` は形状検査を免除しない | 同名・同サイズ・同レイアウトの別機種は原理的に区別不能（§6.1 の要検証） |
 | R5 | **テスト爆発** — 機種ごとにテストをコピー | 実行時間・保守コスト増 | `for profile in PROFILES` で横断テスト。ゴールデンは wire 重要な経路のみ | 実機証跡は機種ごとに必要（自動化できない） |
 | R6 | **ドキュメント drift** — 表と実装の不一致 | 誤実装の温床 | レイアウトの正本を `models/` の定数にし、docs は生成物ではなく参照。`profile_layout_matches_constants` で乖離を検出 | 能力の証跡は人手で更新するため遅れる |
 | R7 | **移行中の二重実装** — re-export が恒久化 | どちらが正か分からない | re-export は S3〜S8 の期間限定とし、S8 完了時に削除（`DEPRECATED` 注記付き）。削除 PR を計画に含める | 削除前に外部利用者が現れた場合は期間延長 |
@@ -1094,10 +1132,10 @@ core/tests/scripts/<profile_id>/
 | --- | --- |
 | 成果物 | 本ドキュメント（§3 の棚卸し 54 行、§5 の型設計、§9 の移行計画） |
 | 受け入れ条件 | (1) 棚卸しの行数と §3.1 / §0 の集計が一致（機械的に数えられる形式） (2) 相対リンクが全て実在 (3) `git diff --check` がクリーン (4) **コード差分ゼロ** |
-| Tier | Tier 1（docs のみ。ただし規範ドキュメントの新設なのでレビューは 1 名以上） |
+| Tier | **Tier 2**（**規範仕様の新設**。[AGENTS.md](../AGENTS.md) §5: 規範仕様・ゲート/プロセス文書は Tier 1 にしない＝最低 Tier 2。判定の正本は [REVIEW_TIERS.md](REVIEW_TIERS.md)） |
 | 状態 | **本 PR で完了** |
 
-### P1: trait / registry 導入（BT2 のみ）
+### P1: registry 導入（BT2 のみ。機種ごとの trait 実装は作らない）
 
 | 項目 | 内容 |
 | --- | --- |
@@ -1111,8 +1149,8 @@ core/tests/scripts/<profile_id>/
 | 項目 | 内容 |
 | --- | --- |
 | 範囲 | S5〜S6。descriptor の生成・公開、Tauri 側の出し分け |
-| 受け入れ条件 | (1) `capabilities --json` が §8.1 の schema を満たす (2) `unverified` の機能が UI で無効 + 理由表示 (3) 未知デバイスでは読み取りのみ、書き込み導線が出ない (4) descriptor の 3 パターンの headless テスト (5) CLI の既存終了コード・出力が不変（追加のみ） |
-| Tier | Tier 2（表示・境界。ただし無効化ロジックは必須レビュー） |
+| 受け入れ条件 | (1) `capabilities --json` が §8.1 の schema を満たす (2) `unverified` の機能が UI で無効 + 理由表示 (3) 未知デバイスでは `info`（ReadVersion）のみで、`config` 読み取りと書き込み導線が出ない (4) descriptor の 3 パターンの headless テスト (5) CLI の既存終了コード・出力が不変（追加のみ） |
+| Tier | **Tier 3**（S5 が **UniFFI の公開 API** を変更するため、AGENTS.md §6.3 に従い最大 Tier。S6 単独なら表示のみで Tier 2） |
 | 見積り | 5〜7 日 |
 
 ### P3: 2 機種目の追加手順（ドキュメント化 + dry-run）
@@ -1121,7 +1159,7 @@ core/tests/scripts/<profile_id>/
 | --- | --- |
 | 成果物 | `docs/ADDING_A_MODEL.md`（新規）: チェックリスト（PID/BLE 名の確認 → レイアウトの RE → `models/<id>/` 追加 → 証跡ファイル → 能力表 → golden → 実機検証 → 段階的 `Supported` 化）と、test-only ダミーでの dry-run 結果 |
 | 受け入れ条件 | (1) ダミープロファイルの追加が「1 ディレクトリ + registry 1 行 + 証跡 1 ファイル」で完結することをテストで実証 (2) ダミーが production に含まれない (3) 手順書の全項目に「証跡の置き場所」が明記されている (4) Ultimate 2 Wireless（[STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md) §10）を例に、既知情報だけでどこまで埋まるか / 何が `要検証` かを表にする |
-| Tier | Tier 1（docs + test-only code。テスト追加は Tier 2 相当でレビュー） |
+| Tier | **Tier 2**（`docs/ADDING_A_MODEL.md` は**コントリビューター向けの手順書（プロセス文書）**の新設のため Tier 1 にしない。test-only code の追加も含む。既存の Tier 定義・required check・安全手順を変える場合は Tier 3） |
 | 見積り | 2〜3 日 |
 
 ### P4: 他社検討
@@ -1130,7 +1168,7 @@ core/tests/scripts/<profile_id>/
 | --- | --- |
 | 範囲 | 他社コントローラのプロトコル・レイアウト・法的/商標上の扱い（[TRADEMARKS.md](../TRADEMARKS.md)、[DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md)）の調査。実装はしない |
 | 受け入れ条件 | (1) 他社対応の Go/No-Go 判断メモ（§11.4 のファサード案の採否を含む） (2) 8BitDo 以外の 1 機種について、`DeviceProfile` の 4 軸で「何が分かっていて何が不明か」の表 (3) 商標・配布ポリシーへの影響の整理 |
-| Tier | Tier 1（調査ドキュメント） |
+| Tier | Tier 1（**通常 docs の調査メモ**。規範仕様・ゲート/プロセス文書ではない。実装を伴わない） |
 | 見積り | 2〜3 日（調査のみ） |
 
 ### 13.1 フェーズ間の依存
@@ -1174,10 +1212,11 @@ P2 と P3 は P1 の後に並行可能。ただし P2 で descriptor の形が�
 - [FEATURE_MATRIX.md](FEATURE_MATRIX.md) — 機能ごとの RE / 実装 / 実機検証ラベル（能力三値の根拠）
 - [DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) — 実機 dump と `0x0015` の証跡
 - [OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md) — OTA の未確認事項と採取手順
-- [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) — 全体アーキテクチャと Phase（**§2 の GUI 記述は Tauri 移行前のもの。要更新**）
+- [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) — 全体アーキテクチャと Phase（**main は egui 前提**。§2 の GUI 記述は `feat/tauri-gui` のマージ時に更新が必要）
 - [REVIEW_TIERS.md](REVIEW_TIERS.md) — 本設計の各フェーズのレビュー Tier
 - [CROSS_PLATFORM.md](CROSS_PLATFORM.md) — ビルド確認状況
 - [SESSION_OPERATIONS.md](SESSION_OPERATIONS.md) — 常駐セッションの運用
+- [ANTI_SLOP.md](ANTI_SLOP.md) — main の GUI 記述（egui 正本・Tauri は未マージの `feat/tauri-gui`）と Padbench 改名の整理（#31）
 - [DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md) / [TRADEMARKS.md](../TRADEMARKS.md) — 製品名・商標の扱い
 
 ### 15.2 コードの起点
@@ -1195,7 +1234,7 @@ P2 と P3 は P1 の後に並行可能。ただし P2 で descriptor の形が�
 
 ### 15.3 更新ルール
 
-- この文書は**設計の正本**であり、実装フェーズの進行に合わせて「状態」列を更新する。プロトコル値は各仕様書を正とし、ここに複写しない。
+- この文書は**機種抽象化の設計・実装計画の正本**（Phase 全体の正本は [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) §5）であり、実装フェーズの進行に合わせて「状態」列を更新する。プロトコル値は各仕様書を正とし、ここに複写しない。
 - 棚卸し表（§3）は移行の進行に合わせて「抽象化後」列を追加し、完了した行にチェックを付ける。**行を消さない**（何を抽象化したかの記録になる）。
 - 能力表（§5.5）は `Capabilities` の実装と同期させる。片方だけ更新しない。
 - 新しい機種の追加手順は P3 で `docs/ADDING_A_MODEL.md` に分離する。本ドキュメントは「なぜ」を持ち、手順書は「どうやるか」を持つ。
