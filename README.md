@@ -20,13 +20,13 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 - **GUI**: egui / Pure Rust。日本語 UI、燻しスレートのテーマ、Noto Sans JP 同梱。読み取り 4 タブ（デバイス / ライブ入力 / 設定値 / ログ）に加え、PR #16 で設定・ボタンリマップ・マクロの書き込み UI を追加（確認ダイアログ、pre-write backup、read-back 検証）。**GUI 書込は実機未検証**。
 - **セッション REPL**: 1 接続で `info` / `config dump` / `backup` / `monitor` / `macro backup` / `config map show` などを実行。書込系は `--allow-macro-write` / `--allow-config-write` と確認が必須。
 - **マクロ・設定の JSON / TOML I/O**: `MacroFile` のインポート / エクスポート。1ms 解像度・8-bit スティック / トリガー値を保持。
-- **モバイル雛形**: `eightbitdo-uniffi` 経由の読み取り API、iOS SwiftUI + CoreBluetooth、Android Compose + BluetoothGatt。iOS は unsigned IPA、Android は Kotlin-only APK を生成可能。
+- **モバイル雛形**: `eightbitdo-uniffi` 経由の読み取り API、iOS SwiftUI + CoreBluetooth、Android Compose + BluetoothGatt。iOS は unsigned IPA、Android は JNI 同梱 APK（arm64-v8a / x86_64）を生成可能。
 
 ### 計画中・未提供
 
 - **GUI からの書き込み**: PR #16 で設定 2768B・リマップ・マクロを実装。確認ダイアログ、pre-write backup、read-back 検証、TOCTOU 検出付き。**実機未検証・Tier 3**。
 - **ファームウェア更新（BLE OTA）**: core の状態機械のみ実装済み。実機 wire 未確定・CLI / GUI / UniFFI 未配線。USB OTA は USB Boot TX フレーミング未文書化のため保留。
-- **モバイルの書き込み・OTA**: バックアップ UI と Tier 3 レビュー待ちで未公開。Android の Rust JNI 同梱 APK、iOS / Android 実機確認、App Store 配布も未着手。
+- **モバイルの書き込み・OTA**: バックアップ UI と Tier 3 レビュー待ちで未公開。Android の JNI 同梱 APK はビルド成功（実機未検証）、iOS / Android 実機確認、App Store 配布は未着手。
 - **USB HID / 2.4G transport**: 未実装・保留。
 
 ---
@@ -47,7 +47,7 @@ main は `4004757`（2026-11-23）時点。フェーズの詳細・残課題は 
 | 3c | OTA 画面 | 未着手（Phase 2c の wire 確定後） |
 | 3d | GUI 設定タブ / 22 ボタンリマップ | **実装（PR #16）。実機未検証・Tier 3** |
 | 4 | USB OTA | 保留（USB Boot TX 未文書化） |
-| 5 | UniFFI + iOS / Android | 雛形完了。実機・JNI 同梱 APK・配布は未着手 |
+| 5 | UniFFI + iOS / Android | 雛形完了。JNI 同梱 APK・unsigned IPA はビルド成功。実機確認・配布は未着手 |
 
 **実機で確認済み（Linux・BLE・MTU 200、2026-11-21〜23）**: version / 2768B dump / マクロ backup、マクロ書込（絶対終端 `total_len`）と復元、設定 full write（38 write + 1 Save = 合計 39 packets・74B chunk・read-back SHA 一致）、remap A→B→A。**設定の実機確認範囲は full write / remap のみ**（`config set` 各フィールド・`--force-raw`・MTU 200 以外は未確認）。
 
@@ -124,8 +124,8 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 
 `mobile/` に iOS（SwiftUI + CoreBluetooth）と Android（Jetpack Compose + BluetoothGatt）の雛形があります。プロトコル・設定・マクロはすべて Rust コアを `eightbitdo-uniffi` 経由で共有します。
 
-- **到達点**: Rust 側の読み取り API（version / config / macro backup / input / disconnect / `describeConfig` / `prepareConfigWrite`）、iOS unsigned IPA、Android Kotlin-only APK（JVM unit test 8 件）。
-- **未達**: Android の Rust JNI（`libeightbitdo_uniffi.so`）同梱 APK、iOS / Android 実機での BLE 読み取り、App Store / TestFlight 配布（macOS + Xcode 必須）。書き込み・OTA はバックアップ UI と Tier 3 レビュー待ちで未公開。
+- **到達点**: Rust 側の読み取り API（version / config / macro backup / input / disconnect / `describeConfig` / `prepareConfigWrite`）、iOS unsigned IPA、Android JNI 同梱 APK（arm64-v8a / x86_64、JVM unit test 8 件）。
+- **未達**: iOS / Android 実機での BLE 読み取り、App Store / TestFlight 配布（macOS + Xcode 必須）、Android の JNI ロード実機確認。書き込み・OTA はバックアップ UI と Tier 3 レビュー待ちで未公開。
 - 手順・制約の詳細は [mobile/README.md](mobile/README.md)。
 
 ## ファームウェア更新（OTA）の現状
@@ -152,7 +152,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 | **[docs/OTA_BLE_EVIDENCE.md](docs/OTA_BLE_EVIDENCE.md)** | BLE OTA の解析証跡（確定した順序・タイムアウト・`.dat` ヘッダ）と未確認事項の優先順 |
 | **[docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)** | クロスプラットフォームのビルド確認状況（Windows クロス `check` の結果と警告 4 件、MSRV 1.85 が Windows で通らない理由、iOS target check、macOS 未確認の理由、CI 追加提案） |
 | **[docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)** | BLE OTA 実機検証の準備: btsnoop 採取（Linux `btmon` / Android HCI snoop）、確認項目と判定、EVIDENCE への追記、Phase A / B の安全手順 |
-| **[mobile/README.md](mobile/README.md)** | iOS / Android のビルド手順、UniFFI 公開 API、到達点と制約（unsigned IPA / Kotlin-only APK / 未公開の書込） |
+| **[mobile/README.md](mobile/README.md)** | iOS / Android のビルド手順、UniFFI 公開 API、到達点と制約（unsigned IPA / JNI 同梱 APK / 未公開の書込） |
 | **[docs/SESSION_OPERATIONS.md](docs/SESSION_OPERATIONS.md)** | 常駐 `session` の運用（per-user BLE 単一所有者ロック、degraded 終了コード 3、SIGINT 範囲、押下依頼前の `scan` 確認手順、`scripts/session-loop.sh` の scan 契約と backoff） |
 | **[AGENTS.md](AGENTS.md)** | AI エージェント／開発者向け引き継ぎガイド（[CLAUDE.md](CLAUDE.md) からも参照） |
 | **[CONTRIBUTING.md](CONTRIBUTING.md)** | ブランチ運用、必須 CI、独立レビュー（Tier 1〜3 / SHA 紐づきの `review-gate` 成功）の手順 |
@@ -161,6 +161,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 | **[LICENSE-MIT](LICENSE-MIT)** / **[LICENSE-APACHE](LICENSE-APACHE)** | コードのライセンス全文（MIT / Apache-2.0） |
 | **[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)** | 依存ライブラリのライセンス一覧、帰属表示、同梱フォント（OFL / UFL）・Gradle wrapper（Apache-2.0）の扱い |
 | **[TRADEMARKS.md](TRADEMARKS.md)** | 第三者の商標、非公式・非提携、ロゴ不使用の方針 |
+| **[docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md)** | リポジトリ公開・コードライセンス・商標・同梱フォント・App Store / Google Play 配布・マネタイズの決定事項（決定日 2026-11-23）と未決定事項 |
 
 ---
 
@@ -180,7 +181,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 - [ ] Phase 3c: GUI OTA 画面（Phase 2c の実機 wire 確定後）
 - [x] Phase 3d: GUI 設定タブ / 22 ボタンリマップ（PR #16。**実機未検証・Tier 3**）
 - [ ] Phase 4: USB OTA（保留）
-- [ ] Phase 5: `eightbitdo-uniffi` + iOS (SwiftUI) / Android (Jetpack Compose) アプリ（雛形完了・PR #12。Rust JNI 同梱 APK・実機確認・App Store 配布は未着手）
+- [ ] Phase 5: `eightbitdo-uniffi` + iOS (SwiftUI) / Android (Jetpack Compose) アプリ（雛形完了・PR #12。JNI 同梱 APK / unsigned IPA はビルド成功。実機確認・App Store 配布は未着手）
 
 ---
 
@@ -199,6 +200,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 - **Gradle wrapper**（`mobile/android/gradle/wrapper/gradle-wrapper.jar` など、ビルド再現性のためコミット済み）: Apache-2.0（jar 内 `META-INF/LICENSE`、manifest の `SPDX-License-Identifier`）。帰属は [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) §3.6.3 を参照してください。
 - 依存ソフトウェアのライセンスは [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) を参照してください。2026-11-23 時点（main `6b39e23`）で **第三者クレート 497**（全 502 パッケージ − workspace 5）です。大半は MIT または Apache-2.0 で、代表的な依存は `eframe`/`egui`（MIT OR Apache-2.0）、`uniffi`（MPL-2.0、ファイル単位コピーレフト）、`btleplug`（MIT/Apache-2.0/BSD-3-Clause）です。Cargo 管理外では Noto Sans JP（OFL 1.1）と Gradle wrapper（Apache-2.0）を同梱しています。同ファイルは要約と参照であり、全クレートの著作権表示・ライセンス本文を網羅しません。バイナリ配布時は `cargo-about` 等で完全な第三者通知を生成して同梱してください。
 - 商標・非公式に関する方針は [TRADEMARKS.md](TRADEMARKS.md) を参照してください。
+- リポジトリ公開・コードライセンス・商標・同梱フォント・ストア配布・マネタイズの方針は、[docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md) に決定事項としてまとめています（決定日 2026-11-23）。未決定の項目は同ファイル §7 に「要判断」として列挙しています。
 
 ## 免責
 
