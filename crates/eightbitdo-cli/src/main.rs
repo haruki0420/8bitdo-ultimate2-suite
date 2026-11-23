@@ -154,9 +154,11 @@ enum Command {
         #[arg(long)]
         allow_macro_write: bool,
 
-        /// Enable `config set` / `config remap` / `config write` inside the
-        /// REPL. Each write still needs `--yes` or the interactive `yes`
-        /// confirmation, and a pre-write backup is always taken.
+        /// Enable `config set` / `config remap` / `config write` and
+        /// `profile switch` inside the REPL. Each write still needs `--yes` or
+        /// the interactive `yes` confirmation, and a pre-write backup is always
+        /// taken for the configuration writes. `profile switch` is the
+        /// exception: it sends one `0x0015` request and takes no backup.
         #[arg(long)]
         allow_config_write: bool,
 
@@ -314,6 +316,25 @@ enum ConfigCommand {
     Map {
         #[command(subcommand)]
         command: MapCommand,
+    },
+
+    /// Switch the controller's active profile (`cmd 0x0015`).
+    ///
+    /// Sends one payload-less `WriteSLOT` request (`subcmd = slot`,
+    /// `total_len = 0`, `offset = 0`) and waits for its acknowledgement. No
+    /// `Save (0x0006)` is sent: whether `0x0015` needs one is **unconfirmed on
+    /// hardware** (`docs/PROTOCOL_SPEC.md` §6.2, docs/FEATURE_MATRIX.md).
+    ///
+    /// This changes the controller's active profile immediately. It does not
+    /// rewrite the 2768-byte configuration, so no pre-write backup is taken;
+    /// switch back with another `profile` call if needed.
+    Profile {
+        /// Profile slot (0..=2, matching the protocol and `config map`).
+        slot: u8,
+
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -663,6 +684,10 @@ async fn dispatch_config_command(
                 config_map_show(options, slot).await?;
             }
         },
+        ConfigCommand::Profile { slot, yes } => {
+            let slot = parse_slot(slot)?;
+            config_profile_switch(options, slot, yes).await?;
+        }
     }
     Ok(())
 }
@@ -2118,6 +2143,48 @@ async fn config_map_show(options: &BleOptions, slot: Slot) -> Result<(), Error> 
     Ok(())
 }
 
+/// Switch the active profile (`cmd 0x0015`).
+///
+/// The wire is RE-confirmed (`docs/PROTOCOL_SPEC.md` §6.2) but the ACK shape,
+/// the need for a Save and the persistence of the selection are **unconfirmed
+/// on hardware**. This sends exactly the official request and reports what the
+/// controller acknowledged; it deliberately does not claim the switch persisted.
+async fn config_profile_switch(
+    options: &BleOptions,
+    slot: Slot,
+    assume_yes: bool,
+) -> Result<(), Error> {
+    let transport = BleTransport::connect(options).await?;
+    let session = Session::new(transport);
+    let mut confirmation_io = TopLevelConfirmation::new(assume_yes);
+    let mut confirmation = confirmation_io.confirmation();
+    if !confirmation.confirm_with(PROFILE_CONFIRM_PROMPT).await? {
+        best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
+        // Answering "no" is not a failure: match the other write commands,
+        // which report the abort and exit successfully.
+        println!("aborted; no profile switch was sent");
+        return Ok(());
+    }
+    let result = session.switch_profile(slot).await;
+    best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
+    if let Err(error) = result {
+        if matches!(error, Error::Timeout { .. }) {
+            eprintln!("{PROFILE_SWITCH_TIMEOUT_WARNING}");
+        }
+        return Err(error);
+    }
+    println!(
+        "sent WriteSLOT slot {} (profile {}) (cmd 0x0015, no Save); acknowledged but unverified",
+        slot.index(),
+        slot.index() + 1
+    );
+    println!(
+        "note: ACK shape, Save requirement and persistence are unconfirmed on hardware; \
+         no read-back is claimed"
+    );
+    Ok(())
+}
+
 /// Read a 2768-byte configuration file.
 fn read_config_file(path: &Path) -> Result<Bt2Config, Error> {
     ensure_regular_file(path, "configuration file")?;
@@ -2180,11 +2247,16 @@ enum ConfigConfirmation<'a> {
 
 impl ConfigConfirmation<'_> {
     async fn confirm(&mut self) -> Result<bool, Error> {
+        self.confirm_with(CONFIG_CONFIRM_PROMPT).await
+    }
+
+    /// Confirm using an operation-specific prompt.
+    async fn confirm_with(&mut self, prompt: &str) -> Result<bool, Error> {
         match self {
             Self::AssumeYes => Ok(true),
-            Self::Reader(prompt) => prompt(),
+            Self::Reader(read) => read(),
             Self::AsyncReader { reader, line_state } => {
-                confirm_config_write_async(*reader, line_state).await
+                confirm_config_write_async_with(*reader, line_state, prompt).await
             }
         }
     }
@@ -2192,6 +2264,20 @@ impl ConfigConfirmation<'_> {
 
 /// The confirmation prompt shared by the sync and async readers.
 const CONFIG_CONFIRM_PROMPT: &str = "Type 'yes' to write the 2768-byte configuration: ";
+
+/// Confirmation prompt for the profile switch (`0x0015`), which does **not**
+/// write the 2768-byte configuration and therefore must not reuse the config
+/// write wording.
+const PROFILE_CONFIRM_PROMPT: &str =
+    "Type 'yes' to switch the controller's active profile (cmd 0x0015, no Save): ";
+
+/// Warning printed when a profile switch ends in an ACK timeout.
+///
+/// Shared by the top-level `config profile` command and the REPL `profile
+/// switch` command so the wording cannot drift between them.
+const PROFILE_SWITCH_TIMEOUT_WARNING: &str =
+    "warning: no WriteSLOT acknowledgement arrived. The 0x0015 ACK shape is unconfirmed, \
+     so the switch may still have happened; check the active profile on the controller.";
 
 /// Top-level `yes/no` confirmation that is assembled lazily.
 ///
@@ -2244,7 +2330,16 @@ async fn confirm_config_write_async(
     reader: &mut (dyn tokio::io::AsyncBufRead + Unpin + Send),
     line_state: &mut LineState,
 ) -> Result<bool, Error> {
-    eprint!("{CONFIG_CONFIRM_PROMPT}");
+    confirm_config_write_async_with(reader, line_state, CONFIG_CONFIRM_PROMPT).await
+}
+
+/// Async confirmation with an explicit prompt, used by the profile switch.
+async fn confirm_config_write_async_with(
+    reader: &mut (dyn tokio::io::AsyncBufRead + Unpin + Send),
+    line_state: &mut LineState,
+    prompt: &str,
+) -> Result<bool, Error> {
+    eprint!("{prompt}");
     std::io::stderr().flush()?;
     match read_session_line(reader, line_state).await? {
         LineRead::Line { text, cut } => {
@@ -5259,6 +5354,10 @@ enum SessionCommand {
     ConfigMapShow {
         slot: u8,
     },
+    ProfileSwitch {
+        slot: u8,
+        yes: bool,
+    },
     ConfigWrite {
         file: PathBuf,
         backup_dir: Option<PathBuf>,
@@ -5351,6 +5450,8 @@ fn parse_session_command(line: &str) -> SessionCommand {
         "info" if parts.next().is_none() => SessionCommand::Info,
         "config" => parse_config_session_command(parts)
             .unwrap_or_else(|| SessionCommand::Unknown(line.to_string())),
+        "profile" => parse_profile_session_command(parts)
+            .unwrap_or_else(|| SessionCommand::Unknown(line.to_string())),
         "backup" => match parse_file_options(parts) {
             Some((raw, json)) => SessionCommand::Backup { raw, json },
             None => SessionCommand::Unknown(line.to_string()),
@@ -5380,6 +5481,24 @@ fn parse_session_command(line: &str) -> SessionCommand {
 fn session_plain_value<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<&'a str> {
     let value = parts.next()?;
     (!value.starts_with("--")).then_some(value)
+}
+
+/// Parse the `profile ...` REPL subcommand (`profile switch <N> [--yes]`).
+fn parse_profile_session_command<'a>(
+    mut parts: impl Iterator<Item = &'a str>,
+) -> Option<SessionCommand> {
+    if parts.next()? != "switch" {
+        return None;
+    }
+    let slot: u8 = session_plain_value(&mut parts)?.parse().ok()?;
+    let mut yes = false;
+    for part in parts {
+        match part {
+            "--yes" if !yes => yes = true,
+            _ => return None,
+        }
+    }
+    Some(SessionCommand::ProfileSwitch { slot, yes })
 }
 
 /// Parse the `config ...` REPL subcommands.
@@ -5578,6 +5697,24 @@ fn is_config_write_command(command: &SessionCommand) -> bool {
         SessionCommand::ConfigSet { .. }
             | SessionCommand::ConfigRemap { .. }
             | SessionCommand::ConfigWrite { .. }
+            | SessionCommand::ProfileSwitch { .. }
+    )
+}
+
+/// True for REPL config commands that run the two-phase
+/// prepare (backup / plan / prompt) then TOCTOU-write path.
+///
+/// `profile switch` is deliberately **not** in this set: it sends one
+/// payload-less `0x0015`, takes no pre-write backup and has no plan, so it is
+/// dispatched through the normal single-phase path. It still needs
+/// `--allow-config-write` (see [`is_config_write_command`]) because it changes
+/// controller state.
+fn is_prepared_config_write(command: &SessionCommand) -> bool {
+    matches!(
+        command,
+        SessionCommand::ConfigSet { .. }
+            | SessionCommand::ConfigRemap { .. }
+            | SessionCommand::ConfigWrite { .. }
     )
 }
 
@@ -5614,6 +5751,7 @@ fn print_session_help(allow_macro_write: bool, allow_config_write: bool) {
     if allow_config_write {
         println!("  config set <FIELD> <VALUE> [--slot N] [--write-chunk BYTES] [--yes]");
         println!("  config remap <PHYSICAL> <TARGET> [--slot N] [--write-chunk BYTES] [--yes]");
+        println!("  profile switch <0|1|2> [--yes]");
         println!(
             "  config write --file <PATH> [--backup-dir DIR] [--write-chunk BYTES] \
              [--accept-reserved-drift] [--force-raw] [--yes]"
@@ -5621,6 +5759,7 @@ fn print_session_help(allow_macro_write: bool, allow_config_write: bool) {
     } else {
         println!("  config set ... (disabled; restart with --allow-config-write)");
         println!("  config remap ... (disabled; restart with --allow-config-write)");
+        println!("  profile switch ... (disabled; restart with --allow-config-write)");
         println!("  config write ... (disabled; restart with --allow-config-write)");
     }
     println!("  backup [--raw FILE] [--json FILE]");
@@ -6538,6 +6677,38 @@ async fn execute_session_command_with_io<T: Transport + 'static>(
             }
             Ok(SessionOutcome::Continue)
         }
+        SessionCommand::ProfileSwitch { slot, yes } => {
+            if monitor.is_some() {
+                eprintln!("monitor is running; use 'monitor stop' first");
+                return Ok(SessionOutcome::Continue);
+            }
+            let slot = parse_slot(slot)?;
+            let mut confirmation =
+                config_confirmation_for_session(yes, &mut repl_reader, &mut repl_line_state)?;
+            if !confirmation.confirm_with(PROFILE_CONFIRM_PROMPT).await? {
+                eprintln!("aborted; no profile switch was sent");
+                return Ok(SessionOutcome::Continue);
+            }
+            let guard = session.lock().await;
+            let result = guard.switch_profile(slot).await;
+            drop(guard);
+            if let Err(error) = result {
+                if matches!(error, Error::Timeout { .. }) {
+                    eprintln!("{PROFILE_SWITCH_TIMEOUT_WARNING}");
+                }
+                return Err(error);
+            }
+            println!(
+                "sent WriteSLOT slot {} (profile {}) (cmd 0x0015, no Save); acknowledged but \
+                 unverified",
+                slot.index(),
+                slot.index() + 1
+            );
+            println!(
+                "note: ACK shape, Save requirement and persistence are unconfirmed on hardware"
+            );
+            Ok(SessionOutcome::Continue)
+        }
         SessionCommand::ConfigWrite {
             file,
             backup_dir,
@@ -6988,7 +7159,7 @@ where
                 // Ctrl-C-cancellable (the keepalive continues while the prompt
                 // waits), and only the actual 0x0001/Save/read-back section is
                 // non-cancellable.
-                if allow_config_write && is_config_write_command(&command) {
+                if allow_config_write && is_prepared_config_write(&command) {
                     if monitor.is_some() {
                         eprintln!("monitor is running; use 'monitor stop' first");
                         continue;
@@ -7096,7 +7267,7 @@ where
                 // serviced after the command returns by the loop's own Ctrl-C
                 // branch.
                 let flash_command = (allow_macro_write && is_macro_flash_command(&command))
-                    || (allow_config_write && is_config_write_command(&command));
+                    || (allow_config_write && is_prepared_config_write(&command));
                 let outcome = if flash_command {
                     let mut command_future = std::pin::pin!(execute_session_command_with_io(
                         session,
@@ -9439,6 +9610,67 @@ mod tests {
         assert!(
             transport.is_disconnected(),
             "shutdown after a monitor disconnect must disconnect the link"
+        );
+    }
+
+    /// `profile switch` must reach the normal dispatch, not the two-phase
+    /// config-write path (`prepare_repl_config_command`, which rejects it).
+    ///
+    /// This is the regression test for the REPL dead-code bug: the command
+    /// classifies as a config write for the `--allow-config-write` gate but it
+    /// is not a prepared flash write, so it must be executed directly.
+    #[tokio::test]
+    async fn repl_profile_switch_sends_one_0x0015_frame_and_no_save() {
+        let transport = MockTransport::new();
+        // A direct `cmd = 0x0015` ACK for slot 1.
+        let ack = CustomHeader::new(commands::cmd::WRITE_SLOT, 1, 0, 0)
+            .to_bytes()
+            .to_vec();
+        transport.push_incoming(&ack);
+
+        let session = Arc::new(AsyncMutex::new(Session::new(transport)));
+        let state = Arc::new(SessionKeepaliveState::new());
+        let input = b"profile switch 1 --yes\nquit\n";
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input.to_vec()));
+        let result = session_repl_loop_with_io(
+            &session,
+            &state,
+            Instant::now(),
+            64,
+            Duration::from_millis(1),
+            false,
+            true,
+            &mut reader,
+            std::future::pending::<()>(),
+            false,
+        )
+        .await;
+
+        assert!(result.is_ok(), "the REPL must not fail: {result:?}");
+        let sent = session.lock().await.transport().sent_frames();
+        let switches: Vec<_> = sent
+            .iter()
+            .filter(|frame| {
+                frame.len() > 1
+                    && CustomHeader::parse(&frame[1..])
+                        .map(|header| header.cmd == commands::cmd::WRITE_SLOT)
+                        .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(
+            switches.len(),
+            1,
+            "exactly one 0x0015 frame must be sent (a REPL dead-code regression sends none); \
+             frames: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|frame| {
+                frame.len() > 1
+                    && CustomHeader::parse(&frame[1..])
+                        .map(|header| header.cmd == commands::cmd::SAVE)
+                        .unwrap_or(false)
+            }),
+            "no Save may be sent with 0x0015"
         );
     }
 
@@ -11842,6 +12074,17 @@ mod tests {
             SessionCommand::ConfigMapShow { slot: 2 }
         );
         assert_eq!(
+            parse_session_command("profile switch 1"),
+            SessionCommand::ProfileSwitch {
+                slot: 1,
+                yes: false
+            }
+        );
+        assert_eq!(
+            parse_session_command("profile switch 2 --yes"),
+            SessionCommand::ProfileSwitch { slot: 2, yes: true }
+        );
+        assert_eq!(
             parse_session_command(
                 "config write --file /tmp/c.bin --backup-dir /tmp/b --accept-reserved-drift \
                  --force-raw --write-chunk 180 --yes"
@@ -11867,6 +12110,11 @@ mod tests {
             "config set a b --slot 1 --slot 2",
             "config write --file /tmp/c.bin --yes --yes",
             "config unknown",
+            "profile",
+            "profile switch",
+            "profile switch 1 --yes --yes",
+            "profile switch 1 extra",
+            "profile other 1",
         ] {
             assert!(
                 matches!(parse_session_command(line), SessionCommand::Unknown(_)),
@@ -12022,7 +12270,8 @@ mod tests {
         let session = Arc::new(AsyncMutex::new(Session::new(transport.clone())));
         let state = Arc::new(SessionKeepaliveState::new());
         let input = format!(
-            "config set joy.left_start 42 --slot 1 --backup-dir {} --yes\nquit\n",
+            "config set joy.left_start 42 --slot 1 --backup-dir {} --yes\n\
+             profile switch 1 --yes\nquit\n",
             dir.join("backup").display()
         );
         let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes()));
@@ -12042,7 +12291,7 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         assert!(
             transport.sent().is_empty(),
-            "gated config write sent frames"
+            "gated config write sent frames (including the gated profile switch)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

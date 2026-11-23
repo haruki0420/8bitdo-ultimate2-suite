@@ -622,6 +622,18 @@ impl<T: Transport> Session<T> {
         output
     }
 
+    /// Bounded best-effort drain of frames left over from an operation whose
+    /// acknowledgement shape is unconfirmed (see `switch_profile`).
+    ///
+    /// Unlike a failed read, exhaustion is **not** an error here: the pending
+    /// frames are input reports / notices, and the caller has either not sent
+    /// its request yet or has already completed it, so there is no response to
+    /// lose.
+    pub(crate) async fn drain_before_unconfirmed_write(&self) -> Result<(), Error> {
+        self.drain_pending(DrainPolicy::RESYNC).await?;
+        Ok(())
+    }
+
     /// Clear the resync flag, failing closed when the drain budget runs out.
     ///
     /// If stale frames may still be queued, the flag stays set so the next

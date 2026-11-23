@@ -150,7 +150,7 @@ graph TD
 
 ## 5. フェーズ別実装ロードマップ
 
-> **2026-11-23 改訂（現状反映）**: Phase 1 / 2a / 2b / 2d / 3a は main にマージ済み。PR #16（`feat/gui-write`）で Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）の GUI 書込を実装（実機未検証・Tier 3）。Phase 2c は core のみマージ済みで、実機 wire 未確定のため CLI / GUI / UniFFI に未配線。Phase 3c（OTA 画面）は未着手。Phase 5 は UniFFI と iOS / Android の雛形まで。USB OTA（Phase 4）は USB Boot TX フレーミングが未文書化のため保留を継続する。詳細な残課題は §5.4。
+> **2026-11-23 改訂（現状反映、main `0582e9a`）**: Phase 1 / 2a / 2b / 2d / 3a は main にマージ済み。PR #16（`feat/gui-write`）で Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）の GUI 書込を実装し **main にマージ済み**（実機未検証・Tier 3）。Phase 2c は core のみマージ済みで、#20 で `ota-bench` 段階実行 API、#19 で実機 btsnoop 採取計画を追加。実機 wire 未確定のため CLI / GUI / UniFFI に未配線。Phase 3c（OTA 画面）は未着手。Phase 5 は UniFFI と iOS / Android の雛形に加え、#21 で **JNI 同梱 APK / unsigned IPA のビルド成功まで記録**（実機未検証）。#17 で raw config の実機 flag 検証を opaque 値対応に修正、#18 でクロスプラットフォーム・ビルド確認、#22 で配布方針、#23 で機能マトリクスを追加。GUI ライセンス画面は PR #24 でレビュー中・未マージ。プロファイル切替（`0x0015`）の core / CLI 配線は PR #26 でレビュー中・未マージで、[docs/FEATURE_MATRIX.md](FEATURE_MATRIX.md) の残作業「`0x0015` 切替のセッション API 化」に対応する。USB OTA（Phase 4）は USB Boot TX フレーミングが未文書化のため保留を継続する。詳細な残課題は §5.4。
 
 ### 5.1 トラック構成（2026-11-23）
 
@@ -161,34 +161,41 @@ Track A: コア / CLI（Linux・デスクトップ）
   Phase 2b macro write              完了・実機確認済み（S1 の M1/M2。M3/M4・S2/S3 は外挿）
   Phase 2c BLE OTA                  core のみ完了（Mock 52/55/58/61）。実機 wire 未確定・未配線
   Phase 2d config apply             完了・実機確認済み（BLE・MTU 200・74B chunk）
+  プロファイル切替 0x0015           PR #26（core + CLI 配線、レビュー中・未マージ）
   Phase 2e USB / 2.4G transport     保留
 
 Track B: GUI（egui / Pure Rust）
   Phase 3a read-only GUI            完了（PR #9）
-  Phase 3b macro editor             実装済み（PR #16。実機未検証・Tier 3）
+  Phase 3b macro editor             実装・main にマージ済み（PR #16。実機未検証・Tier 3）
   Phase 3c OTA screen               2c の wire 確定後（未着手）
-  Phase 3d settings tabs            実装済み（PR #16。実機未検証・Tier 3）
+  Phase 3d settings tabs            実装・main にマージ済み（PR #16。実機未検証・Tier 3）
+  ライセンス画面                     PR #24（レビュー中・未マージ）
 
 Track C: モバイル
-  Phase 5  UniFFI + iOS / Android   雛形完了（PR #12）。JNI 同梱 APK・実機・配布は未着手
+  Phase 5  UniFFI + iOS / Android   雛形完了（PR #12）+ JNI 同梱 APK / unsigned IPA ビルド成功（#21）。
+                                    実機 BLE・JNI ロード・署名・配布は未着手
 ```
 
-### 5.2 現状（2026-11-23、main `4004757`）
+### 5.2 現状（2026-11-23、main `0582e9a`）
 
 | 項目 | 状態 |
 | --- | --- |
 | Phase 1 | 完了。実機検証で判明した ReadVersion の 4B ペイロード、ReadConfig の `chunk_len = 0x0AD0`、1 要求 = 1 チャンク、最終 142B パディングは Phase 2a で補正した。`cargo test -p eightbitdo-protocol` は単体 100 + doc 4 |
-| Phase 2a | 完了。実機で ReadVersion **200 (0xC8)**、2768B dump（SHA-256 `1dca47fa...59c600`）、20ms keepalive **128.9 秒**、`session` の info / config dump / backup / monitor を確認 |
-| Phase 2b | 完了（PR #6）。実機（BLE・slot S1）でマクロ書込・読み戻し・restore を確認。Write `0x0103` の `total_len` は絶対終端が必須。**Switch 側でのマクロ発動は未確認**。M3/M4・S2/S3・USB HID は未確認 |
-| Phase 2c | core 実装済み（PR #11）。Mock 55 テスト（既定 52）。**実機 btsnoop 未取得、CLI / GUI / UniFFI 未配線、実機書込未検証**。マルチセクション `.dat` 非対応が公式ファーム対応の blocker |
-| Phase 2d | 完了（PR #7）。実機（BLE・MTU 200・74B chunk）で full 2768B write → Save → read-back 一致、`config remap` A→B→A を同一接続で確認。**実機確認は full write / remap のみ**で、`config set` 各フィールド・`--force-raw`・MTU 200 以外は未確認。USB config write は未実装 |
+| Phase 2a | 完了。実機で ReadVersion **200 (0xC8)**、2768B dump、20ms keepalive **128.9 秒**、`session` の info / config dump / backup / monitor を確認（2026-11-22 時点の dump SHA-256 は `1dca47fa...59c600`。以降プロファイル名の変更で実機 config の SHA が変化したと考えられ、**SHA 固定値では判定しない**） |
+| Phase 2b | 完了（PR #6）。実機（BLE・slot S1）でマクロ書込・読み戻し・restore を確認。Write `0x0103` の `total_len` は絶対終端が必須。2026-11-23 に再接続後に `macro restore`（slot 0 の M1/M2、22 packets、復元後の read-back が書込前の read-back と SHA-256 一致）を再確認。**Switch 側でのマクロ発動は未確認**。M3/M4・S2/S3・USB HID は未確認 |
+| Phase 2c | core 実装済み（PR #11）。Mock 52 テスト（既定）/ 55（`mobile-boot`）/ 58（`ota-bench`）/ 61（`--all-features`）。#20 で実機採取用の段階実行 API（`ota-bench`、既定 OFF）をマージ、#19 で btsnoop 採取計画（[docs/OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md)、Phase A / Phase B）を追加。**実機 btsnoop 未取得、CLI / GUI / UniFFI 未配線、実機書込未検証**。マルチセクション `.dat` 非対応が公式ファーム対応の blocker |
+| Phase 2d | 完了（PR #7、#17 で実機 flag 対応を修正）。実機（BLE・MTU 200・74B chunk）で full 2768B write → Save → read-back 一致、`config remap` A→B→A を同一接続で確認。2026-11-23 に再接続後に version `0xC8` / full write read-back / `config remap A B` → `A A` の往復を再確認し、**各操作後の read-back が期待状態と一致し、復帰後は書込前の read-back と一致する**ことで検証した（実機 config の SHA はユーザーのプロファイル名設定により変わったと考えられるため固定値では判定しない）。**実機確認は full write / remap のみ**で、`config set` 各フィールド・`--force-raw`・MTU 200 以外は未確認。USB config write は未実装 |
 | Phase 3a | 完了（PR #9）。読み取り専用 GUI、日本語、燻しスレート。デバイス / ライブ入力 / 設定値 / ログの 4 タブ。 |
-| Phase 3b | **実装（PR #16）**。マクロエディタ／20ms 録音／ステップ編集／既存非空マクロへの書込。pre-write backup・read-back・TOCTOU・録音中書込不可。**実機未検証・Tier 3** |
+| Phase 3b | **実装・main にマージ済み（PR #16）**。マクロエディタ／20ms 録音／ステップ編集／既存非空マクロへの書込。pre-write backup・read-back・TOCTOU・録音中書込不可。**実機未検証・Tier 3** |
 | Phase 3c | 未着手。Phase 2c の実機 wire 確定後に OTA 画面を実装 |
-| Phase 3d | **実装（PR #16）**。設定タブ／22 ボタンリマップ／振動／スティック・トリガー／ジャイロ／LED。確認ダイアログ・pre-write backup・read-back。**実機未検証・Tier 3** |
+| Phase 3d | **実装・main にマージ済み（PR #16）**。設定タブ／22 ボタンリマップ／振動／スティック・トリガー／ジャイロ／LED。確認ダイアログ・pre-write backup・read-back。**実機未検証・Tier 3** |
 | Phase 4 | 保留（USB Boot TX 未文書化） |
-| Phase 5 | 雛形完了（PR #12）。UniFFI 公開 API、iOS unsigned IPA、Android Kotlin-only APK まで。Android JNI 同梱 APK・実機確認・App Store 配布は未着手。書き込み・OTA は意図的に未公開 |
-| ライセンス | 完了（PR #13）。LICENSE-MIT / LICENSE-APACHE / NOTICE / THIRD_PARTY_LICENSES / TRADEMARKS |
+| Phase 5 | **JNI 同梱 APK / unsigned IPA のビルド成功、実機未検証（#21）**。UniFFI 公開 API（PR #12）、iOS unsigned IPA 1,550,522 bytes、Android Kotlin-only APK に続き、NDK r29 + cargo-ndk で `libeightbitdo_uniffi.so` を同梱した APK 14,551,011 bytes を生成（ビルド・パッケージ内容の確認のみ）。iOS / Android 実機での BLE・JNI ロード、署名・App Store 配布は未着手。書き込み・OTA は意図的に未公開。証跡は [docs/MOBILE_BUILD_EVIDENCE.md](MOBILE_BUILD_EVIDENCE.md) |
+| ライセンス | 完了（PR #13）。LICENSE-MIT / LICENSE-APACHE / NOTICE / THIRD_PARTY_LICENSES / TRADEMARKS。公開範囲・コードライセンス・商標・同梱フォント・ストア配布・マネタイズの決定は [docs/DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md)（#22、決定日 2026-11-23）が正本 |
+| クロスプラットフォーム | ビルド確認のみ（#18、[docs/CROSS_PLATFORM.md](CROSS_PLATFORM.md)）。Linux ホスト / Windows `cargo check` / iOS target check は成功、macOS は本ホストで確認不能、Windows の実効 MSRV は 1.88 以上。**実機は Linux のみ** |
+| 機能カバレッジ | 公式 Windows / Android ソフトとの比較表 [docs/FEATURE_MATRIX.md](FEATURE_MATRIX.md)（#23） |
+| GUI ライセンス画面 | **PR #24 でレビュー中・未マージ**。現 main の GUI にライセンス画面は無い（実装予定） |
+| プロファイル切替 API | **PR #26 でレビュー中・未マージ**。core `Session::switch_profile` + CLI `config profile <N>` + REPL `profile switch <N>`。FEATURE_MATRIX の残作業「`0x0015` 切替のセッション API 化」に対応。実機未検証（ACK 形状・Save 要否・永続性は未確認） |
 | レビュー | 2a / 2b / 2c / 2d と書き込み系 GUI は **Tier 3**（3 セッション）。3a の表示のみの変更は Tier 2、`eightbitdo-core/**` に触れる場合は Tier 3 |
 
 ### Phase 1: `eightbitdo-protocol`（純粋プロトコル＆バイナリ層）
@@ -210,7 +217,7 @@ Track C: モバイル
   - CLI: `scan` / `info` / `config dump` / `backup` / `monitor` / `keepalive` / **`session`**
   - `session`: 1 接続、`0x0007` enable（既定。`--no-report-enable` 時は起動時の enable(1) を送らず `0x0003` keepalive のみ。終了時の disable(0) は best-effort）+ 20ms `0x0003` keepalive + 受信ドレイン、operation lock でコマンド中は keepalive を停止、scan / connect / session と `BleTransport::connect` を使う全 CLI コマンドは BLE を触る前に **per-user** BLE 単一所有者 flock を取得し、取得できなければ「別プロセスが BLE を使用中」として失敗（環境非依存パス: `EIGHTBITDO_BLE_LOCK`（テスト用例外）→ NSS（`getpwuid_r`）の euid ホーム由来 `~/.cache/8bitdo/8bitdo-ble.lock` → ホーム不明時のみ temp の per-user dir。`XDG_RUNTIME_DIR` / `XDG_CACHE_HOME` は参照しない。symlink / 非通常ファイル / 他ユーザー所有は `O_NOFOLLOW` と fd 検証で拒否し、既定パスでは既存 parent が euid 所有 + group/other write なし + symlink でないことを検証し、Unix は dirfd（`openat`）で TOCTOU も閉じる。別ユーザー同士は排他しない。session は接続保持中ロックを保持し teardown 成功時のみ解放）、`info` / `config dump` / `backup` / `monitor` / `monitor stop` / `status` / `help` / `quit`。`monitor` 自身も 20ms `0x0003` を送り、その間は keepalive が止まる（monitor が keepalive を兼ねる）。`monitor stop` 後は keepalive が自動再開。トップレベルの `monitor` も同じ 20ms `0x0003` ポーリングを共有し、終了時に `0x0007` disable → 切断する。なお `monitor --count N` は公式 `ReadKeysAndJoy` と同様に投げっぱなしで、応答が 1 件も来ない場合も 20ms 周期で `0x0003` を送り続け、`--count` に達するまで Ctrl-C まで回り続ける。`status` は `monitor sent` / `monitor received` を表示し、終了時のロック待ち・切断はタイムアウト付きで有界にする。連続する keepalive I/O エラー 3 回または `Disconnected` で degraded 停止し、`session` は終了コード **3** で終了して自動再接続しない（無応答は failure に数えない。`keepalive degraded ...` のメッセージで、切断と同時に App Mode を抜けて `80ND` が広告されなくなること、Profile 約 3 秒押しでの再入が必要なことを案内する。常駐ループは 3 で再試行せず押下待ち停止）。degraded 以外でコマンドが `Disconnected` を観測した場合は exit 1。押下依頼前の `scan` 確認手順・per-user ロック・常駐ループは `docs/SESSION_OPERATIONS.md` を参照）。1 tick の受信ドレインは最大 4 レポート（`try_next_input` 自体も 1 回最大 16 フレーム + 1ms）に固定し、通知が途切れなくても operation lock を保持し続けない。設定の `--raw` / `--json` は同一ディレクトリの一時ファイルへ書いてから rename するアトミック書込で、同一ファイルを指す 2 つの出力パス（`.` / `..`、symlink、Unix の hard link）は端末にアクセスする前に拒否する。hard link の同一性検出は Unix のみ（device/inode）で、Windows は file identity 未実装のため hard link alias を事前拒否しない。ただし出力は一時ファイル + `rename` なので、JSON の `rename` が raw の内容を直接書き換えることはない。case-insensitive alias は raw 書き込み後の再検証で拾う。この再検証は偶発的な alias 用であり、出力ディレクトリに write 権限を持つ攻撃者による TOCTOU / 並行 rename は非保証である。REPL の 1 行は最大 4096 バイトで、超過分は読み捨てて次の行を正常に読む。`session` の Ctrl-C はコマンド実行中でも future を drop して REPL を抜け、セッションを終了する（終了直前に BLE 切断・`80ND` 消滅・Profile 約 3 秒押しが必要な旨を stderr に表示する。`--allow-macro-write` 有効時の macro write / restore は、準備（ファイル読込・pre-write / pre-restore backup）を含むコマンド全体が完了するまで Ctrl-C を遅延してから終了する。次項参照）。行リーダーのキャンセル耐性は `monitor` / keepalive の終了通知による中断で読みかけの行を壊さないためのもので、Ctrl-C 後の継続を意味しない。
   - `session` の macro 操作（2026-11-22 追加。REPL 経由の macro 書込は実機未検証）: REPL から `macro backup <DIR>`（読み取りのみ、常に利用可）/ `macro write <SLOT> <INDEX> <FILE> [--trigger <KEY>] [--chunk-size <32|64>]` / `macro restore <DIR> [--force]` を実行できる。`macro write` / `macro restore` は **`--allow-macro-write`（既定 OFF）** が必要で、無い場合は `restart with --allow-macro-write` を案内して拒否する。`session` は**既定で起動時に `0x0007 enable(1)` を送る（公式相当）**ため、**REPL の `macro write` は enable 状態で実行される**。`--no-report-enable` を指定すると起動時の enable(1) を送らずに `0x0003` keepalive を継続し（終了時の disable(0) は best-effort）、トップレベル `macro write` の既定（enable なし）と同じ書込条件で A/B できる。macro 操作中は operation lock により 20ms `0x0003` ポーリングが止まり、操作後に再開する（公式は書込中 `0x0003` なし）。**`--allow-macro-write` 有効時の `macro write` / `macro restore` は、準備（ファイル読込・pre-write / pre-restore backup）を含むコマンド全体が完了するまで Ctrl-C を遅延してから終了する**。非通常ファイル（FIFO / socket / directory）は読み取り前に拒否するためブロックせず、デバイス I/O は timeout で有界（SIGKILL・電源断は防げない）。REPL の `macro write` は `--backup-dir` 非対応（cwd の `macro-backup-<unix-nanos>-<pid>-<sequence>` を使う）、`macro restore` は `--chunk-size` 非対応（pre-restore backup は `<backup dir 名>-pre-restore-<unix-nanos>-<pid>-<sequence>`）。
-  - `session` の config 書込（2026-11-23 追加）: `--allow-config-write` 付きで REPL から `config set <field> <value>` / `config remap <physical> <target>` / `config map show` / `config write --file <path>` を実行できる。各書込はトップレベルと同じ共通関数（`ConfigWritePlan` / `PreparedConfigWrite` / `raw` 検証 / pre-write backup / 前後 SHA-256 / read-back / `--accept-reserved-drift` / `--force-raw` / `--write-chunk`）を使い、`--yes`（対話確認なし）または REPL 上の `yes` 入力で確認する。REPL は二段階で実行する: (1) snapshot 読込・plan・pre-write backup・確認プロンプトはキャンセル可能フェーズ（operation lock は prepare 中のみ保持し、プロンプト待機中は解放して 20ms keepalive を継続。Ctrl-C で中止でき、backup は残る）、(2) `finish_config_prepared`（TOCTOU 再読込 → `0x0001` 連続 → Save → read-back）は operation lock 下の非キャンセルフェーズ（Ctrl-C は遅延 + notice）。終了後に keepalive を再開する。失敗時は backup path と復旧コマンド（top-level / REPL 双方）を表示する。REPL の引数は空白区切りのため、スペース入りプロファイル名は top-level `config set` を使う。`config map show` / `config dump` は `--allow-config-write` 不要。`session` は将来のデーモン化（常駐プロセス）への布石。1 回の Profile 長押しで複数操作を完結させる
+  - `session` の config 書込（2026-11-23 追加）: `--allow-config-write` 付きで REPL から `config set <field> <value>` / `config remap <physical> <target>` / `config map show` / `config write --file <path>` を実行できる。各書込はトップレベルと同じ共通関数（`ConfigWritePlan` / `PreparedConfigWrite` / `raw` 検証 / pre-write backup / 前後 SHA-256 / read-back / `--accept-reserved-drift` / `--force-raw` / `--write-chunk`）を使い、`--yes`（対話確認なし）または REPL 上の `yes` 入力で確認する。REPL は二段階で実行する: (1) snapshot 読込・plan・pre-write backup・確認プロンプトはキャンセル可能フェーズ（operation lock は prepare 中のみ保持し、プロンプト待機中は解放して 20ms keepalive を継続。Ctrl-C で中止でき、backup は残る）、(2) `finish_config_prepared`（TOCTOU 再読込 → `0x0001` 連続 → Save → read-back）は operation lock 下の非キャンセルフェーズ（Ctrl-C は遅延 + notice）。終了後に keepalive を再開する。失敗時は backup path と復旧コマンド（top-level / REPL 双方）を表示する。REPL の引数は空白区切りのため、スペース入りプロファイル名は top-level `config set` を使う。`config map show` / `config dump` は `--allow-config-write` 不要。`profile switch <N> [--yes]` は `--allow-config-write` が必要だが、二段階の prepare（backup / plan / TOCTOU / read-back）を伴わない単発の `0x0015` 送信として通常パスで実行する。`session` は将来のデーモン化（常駐プロセス）への布石。1 回の Profile 長押しで複数操作を完結させる
   - docs: `FF13` 実機観測、`cmd=0x0004` エンベロープ、ReadConfig の `chunk_len`、keepalive 設計
 - **完了条件**: 1 回の Profile で `session` 内の `info` → `backup` → `monitor` が通り、Tier 3 レビューと CI 4/4 を満たすこと。
 - **状態**: **完了（2026-11-21〜22、実機確認済み）**。実機で `session` の info / config dump / backup / monitor / keepalive、BLE 単一所有ロック、degraded 終了コード 3 を確認した。
@@ -237,7 +244,7 @@ Track C: モバイル
 - **完了条件**: 実機で 1 マクロ書き込み → 読み戻し一致 → 元のマクロへ復元（**書込・読み戻し・復元は実機確認済み。Switch 側でのマクロ発動確認は未実施**）。
 - **完了条件の変更（レビュー指摘）**: 当初の「Switch 側で発動」は未確認のため、実機で確認できた「書込 → 読み戻し一致 → 復元」を完了条件とし、**Switch 側の発動確認は未確認のまま完了扱い**として §5.4 の残課題に分離した。
 - **Tier**: **3**（write-path / Flash / CRC / マクロ）。
-- **状態**: **完了（実機で書込・読み戻し・復元まで確認。Switch 側でのマクロ発動は未確認）**。読み取り・バックアップ（142B チャンク、offset エコー）に加え、**2026-11-22 実機（BLE・slot S1・`macro_idx=0/1 (M1/M2)`）: Write `0x0103` の `total_len` を絶対終端 `(macro_idx << 12) + align32(steps * 10)` にすることで `macro_idx=1` の永続化を確認**（相対値 `align32(steps * 10)` では ACK のみで未永続。`macro_idx=0` は base 0 のため両者一致）。**restore も実行し、復元後の config SHA-256 が書込前の `1dca47fa...59c600` に一致した。** `macro_idx=2/3 (M3/M4)` と slot S2/S3 は式からの外挿で未確認。これが既定。CLI `--write-total-relative` は旧 framing に戻す A/B 用。USB HID の Write は未実装・未検証（BLE のみ実装）。残る未確定点は `PROTOCOL_SPEC.md` §6.5（ACK 形状 / total_len 照合、Save タイムアウト、config CRC 再計算、MTU 200 以外での実機挙動）。
+- **状態**: **完了（実機で書込・読み戻し・復元まで確認。Switch 側でのマクロ発動は未確認）**。読み取り・バックアップ（142B チャンク、offset エコー）に加え、**2026-11-22 実機（BLE・slot S1・`macro_idx=0/1 (M1/M2)`）: Write `0x0103` の `total_len` を絶対終端 `(macro_idx << 12) + align32(steps * 10)` にすることで `macro_idx=1` の永続化を確認**（相対値 `align32(steps * 10)` では ACK のみで未永続。`macro_idx=0` は base 0 のため両者一致）。**restore も実行し、復元後の config を read-back して書込前の read-back と SHA-256 が一致することを確認した（2026-11-22 時点の値は `1dca47fa...59c600`。以降プロファイル名の変更で実機 config の SHA は変わると考えられるため、以降は固定値ではなく都度の read-back 一致で検証する）。** `macro_idx=2/3 (M3/M4)` と slot S2/S3 は式からの外挿で未確認。これが既定。CLI `--write-total-relative` は旧 framing に戻す A/B 用。USB HID の Write は未実装・未検証（BLE のみ実装）。残る未確定点は `PROTOCOL_SPEC.md` §6.5（ACK 形状 / total_len 照合、Save タイムアウト、config CRC 再計算、MTU 200 以外での実機挙動）。
 
 ### Phase 2c: Linux BLE OTA
 - **ゴール**: Linux から BLE Bootloader 経由でファームウェア更新・復旧を行う。
@@ -272,7 +279,7 @@ Track C: モバイル
 - **実装状況（2026-11-23、BLE のみ。実機 write / remap 確認済み）**:
   - core `config_ops`: デバイス snapshot に型付き編集を適用し、予約バイト（`0x1F4..0x68C` / `0x914..0x92C`）を保持、`ANSI_CRC_16_sh` を再計算して **2768B 全体を `0x0001` 分割送信 → `0x0006/0x0067` Save → `0x0002` read-back 検証**。CRC 不一致・ACK 失敗は `ConfigWriteStage`（Write/Save/Verify）+ `ConfigWriteState`（NotSaved/Saved）で fail-closed。失敗時は段階別の復旧文を返す。
   - 書込 chunk の既定は **`min(MTU ペイロード, 74)`**（RE: 公式書込上限 74B、`MAX_ATT_MTU 92 - 0x12`。静的解析。既定 74B での実機 write は確認済み）。`--write-chunk <BYTES>` は接続前に **1..=180**（観測 MTU 200 のペイロード上限）で検証し、任意サイズ（例: 180B、旧 MTU 連動の A/B）を指定可能。接続後は交渉 MTU の上限も検証する。
-  - CLI: `config dump` / **`config write --file <2768B>`** / **`config set <field> <value>`** / **`config remap <physical> <target>`** / **`config map show`**。`config write` はファイル読込・既知フィールド検証を **BLE 接続前** に行う。
+  - CLI: `config dump` / **`config write --file <2768B>`** / **`config set <field> <value>`** / **`config remap <physical> <target>`** / **`config map show`** / **`config profile <0|1|2>`**（公式 `0x0015` WriteSLOT。Save は送らない。ACK 形状・Save 要否・永続性は実機未確認）。`config write` はファイル読込・既知フィールド検証を **BLE 接続前** に行う。
   - 安全策: **pre-write backup 必須**（`config.bin` + `config.json`、`REVIEW_TIERS` §6 の例外としてマクロ step sector は対象外）、`--yes` なしの対話確認、**前後 SHA-256 表示**、確認後の **TOCTOU 再読込**（変化時は中止）、read-back 検証、ゲームパッドモード / cur_slot 変更とマクロヘッダ（`0x68C..0x914`）変更の警告。
   - 復旧: `config write --file <backup>/config.bin --yes`。device が予約バイトを正規化した場合は `--accept-reserved-drift` で現在の device 予約バイトに合わせる。
   - **実機確認（2026-11-23、BLE・MTU 200・74B chunk）**: **確認範囲は `config write --file` の full 2768B write と `config remap` のみ**。full write は **38 write + 1 Save（合計 39 packets）**で送信し、Save 後の read-back SHA-256 が送信内容と一致した。device は送信した CRC を保持し（`stored` 一致、`in_place` 解釈とは不一致）、`config remap A B` の反映（read-back で A→B）と B→A への復帰を同一接続で確認した。書込前後で `config-backup-*` が作成され、各回の before / after SHA-256 が記録されている。**`config set` の各フィールド、`--force-raw` / `--accept-reserved-drift`、MTU 200 以外は未確認。**
@@ -292,9 +299,9 @@ Track C: モバイル
 ### Phase 3: `eightbitdo-gui`（デスクトップ ネイティブ GUI：Linux / macOS / Windows）
 - **技術**: `egui` (`eframe`)、Pure Rust。Node.js / WebView / Electron / Tauri は使わない。
 - **Phase 3a（read-only GUI、完了）**: 接続パネル、デバイス情報、ライブ入力、設定ビューア、マクロ一覧、バックアップ、ログの読み取り専用 GUI。日本語 UI・燻しスレートのテーマ・同梱 Noto Sans JP（OFL）。デバイス書込は行わない。**2026-11-22 に PR #9 で main にマージ済み**。既定は **Tier 2**、ただし `crates/eightbitdo-core/**`（`session` / transport / mock を含む）の変更を伴う場合は **Tier 3**。GUI 側だけで完結する場合も、`session` の読み取り契約（ドレインの fail-closed、応答 `total_len` / `crc16` 照合、`Instant` 上限）を検証するテストを変えるなら Tier 3。
-- **Phase 3b（マクロエディタ、Phase 2b 後）**: タイムライン / テーブル、リアルタイム録音、1ms、8bit スティック、トリガー、JSON/TOML。Tier 3。**現状: PR #16 で実装済み（未マージ時点）。** 20ms ライブ録音、ステップ編集（削除・待ち時間挿入・値変更）、既存非空マクロへの Header → Save → Erase → Write → Save、read-back 検証、pre-write macro backup、TOCTOU（expected SHA-256 不一致で中止）。空マクロ作成は拒否。録音中は書込不可（確認ダイアログは非モーダルだが確定時に再検証、録音中のロードは停止通知）。**実機未検証。JSON/TOML 入出力は未実装。**
+- **Phase 3b（マクロエディタ、Phase 2b 後）**: タイムライン / テーブル、リアルタイム録音、1ms、8bit スティック、トリガー、JSON/TOML。Tier 3。**現状: PR #16 で実装済み・main にマージ済み（実機未検証）。** 20ms ライブ録音、ステップ編集（削除・待ち時間挿入・値変更）、既存非空マクロへの Header → Save → Erase → Write → Save、read-back 検証、pre-write macro backup、TOCTOU（expected SHA-256 不一致で中止）。空マクロ作成は拒否。録音中は書込不可（確認ダイアログは非モーダルだが確定時に再検証、録音中のロードは停止通知）。**実機未検証。JSON/TOML 入出力は未実装。**
 - **Phase 3c（OTA 画面、Phase 2c 後）**: バージョン確認、進捗、復旧モード。Tier 3。**Phase 2c の実機 wire 確定まで着手しない**。
-- **Phase 3d（設定タブ、Phase 2d 後）**: プロファイル、リマップ、デッドゾーン、振動、6 軸、RGB。Tier 3。**現状: PR #16 で実装済み（未マージ時点）。** プロファイル名、`gamepad_mode`、有効プロファイル、22 ボタンリマップ（未変更の unsupported 値は保持、新規選択は単一文書化キーのみ）、振動、スティック / トリガー、特殊機能、ジャイロ、LED。確認ダイアログ、pre-write backup、read-back 検証、TOCTOU 付き。**実機未検証。**
+- **Phase 3d（設定タブ、Phase 2d 後）**: プロファイル、リマップ、デッドゾーン、振動、6 軸、RGB。Tier 3。**現状: PR #16 で実装済み・main にマージ済み（実機未検証）。** プロファイル名、`gamepad_mode`、有効プロファイル、22 ボタンリマップ（未変更の unsupported 値は保持、新規選択は単一文書化キーのみ）、振動、スティック / トリガー、特殊機能、ジャイロ、LED。確認ダイアログ、pre-write backup、read-back 検証、TOCTOU 付き。**実機未検証。**
 - **完了条件**: Linux / macOS / Windows でビルド・起動し、実機と同期すること（現状の確認は Linux のみ）。
 
 ### Phase 4: USB OTA（保留）
@@ -310,8 +317,8 @@ Track C: モバイル
   - `mobile/android`: Kotlin + Jetpack Compose UI + Android BLE GATT トランスポート + `cargo-ndk` ビルド構成（`scripts/mobile/build-android.sh`）。USB OTG は未実装。
 - **現状（2026-11-23、PR #12 で main にマージ済み）**:
   - `eightbitdo-uniffi`: `NativeTransport` callback、同期 `MobileSession`（version / config / macro backup / input / disconnect）、`describeConfig`、`prepareConfigWrite`（送信なしの書き込み準備のみ）。`cargo test -p eightbitdo-uniffi` は 14 テスト。
-  - iOS: SwiftUI 雛形 + CoreBluetooth transport。Linux の xtool で **署名なし IPA の生成まで成功**。実機インストール・App Store / TestFlight 配布は macOS + Xcode が必要で未実施。
-  - Android: Compose 雛形 + GATT transport。**Kotlin-only APK**（`assembleDebug`、JVM unit test 8 件）まで成功。**Rust JNI（`libeightbitdo_uniffi.so`）は NDK 不在のため未同梱**で、実機で Rust コアを動かすには NDK + cargo-ndk の完全ビルドが必要。
+  - iOS: SwiftUI 雛形 + CoreBluetooth transport。Linux の xtool で **署名なし IPA の生成まで成功（#21: 1,550,522 bytes、SHA-256 `e63d7822…b804f`）**。実機インストール・App Store / TestFlight 配布は macOS + Xcode が必要で未実施。
+  - Android: Compose 雛形 + GATT transport。**JNI 同梱 APK をビルド成功（#21、[docs/MOBILE_BUILD_EVIDENCE.md](MOBILE_BUILD_EVIDENCE.md)）**。NDK 29.0.14206865 + cargo-ndk 4.1.2 で `libeightbitdo_uniffi.so`（arm64-v8a / x86_64）を同梱した debug APK **14,551,011 bytes**（SHA-256 `879e894c…a351f1`）を生成し、JVM unit test 8 件も成功。**実機 / エミュレータでの JNI ロードは未確認**（ホストの emulator 実行ファイルに実行権限が無く、エミュレータ起動も未実施）。
   - 設定書き込み・OTA は UniFFI に公開していない（バックアップ UI・Tier 3 レビュー待ち）。Android USB OTG は未実装。
 - **完了条件**: iOS / Android 実機で `"80ND"` 接続・設定変更・マクロ編集・BLE OTA が動作すること（現状は実機未確認）。
 - **Tier**: 3。
@@ -322,8 +329,8 @@ Track C: モバイル
 2. ~~Phase 2b マクロ書き込み → Tier 3 レビュー → マージ~~ **完了（実機確認済み）**
 3. **Phase 2c BLE OTA: 実機 btsnoop で wire / ACK を確定 → ACK `offset` / `total_len` 照合とマルチセクション `.dat` 対応 → Tier 3 → CLI / GUI / UniFFI 配線 → 実機書込**
 4. ~~Phase 2d 設定書き込み → Tier 3 レビュー → マージ~~ **完了（実機確認済み）**
-5. ~~Phase 3a GUI 読み取り専用~~ **完了** / ~~Phase 3b / 3d GUI 書き込み UI~~ **PR #16 で実装済み（実機未検証）**。次に着手するのは **Phase 3c OTA 画面**（Phase 2c の実機 wire 確定後）と、GUI 書込の実機確認（Tier 3）
-6. Phase 5 モバイル: Android JNI 同梱 APK → 実機確認 → 配布（書き込み・OTA は後続）
+5. ~~Phase 3a GUI 読み取り専用~~ **完了** / ~~Phase 3b / 3d GUI 書き込み UI~~ **PR #16 で実装・main にマージ済み（実機未検証）**。次に着手するのは **Phase 3c OTA 画面**（Phase 2c の実機 wire 確定後）と、GUI 書込の実機確認（Tier 3）。GUI ライセンス画面は PR #24（レビュー中・未マージ）、プロファイル切替（`0x0015`）の core / CLI 配線は PR #26（レビュー中・未マージ）
+6. Phase 5 モバイル: ~~Android JNI 同梱 APK のビルド~~ **完了（#21）** → 実機 BLE・JNI ロード確認 → 署名・配布（書き込み・OTA は後続）
 7. Phase 2e / 4（USB / 2.4G）: 実機証跡と USB Boot TX フレーミングが揃うまで保留
 
 ### 5.4 残課題（優先順）
@@ -335,11 +342,16 @@ Track C: モバイル
 | 3 | マルチセクション `.dat` 対応（公式 `.dat` がマルチセクションなら現実装は拒否する） | 公式ファーム更新の blocker | 3 |
 | 4 | OTA の CLI / GUI / UniFFI 配線、バッテリー警告、バージョン / ダウングレード判定、SHA-256 検証 | OTA 未提供 | 3 |
 | 5 | GUI 書込み UI（PR #16）の実機確認と、Phase 3c OTA 画面。backup 復元 UI・JSON/TOML 入出力 | GUI 書込が実機未検証 | 3 |
-| 6 | Android NDK + cargo-ndk による Rust JNI 同梱 APK | Android 実機でコア不可 | 2–3 |
-| 7 | iOS / Android 実機での BLE 読み取り確認、App Store 配布（macOS 必須） | モバイル未実証 | 3 |
+| 6 | ~~Android NDK + cargo-ndk による Rust JNI 同梱 APK~~ **完了（#21、ビルド・パッケージ確認のみ）**。残るのは Android 実機 / エミュレータでの JNI ロード確認 | Android 実機でコア未確認 | 3 |
+| 7 | iOS / Android 実機での BLE 読み取り確認、署名・App Store 配布（macOS 必須） | モバイル未実証 | 3 |
 | 8 | macOS / Windows の BLE 実機確認（現状は Linux のみ） | クロスプラットフォーム未実証 | 2–3 |
 | 9 | マクロ M3/M4・slot S2/S3、MTU 200 以外、REPL 経由の書込の実機確認 | 外挿・未検証が残る | 3 |
-| 10 | USB HID / 2.4G transport と USB OTA（USB Boot TX 未文書化） | Phase 2e / 4 保留 | 3 |
+| 10 | **既知バグ: BLE 切断後も `session` の `status` が `connected: true` と keepalive カウンタを保持する。送信時に `Not connected` エラーが返ることは確認済み（2026-11-23 発見・未修正）** | リンク断を `status` から検知できない | 3 |
+| 11 | USB HID / 2.4G transport と USB OTA（USB Boot TX 未文書化） | Phase 2e / 4 保留 | 3 |
+| 12 | GUI ライセンス画面（PR #24、レビュー中・未マージ） | ライセンス表示が GUI に無い | 1–2 |
+| 13 | プロファイル切替 API（PR #26、レビュー中・未マージ。core `Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`） | `0x0015` の core / CLI 配線が未マージ | 3 |
+
+**実機の追加確認（2026-11-23）**: Linux BLE・MTU 200 で再接続し、version `0xC8`、config full write → read-back、`config remap A B` → read-back で `A A` の往復（read-back SHA `fae1de6…` / `7a9838e…`）、`macro restore`（slot 0 の M1/M2、read-back SHA `7ebbfde…` / `c6f2419…`、22 packets）を再確認した。実機 config の SHA は 2026-11-22 時点の `1dca47fa…` と異なる（プロファイル名 `za` / `Profile2` を設定したためと考えられ、現在は `95b87bb0…`）ため、**固定値ではなく、各操作後の read-back が期待状態と一致し、復帰後は書込前の read-back と一致する**ことで検証している。
 
 ---
 
