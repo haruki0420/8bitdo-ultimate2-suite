@@ -167,6 +167,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 | **[LICENSE-MIT](LICENSE-MIT)** / **[LICENSE-APACHE](LICENSE-APACHE)** | コードのライセンス全文（MIT / Apache-2.0） |
 | **[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)** | 依存ライブラリのライセンス一覧、帰属表示、同梱フォント（OFL / UFL）・Gradle wrapper（Apache-2.0）の扱い |
 | **[TRADEMARKS.md](TRADEMARKS.md)** | 第三者の商標、非公式・非提携、ロゴ不使用の方針 |
+| **[docs/ANTI_SLOP.md](docs/ANTI_SLOP.md)** | AI 生成 UI が量産的に見える原因と、適用量のトリアージ（heavy / light / no-slop）。heavy のみ方向 5 行 → 9 パス → サイズ別スクショ検証を通す手順（検出チェックリストは §2、自動テスト等は §4） |
 | **[docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md)** | リポジトリ公開・コードライセンス・商標・同梱フォント・App Store / Google Play 配布・マネタイズの決定事項（決定日 2026-11-23）と未決定事項 |
 
 ---
