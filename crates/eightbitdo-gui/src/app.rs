@@ -206,6 +206,8 @@ pub struct App {
     right_trail: VecDeque<(f32, f32)>,
     tab_underline_x: f32,
     motion_scale: f32,
+    /// Whether the licenses / open-source screen is open.
+    licenses_open: bool,
 }
 
 impl App {
@@ -252,6 +254,7 @@ impl App {
             right_trail: VecDeque::new(),
             tab_underline_x: 0.0,
             motion_scale: 1.0,
+            licenses_open: false,
         }
     }
 
@@ -849,7 +852,7 @@ impl App {
                 );
 
                 let inner = rect.shrink2(Vec2::new(20.0, 20.0));
-                let footer_height = 124.0;
+                let footer_height = 150.0;
                 let body_height = (inner.height() - footer_height).max(80.0);
                 let body_rect =
                     Rect::from_min_size(inner.min, Vec2::new(inner.width(), body_height));
@@ -1046,6 +1049,21 @@ impl App {
         section_label(ui, self.lang, Key::SectionSafety);
         ui.add_space(theme::SPACE_1);
         ui.add(egui::Label::new(theme::job_meta(self.text(Key::SafetyText))).wrap());
+        ui.add_space(theme::SPACE_2);
+        // The write confirmation is a centered modal that covers this button
+        // and must be resolved first; disabling the entry keeps the two
+        // dialogs from being open at once.
+        if secondary_key(
+            ui,
+            "open-licenses",
+            self.pending.is_none(),
+            self.text(Key::OpenLicenses),
+            theme::SURFACE_2,
+        )
+        .clicked()
+        {
+            self.licenses_open = true;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2588,6 +2606,104 @@ impl App {
         self.side_panel(ctx);
         self.central_panel(ctx);
         self.write_dialog(ctx);
+        self.licenses_dialog(ctx);
+    }
+
+    /// Licenses / open-source screen.
+    ///
+    /// Binary distribution must ship the OFL / UFL / MIT texts for the bundled
+    /// fonts, so they are embedded with `include_str!` (see [`crate::licenses`])
+    /// and shown here. `docs/DISTRIBUTION_POLICY.md` §4.4 keeps this list and
+    /// `THIRD_PARTY_LICENSES.md` in sync.
+    fn licenses_dialog(&mut self, ctx: &egui::Context) {
+        if !self.licenses_open {
+            return;
+        }
+        let lang = self.lang;
+        let mut close = false;
+        let mut open = true;
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.licenses_open = false;
+            return;
+        }
+        egui::Window::new(i18n::t(lang, Key::LicensesTitle))
+            .id(Id::new("licenses"))
+            .collapsible(false)
+            .resizable(false)
+            .vscroll(false)
+            .open(&mut open)
+            // A centred window taller than the viewport clips both its title
+            // bar and the close key, so cap it at the screen height.
+            .max_height((ctx.screen_rect().height() - 32.0).max(260.0))
+            .max_width(760.0)
+            .default_width(720.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.add(egui::Label::new(theme::job_meta(i18n::t(lang, Key::LicensesIntro))).wrap());
+                ui.add_space(theme::SPACE_3);
+                section_label(ui, lang, Key::LicensesAppHeading);
+                ui.add(
+                    egui::Label::new(theme::job_meta(i18n::t(lang, Key::LicensesAppBody))).wrap(),
+                );
+                ui.add_space(theme::SPACE_3);
+                section_label(ui, lang, Key::LicensesNotoHeading);
+                ui.add(
+                    egui::Label::new(theme::job_meta(i18n::t(lang, Key::LicensesNotoNote))).wrap(),
+                );
+                ui.add_space(theme::SPACE_3);
+                section_label(ui, lang, Key::LicensesEguiHeading);
+                ui.add(
+                    egui::Label::new(theme::job_meta(i18n::t(lang, Key::LicensesEguiNote))).wrap(),
+                );
+                ui.add_space(theme::SPACE_2);
+                for (font, holder) in crate::licenses::ATTRIBUTIONS {
+                    ui.add(egui::Label::new(theme::job_meta(&format!("{font}: {holder}"))).wrap());
+                }
+                ui.add_space(theme::SPACE_3);
+                // The header and the close key are fixed; only the text
+                // viewport shrinks in short windows so the close key stays
+                // reachable. The viewport height is the stable input here:
+                // inside an auto-sized window the available height depends on
+                // the size this frame has not settled on yet.
+                let scroll_height = (ctx.screen_rect().height() - 560.0).clamp(96.0, 240.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("licenses-scroll")
+                    .max_height(scroll_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for license in crate::licenses::ALL {
+                            ui.add_space(theme::SPACE_2);
+                            ui.add(egui::Label::new(theme::text_job(
+                                license.name,
+                                theme::medium(theme::FONT_BODY),
+                                theme::TEXT,
+                                0.0,
+                                None,
+                            )));
+                            ui.add_space(theme::SPACE_1);
+                            ui.add(
+                                egui::Label::new(theme::job_meta(license.body))
+                                    .wrap()
+                                    .selectable(true),
+                            );
+                        }
+                    });
+                ui.add_space(theme::SPACE_3);
+                if secondary_key(
+                    ui,
+                    "licenses-close",
+                    true,
+                    i18n::t(lang, Key::LicensesClose),
+                    theme::SURFACE_2,
+                )
+                .clicked()
+                {
+                    close = true;
+                }
+            });
+        if close || !open {
+            self.licenses_open = false;
+        }
     }
 }
 
@@ -4999,5 +5115,91 @@ mod tests {
             widest <= theme::CONTENT_MAX_WIDTH + 1.0,
             "body text must stay inside the content column, widest was {widest}"
         );
+    }
+
+    #[test]
+    fn headless_licenses_screen_opens_shows_attribution_and_closes() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let base = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            ..Default::default()
+        };
+
+        let mut app = app();
+        app.licenses_open = true;
+        // An egui window auto-sizes over several frames (text wraps once the
+        // width is known), so let the layout settle before reading rects.
+        for _ in 0..8 {
+            let _ = ctx.run(base.clone(), |ctx| app.draw(ctx));
+        }
+        let output = ctx.run(base.clone(), |ctx| app.draw(ctx));
+        let texts = text_shapes(&output);
+
+        // The app license (MIT + Apache-2.0) and every attribution line are on
+        // screen, and the subset marker required by DISTRIBUTION_POLICY §4.4 is
+        // part of the heading.
+        assert!(texts
+            .iter()
+            .any(|(text, _, _)| text == "ライセンス / オープンソース"));
+        assert!(texts
+            .iter()
+            .any(|(text, _, _)| text == "Noto Sans JP (subset) — 同梱フォント"));
+        assert!(texts
+            .iter()
+            .any(|(text, _, _)| text.contains("eightbitdo-suite — MIT License")));
+        for holder in [
+            "Copyright 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'",
+            "Copyright 2013 Google Inc. All Rights Reserved.",
+            "Copyright 2011 Canonical Ltd.",
+            "Copyright (c) 2018 Source Foundry Authors",
+            "Copyright (c) 2014 John Slegers",
+        ] {
+            assert!(
+                texts.iter().any(|(text, _, _)| text.contains(holder)),
+                "attribution line {holder:?} is not painted"
+            );
+        }
+        let close = texts
+            .iter()
+            .find(|(text, _, _)| text == "閉じる")
+            .map(|(_, rect, _)| *rect)
+            .expect("the close key is painted");
+
+        // A press and a release on 閉じる dismisses the screen. egui resolves a
+        // same-frame press/release as a click (it is not treated as a drag).
+        let at = close.center();
+        let pointer_button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut click = base.clone();
+        click.events = vec![
+            egui::Event::PointerMoved(at),
+            pointer_button(true),
+            pointer_button(false),
+        ];
+        let _ = ctx.run(click, |ctx| app.draw(ctx));
+        assert!(
+            !app.licenses_open,
+            "the close key must close the licenses screen"
+        );
+
+        // Escape closes it too.
+        app.licenses_open = true;
+        // Let the window lay out again before sending the key.
+        let _ = ctx.run(base.clone(), |ctx| app.draw(ctx));
+        let mut escape = base;
+        escape.events = vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }];
+        let _ = ctx.run(escape, |ctx| app.draw(ctx));
+        assert!(!app.licenses_open, "Escape must close the licenses screen");
     }
 }

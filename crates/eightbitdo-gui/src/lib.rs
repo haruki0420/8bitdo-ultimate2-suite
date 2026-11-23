@@ -21,6 +21,7 @@ pub mod app;
 pub mod backup;
 pub mod driver;
 pub mod i18n;
+pub mod licenses;
 pub mod model;
 pub mod theme;
 pub mod util;

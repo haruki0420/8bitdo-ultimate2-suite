@@ -100,6 +100,7 @@ JSON は CLI のサマリと互換のキー（`size`, `sha256`, `cur_slot`, `gam
 ```text
 crates/eightbitdo-gui/
   assets/fonts/            Noto Sans JP のサブセット（Regular/Medium/Bold）+ OFL.txt
+  assets/licenses/         アプリと同梱フォントのライセンス全文（include_str! で埋め込み）
   src/
     main.rs    eframe の起動だけを行う薄いエントリポイント（窓タイトルは日本語）
     app.rs     egui の画面。UI スレッドで .await しない
@@ -180,7 +181,16 @@ crates/eightbitdo-gui/
 - **フォント**: Noto Sans CJK JP（OFL 1.1）を JIS X 0208 第 1・2 水準 +
   UI 文言へサブセット化。Regular 1.48 MiB / Medium 0.11 MiB / Bold 0.11 MiB。
   同梱物と生成手順は [`assets/fonts/README.md`](assets/fonts/README.md)、
-  ライセンス本文は [`assets/fonts/OFL.txt`](assets/fonts/OFL.txt)。
+  ライセンス本文は [`assets/licenses/OFL-NotoSansJP.txt`](assets/licenses/OFL-NotoSansJP.txt)
+  （[`assets/fonts/OFL.txt`](assets/fonts/OFL.txt) と同一内容を維持）。
+- **ライセンス画面**: 左レール下部の「ライセンス」ボタン（Esc・閉じるボタン・
+  ウィンドウの × で閉じる。書き込み確認中は開けない）。このアプリの MIT /
+  Apache-2.0 全文（リポジトリ直下の `LICENSE-MIT` / `LICENSE-APACHE`）と、
+  同梱フォント（Noto Sans JP (subset) / NotoEmoji / Ubuntu-Light / Hack /
+  emoji-icon-font）の全文・著作権表示（`licenses::ATTRIBUTIONS`）を表示する。
+  フォント原文は [`assets/licenses/`](assets/licenses/) に置き、
+  [`src/licenses.rs`](src/licenses.rs) の `include_str!` でバイナリに埋め込む
+  （`docs/DISTRIBUTION_POLICY.md` §4.4 のリリースチェックリストと対応）。
 
 ## 検証
 
