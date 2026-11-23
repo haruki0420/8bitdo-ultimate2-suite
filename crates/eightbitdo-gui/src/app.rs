@@ -206,6 +206,8 @@ pub struct App {
     right_trail: VecDeque<(f32, f32)>,
     tab_underline_x: f32,
     motion_scale: f32,
+    /// Whether the licenses / open-source screen is open.
+    licenses_open: bool,
 }
 
 impl App {
@@ -252,6 +254,7 @@ impl App {
             right_trail: VecDeque::new(),
             tab_underline_x: 0.0,
             motion_scale: 1.0,
+            licenses_open: false,
         }
     }
 
@@ -1046,6 +1049,18 @@ impl App {
         section_label(ui, self.lang, Key::SectionSafety);
         ui.add_space(theme::SPACE_1);
         ui.add(egui::Label::new(theme::job_meta(self.text(Key::SafetyText))).wrap());
+        ui.add_space(theme::SPACE_2);
+        if secondary_key(
+            ui,
+            "open-licenses",
+            true,
+            self.text(Key::OpenLicenses),
+            theme::SURFACE_2,
+        )
+        .clicked()
+        {
+            self.licenses_open = true;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2588,6 +2603,86 @@ impl App {
         self.side_panel(ctx);
         self.central_panel(ctx);
         self.write_dialog(ctx);
+        self.licenses_dialog(ctx);
+    }
+
+    /// Licenses / open-source screen.
+    ///
+    /// Binary distribution must ship the OFL / UFL / MIT texts for the bundled
+    /// fonts, so they are embedded with `include_str!` (see [`crate::licenses`])
+    /// and shown here. `docs/DISTRIBUTION_POLICY.md` §4.4 keeps this list and
+    /// `THIRD_PARTY_LICENSES.md` in sync.
+    fn licenses_dialog(&mut self, ctx: &egui::Context) {
+        if !self.licenses_open {
+            return;
+        }
+        let lang = self.lang;
+        let mut close = false;
+        egui::Window::new(i18n::t(lang, Key::LicensesTitle))
+            .id(Id::new("licenses"))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(720.0)
+            .default_height(560.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.add(egui::Label::new(theme::job_meta(i18n::t(lang, Key::LicensesIntro))).wrap());
+                ui.add_space(theme::SPACE_3);
+                ui.horizontal(|ui| {
+                    section_label(ui, lang, Key::LicensesAppHeading);
+                });
+                ui.add(
+                    egui::Label::new(theme::job_meta(i18n::t(lang, Key::LicensesAppBody))).wrap(),
+                );
+                ui.add_space(theme::SPACE_3);
+                section_label(ui, lang, Key::LicensesNotoHeading);
+                ui.add(
+                    egui::Label::new(theme::job_meta(i18n::t(lang, Key::LicensesNotoNote))).wrap(),
+                );
+                ui.add_space(theme::SPACE_3);
+                section_label(ui, lang, Key::LicensesEguiHeading);
+                ui.add(
+                    egui::Label::new(theme::job_meta(i18n::t(lang, Key::LicensesEguiNote))).wrap(),
+                );
+                ui.add_space(theme::SPACE_3);
+                egui::ScrollArea::vertical()
+                    .id_salt("licenses-scroll")
+                    .max_height(320.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for license in crate::licenses::ALL {
+                            ui.add_space(theme::SPACE_2);
+                            ui.add(egui::Label::new(theme::text_job(
+                                license.name,
+                                theme::medium(theme::FONT_BODY),
+                                theme::TEXT,
+                                0.0,
+                                None,
+                            )));
+                            ui.add_space(theme::SPACE_1);
+                            ui.add(
+                                egui::Label::new(theme::job_meta(license.body))
+                                    .wrap()
+                                    .selectable(true),
+                            );
+                        }
+                    });
+                ui.add_space(theme::SPACE_3);
+                if secondary_key(
+                    ui,
+                    "licenses-close",
+                    true,
+                    i18n::t(lang, Key::LicensesClose),
+                    theme::SURFACE_2,
+                )
+                .clicked()
+                {
+                    close = true;
+                }
+            });
+        if close {
+            self.licenses_open = false;
+        }
     }
 }
 

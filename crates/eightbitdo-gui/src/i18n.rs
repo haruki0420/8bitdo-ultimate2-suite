@@ -124,6 +124,16 @@ define_keys! {
     SectionNextSteps => "次の一手" | "Next step",
     SectionConnectSteps => "接続の手順" | "Connection steps",
     FooterMeta => "書き込み対応 / 設定 2768 バイト / マクロ 4×3" | "Write-capable / 2768-byte config / 4×3 macros",
+    OpenLicenses => "ライセンス" | "Licenses",
+    LicensesTitle => "ライセンス / オープンソース" | "Licenses / open source",
+    LicensesIntro => "この配布物に含まれる第三者ソフトウェアとフォントのライセンス全文です。リポジトリの THIRD_PARTY_LICENSES.md も参照してください。" | "Full license texts for the third-party software and fonts bundled with this build. See THIRD_PARTY_LICENSES.md in the repository as well.",
+    LicensesAppHeading => "このアプリ" | "This application",
+    LicensesAppBody => "eightbitdo-suite は MIT License または Apache License 2.0 のいずれかを選択して利用できます（MIT OR Apache-2.0）。全文はリポジトリの LICENSE-MIT / LICENSE-APACHE にあります。" | "eightbitdo-suite is available under either the MIT License or the Apache License 2.0 (MIT OR Apache-2.0). The full texts are in LICENSE-MIT / LICENSE-APACHE in the repository.",
+    LicensesNotoHeading => "Noto Sans JP（同梱フォント）" | "Noto Sans JP (bundled font)",
+    LicensesNotoNote => "SIL Open Font License 1.1。サブセットを同梱しています。" | "SIL Open Font License 1.1. A subset is bundled.",
+    LicensesEguiHeading => "egui 既定フォント" | "egui default fonts",
+    LicensesEguiNote => "NotoEmoji（OFL 1.1）、Ubuntu-Light（Ubuntu Font Licence 1.0）、Hack（MIT + Bitstream Vera + DejaVu）、emoji-icon-font（MIT）。各全文を以下に収録しています。" | "NotoEmoji (OFL 1.1), Ubuntu-Light (Ubuntu Font Licence 1.0), Hack (MIT + Bitstream Vera + DejaVu), emoji-icon-font (MIT). The full texts follow.",
+    LicensesClose => "閉じる" | "Close",
 
     // Connection controls and onboarding.
     Connect => "80ND に接続" | "Connect to 80ND",

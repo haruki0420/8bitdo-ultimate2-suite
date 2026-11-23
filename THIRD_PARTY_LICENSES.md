@@ -349,7 +349,7 @@ Copyright 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Sour
 - `crates/eightbitdo-gui/assets/fonts/OFL.txt` に**上流の OFL.txt を改変せず**配置する（現状は配置済み）。
 - **サブセット化は可能**（Modified Version 扱い）。サブセット版も OFL で配布し、`Source` を名前に使わず、Adobe / Google の著作権表示を保持し、単体販売しない。アプリ内では「サブセット版である」旨を明記する。
 - `Noto` は Google のブランドです。OFL は商標権を許諾しないため、公式 Noto と誤認させない（例: `Noto Sans JP (subset)` と表示）。
-- **未対応（残課題）**: GUI の **About > Open Source Licenses** 等のライセンス画面は未実装です。現状 `OFL.txt` はリポジトリにあるだけで、バイナリには `include_bytes!` していません。バイナリ配布前に、OFL 全文と著作権表示、サブセットである旨を閲覧できる形で同梱してください（standalone のテキストファイル、またはライセンス画面）。
+- **実装済み（2026-11-23）**: GUI のライセンス画面（左レール下部の「ライセンス」ボタン → `App::licenses_dialog`）が、OFL 全文・著作権表示・サブセット表記・egui 同梱フォントの 4 ライセンスを表示します。全文は `crates/eightbitdo-gui/assets/licenses/` に置き、`crates/eightbitdo-gui/src/licenses.rs` の `include_str!` でバイナリに埋め込んでいます（配布物は standalone のテキストと画面の両方で要件を満たす形）。
 - アプリのライセンス（MIT / Apache-2.0）とフォントの OFL は独立です。アプリのライセンス条項で OFL の義務を制限しないでください。
 - `egui` の `default_fonts` も有効なため、egui 同梱フォントの帰属（OFL / UFL / MIT / Bitstream Vera）も本ファイルとライセンス画面に追加する（§3.6.1）。
 

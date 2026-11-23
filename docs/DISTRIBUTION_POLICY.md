@@ -19,7 +19,7 @@
 | CLA | **導入しない**。当面は inbound=outbound（§2.4） |
 | 商標 | 説明的使用のみ。公式バイナリ・ファーム・ロゴを同梱しない。アプリ名に商標・製品名を使わない |
 | 同梱フォント | Noto Sans JP（OFL-1.1）と egui 既定フォントを同梱する |
-| ライセンス帰属表示 | **未実装**。バイナリ配布のリリース blocker とする（§4.3・§4.4） |
+| ライセンス帰属表示 | **実装済み**（GUI のライセンス画面に全文を埋め込み）。配布時に §4.4 を再確認する |
 | ストア配布 | 無料配布・IAP なし。MPL-2.0 の runtime 依存と両立させ、GPL / LGPL は選択しない（§5.2・§5.3） |
 | マネタイズ | 寄付・スポンサー・有料サポート。ストア課金は条件付きの将来案 |
 
@@ -149,20 +149,21 @@
 - `LicenseRef-UFL-1.0` は SPDX 標準識別子ではない。`cargo-deny` を導入する場合は例外扱いを検討する（[THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md) 付録 B）。
 - Ubuntu Font Licence 1.0 は OFL 1.1 を基礎にしたライセンスで、単体販売の禁止と予約名 "Ubuntu" の扱いを持つ。egui 同梱の `Ubuntu-Light.ttf` は**未改変のままアプリに同梱**するため、改変・単体販売の条件には該当せず、帰属表示で足りると理解している（法的助言ではない）。
 
-### 4.3 帰属の実装状況（未実施・リリース blocker）
+### 4.3 帰属の実装状況（実装済み・配布時に確認）
 
-- **未実施**: フォント本体は `include_bytes!` で GUI バイナリに同梱済み（`crates/eightbitdo-gui/src/theme.rs`）だが、`OFL.txt` と egui の 4 ライセンスファイルはバイナリに含めていない。ライセンス画面（About > Open Source Licenses 等）も未実装（2026-11-23 確認。[THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md) §5.3）。
-- **決定**: 帰属表示の欠落は**バイナリ配布（ストア配布を含む）のリリース blocker** とする。§4.4 を満たすまでバイナリを配布しない。ライセンス画面の実装は別 PR とし、レビュー Tier は [REVIEW_TIERS.md](REVIEW_TIERS.md) に従う。
+- **実装済み（2026-11-23）**: フォント本体は `include_bytes!` で GUI バイナリに同梱済み（`crates/eightbitdo-gui/src/theme.rs`）。ライセンス全文は `crates/eightbitdo-gui/assets/licenses/` に置き、`crates/eightbitdo-gui/src/licenses.rs` の `include_str!` でバイナリに埋め込む。GUI の左レール下部「ライセンス」ボタンから開く画面（`App::licenses_dialog`）で、Noto Sans JP（OFL 1.1）・NotoEmoji（OFL 1.1）・Ubuntu-Light（UFL 1.0）・Hack（MIT + Bitstream Vera + DejaVu）・emoji-icon-font（MIT）の全文と、このアプリの `MIT OR Apache-2.0` をユーザーが閲覧できる。
+- **決定**: 帰属表示の欠落は**バイナリ配布（ストア配布を含む）のリリース blocker** とする。§4.4 を満たすまでバイナリを配布しない。
 
 ### 4.4 バイナリ配布前のリリースチェックリスト
 
-- [ ] `crates/eightbitdo-gui/assets/fonts/OFL.txt`（上流の OFL 全文、改変なし）をバイナリ配布物に含める。
-- [ ] egui の 4 ライセンスファイル（`fonts/OFL.txt` / `fonts/UFL.txt` / `fonts/Hack-Regular.txt` / `fonts/emoji-icon-font-mit-license.txt`）を含める。
-- [ ] Noto Sans JP の著作権表示（`Copyright 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'`）を含める。
-- [ ] Noto Sans JP をサブセット版として表記する（"Noto Sans JP (subset)"。公式 Noto と誤認させない）。
-- [ ] Ubuntu Light（UFL-1.0）の帰属と UFL 全文を、閲覧できる形で含める。
-- [ ] ライセンス画面または同梱テキストから、上記をユーザーが閲覧できる。
-- [ ] `THIRD_PARTY_LICENSES.md` の記載と実際の同梱物が一致している。
+- [x] `crates/eightbitdo-gui/assets/licenses/OFL-NotoSansJP.txt`（上流の OFL 全文、改変なし）をバイナリに埋め込む（`licenses.rs`）。
+- [x] egui の 4 ライセンスファイル（`OFL-NotoEmoji-Ubuntu.txt` / `UFL-Ubuntu.txt` / `Hack-BitstreamVera.txt` / `emoji-icon-font-MIT.txt`）をバイナリに埋め込む。
+- [x] Noto Sans JP の著作権表示（`Copyright 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'`）を含める。
+- [x] Noto Sans JP をサブセット版として表記する（"Noto Sans JP (subset)"。公式 Noto と誤認させない）。
+- [x] Ubuntu Light（UFL-1.0）の帰属と UFL 全文を、閲覧できる形で含める。
+- [x] ライセンス画面から、上記をユーザーが閲覧できる（`crates/eightbitdo-gui/src/app.rs` の `licenses_dialog`）。
+- [ ] `THIRD_PARTY_LICENSES.md` の記載と実際の同梱物が一致している（リリース時に再確認）。
+- [ ] リリースビルドで `cargo test -p eightbitdo-gui licenses` が通る（埋め込みテキストの存在をテストで固定）。
 
 OFL / UFL の条文解釈と同梱方法の最終判断は、専門家に確認すること（法的助言ではない）。
 

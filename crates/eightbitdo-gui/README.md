@@ -181,6 +181,12 @@ crates/eightbitdo-gui/
   UI 文言へサブセット化。Regular 1.48 MiB / Medium 0.11 MiB / Bold 0.11 MiB。
   同梱物と生成手順は [`assets/fonts/README.md`](assets/fonts/README.md)、
   ライセンス本文は [`assets/fonts/OFL.txt`](assets/fonts/OFL.txt)。
+- **ライセンス画面**: 左レール下部の「ライセンス」ボタンで、同梱フォント
+  （Noto Sans JP / NotoEmoji / Ubuntu-Light / Hack / emoji-icon-font）とこの
+  アプリのライセンス全文を表示する。原文は
+  [`assets/licenses/`](assets/licenses/) に置き、[`src/licenses.rs`](src/licenses.rs)
+  の `include_str!` でバイナリに埋め込む（`docs/DISTRIBUTION_POLICY.md` §4.4
+  のリリースチェックリストと対応）。
 
 ## 検証
 
