@@ -1,0 +1,112 @@
+/* Padbench design tokens — 正本: docs/DESIGN_TAURI.md §5
+ *
+ * このファイルの CSS 変数が実装上の唯一の値です。Tailwind の `@theme`（index.css）は
+ * ここで定義した変数を参照するだけで、値は書きません。`src/design/tokens.ts` は
+ * テストと TypeScript から同じ値を参照するための写しで、tokens.test.ts が両者の一致を
+ * 検査します。値を変えるときは 3 か所（ここ・tokens.ts・テスト）を同時に直します。
+ *
+ * 色は「ライト面 + 入力モニターの暗いステージ」の 2 スコープです。ステージの変数は
+ * `[data-surface="stage"]` の中だけで有効になります（§5.1.4）。
+ */
+
+:root {
+  color-scheme: light;
+
+  /* ライト面（§5.1.2） */
+  --surface-bg: #f4f6f7;
+  --surface-panel: #ffffff;
+  --surface-sunken: #edf0f2;
+  --surface-hover: #f1f4f5;
+  --surface-active: #e7ebee;
+
+  /* 境界（§5.1.2）: line は構造、line-strong は操作要素の輪郭（3:1 以上） */
+  --line: #d6dce0;
+  --line-strong: #7c868f;
+
+  /* 文字（§5.1.2） */
+  --text: #15191c;
+  --text-2: #3a434b;
+  --text-muted: #5b656e;
+  --text-disabled: #646e78;
+
+  /* アクセントと主キー（§5.1.2）: アクセントは 1 色だけ */
+  --accent: #0b6a63;
+  --accent-soft: #e3f1ef;
+  --ink-fill: #15191c;
+  --ink-hover: #2a3138;
+  --ink-active: #0b0e10;
+  --on-ink: #ffffff;
+
+  /* 状態色（§5.1.3） */
+  --warning: #8a5200;
+  --warning-soft: #fdf4e3;
+  --danger: #ae2418;
+  --danger-soft: #fcefee;
+  --danger-fill: #a3211a;
+  --danger-fill-hover: #8e1c13;
+  --success: #15653c;
+  --success-soft: #e7f4ec;
+
+  /* その他 */
+  --overlay: rgba(11, 14, 17, 0.44);
+  --bar-w: 3px;
+
+  /* 書体（§5.2.1）
+   * TODO(fonts): Noto Sans JP / Hack の woff2 サブセットは未同梱です。フォントファイルを
+   * apps/desktop/public/fonts/ に置いたら @font-face（font-display: swap）と preload を
+   * 追加し、このスタックの先頭に "Noto Sans JP" / "Hack" が実在する状態にしてください。
+   * 現状は OS の日本語フォントと Hack にフォールバックします。 */
+  --font-ui:
+    "Noto Sans JP", "Noto Sans CJK JP", "Hiragino Kaku Gothic ProN",
+    "Yu Gothic UI", "Yu Gothic", system-ui, sans-serif;
+  --font-data:
+    "Hack", "SFMono-Regular", "Cascadia Mono", ui-monospace, "DejaVu Sans Mono",
+    monospace;
+
+  /* 寸法（§5.3.2）: 200% ズームでも崩れないよう rem で持つ（52px = 3.25rem など） */
+  --topbar-h: 3.25rem;
+  --nav-w: 13.5rem;
+  --rail-w: 21.5rem;
+  --rail-w-min: 20rem;
+  --content-max: 45rem;
+  --control-h: 2rem;
+  --control-h-sm: 1.75rem;
+  --row-h: 2.25rem;
+  --row-header-h: 2rem;
+  --tab-h: 2.5rem;
+  --nav-row-h: 2.125rem;
+  --stage-h: 15rem;
+  --stage-h-short: 12.5rem;
+  --dialog-w: 30rem;
+  --dialog-w-lg: 35rem;
+
+  /* モーション（§5.7.1）: 曲線は 1 本だけ */
+  --dur-1: 90ms;
+  --dur-2: 160ms;
+  --dur-3: 240ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* ダークステージ（§5.1.4）: 光はこのスコープの中だけで使う */
+[data-surface="stage"] {
+  --stage-bg: #0e1115;
+  --stage-panel: #141a1f;
+  --stage-line: #2a3239;
+  --stage-line-strong: #3c4752;
+  --stage-text: #e7eaee;
+  --stage-text-2: #a9b2bc;
+  --stage-text-muted: #7e8893;
+  --stage-led: #6fe7d8;
+  --stage-led-dim: #3a6f69;
+  --stage-amber: #e9b65c;
+  --stage-danger: #ff8f8f;
+}
+
+/* reduce-motion（§5.7.2）: 動きだけを止め、状態は残す */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-1: 0ms;
+    --dur-2: 0ms;
+    --dur-3: 0ms;
+  }
+}

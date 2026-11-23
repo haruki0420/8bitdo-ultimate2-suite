@@ -1,50 +1,81 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
+import { Button, Dialog, Toast, type ToastTone } from "./components";
 import { getAppInfo, type AppInfo } from "./lib/app-info";
+import { DevicesScreen } from "./screens/DevicesScreen";
+import { InputMonitorScreen } from "./screens/InputMonitorScreen";
+import { PlaceholderScreen } from "./screens/PlaceholderScreen";
+import { SafetyRail } from "./shell/SafetyRail";
+import { SideNav } from "./shell/SideNav";
+import { TopBar } from "./shell/TopBar";
+import type { ViewId } from "./shell/views";
 
-interface NavItem {
-  id: string;
-  label: string;
-  /** Views beyond the device placeholder are implemented by later phases. */
-  available: boolean;
+interface ToastState {
+  tone: ToastTone;
+  title: string;
+  meta?: string;
 }
 
-const NAV_ITEMS: readonly NavItem[] = [
-  { id: "devices", label: "デバイス", available: true },
-  { id: "input", label: "ライブ入力", available: false },
-  { id: "config", label: "設定", available: false },
-  { id: "macros", label: "マクロ", available: false },
-  { id: "logs", label: "ログ", available: false },
-];
+type PlaceholderView = Exclude<ViewId, "devices" | "monitor">;
 
-const DEVICE_FACTS: readonly { label: string; value: string }[] = [
-  { label: "トランスポート", value: "BLE / USB（未実装）" },
-  { label: "ファームウェア", value: "—" },
-  { label: "プロファイル", value: "—" },
-];
+const PLACEHOLDERS: Record<
+  PlaceholderView,
+  { title: string; description: string }
+> = {
+  current: {
+    title: "現在値",
+    description: "接続したデバイスの現在値を読み込みます。",
+  },
+  settings: {
+    title: "設定",
+    description: "プロファイル・スティック・振動などを変更します。",
+  },
+  macros: {
+    title: "マクロ",
+    description: "マクロのステップを編集し、記録します。",
+  },
+  logs: {
+    title: "ログ",
+    description: "接続や書き込みの結果がここに残ります。",
+  },
+};
 
-function EmptyStateIcon() {
+function Screen({
+  view,
+  ipcError,
+  onScan,
+  onOpenDevices,
+}: {
+  view: ViewId;
+  ipcError: string | null;
+  onScan: () => void;
+  onOpenDevices: () => void;
+}) {
+  if (view === "devices") {
+    return <DevicesScreen ipcError={ipcError} onScan={onScan} />;
+  }
+
+  if (view === "monitor") {
+    return <InputMonitorScreen />;
+  }
+
+  const placeholder = PLACEHOLDERS[view];
+
   return (
-    <svg
-      aria-hidden="true"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className="h-6 w-6"
-    >
-      <path d="M6 8h12a3 3 0 0 1 3 3v5a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3v-5a3 3 0 0 1 3-3Z" />
-      <path d="M8 12v3M6.5 13.5h3M16 13h.01M18 15h.01" />
-    </svg>
+    <PlaceholderScreen
+      title={placeholder.title}
+      description={placeholder.description}
+      onOpenDevices={onOpenDevices}
+    />
   );
 }
 
 export default function App() {
-  const [activeView, setActiveView] = useState<string>("devices");
+  const [activeView, setActiveView] = useState<ViewId>("devices");
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [ipcError, setIpcError] = useState<string | null>(null);
+  const [toast, setToast] = useState<ToastState | null>(null);
+  const [licensesOpen, setLicensesOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -57,8 +88,8 @@ export default function App() {
       })
       .catch(() => {
         if (!cancelled) {
-          setError(
-            "Rust バックエンド（app_info）に接続できませんでした。Tauri ランタイム外で実行している可能性があります。",
+          setIpcError(
+            "Tauri ランタイム外で実行している可能性があります。Tauri から起動すると表示されます。",
           );
         }
       });
@@ -68,125 +99,99 @@ export default function App() {
     };
   }, []);
 
+  const closeToast = useCallback(() => {
+    setToast(null);
+  }, []);
+
+  const openDevices = useCallback(() => {
+    setActiveView("devices");
+  }, []);
+
+  const handleScan = useCallback(() => {
+    setToast({
+      tone: "warning",
+      title: "スキャンはまだ実装していません",
+      meta: "BLE 接続は次のフェーズで追加します",
+    });
+  }, []);
+
+  const closeLicenses = useCallback(() => {
+    setLicensesOpen(false);
+  }, []);
+
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-slate-950 text-slate-200">
-      <header className="flex h-14 shrink-0 items-center justify-between border-b border-slate-800 bg-slate-900/70 px-5">
-        <div className="flex items-center gap-3">
-          <div className="flex h-8 w-8 items-center justify-center rounded-md bg-emerald-500/15 text-sm font-bold text-emerald-300 ring-1 ring-emerald-500/30">
-            P
-          </div>
-          <div className="leading-tight">
-            <p className="text-sm font-semibold tracking-wide text-slate-100">
-              Padbench
-            </p>
-            <p className="text-[11px] text-slate-500">Desktop</p>
-          </div>
-        </div>
-        <div className="flex items-center gap-4 text-xs text-slate-400">
-          <span className="inline-flex items-center gap-2 rounded-full border border-slate-700 px-3 py-1">
-            <span
-              aria-hidden="true"
-              className="h-2 w-2 rounded-full bg-slate-500"
-            />
-            未接続
-          </span>
-          <span
-            data-testid="app-version"
-            className="font-mono text-slate-500"
-          >
-            {appInfo ? `v${appInfo.version}` : "v—"}
-          </span>
-        </div>
-      </header>
+    <div className="relative flex h-dvh flex-col overflow-hidden bg-bg text-ink">
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:rounded-sm focus:bg-panel focus:px-3 focus:py-2 focus:text-ui focus:font-medium focus:text-ink focus:shadow-focus"
+      >
+        本文へスキップ
+      </a>
+
+      <TopBar appInfo={appInfo} />
 
       <div className="flex min-h-0 flex-1">
-        <nav
-          aria-label="メインナビゲーション"
-          className="flex w-56 shrink-0 flex-col border-r border-slate-800 bg-slate-900/40 p-3"
-        >
-          <ul className="space-y-1">
-            {NAV_ITEMS.map((item) => {
-              const isActive = activeView === item.id;
+        <SideNav
+          activeView={activeView}
+          onSelect={setActiveView}
+          onOpenLicenses={() => setLicensesOpen(true)}
+        />
 
-              return (
-                <li key={item.id}>
-                  <button
-                    type="button"
-                    disabled={!item.available}
-                    onClick={() => setActiveView(item.id)}
-                    aria-current={isActive ? "page" : undefined}
-                    className={[
-                      "flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-sm transition-colors",
-                      isActive
-                        ? "bg-slate-800 text-slate-100"
-                        : item.available
-                          ? "text-slate-300 hover:bg-slate-800/60"
-                          : "cursor-not-allowed text-slate-600",
-                    ].join(" ")}
-                  >
-                    <span>{item.label}</span>
-                    {!item.available && (
-                      <span className="text-[10px] uppercase tracking-wider">
-                        準備中
-                      </span>
-                    )}
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
+        {/* 1180px 未満では右レールをコンテンツの下へ回す（§5.4.2） */}
+        <div className="flex min-w-0 flex-1 flex-col overflow-y-auto rail:flex-row rail:overflow-hidden">
+          <main
+            id="main-content"
+            tabIndex={-1}
+            className="min-w-0 flex-1 px-6 py-6 focus-visible:outline-hidden rail:overflow-y-auto"
+          >
+            <div className="mx-auto max-w-content">
+              <Screen
+                view={activeView}
+                ipcError={ipcError}
+                onScan={handleScan}
+                onOpenDevices={openDevices}
+              />
+            </div>
+          </main>
 
-          <div className="mt-auto space-y-1 border-t border-slate-800 pt-3 text-[11px] text-slate-500">
-            <p className="truncate">{appInfo?.name ?? "Padbench"}</p>
-            <p className="font-mono">Tauri {appInfo?.tauriVersion ?? "—"}</p>
-          </div>
-        </nav>
-
-        <main className="min-w-0 flex-1 overflow-y-auto p-8">
-          <div className="mx-auto max-w-3xl">
-            <h2 className="text-xl font-semibold text-slate-100">デバイス</h2>
-            <p className="mt-1 text-sm text-slate-400">
-              コントローラの接続状態をここに表示します。BLE
-              接続と読み取りは次のフェーズで実装予定です。
-            </p>
-
-            {error !== null && (
-              <div
-                role="alert"
-                className="mt-5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs leading-relaxed text-amber-200"
-              >
-                {error}
-              </div>
-            )}
-
-            <section className="mt-6 rounded-xl border border-dashed border-slate-800 bg-slate-900/30 px-6 py-12 text-center">
-              <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full border border-slate-700 text-slate-500">
-                <EmptyStateIcon />
-              </div>
-              <p className="mt-4 text-sm font-medium text-slate-300">
-                デバイスは未接続です
-              </p>
-              <p className="mt-1 text-xs text-slate-500">
-                8BitDo Ultimate 2（PID 0x600F / 0x6011）を検出すると、ここに状態が表示されます。
-              </p>
-            </section>
-
-            <dl className="mt-6 grid gap-3 sm:grid-cols-3">
-              {DEVICE_FACTS.map((fact) => (
-                <div
-                  key={fact.label}
-                  className="rounded-lg border border-slate-800 bg-slate-900/40 px-4 py-3"
-                >
-                  <dt className="text-[11px] uppercase tracking-wider text-slate-500">
-                    {fact.label}
-                  </dt>
-                  <dd className="mt-1 text-sm text-slate-300">{fact.value}</dd>
-                </div>
-              ))}
-            </dl>
-          </div>
-        </main>
+          <aside
+            aria-label="書き込み前の確認"
+            className="shrink-0 border-t border-line px-6 py-6 rail:w-rail rail:border-t-0 rail:border-l rail:overflow-y-auto"
+          >
+            <SafetyRail />
+          </aside>
+        </div>
       </div>
+
+      {toast !== null && (
+        <div className="pointer-events-none absolute right-5 bottom-5 z-30">
+          <Toast
+            tone={toast.tone}
+            title={toast.title}
+            meta={toast.meta}
+            onClose={closeToast}
+          />
+        </div>
+      )}
+
+      <Dialog
+        open={licensesOpen}
+        onClose={closeLicenses}
+        title="ライセンス"
+        footer={
+          <Button variant="secondary" onClick={closeLicenses}>
+            閉じる
+          </Button>
+        }
+      >
+        <p>アプリのライセンスは MIT または Apache-2.0 です。</p>
+        <p className="mt-2">
+          同梱フォントのライセンス全文の表示は次のフェーズで追加します。
+        </p>
+        <p className="mt-3 font-mono text-data tracking-data text-muted">
+          MIT OR Apache-2.0
+        </p>
+      </Dialog>
     </div>
   );
 }
