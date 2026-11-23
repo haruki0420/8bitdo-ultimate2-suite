@@ -7,7 +7,7 @@
 ## 1. プロジェクト概要
 
 - **目的**: **8BitDo Ultimate 2 Bluetooth Controller**（内部 PID `0x600F` / 2.4G レシーバー `0x6011`）を、Nintendo Switch と接続したまま **Linux / macOS / Windows / Android / iOS** から BLE GATT（および USB/2.4G HID）でフル設定・マクロ編集・ファームウェアアップデートできるクロスプラットフォーム OSS ツール群を構築する。
-- **現在のフェーズ（2026-11-23、main `0582e9a`）**: **Phase 1・2a・2b（マクロ）・2d（設定書き込み / リマップ）・3a（読み取り専用 GUI）完了。PR #16 で GUI の Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）を実装し main にマージ済みだが、GUI 書込は実機未検証・Tier 3。** Phase 2c は core 実装済みで、#20 で実機採取用の `ota-bench` 段階実行 API を追加（実機 wire 未確定・CLI / GUI / UniFFI 未配線）。Phase 3c（OTA 画面）は未着手。Phase 5 は UniFFI と iOS / Android の雛形に加え、#21 で **Android JNI 同梱 APK と iOS unsigned IPA のビルド成功まで記録**（実機未検証）。Phase 2e / 4（USB / 2.4G）は保留。**#17〜#23（実機 flag 対応 / クロスプラットフォーム確認 / OTA 採取計画 / `ota-bench` / モバイル証跡 / 配布方針 / 機能マトリクス）は main にマージ済み。GUI ライセンス画面は PR #24、プロファイル切替（`0x0015`）の core / CLI 配線（`Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`）は PR #26 として、いずれもレビュー中で未マージ。** 詳細と残課題は §6 と [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) を参照。
+- **現在のフェーズ（2026-11-23、main `a8e3e2b`）**: **Phase 1・2a・2b（マクロ）・2d（設定書き込み / リマップ）・3a（読み取り専用 GUI）完了。PR #16 で GUI の Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）を実装し main にマージ済みだが、GUI 書込は実機未検証・Tier 3。** Phase 2c は core 実装済みで、#20 で実機採取用の `ota-bench` 段階実行 API を追加（実機 wire 未確定・CLI / GUI / UniFFI 未配線）。Phase 3c（OTA 画面）は未着手。Phase 5 は UniFFI と iOS / Android の雛形に加え、#21 で **Android JNI 同梱 APK と iOS unsigned IPA のビルド成功まで記録**（実機未検証）。Phase 2e / 4（USB / 2.4G）は保留。**#17〜#26（実機 flag 対応 / クロスプラットフォーム確認 / OTA 採取計画 / `ota-bench` / モバイル証跡 / 配布方針 / 機能マトリクス / GUI ライセンス画面 #24 / 状態 docs 更新 #25 / プロファイル切替 #26）は main にマージ済み。GUI ライセンス画面（#24）はアプリの MIT / Apache-2.0 全文と同梱 5 フォント全文・著作権者行を表示し、プロファイル切替（`0x0015`）は core / CLI / REPL 配線（`Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`、Save 送信なし・実機未検証）として実装済み。** 詳細と残課題は §6 と [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) を参照。
 - **ライセンス／公開方針**: パブリックリポジトリ。公式バイナリ（`.apk`, `.exe`, `.dll`, `.so` 等）や公式ファームウェアファイル自体は `.gitignore` で除外しており、**絶対にコミットしないこと**。リポジトリ公開・コードライセンス（`MIT OR Apache-2.0`）・商標・同梱フォント・ストア配布・マネタイズの決定は [docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md)（決定日 2026-11-23）を正本とする。
 
 ---
@@ -97,7 +97,7 @@
 
 ## 6. 現在の状態と次に着手すべき作業
 
-最終更新: **2026-11-23（main `0582e9a`、PR #16 と #17〜#23 反映）**。フェーズの詳細・レビュー Tier・残課題は [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) §5 を正本とする。
+最終更新: **2026-11-23（main `a8e3e2b`、PR #16 と #17〜#26 反映）**。フェーズの詳細・レビュー Tier・残課題は [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) §5 を正本とする。
 
 ### 6.1 機能の実装状況
 
@@ -116,8 +116,8 @@
 | — | ライセンス文書（LICENSE-MIT / LICENSE-APACHE / NOTICE / THIRD_PARTY_LICENSES / TRADEMARKS） | 完了（PR #13）。リポジトリ公開・コードライセンス・商標・同梱フォント・ストア配布・マネタイズの決定は [docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md)（#22、決定日 2026-11-23）が正本 |
 | — | クロスプラットフォーム・ビルド確認 | [docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)（#18）。Windows は `cargo check` 成功（リンク・実行・テストは未確認、実効 MSRV 1.88+）、macOS は本ホストで確認不能、iOS target の `cargo check` 成功。**実機は Linux のみ** |
 | — | 公式機能カバレッジ・マトリクス | [docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md)（#23）。公式 Windows / Android ソフトとの機能比較、RE / 実装 / 実機検証のラベル定義 |
-| — | GUI ライセンス画面（PR #24） | **レビュー中・未マージ（実装予定）**。現 main の GUI にはライセンス画面が無い |
-| — | プロファイル切替 API（PR #26） | **レビュー中・未マージ**。core `Session::switch_profile` + CLI `config profile <N>` + REPL `profile switch <N>` を追加し、[docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md)（プロファイル節 / 残作業）・[docs/PROTOCOL_SPEC.md](docs/PROTOCOL_SPEC.md)・README を更新。FEATURE_MATRIX の残作業「`0x0015` 切替のセッション API 化」に対応する。実機未検証 |
+| — | GUI ライセンス画面（#24、main にマージ済み） | 左レール下部「ライセンス」ボタンから開く `App::licenses_dialog`。アプリの MIT / Apache-2.0 全文と、同梱 5 フォント（Noto Sans JP (subset) の OFL、NotoEmoji の OFL、Ubuntu-Light の UFL、Hack の MIT + Bitstream Vera + DejaVu、emoji-icon-font の MIT）の全文、各著作権者行を表示。Esc / × / 「閉じる」で閉じられ、書込確認中（write ダイアログ表示中）はボタンを無効化。ヘッドレステストで開閉・帰属行・本文見出しの描画を検証 |
+| — | プロファイル切替 API（#26、main にマージ済み） | core `Session::switch_profile` + CLI `config profile <N>` + REPL `profile switch <N>`。`0x0015` を送り **Save は送らない**。ACK 形状・Save 要否・永続性は実機未確認（[docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md) の残作業「`0x0015` 切替のセッション API 化」に対応） |
 
 **実機検証済み（2026-11-21〜23、Linux・BLE・MTU 200）**:
 
@@ -134,7 +134,7 @@
 
 1. **BLE OTA の実機 wire 確定（Tier 3・最優先 blocker）**: 採取手順と判定基準は [docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)（#19、Phase A / Phase B）、段階実行 API は `ota-bench` feature（#20）で用意済み。実機 btsnoop を取得し、[docs/PROTOCOL_SPEC.md](docs/PROTOCOL_SPEC.md) §8.5「未検証事項」のうち wire 関連の 1〜13 を確定する（14 は trust boundary、15 はバッテリー / 取得検証で別課題）。特に (a) **ACK の `offset` / `total_len` 照合の追加**（現状は cmd/subcmd のみで遅延・重複 ACK を区別しない）、(b) **マルチセクション `.dat` 対応**（現実装は単一セクションのみで、公式 `.dat` がマルチセクションなら更新を拒否する）、(c) `readPID` / ready ACK / Erase・Write のアドレス規約 / `WriteVersion` payload / `WriteFirmware` フレーム長 / Bootloader MTU。確定まで CLI / GUI / UniFFI に OTA を配線しない。
 2. **OTA の配線と安全機構**: 確定後、CLI / GUI / UniFFI に OTA を追加し、バッテリー警告、バージョン / ダウングレード判定、ファームウェア取得・SHA-256 検証、成功時の `"80ND"` 再接続 + バージョン確認を実装する。Tier 3。
-3. **GUI 書き込み UI**（PR #16）: config write / remap / マクロエディタは main にマージ済み。残るのは実機確認（Tier 3、pre-write backup + read-back 前提）と、backup 復元 UI / JSON・TOML 入出力。**GUI ライセンス画面（PR #24）はレビュー中で未マージ**。プロファイル切替（`0x0015`）の core / CLI 配線（PR #26）もレビュー中・未マージ。
+3. **GUI 書き込み UI**（PR #16）: config write / remap / マクロエディタは main にマージ済み。残るのは実機確認（Tier 3、pre-write backup + read-back 前提）と、backup 復元 UI / JSON・TOML 入出力。**GUI ライセンス画面（#24）とプロファイル切替（`0x0015`）の core / CLI / REPL 配線（#26）は main にマージ済み**（実機未検証・ACK 形状と Save 要否は未確認）。
 4. **モバイルの仕上げ**: **ビルド証跡は [docs/MOBILE_BUILD_EVIDENCE.md](docs/MOBILE_BUILD_EVIDENCE.md)（#21）に記録済み**（Android JNI 同梱 APK 14,551,011 bytes / iOS unsigned IPA 1,550,522 bytes。いずれもビルド・パッケージ確認のみ）。残るのは iOS / Android 実機での BLE 読み取りと JNI ロード、エミュレータ起動確認、署名・App Store / TestFlight 配布（macOS + Xcode が必要）。書き込み・OTA の公開は Tier 3 レビューとバックアップ UI が揃うまで行わない（[mobile/README.md](mobile/README.md)）。
 5. **クロスプラットフォーム実機確認**: macOS / Windows の BLE（btleplug）と Linux BlueZ の回帰、Android / iOS。現状の実機証跡は Linux のみ。**ビルド/コンパイルの確認状況は [docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)（#18）**: Windows は `cargo check`（リンク・実行は未確認、MinGW 必要）のみ確認済みで、**Windows ビルドは Rust 1.88 以上が必要**（`btleplug` の Windows バックエンドの let チェーン由来。宣言 MSRV 1.85 では `E0658`）、macOS は target / SDK 不在のため Linux からは確認不能。
 6. **`status` のリンク断検知バグの修正**: 上記の既知バグ（切断後も `connected: true` と keepalive カウンタが残る）を直し、`status` を実リンク状態に追従させる。session / keepalive に触れるため **Tier 3**。テストで固定してから直す。

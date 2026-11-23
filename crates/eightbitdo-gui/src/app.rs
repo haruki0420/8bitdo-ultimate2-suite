@@ -2650,13 +2650,25 @@ impl App {
                 ui.add(
                     egui::Label::new(theme::job_meta(i18n::t(lang, Key::LicensesNotoNote))).wrap(),
                 );
+                ui.add_space(theme::SPACE_2);
+                // The Noto Sans JP holder line belongs under the Noto heading;
+                // the remaining holders belong to the egui default fonts.
+                for (font, holder) in crate::licenses::ATTRIBUTIONS
+                    .iter()
+                    .filter(|(font, _)| font.starts_with("Noto Sans JP"))
+                {
+                    ui.add(egui::Label::new(theme::job_meta(&format!("{font}: {holder}"))).wrap());
+                }
                 ui.add_space(theme::SPACE_3);
                 section_label(ui, lang, Key::LicensesEguiHeading);
                 ui.add(
                     egui::Label::new(theme::job_meta(i18n::t(lang, Key::LicensesEguiNote))).wrap(),
                 );
                 ui.add_space(theme::SPACE_2);
-                for (font, holder) in crate::licenses::ATTRIBUTIONS {
+                for (font, holder) in crate::licenses::ATTRIBUTIONS
+                    .iter()
+                    .filter(|(font, _)| !font.starts_with("Noto Sans JP"))
+                {
                     ui.add(egui::Label::new(theme::job_meta(&format!("{font}: {holder}"))).wrap());
                 }
                 ui.add_space(theme::SPACE_3);
@@ -5117,6 +5129,14 @@ mod tests {
         );
     }
 
+    fn holder_rect(texts: &[(String, Rect, Color32)], needle: &str) -> Rect {
+        texts
+            .iter()
+            .find(|(text, _, _)| text.contains(needle))
+            .map(|(_, rect, _)| *rect)
+            .unwrap_or_else(|| panic!("{needle:?} is not painted"))
+    }
+
     #[test]
     fn headless_licenses_screen_opens_shows_attribution_and_closes() {
         let ctx = egui::Context::default();
@@ -5160,6 +5180,65 @@ mod tests {
                 "attribution line {holder:?} is not painted"
             );
         }
+        // Each holder line sits under the heading it belongs to: the Noto Sans
+        // JP holder is above the egui heading, and the egui-font holders are
+        // below it (PR #24 review follow-up).
+        let noto_holder = holder_rect(&texts, "Copyright 2014-2021 Adobe");
+        let egui_heading = texts
+            .iter()
+            .find(|(text, _, _)| text == "egui 既定フォント")
+            .map(|(_, rect, _)| *rect)
+            .expect("the egui font heading is painted");
+        let ubuntu_holder = holder_rect(&texts, "Ubuntu-Light: Copyright 2011 Canonical Ltd.");
+        assert!(
+            noto_holder.bottom() < egui_heading.top(),
+            "the Noto Sans JP holder must be above the egui heading"
+        );
+        assert!(
+            ubuntu_holder.top() > egui_heading.bottom(),
+            "the egui-font holders must be below the egui heading"
+        );
+        // The full texts live in a scroll area, so a body's heading is painted
+        // once it is scrolled into view. Wheel over the first body heading
+        // until the Apache-2.0 terms and the Ubuntu Font Licence title appear.
+        let body_at = texts
+            .iter()
+            .find(|(text, _, _)| text.contains("eightbitdo-suite — MIT License"))
+            .map(|(_, rect, _)| rect.center())
+            .expect("the first license heading is painted");
+        let mut seen_apache_terms = false;
+        let mut seen_ubuntu_licence = false;
+        for _ in 0..400 {
+            let mut scroll_input = base.clone();
+            scroll_input.events = vec![
+                egui::Event::PointerMoved(body_at),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    // A negative Y delta scrolls the content up (reveals below).
+                    delta: Vec2::new(0.0, -160.0),
+                    modifiers: egui::Modifiers::default(),
+                },
+            ];
+            let scrolled = ctx.run(scroll_input, |ctx| app.draw(ctx));
+            let scrolled_texts = text_shapes(&scrolled);
+            seen_apache_terms |= scrolled_texts
+                .iter()
+                .any(|(text, _, _)| text.contains("TERMS AND CONDITIONS"));
+            seen_ubuntu_licence |= scrolled_texts
+                .iter()
+                .any(|(text, _, _)| text.contains("UBUNTU FONT LICENCE"));
+            if seen_apache_terms && seen_ubuntu_licence {
+                break;
+            }
+        }
+        assert!(
+            seen_apache_terms,
+            "the Apache-2.0 body heading must paint when scrolled into view"
+        );
+        assert!(
+            seen_ubuntu_licence,
+            "the Ubuntu Font Licence heading must paint when scrolled into view"
+        );
         let close = texts
             .iter()
             .find(|(text, _, _)| text == "閉じる")

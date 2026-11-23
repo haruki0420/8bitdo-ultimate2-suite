@@ -151,7 +151,7 @@
 
 ### 4.3 帰属の実装状況（実装済み・配布時に確認）
 
-- **実装済み（2026-11-23）**: フォント本体は `include_bytes!` で GUI バイナリに同梱済み（`crates/eightbitdo-gui/src/theme.rs`）。ライセンス全文は `crates/eightbitdo-gui/assets/licenses/` とリポジトリ直下の `LICENSE-MIT` / `LICENSE-APACHE` に置き、`crates/eightbitdo-gui/src/licenses.rs` の `include_str!` でバイナリに埋め込む。GUI の左レール下部「ライセンス」ボタンから開く画面（`App::licenses_dialog`）で、このアプリの MIT / Apache-2.0 全文と、Noto Sans JP (subset)（OFL 1.1）・NotoEmoji（OFL 1.1）・Ubuntu-Light（UFL 1.0）・Hack（MIT + Bitstream Vera + DejaVu）・emoji-icon-font（MIT）の全文をユーザーが閲覧できる。**上流の OFL.txt / UFL.txt はライセンス本文のみで著作権者行を含まない**ため、各フォントの `name` テーブル（name ID 0）から取得した著作権表示を画面に併記する（`licenses::ATTRIBUTIONS`）。
+- **実装済み（2026-11-23）**: フォント本体は `include_bytes!` で GUI バイナリに同梱済み（`crates/eightbitdo-gui/src/theme.rs`）。ライセンス全文は `crates/eightbitdo-gui/assets/licenses/` とリポジトリ直下の `LICENSE-MIT` / `LICENSE-APACHE` に置き、`crates/eightbitdo-gui/src/licenses.rs` の `include_str!` でバイナリに埋め込む。GUI の左レール下部「ライセンス」ボタンから開く画面（`App::licenses_dialog`）で、このアプリの MIT / Apache-2.0 全文と、Noto Sans JP (subset)（OFL 1.1）・NotoEmoji（OFL 1.1）・Ubuntu-Light（UFL 1.0）・Hack（MIT + Bitstream Vera + DejaVu）・emoji-icon-font（MIT）の全文をユーザーが閲覧できる。**上流の OFL.txt / UFL.txt はライセンス本文のみで著作権者行を含まない**ため、各フォントの著作権表示を画面に併記する（`licenses::ATTRIBUTIONS`）。著作権表示は各フォントの `name` テーブル（name ID 0）があればそこから取得し、無い場合は同梱ライセンス原文のヘッダを使う（Noto Sans JP subset の OTF は `name` レコード 0 個なので OFL 冒頭行、emoji-icon-font は nameID 0 が無いので MIT 本文から）。
 - **決定**: 帰属表示の欠落は**バイナリ配布（ストア配布を含む）のリリース blocker** とする。§4.4 を満たすまでバイナリを配布しない。
 
 ### 4.4 バイナリ配布前のリリースチェックリスト

@@ -246,7 +246,7 @@ GUI は `eframe` を既定 feature で使うため、`egui` の `default_fonts` 
 
 #### 3.6.2 Noto Sans JP (subset)（同梱済み）
 
-`crates/eightbitdo-gui/assets/fonts/` に `NotoSansJP-{Regular,Medium,Bold}.otf` と `OFL.txt` が、`crates/eightbitdo-gui/assets/licenses/` に `OFL-NotoSansJP.txt`（`assets/fonts/OFL.txt` と同一内容）がコミットされています。後者は `licenses.rs` の `include_str!` でライセンス画面に埋め込みます。詳細と義務は §5 を参照してください。
+`crates/eightbitdo-gui/assets/fonts/` に `NotoSansJP-{Regular,Medium,Bold}.otf` と `OFL.txt` が、`crates/eightbitdo-gui/assets/licenses/` に `OFL-NotoSansJP.txt`（`assets/fonts/OFL.txt` と同一内容。上流 Google Fonts の OFL ともバイト一致、§5.1）がコミットされています。後者は `licenses.rs` の `include_str!` でライセンス画面に埋め込みます。詳細と義務は §5 を参照してください。
 
 #### 3.6.3 Gradle wrapper（Apache-2.0、コミット済み jar）
 
@@ -330,6 +330,7 @@ PY
   - `OFL.txt`（上流の OFL 全文、改変なし）
   - `README.md`（サブセット手順・上流バージョン）、`build_fonts.py`（再生成スクリプト）
 - OFL 全文は `crates/eightbitdo-gui/assets/licenses/OFL-NotoSansJP.txt` にも配置し、バイナリに埋め込んでライセンス画面で閲覧できるようにします。`assets/fonts/OFL.txt` と**同一内容を維持**してください（片方だけ更新しない）。
+- OFL 全文は上流 Google Fonts の [`ofl/notosansjp/OFL.txt`](https://github.com/google/fonts/blob/main/ofl/notosansjp/OFL.txt)（`main`、4,388 B、git blob `1c9f4328…`）と**バイト一致**することを 2026-11-23 に確認した（両ファイルとも）。
 - 上流は Noto Sans CJK JP 2.004 で、サブセット化（グリフ削減・縦組みテーブル等の削除）は Modified Version 扱いです。詳細は `crates/eightbitdo-gui/assets/fonts/README.md` を参照してください。
 - フォントの著作権表示（上流 OFL.txt の冒頭）:
 
@@ -347,7 +348,7 @@ Copyright 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Sour
 
 ### 5.3 同梱時の要件
 
-- `crates/eightbitdo-gui/assets/licenses/OFL-NotoSansJP.txt` に**上流の OFL.txt を改変せず**配置する。`crates/eightbitdo-gui/assets/fonts/OFL.txt` と同一内容を維持する（現状は両方配置済みで一致）。
+- `crates/eightbitdo-gui/assets/licenses/OFL-NotoSansJP.txt` に**上流の OFL.txt を改変せず**配置する。`crates/eightbitdo-gui/assets/fonts/OFL.txt` と同一内容を維持する（現状は両方配置済みで一致し、上流 Google Fonts の OFL ともバイト一致。§5.1）。
 - **サブセット化は可能**（Modified Version 扱い）。サブセット版も OFL で配布し、`Source` を名前に使わず、Adobe / Google の著作権表示を保持し、単体販売しない。アプリ内では「サブセット版である」旨を明記する。
 - `Noto` は Google のブランドです。OFL は商標権を許諾しないため、公式 Noto と誤認させない（例: `Noto Sans JP (subset)` と表示）。
 - **実装済み（2026-11-23）**: GUI のライセンス画面（左レール下部の「ライセンス」ボタン → `App::licenses_dialog`）が、OFL 全文・著作権表示・サブセット表記・egui 同梱フォントの 4 ライセンスを表示します。全文は `crates/eightbitdo-gui/assets/licenses/` に置き、`crates/eightbitdo-gui/src/licenses.rs` の `include_str!` でバイナリに埋め込んでいます。配布物に standalone のテキストファイルは含めず、**バイナリ内に埋め込んだ画面**で全文と著作権表示を閲覧できる形で要件を満たします。

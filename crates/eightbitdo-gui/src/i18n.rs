@@ -126,7 +126,7 @@ define_keys! {
     FooterMeta => "書き込み対応 / 設定 2768 バイト / マクロ 4×3" | "Write-capable / 2768-byte config / 4×3 macros",
     OpenLicenses => "ライセンス" | "Licenses",
     LicensesTitle => "ライセンス / オープンソース" | "Licenses / open source",
-    LicensesIntro => "この配布物に含まれる第三者ソフトウェアとフォントのライセンス全文です。リポジトリの THIRD_PARTY_LICENSES.md も参照してください。" | "Full license texts for the third-party software and fonts bundled with this build. See THIRD_PARTY_LICENSES.md in the repository as well.",
+    LicensesIntro => "このアプリと同梱フォントのライセンス全文です。依存クレートの完全な第三者通知はリポジトリの THIRD_PARTY_LICENSES.md と cargo-about を参照してください。" | "Full license texts for this application and its bundled fonts. For complete third-party notices of the dependency crates, see THIRD_PARTY_LICENSES.md and cargo-about in the repository.",
     LicensesAppHeading => "このアプリ" | "This application",
     LicensesAppBody => "eightbitdo-suite は MIT License または Apache License 2.0 のいずれかを選択して利用できます（MIT OR Apache-2.0）。全文はリポジトリの LICENSE-MIT / LICENSE-APACHE にあります。" | "eightbitdo-suite is available under either the MIT License or the Apache License 2.0 (MIT OR Apache-2.0). The full texts are in LICENSE-MIT / LICENSE-APACHE in the repository.",
     LicensesNotoHeading => "Noto Sans JP (subset) — 同梱フォント" | "Noto Sans JP (subset) — bundled font",
