@@ -24,7 +24,6 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 
 ### 計画中・未提供
 
-- **GUI からの書き込み**: PR #16 で設定 2768B・リマップ・マクロを実装し main にマージ済み。確認ダイアログ、pre-write backup、read-back 検証、TOCTOU 検出付き。**実機未検証・Tier 3**。
 - **ファームウェア更新（BLE OTA）**: core の状態機械と `ota-bench` 段階実行 API（#20）、実機 btsnoop 採取計画（#19）まで用意済み。実機 wire 未確定・CLI / GUI / UniFFI 未配線。USB OTA は USB Boot TX フレーミング未文書化のため保留。
 - **モバイルの書き込み・OTA**: バックアップ UI と Tier 3 レビュー待ちで未公開。Android の JNI 同梱 APK と iOS unsigned IPA はビルド成功（#21、実機未検証）、iOS / Android 実機確認、App Store 配布は未着手。
 - **USB HID / 2.4G transport**: 未実装・保留。

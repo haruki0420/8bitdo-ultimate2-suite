@@ -1,5 +1,7 @@
 # The bundled Noto Sans JP OFL texts are byte-identical copies of the upstream
-# Google Fonts file (ofl/notosansjp/OFL.txt), which has one trailing space.
-# Keep them exempt from whitespace checks so `git diff --check` stays clean.
-crates/eightbitdo-gui/assets/fonts/OFL.txt -whitespace
-crates/eightbitdo-gui/assets/licenses/OFL-NotoSansJP.txt -whitespace
+# Google Fonts file (ofl/notosansjp/OFL.txt, 4,388 B), which contains one
+# trailing space. Exempt only trailing-space from `git diff --check` (keeping
+# the other whitespace rules active) and disable EOL conversion (-text) so
+# `include_str!` embeds LF bytes even when core.autocrlf is enabled.
+crates/eightbitdo-gui/assets/fonts/OFL.txt whitespace=-trailing-space -text
+crates/eightbitdo-gui/assets/licenses/OFL-NotoSansJP.txt whitespace=-trailing-space -text

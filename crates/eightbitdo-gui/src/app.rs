@@ -5129,12 +5129,53 @@ mod tests {
         );
     }
 
-    fn holder_rect(texts: &[(String, Rect, Color32)], needle: &str) -> Rect {
+    fn painted_text_rects(texts: &[(String, Rect, Color32)], exact: &str) -> Vec<Rect> {
         texts
             .iter()
-            .find(|(text, _, _)| text.contains(needle))
+            .filter(|(text, _, _)| text == exact)
             .map(|(_, rect, _)| *rect)
-            .unwrap_or_else(|| panic!("{needle:?} is not painted"))
+            .collect()
+    }
+
+    /// Locate the window title-bar `×` close key. egui paints it as two
+    /// crossing line segments rather than text, so find the pair of
+    /// equal-sized diagonal segments that share a centre.
+    fn window_close_button_center(output: &egui::FullOutput) -> Pos2 {
+        fn visit(shape: &egui::Shape, segments: &mut Vec<(Pos2, Pos2)>) {
+            match shape {
+                egui::Shape::LineSegment { points, .. } => segments.push((points[0], points[1])),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        visit(shape, segments);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut segments = Vec::new();
+        for clipped in &output.shapes {
+            visit(&clipped.shape, &mut segments);
+        }
+        let centres: Vec<Pos2> = segments
+            .iter()
+            .map(|(a, b)| Rect::from_two_pos(*a, *b))
+            .filter(|rect| {
+                (rect.width() - rect.height()).abs() < 2.0 && (4.0..=20.0).contains(&rect.width())
+            })
+            .map(|rect| rect.center())
+            .collect();
+        let mut candidates = Vec::new();
+        for (index, centre) in centres.iter().enumerate() {
+            for other in &centres[index + 1..] {
+                if (*centre - *other).length() < 1.0 {
+                    candidates.push(*centre);
+                }
+            }
+        }
+        candidates
+            .into_iter()
+            .min_by(|a, b| a.y.total_cmp(&b.y))
+            .expect("the licenses window × key is not painted")
     }
 
     #[test]
@@ -5168,36 +5209,38 @@ mod tests {
         assert!(texts
             .iter()
             .any(|(text, _, _)| text.contains("eightbitdo-suite — MIT License")));
-        for holder in [
-            "Copyright 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'",
-            "Copyright 2013 Google Inc. All Rights Reserved.",
-            "Copyright 2011 Canonical Ltd.",
-            "Copyright (c) 2018 Source Foundry Authors",
-            "Copyright (c) 2014 John Slegers",
-        ] {
-            assert!(
-                texts.iter().any(|(text, _, _)| text.contains(holder)),
-                "attribution line {holder:?} is not painted"
+        // Headings and holder lines are painted exactly once, and each holder
+        // sits under the heading it belongs to. A first-match search would
+        // miss a duplicated Noto holder line or a holder placed in the wrong
+        // group, so count every painted occurrence instead (PR #24 review
+        // follow-up).
+        let noto_heading = painted_text_rects(&texts, "Noto Sans JP (subset) — 同梱フォント");
+        let egui_heading = painted_text_rects(&texts, "egui 既定フォント");
+        assert_eq!(noto_heading.len(), 1, "one Noto Sans JP heading");
+        assert_eq!(egui_heading.len(), 1, "one egui default-font heading");
+        let noto_heading = noto_heading[0];
+        let egui_heading = egui_heading[0];
+        for (font, holder) in crate::licenses::ATTRIBUTIONS {
+            let line = format!("{font}: {holder}");
+            let rects = painted_text_rects(&texts, &line);
+            assert_eq!(
+                rects.len(),
+                1,
+                "the attribution line for {font} must be painted exactly once: {line:?}"
             );
+            let rect = rects[0];
+            if *font == "Noto Sans JP (subset)" {
+                assert!(
+                    rect.top() > noto_heading.bottom() && rect.bottom() < egui_heading.top(),
+                    "the Noto Sans JP holder must sit between the Noto and egui headings"
+                );
+            } else {
+                assert!(
+                    rect.top() > egui_heading.bottom(),
+                    "{font} holder must sit below the egui heading"
+                );
+            }
         }
-        // Each holder line sits under the heading it belongs to: the Noto Sans
-        // JP holder is above the egui heading, and the egui-font holders are
-        // below it (PR #24 review follow-up).
-        let noto_holder = holder_rect(&texts, "Copyright 2014-2021 Adobe");
-        let egui_heading = texts
-            .iter()
-            .find(|(text, _, _)| text == "egui 既定フォント")
-            .map(|(_, rect, _)| *rect)
-            .expect("the egui font heading is painted");
-        let ubuntu_holder = holder_rect(&texts, "Ubuntu-Light: Copyright 2011 Canonical Ltd.");
-        assert!(
-            noto_holder.bottom() < egui_heading.top(),
-            "the Noto Sans JP holder must be above the egui heading"
-        );
-        assert!(
-            ubuntu_holder.top() > egui_heading.bottom(),
-            "the egui-font holders must be below the egui heading"
-        );
         // The full texts live in a scroll area, so a body's heading is painted
         // once it is scrolled into view. Wheel over the first body heading
         // until the Apache-2.0 terms and the Ubuntu Font Licence title appear.
@@ -5264,6 +5307,29 @@ mod tests {
         assert!(
             !app.licenses_open,
             "the close key must close the licenses screen"
+        );
+
+        // The title-bar × key closes it as well (AGENTS.md §6.1).
+        app.licenses_open = true;
+        let _ = ctx.run(base.clone(), |ctx| app.draw(ctx));
+        let settled = ctx.run(base.clone(), |ctx| app.draw(ctx));
+        let at = window_close_button_center(&settled);
+        let pointer_button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut click = base.clone();
+        click.events = vec![
+            egui::Event::PointerMoved(at),
+            pointer_button(true),
+            pointer_button(false),
+        ];
+        let _ = ctx.run(click, |ctx| app.draw(ctx));
+        assert!(
+            !app.licenses_open,
+            "the title-bar × key must close the licenses screen"
         );
 
         // Escape closes it too.
