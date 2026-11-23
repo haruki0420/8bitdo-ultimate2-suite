@@ -36,12 +36,17 @@ pub const HACK_LICENSE: &str = include_str!("../assets/licenses/Hack-BitstreamVe
 /// emoji-icon-font (egui default font), MIT.
 pub const EMOJI_ICON_MIT: &str = include_str!("../assets/licenses/emoji-icon-font-MIT.txt");
 
-/// Copyright lines taken from the bundled font `name` tables.
+/// Copyright lines for the bundled fonts.
 ///
 /// The upstream `OFL.txt` / `UFL.txt` in `epaint_default_fonts` 0.29.1 are the
 /// license bodies only and contain no holder line, so the holder must be
-/// displayed explicitly (OFL 1.1 §2, UFL attribution). Values are read from the
-/// fonts' name ID 0 tables, unmodified.
+/// displayed explicitly (OFL 1.1 §2, UFL attribution). Each value is read from
+/// the font's name ID 0 record when one exists. Not every bundled font has one:
+/// the Noto Sans JP subsets have no `name` table records at all, and
+/// `emoji-icon-font.ttf` has name records but no name ID 0. For those two the
+/// holder line is taken from the bundled license text instead (the OFL opening
+/// line for Noto Sans JP, the MIT body for emoji-icon-font). Values are
+/// otherwise unmodified.
 pub const ATTRIBUTIONS: &[(&str, &str)] = &[
     (
         "Noto Sans JP (subset)",
@@ -187,6 +192,56 @@ mod tests {
                 text.name
             );
         }
+    }
+
+    /// Byte size of the upstream Google Fonts `ofl/notosansjp/OFL.txt` at the
+    /// fixed commit `295d98a7…` (git blob `1c9f4328…`); see
+    /// `docs/DISTRIBUTION_POLICY.md` §4.4 and `THIRD_PARTY_LICENSES.md` §5.1.
+    const NOTO_OFL_UPSTREAM_BYTES: usize = 4_388;
+
+    #[test]
+    fn the_two_noto_ofl_copies_match_the_upstream_text() {
+        // `assets/fonts/OFL.txt` ships beside the subset build inputs and
+        // `assets/licenses/OFL-NotoSansJP.txt` is the file embedded in the
+        // binary. Both must stay the upstream text, byte for byte.
+        //
+        // Equality alone is not enough: it still passes when both copies are
+        // truncated together or when the same trailing whitespace is stripped
+        // from both, so pin the absolute byte length and the first/last lines
+        // as well. The trailing space on the `embedded, ` line is upstream
+        // data; `.gitattributes` keeps it from tripping `git diff --check`.
+        let fonts = include_str!("../assets/fonts/OFL.txt");
+        let embedded = include_str!("../assets/licenses/OFL-NotoSansJP.txt");
+        for (path, body) in [
+            ("assets/fonts/OFL.txt", fonts),
+            ("assets/licenses/OFL-NotoSansJP.txt", embedded),
+        ] {
+            assert_eq!(
+                body.len(),
+                NOTO_OFL_UPSTREAM_BYTES,
+                "{path} must stay the 4,388-byte upstream OFL text"
+            );
+            assert!(
+                body.starts_with(
+                    "Copyright 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'\n"
+                ),
+                "{path} must keep the upstream holder line"
+            );
+            assert!(
+                body.contains(
+                    "fonts, including any derivative works, can be bundled, embedded, \n"
+                ),
+                "{path} must keep the upstream trailing space"
+            );
+            assert!(
+                body.ends_with("OTHER DEALINGS IN THE FONT SOFTWARE.\n"),
+                "{path} must keep the upstream final line and trailing newline"
+            );
+        }
+        assert_eq!(
+            fonts, embedded,
+            "the two bundled OFL copies must be byte-identical"
+        );
     }
 
     #[test]

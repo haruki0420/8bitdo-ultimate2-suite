@@ -6,7 +6,7 @@
 >
 > また、依存バージョンと各プロジェクトのライセンスは将来変更され得ます。**依存を追加・更新するたびに再生成・再確認**してください。
 
-> 本ファイルは**要約と参照**です。497 クレート全件の著作権表示・ライセンス本文を網羅するものではありません。現時点で全文を収録しているのは、追加義務のある BSD-3-Clause（btleplug）、Unicode-3.0、SIL OFL 1.1（同梱フォント）です。MPL-2.0（uniffi）・Apache-2.0（Gradle wrapper）・Ubuntu Font Licence（egui 既定フォント）の全文は各クレート／資産に同梱されたライセンスファイルを参照し、配布物には生成した通知を含めてください。バイナリとして配布する場合は、`cargo-about` 等で依存グラフ全体の著作権表示とライセンス本文を生成し、配布物へ同梱してください（§4）。
+> 本ファイルは**要約と参照**です。497 クレート全件の著作権表示・ライセンス本文を網羅するものではありません。現時点で全文を収録しているのは、追加義務のある BSD-3-Clause（btleplug）、Unicode-3.0、SIL OFL 1.1（同梱フォント）です。MPL-2.0（uniffi）・Apache-2.0（Gradle wrapper）・Ubuntu Font Licence（egui 既定フォント）の全文は各クレート／資産に同梱されたライセンスファイルにあります。**バイナリとして配布する場合は、`cargo-about` 等で依存グラフ全体の著作権表示とライセンス本文を生成し、standalone の通知ファイルとして配布物へ同梱してください（§4）。本ファイル（要約）を完全な通知として同梱しないでください。** 一方、**同梱フォントのライセンス全文**は、配布物に個別のテキストを置くのではなく、バイナリ内に埋め込んだライセンス画面（§5.3）でユーザーが閲覧できる形にします。
 
 ## 1. サマリ
 
@@ -246,7 +246,7 @@ GUI は `eframe` を既定 feature で使うため、`egui` の `default_fonts` 
 
 #### 3.6.2 Noto Sans JP (subset)（同梱済み）
 
-`crates/eightbitdo-gui/assets/fonts/` に `NotoSansJP-{Regular,Medium,Bold}.otf` と `OFL.txt` が、`crates/eightbitdo-gui/assets/licenses/` に `OFL-NotoSansJP.txt`（`assets/fonts/OFL.txt` と同一内容）がコミットされています。後者は `licenses.rs` の `include_str!` でライセンス画面に埋め込みます。詳細と義務は §5 を参照してください。
+`crates/eightbitdo-gui/assets/fonts/` に `NotoSansJP-{Regular,Medium,Bold}.otf` と `OFL.txt` が、`crates/eightbitdo-gui/assets/licenses/` に `OFL-NotoSansJP.txt`（`assets/fonts/OFL.txt` と同一内容。上流 Google Fonts の OFL ともバイト一致、§5.1）がコミットされています。後者は `licenses.rs` の `include_str!` でライセンス画面に埋め込みます。詳細と義務は §5 を参照してください。
 
 #### 3.6.3 Gradle wrapper（Apache-2.0、コミット済み jar）
 
@@ -330,6 +330,7 @@ PY
   - `OFL.txt`（上流の OFL 全文、改変なし）
   - `README.md`（サブセット手順・上流バージョン）、`build_fonts.py`（再生成スクリプト）
 - OFL 全文は `crates/eightbitdo-gui/assets/licenses/OFL-NotoSansJP.txt` にも配置し、バイナリに埋め込んでライセンス画面で閲覧できるようにします。`assets/fonts/OFL.txt` と**同一内容を維持**してください（片方だけ更新しない）。
+- OFL 全文は上流 Google Fonts の [`ofl/notosansjp/OFL.txt`](https://github.com/google/fonts/blob/295d98a7a0c17c68f1341eaeea354e7960ea70d3/ofl/notosansjp/OFL.txt)（固定 commit [`295d98a7a0c17c68f1341eaeea354e7960ea70d3`](https://github.com/google/fonts/commit/295d98a7a0c17c68f1341eaeea354e7960ea70d3)、4,388 B、git blob [`1c9f43281b8f216c5461fe9ac729afbade7724e4`](https://api.github.com/repos/google/fonts/git/blobs/1c9f43281b8f216c5461fe9ac729afbade7724e4)）と**バイト一致**することを 2026-11-23 に確認した（両ファイルとも）。`main` は動くため、確認はこの固定 commit を基準にする。
 - 上流は Noto Sans CJK JP 2.004 で、サブセット化（グリフ削減・縦組みテーブル等の削除）は Modified Version 扱いです。詳細は `crates/eightbitdo-gui/assets/fonts/README.md` を参照してください。
 - フォントの著作権表示（上流 OFL.txt の冒頭）:
 
@@ -347,10 +348,10 @@ Copyright 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Sour
 
 ### 5.3 同梱時の要件
 
-- `crates/eightbitdo-gui/assets/licenses/OFL-NotoSansJP.txt` に**上流の OFL.txt を改変せず**配置する。`crates/eightbitdo-gui/assets/fonts/OFL.txt` と同一内容を維持する（現状は両方配置済みで一致）。
+- `crates/eightbitdo-gui/assets/licenses/OFL-NotoSansJP.txt` に**上流の OFL.txt を改変せず**配置する。`crates/eightbitdo-gui/assets/fonts/OFL.txt` と同一内容を維持する（現状は両方配置済みで一致し、上流 Google Fonts の OFL ともバイト一致。§5.1）。
 - **サブセット化は可能**（Modified Version 扱い）。サブセット版も OFL で配布し、`Source` を名前に使わず、Adobe / Google の著作権表示を保持し、単体販売しない。アプリ内では「サブセット版である」旨を明記する。
 - `Noto` は Google のブランドです。OFL は商標権を許諾しないため、公式 Noto と誤認させない（例: `Noto Sans JP (subset)` と表示）。
-- **実装済み（2026-11-23）**: GUI のライセンス画面（左レール下部の「ライセンス」ボタン → `App::licenses_dialog`）が、OFL 全文・著作権表示・サブセット表記・egui 同梱フォントの 4 ライセンスを表示します。全文は `crates/eightbitdo-gui/assets/licenses/` に置き、`crates/eightbitdo-gui/src/licenses.rs` の `include_str!` でバイナリに埋め込んでいます。配布物に standalone のテキストファイルは含めず、**バイナリ内に埋め込んだ画面**で全文と著作権表示を閲覧できる形で要件を満たします。
+- **実装済み（2026-11-23）**: GUI のライセンス画面（左レール下部の「ライセンス」ボタン → `App::licenses_dialog`）が、OFL 全文・著作権表示・サブセット表記・egui 同梱フォントの 4 ライセンスを表示します。全文は `crates/eightbitdo-gui/assets/licenses/` に置き、`crates/eightbitdo-gui/src/licenses.rs` の `include_str!` でバイナリに埋め込んでいます。**同梱フォントの全文**は配布物に standalone のテキストファイルとして含めず、**バイナリ内に埋め込んだ画面**で全文と著作権表示を閲覧できる形で要件を満たします（依存クレートの完全な通知は `cargo-about` の生成物を配布物へ同梱する。本ファイルは要約であり完全な通知ではない）。
 - アプリのライセンス（MIT / Apache-2.0）とフォントの OFL は独立です。アプリのライセンス条項で OFL の義務を制限しないでください。
 - `egui` の `default_fonts` も有効なため、egui 同梱フォントの帰属（OFL / UFL / MIT / Bitstream Vera）も本ファイルとライセンス画面に追加する（§3.6.1）。
 

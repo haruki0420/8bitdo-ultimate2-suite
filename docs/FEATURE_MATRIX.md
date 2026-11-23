@@ -242,7 +242,7 @@ RE の一次証拠（DLL export の RVA、DEX の code_off、構造体オフセ�
 
 1. **GUI 書込（設定 / リマップ / マクロ）の実機確認**（Tier 3）。pre-write backup と read-back を前提に、Linux BLE・MTU 200 で確認する。
 2. **BLE OTA の wire 確定と配線**: 実機 btsnoop で [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §8.5 の未検証事項（特に ACK 形状 / アドレス規約 / Bootloader MTU）を確定し、ACK の `offset` / `total_len` 照合とマルチセクション `.dat` 対応を入れてから CLI / GUI / UniFFI に配線する。
-3. **プロファイル管理の完成**: `0x0015` 切替（core + CLI + REPL 配線済み）は **ACK（`cmd=0x0004/subcmd=0x0015` の 16B 封筒、1 回観測）と `cur_slot` 6→1 の更新を実機確認済み**。残るのは**再接続・電源断を跨ぐ永続性、プロファイル実効、直接 ACK の条件の確認**、GUI 切替 UI、Copy / Delete の `ConfigEdit` 化と CLI / GUI 露出、`slot_flags` の意味確定。
+3. **プロファイル管理の完成**: `0x0015` 切替（core + CLI + REPL 配線済み。CLI `config profile <N>` / REPL `profile switch <N>`）は **ACK（`cmd=0x0004/subcmd=0x0015` の 16B 封筒、1 回観測）と `cur_slot` 6→1 の更新を実機確認済み**。残るのは**再接続・電源断を跨ぐ永続性、プロファイル実効、直接 ACK の条件の確認**、GUI 切替 UI、Copy / Delete の `ConfigEdit` 化と CLI / GUI 露出、`slot_flags` の意味確定。
 4. **実機確認の拡大**: `config set` の各フィールド（スティック / トリガー / 振動 / ジャイロ / LED / プロファイル名）、MTU 200 以外、REPL 経由の書込、M3/M4・S2/S3、Switch 側でのマクロ発動・リマップ実効。
 5. **追加 RE が必要な項目**: ターボのレート / 3 段階、LED の Brightness と効果名、マクロ実行モード / ラウンドモード、空マクロ作成、キャリブレーション、バッテリースケール / 充電状態、キーボードキー割当の可否。
 6. **GUI の残機能**: restore UI、JSON/TOML 入出力、OTA 画面（2 の後）。
