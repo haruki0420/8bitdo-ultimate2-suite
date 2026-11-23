@@ -8,7 +8,7 @@
 
 ## 前提
 
-- **Node.js**: `^20.19.0 || >=22.12.0` / **pnpm**: `12.22.0`（`npm` / `npx` は使わない）
+- **Node.js**: `^20.19.0 || >=22.12.0` / **pnpm**: `12.22.0`（パッケージ管理には pnpm を推奨します（`pnpm-lock.yaml`））
 - **Rust**: **1.90+**（`tauri` 2.12.7 要件。ルート workspace の MSRV 1.85 とは独立）
 - **Linux 依存**: `libwebkit2gtk-4.1-dev` `build-essential` `pkg-config` `libgtk-3-dev` `libayatana-appindicator3-dev` `librsvg2-dev` `libssl-dev`
 
