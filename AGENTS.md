@@ -32,10 +32,10 @@
    - BLE OTA の解析証跡（確定した順序・タイムアウト・`.dat` ヘッダ）と未確認事項の優先順。OTA を触る前に必ず読む。
 5. **[docs/SESSION_OPERATIONS.md](docs/SESSION_OPERATIONS.md)**
    - 常駐 `session` の運用（per-user BLE 単一所有者ロック、degraded 終了コード 3、SIGINT 範囲、`scan --check` と `scripts/session-loop.sh`）
-6. **[docs/ANTI_SLOP.md](docs/ANTI_SLOP.md)**
-   - UI が量産的（AI slop）に見える原因と、回避手順・検出チェックリスト・自動テスト・レビュー観点。画面追加時に必ず参照
-7. **[docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)**
+6. **[docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)**
    - BLE OTA の実機 btsnoop 採取（Linux `btmon` / Android HCI snoop）・確認項目と判定・EVIDENCE への追記方法、Phase A / Phase B の安全手順。OTA の実機検証前に必ず読む。
+7. **[docs/ANTI_SLOP.md](docs/ANTI_SLOP.md)**
+   - UI が量産的（AI スロップ / AI slop）に見える原因と、回避手順・検出チェックリスト・自動テスト（導入予定）・レビュー観点（推奨。レビュー checklist の正本は [docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)）。画面追加時に参照
 
 ---
 
