@@ -4,11 +4,16 @@ plugins {
 }
 
 android {
-    namespace = "dev.eightbitdo.mobile"
+    // Display name and store identity are Padbench. The Kotlin source package
+    // (`dev.eightbitdo.mobile`) is an internal code namespace and is kept as-is
+    // so the Rust/UniFFI binding package (`dev.eightbitdo.mobile.core`) and the
+    // source paths do not change; the manifest therefore names the activity by
+    // its fully-qualified class.
+    namespace = "io.github.haruki0420.padbench"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "dev.eightbitdo.mobile"
+        applicationId = "io.github.haruki0420.padbench"
         minSdk = 26
         targetSdk = 36
         versionCode = 1

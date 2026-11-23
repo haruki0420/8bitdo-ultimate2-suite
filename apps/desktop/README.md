@@ -1,6 +1,6 @@
-# 8BitDo Ultimate 2 — Desktop (Tauri v2)
+# Padbench — Desktop (Tauri v2)
 
-`apps/desktop` は 8BitDo Ultimate 2 スイートのデスクトップ UI です。このスキャフォールドでは
+`apps/desktop` は Padbench（8BitDo Ultimate 2 対応）のデスクトップ UI です。このスキャフォールドでは
 **Tauri v2 + TypeScript + Vite + React + Tailwind CSS** の土台と、Rust 側の `app_info`
 コマンド 1 つだけを提供します。**BLE 接続・デバイス読み書きはまだ実装していません**（次のフェーズ）。
 
@@ -76,7 +76,7 @@ apps/desktop/
     App.test.tsx        レンダリング / 失敗時警告のテスト
   src-tauri/
     Cargo.toml          独立ワークスペース（ルート Cargo.toml の members には入れない）
-    tauri.conf.json     アプリ名 / identifier / ウィンドウ 1120x800（最小 900x620）
+    tauri.conf.json     アプリ名 Padbench / identifier io.github.haruki0420.padbench / ウィンドウ 1120x800（最小 900x620）
     capabilities/       core:default のみ
     src/lib.rs          app_info コマンドと run()
     src/main.rs         バイナリのエントリ

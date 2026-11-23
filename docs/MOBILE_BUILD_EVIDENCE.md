@@ -3,6 +3,7 @@
 - 対象 main: `c169392`
 - ホスト: Arch Linux x86_64、rustc/cargo 1.100.0、JDK 21.0.13、Android SDK `/opt/android-sdk`
 - この文書は **ビルド・リンク・パッケージ内容の確認** の記録です。実機 BLE の動作確認は含みません。
+- **注（2026-11-23）**: 以下の識別子は表示名・識別子を Padbench に統一する前の実測値です。現行の `applicationId` / `bundleID` は `io.github.haruki0420.padbench`、表示名は Padbench。以下の値は当時の記録として保持します。
 
 ## 1. Android（JNI 同梱 APK）
 

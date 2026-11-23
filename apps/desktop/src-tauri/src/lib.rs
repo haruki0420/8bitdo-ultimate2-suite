@@ -2,7 +2,7 @@ use serde::Serialize;
 
 /// Display name of the application (kept in sync with `productName` in
 /// `tauri.conf.json`).
-const APP_NAME: &str = "8BitDo Ultimate 2";
+const APP_NAME: &str = "Padbench";
 
 /// Information surfaced by the placeholder "about" badge in the UI.
 #[derive(Debug, Serialize)]

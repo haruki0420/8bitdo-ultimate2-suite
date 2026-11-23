@@ -1,4 +1,4 @@
-# 実装計画書（8BitDo Ultimate 2 Cross-Platform Suite）
+# 実装計画書（Padbench — 8BitDo Ultimate 2 対応）
 
 ## 1. プロジェクト目標
 

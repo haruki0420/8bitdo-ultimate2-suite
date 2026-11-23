@@ -31,7 +31,7 @@ struct ContentView: View {
                     }
                 }
             }
-            .navigationTitle("Ultimate 2")
+            .navigationTitle("Padbench")
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     if model.stage.isConnected {

@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    eightbitdo_desktop_lib::run()
+    padbench_desktop_lib::run()
 }

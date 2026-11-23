@@ -73,11 +73,11 @@ export default function App() {
       <header className="flex h-14 shrink-0 items-center justify-between border-b border-slate-800 bg-slate-900/70 px-5">
         <div className="flex items-center gap-3">
           <div className="flex h-8 w-8 items-center justify-center rounded-md bg-emerald-500/15 text-sm font-bold text-emerald-300 ring-1 ring-emerald-500/30">
-            8
+            P
           </div>
           <div className="leading-tight">
             <p className="text-sm font-semibold tracking-wide text-slate-100">
-              8BitDo Ultimate 2
+              Padbench
             </p>
             <p className="text-[11px] text-slate-500">Desktop</p>
           </div>
@@ -137,7 +137,7 @@ export default function App() {
           </ul>
 
           <div className="mt-auto space-y-1 border-t border-slate-800 pt-3 text-[11px] text-slate-500">
-            <p className="truncate">{appInfo?.name ?? "8BitDo Ultimate 2"}</p>
+            <p className="truncate">{appInfo?.name ?? "Padbench"}</p>
             <p className="font-mono">Tauri {appInfo?.tauriVersion ?? "—"}</p>
           </div>
         </nav>

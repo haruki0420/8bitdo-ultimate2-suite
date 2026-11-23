@@ -13,7 +13,7 @@ describe("App", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     invokeMock.mockResolvedValue({
-      name: "8BitDo Ultimate 2",
+      name: "Padbench",
       version: "0.1.0",
       tauriVersion: "2.0.0",
     });
@@ -25,6 +25,7 @@ describe("App", () => {
     expect(
       screen.getByRole("heading", { name: "デバイス" }),
     ).toBeInTheDocument();
+    expect(screen.getAllByText("Padbench").length).toBeGreaterThan(0);
     const version = await screen.findByTestId("app-version");
     expect(version).toHaveTextContent("v0.1.0");
     expect(invokeMock).toHaveBeenCalledWith("app_info");

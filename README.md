@@ -1,8 +1,10 @@
-# 8BitDo Ultimate 2 Cross-Platform Suite
+# Padbench
 
 [![CI](https://github.com/haruki0420/8bitdo-ultimate2-suite/actions/workflows/ci.yml/badge.svg)](https://github.com/haruki0420/8bitdo-ultimate2-suite/actions/workflows/ci.yml)
 
-**8BitDo Ultimate 2 Bluetooth Controller**（内部 PID `0x600F` / 2.4G レシーバー `0x6011`）向けのオープンソース・クロスプラットフォーム設定／マクロ編集／ファームウェアアップデートスイートです。
+**Padbench** は、**8BitDo Ultimate 2 Bluetooth Controller**（内部 PID `0x600F` / 2.4G レシーバー `0x6011`）に対応するオープンソース・クロスプラットフォームの設定／マクロ編集／ファームウェアアップデートツール群です。
+
+> **表示名と識別子**: 表示名は **Padbench**、識別子はデスクトップ・モバイル共通で `io.github.haruki0420.padbench` です。リポジトリ名 `8bitdo-ultimate2-suite` は既存の GitHub URL を維持するため変更していません。
 
 Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続したまま、**Linux / macOS / Windows / Android / iOS** から **BLE GATT（アドバタイズ名 `"80ND"`）** 経由で同時接続し、リアルタイムにマクロやプロファイルを編集・適用することを目指しています。**現時点の実機検証は Linux・BLE のみ**で、ファームウェア更新（OTA）は core 実装のみ・未配線です（[実装状況](#実装状況)）。
 

@@ -38,7 +38,7 @@
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <activity
-            android:name=".MainActivity"
+            android:name="dev.eightbitdo.mobile.MainActivity"
             android:exported="true"
             android:screenOrientation="portrait">
             <intent-filter>

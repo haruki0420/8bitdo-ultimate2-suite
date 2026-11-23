@@ -1,9 +1,9 @@
 {
-  "name": "eightbitdo-desktop",
+  "name": "padbench-desktop",
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Tauri v2 desktop shell for the 8BitDo Ultimate 2 suite",
+  "description": "Tauri v2 desktop shell for Padbench (8BitDo Ultimate 2 support)",
   "license": "MIT OR Apache-2.0",
   "scripts": {
     "dev": "vite",

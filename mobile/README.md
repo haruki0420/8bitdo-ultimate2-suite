@@ -1,5 +1,6 @@
 # モバイルアプリ（iOS / Android）
 
+**Padbench**（表示名。識別子は `io.github.haruki0420.padbench`）は、
 8BitDo Ultimate 2 Bluetooth Controller（BLE `80ND` / PID `0x600F`）を、
 Nintendo Switch 接続したまま設定の読み出し・バックアップを行う
 **非公式**モバイルクライアントです。
@@ -201,7 +202,7 @@ cd mobile/ios && xtool dev build -c release --ipa
 * `Payload/EightBitDo.app/EightBitDo`: `Mach-O 64-bit arm64 executable`
 * `llvm-nm` で `_uniffi_eightbitdo_uniffi_fn_constructor_mobilesession_new` など
   UniFFI シンボル 61 個を確認（Rust staticlib が実際にリンクされている）
-* `Info.plist`: `CFBundleIdentifier=dev.eightbitdo.mobile`,
+* `Info.plist`: `CFBundleIdentifier=dev.eightbitdo.mobile`（当時の値。現行は `io.github.haruki0420.padbench`、表示名 Padbench）,
   `NSBluetoothAlwaysUsageDescription`（"read its settings and enable live
   input"）, `UIBackgroundModes=[bluetooth-central]`, `MinimumOSVersion=17.0`
 * Rust staticlib サイズ: 20,899,048 bytes（release、LTO なし）
@@ -263,7 +264,7 @@ with-response しか広告しない実装があります。フレーム自体は
 | App Store / TestFlight 配布 | **不可** | macOS + Xcode / Transporter（または macOS CI ランナー） |
 
 * `bundleID` は Apple Developer Services 上で永続なので、最初に確定させる
-  （`mobile/ios/xtool.yml` の `bundleID: dev.eightbitdo.mobile`）。
+  （`mobile/ios/xtool.yml` の `bundleID: io.github.haruki0420.padbench`）。
 * 実機では初回起動後に「設定 > 一般 > VPN とデバイス管理」で開発者を信頼する。
 * 無料 Apple ID では配布用証明書・App Store 配布はできない。
 

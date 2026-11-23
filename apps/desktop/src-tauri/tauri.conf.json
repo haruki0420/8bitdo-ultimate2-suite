@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "8BitDo Ultimate 2",
+  "productName": "Padbench",
   "version": "0.1.0",
-  "identifier": "dev.eightbitdo.desktop",
+  "identifier": "io.github.haruki0420.padbench",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "8BitDo Ultimate 2",
+        "title": "Padbench",
         "width": 1120,
         "height": 800,
         "minWidth": 900,

@@ -1,5 +1,6 @@
 # eightbitdo-gui（Phase 3a + 3b / 設定・マクロ書き込み対応）
 
+**Padbench**（表示名。識別子は `io.github.haruki0420.padbench`）は、
 8BitDo Ultimate 2 Bluetooth Controller（BLE App Mode `"80ND"`）を操作する
 Pure Rust デスクトップ GUI です。egui / eframe を使い、Node.js・WebView・
 Electron・Tauri は使用していません。

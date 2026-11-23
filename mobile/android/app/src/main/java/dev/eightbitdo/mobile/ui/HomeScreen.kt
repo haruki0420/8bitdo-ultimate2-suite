@@ -39,7 +39,7 @@ fun HomeScreen(viewModel: DeviceViewModel) {
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         item {
-            Text("Ultimate 2 Mobile", style = MaterialTheme.typography.headlineSmall)
+            Text("Padbench", style = MaterialTheme.typography.headlineSmall)
             Text(
                 "非公式ツール / unofficial. BLE 読み取り専用（このマイルストーン）",
                 style = MaterialTheme.typography.bodySmall,
