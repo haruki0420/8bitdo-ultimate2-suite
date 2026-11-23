@@ -1,13 +1,13 @@
 # モバイルネイティブ フル機能ギャップ監査 / 実装計画
 
-- 対象ブランチ: `feat/native-mobile`（監査時点の `origin/main` = `81b0ac1`）
+- 対象ブランチ: `feat/native-mobile`（監査時点の `origin/main` = `81b0ac1`。本計画は #30 で main にマージ済み）
 - 監査日: 2026-11-23
 - 種別: **調査ドキュメントのみ**（この文書の追加以外にコード差分はない）
 - 目的: iOS（SwiftUI）と Android（Jetpack Compose）のネイティブアプリを、デスクトップ CLI / GUI と同等のフル機能まで仕上げるための不足（UniFFI API・画面・検証・工数・順序・リスク）を確定する
 
-> 前提: モバイルは Tauri の Web UI ではなく、**各 OS のネイティブ UI + `eightbitdo-uniffi` 経由の Rust コア**で作る（[AGENTS.md](../AGENTS.md) §3）。プロトコル・構造体・書き込み順序の正本は [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) / [STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md) とし、この文書はそれらを再定義しない。
+> 前提: モバイルの**現行方針は Tauri v2 モバイル（デスクトップと同じ Web UI）+ ネイティブ BLE プラグイン**（Kotlin BluetoothGatt / Swift CoreBluetooth。プラグインから `eightbitdo-core` へ transport を注入する）です（[AGENTS.md](../AGENTS.md) §3、[TAURI_PLAN.md](TAURI_PLAN.md) P8）。本計画は **UniFFI + 各 OS ネイティブ UI 版（iOS SwiftUI / Android Jetpack Compose）**を、Tauri v2 モバイルが実機で動くまでの**代替・先行実装**として位置づけ、その機能ギャップ・契約・実装順序を定義します。プロトコル・構造体・書き込み順序の正本は [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) / [STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md) とし、この文書はそれらを再定義しません。
 >
-> デスクトップ側の移行: デスクトップ GUI は別ブランチ `feat/tauri-gui` で Tauri v2 へゼロベース移行中で、表示名は `Padbench` にする予定（ユーザー方針。本ブランチ `feat/native-mobile` には未反映）。この文書で「デスクトップ / GUI」と書くときは、比較基準として監査時点の base `81b0ac1` の egui GUI と CLI を指す。Tauri 版に移っても共有する正本は Rust コア（`eightbitdo-core` / `eightbitdo-protocol`）であり、**モバイル向け UniFFI の契約・不足 API・書き込み安全手順・用語集はそのまま適用できる**。モバイルの表示名も `Padbench` 系列に揃えるか別名にするかは §10 #1 で決める。
+> デスクトップ側の状態: デスクトップ GUI は **PR #32 で Tauri v2 に移行済み**（`apps/desktop`、main にマージ済み。**P0 / P1 完了・P2 以降未着手**。画面骨格と静的 2 画面までで、BLE 接続・実データは未実装）。この文書で「デスクトップ / GUI」と書くときは、比較基準として監査時点の base `81b0ac1` の egui GUI と CLI を指します（egui 版は凍結）。Tauri 版に移っても共有する正本は Rust コア（`eightbitdo-core` / `eightbitdo-protocol`）であり、**モバイル向け UniFFI の契約・不足 API・書き込み安全手順・用語集はそのまま適用できます**。モバイルの表示名・識別子は **Padbench** / `io.github.haruki0420.padbench` に統一済みです（PR #32）。
 
 ---
 
@@ -836,7 +836,7 @@ export ANDROID_NDK_HOME=/opt/android-sdk/ndk/29.0.14206865
 7. release 署名・AAB・Play Console 設定（データセーフティ、プライバシーポリシー、クローズドテスト）。
 8. CI への Android ビルド追加（現状 CI は Rust のみ。§6.2）。`gen-bindings.sh` を含めること。
 9. 入力ストリームの配線（`0x0007` → `0x0003` 20ms）と `0x0007` の MTU 0x3F 副作用の実機確認（§2.3 API-9）。
-10. 表示名の変更（`app_name = "Ultimate2 Mobile"` → 自前名称）。R8 / §10 #1。
+10. 表示名・識別子の確認（`app_name` / `applicationId` / `namespace` は **Padbench** / `io.github.haruki0420.padbench` に統一済み。PR #32）。R8 / §10 #1。
 
 ---
 
@@ -889,7 +889,7 @@ export ANDROID_NDK_HOME=/opt/android-sdk/ndk/29.0.14206865
 
 - **MTU 推定のリスク**: 常に `.withoutResponse` の最大書込長から MTU を推定している。FF11/FF13 の中には with-response しか広告しない実装があり、その場合 `maximumWriteValueLength(for: .withoutResponse)` が 0 になる可能性がある（0 なら MTU 3 → エラーでリンク切断）。**実機で properties と値を記録し、必要なら with-response 側の値も見るフォールバックを検討**（Tier 3 ではなく transport 契約の変更なのでレビュー対象）。
 - `Info.plist` は `NSBluetoothAlwaysUsageDescription` / `UIBackgroundModes = bluetooth-central` 設定済み。書き込みは前景専用のため、バックグラウンドで実行させない UI 制御が必要。
-- App Store 提出前に必要: プライバシーマニフェスト（`PrivacyInfo.xcprivacy`）、暗号輸出コンプライアンス（`ITSAppUsesNonExemptEncryption`）、非公式・非提携の Review Note、**アプリ表示名の変更**（[DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md) §3.3）。
+- App Store 提出前に必要: プライバシーマニフェスト（`PrivacyInfo.xcprivacy`）、暗号輸出コンプライアンス（`ITSAppUsesNonExemptEncryption`）、非公式・非提携の Review Note。表示名・識別子は **Padbench** / `io.github.haruki0420.padbench` に統一済み（PR #32、[DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md) §3.3）。
 
 ### 4.4 iOS の不足タスク
 
@@ -902,17 +902,17 @@ export ANDROID_NDK_HOME=/opt/android-sdk/ndk/29.0.14206865
 7. 実機テスト（BLE 読み取り → 書き込み）と MTU 推定の実測（`maximumWriteValueLength` が with-response 専用機種で 0 になる可能性。§4.3）。
 8. CI（Linux では xtool ビルドのみ。macOS ランナーが無いと署名はできない）。`gen-bindings.sh` を含めること。
 9. 入力ストリームの配線（0x0007 → 0x0003 20ms）と `0x0007` の MTU 0x3F 副作用の実機確認（§2.3 API-9）。
-10. 表示名の変更（`CFBundleDisplayName = "Ultimate2 Mobile"` → 自前名称）。R8 / §10 #1。
+10. 表示名・識別子の確認（`CFBundleDisplayName` / `applicationId` などは **Padbench** / `io.github.haruki0420.padbench` に統一済み。PR #32）。R8 / §10 #1。
 
 ---
 
 ## 5. 共通化（3 実装で重複しない構造）
 
-3 実装 = **現行デスクトップ GUI（egui）/ Android / iOS**。デスクトップは別ブランチで Tauri v2 + Web UI へ移行中（§0 の前提）で、移行後は「Web フロント + Rust コマンド」になるが、**共有する正本は Rust コアと `mobile/shared/` のデータ**であり、本節の共通化方針は変わらない（Web 側の文言は Web の i18n に載せ、同じキー体系を使う）。現状もロジックは Rust にあるが、UI に漏れている知識（文言・エラー分類・書き込み手順・ファイル形式・スロット基底・入力→マクロ変換）が重複の温床。以下を共通化の単位とする。
+3 実装 = **デスクトップ GUI（Tauri v2 版が正式。egui 版は凍結）/ Android / iOS**。デスクトップは PR #32 で Tauri v2 + Web UI に移行済み（§0 の前提）で、移行後は「Web フロント + Rust コマンド」になるが、**共有する正本は Rust コアと `mobile/shared/` のデータ**であり、本節の共通化方針は変わらない（Web 側の文言は Web の i18n に載せ、同じキー体系を使う）。現状もロジックは Rust にあるが、UI に漏れている知識（文言・エラー分類・書き込み手順・ファイル形式・スロット基底・入力→マクロ変換）が重複の温床。以下を共通化の単位とする。
 
 ### 5.1 日本語文言（用語集）
 
-用語の正本を 1 つ決め、UI 文言はキー化する。デスクトップ GUI は `crates/eightbitdo-gui/src/i18n.rs` に日英の対応表を持っているので、**そこから用語を抽出して同じ語を使う**。
+用語の正本を 1 つ決め、UI 文言はキー化する。デスクトップ GUI の用語の正本は Tauri 版の [DESIGN_TAURI.md](DESIGN_TAURI.md) §6.3（と [TAURI_PLAN.md](TAURI_PLAN.md) §8）なので、**そこから用語を抽出して同じ語を使う**。凍結された egui 版の `crates/eightbitdo-gui/src/i18n.rs` にも日英の対応表があり、既存語の参照元にできる。
 
 | 概念 | 日本語（UI） | English | 備考 |
 | --- | --- | --- | --- |
@@ -1206,7 +1206,7 @@ EOF
 | **iPhone 実機 + Apple ID** | iOS の署名付き実機インストール | このホストは `xtool auth status` ログイン済みだが端末未接続。無料 Apple ID では配布証明書なし |
 | **macOS + Xcode** | iOS シミュレータ、TestFlight / App Store 提出、プライバシーマニフェスト検証 | 無し（Linux では unsigned IPA まで） |
 | **ファームウェアイメージ + btsnoop 採取環境** | OTA（M6）の wire 確定 | Android の HCI snoop または Linux `btmon`。公式 `.dat` はリポジトリに置かない |
-| **表示名の決定** | ストア申請（M7） | `Padbench` 系列に揃えるか別名か（§10 #1）。`applicationId` / `bundleID` の再確認も |
+| **表示名・識別子** | ストア申請（M7） | **決定済み**: 表示名 **Padbench**、識別子 `io.github.haruki0420.padbench`（PR #32 で統一。[DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md) §3.3） |
 | **ストアアカウント** | Android 本番公開 / iOS 配布 | Google Play のクローズドテスト（12 テスター × 14 日）、Apple Developer Program（有料） |
 
 ---
@@ -1222,7 +1222,7 @@ EOF
 | R5 | プロファイル切替（0x0015）の永続性・実効・ACK 形状が未確認 | 切替 UI が誤った成功表示をする | 切替後に config を読み直して `cur_slot` を表示。再接続後の再確認を案内。Save 不要と断定しない | 実機 |
 | R6 | マクロ書込の実機証跡が **S1 の M1 / M2 のみ**（S2/S3・M3/M4 は外挿） | 一部スロットで永続化しない可能性 | M4 の exit 条件に実機検証を含める。UI に検証範囲を明記 | 実機 |
 | R7 | OTA の wire 未確定（ACK 照合・マルチセクション `.dat`・Bootloader MTU） | OTA 実装不能 | **配線しない**。core の Phase 2c を先に完了させる | btsnoop |
-| R8 | 表示名が商標方針に不適合（"Ultimate2 Mobile"） | ストア却下 | 自前名称へ変更（[DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md) §3.3）。識別子も再確認 | 申請前チェック |
+| R8 | 表示名・識別子が商標方針に不適合（旧 "Ultimate2 Mobile"） | ストア却下 | **解消済み**: 自前名称 **Padbench** と識別子 `io.github.haruki0420.padbench` に統一（PR #32、[DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md) §3.3） | 申請前チェック |
 | R9 | iOS の署名 / ストアが macOS 必須 | リリース不能 | macOS + Xcode 環境（または macOS CI）を用意。Linux は unsigned IPA / 実機署名まで | ビルド / 提出 |
 | R10 | Google Play 個人アカウントのクローズドテスト（12 テスター × 14 日） | 公開遅延 | 読み取りのみ版で早期にクローズドテスト開始 | Play Console |
 | R11 | UniFFI 0.31.2 固定（0.32 系は MSRV 超過） | API 追加時に bindgen を上げられない | 0.31.2 の範囲で設計。必要なら bindgen を workspace 外へ分離 | CI `msrv` |
@@ -1240,7 +1240,7 @@ EOF
 
 ## 10. 未決事項（オープンクエスチョン）
 
-1. **アプリの最終名称**: デスクトップは別ブランチで `Padbench` へ改名予定（§0 前提）。モバイルも同じ系列名にするか、別名にするか。[DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md) §3.3 の「商標・製品名を使わない」決定に合わせ、`applicationId` / `bundleID` も同時に確認する。
+1. **アプリの最終名称**: **決定済み**。デスクトップ・モバイルとも表示名 **Padbench**、識別子 `io.github.haruki0420.padbench`（PR #32 で統一。[DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md) §3.3）。
 2. **書き込み公開の条件**: どの機種 / OS バージョンで実機検証できたら公開するか（Android 12+ / iPhone の最低 2 機種など）。
 3. **記録の仕様**: `0x0007`（ReportEnable）と `0x0003`（ReadKeysAndJoy）のどちらを記録に使うか。`0x0007` の MTU 0x3F 副作用をどう扱うか。ポーリング周期（≈20ms）と 1ms 分解能の扱い（丸め / 保持）。
 4. **バックアップの既定保存先**: Android SAF の永続 URI、iOS Files のどちらを既定にするか。暗号化はしない方針でよいか（設定値は機微情報ではないが端末外に出る）。

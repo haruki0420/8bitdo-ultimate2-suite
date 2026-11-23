@@ -1,9 +1,12 @@
 # eightbitdo-gui（Phase 3a + 3b / 設定・マクロ書き込み対応）
 
+> **凍結（2026-11-23）**: デスクトップ GUI の正式実装は **Tauri v2 版（[`apps/desktop`](../../apps/desktop/README.md)）** です（PR #32 で main にマージ済み。P0 / P1 完了・P2 以降未着手）。この egui 版は比較・撤退用として**凍結**しており、今後は**既知バグの修正と実機検証の記録のみ**を行い、新機能は Tauri 版にだけ追加します（[docs/TAURI_PLAN.md](../../docs/TAURI_PLAN.md) §4）。以下の内容は凍結時点の実装記録です。
+
 **Padbench**（表示名。識別子は `io.github.haruki0420.padbench`）は、
 8BitDo Ultimate 2 Bluetooth Controller（BLE App Mode `"80ND"`）を操作する
 Pure Rust デスクトップ GUI です。egui / eframe を使い、Node.js・WebView・
-Electron・Tauri は使用していません。
+Electron・Tauri は使用していません（**この crate 自体**の話であり、正式な
+デスクトップ GUI は Tauri v2 版です）。
 
 **書き込みは明示的な確認ダイアログの後だけ実行します。** 書き込みの直前に
 設定 2768 バイト（`prewrite-config-*.bin` + JSON）またはマクロ 3 スロット ×

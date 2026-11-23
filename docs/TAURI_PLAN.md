@@ -160,7 +160,7 @@ graph TD
 | **P7 パッケージ / CI** | 配布物の生成 | Linux AppImage / deb、macOS dmg（署名・公証）、Windows MSI / NSIS、CI matrix、既存 Rust テストの維持 | 各 OS でインストールと起動を確認する。署名・公証の資格情報が無い間は未署名ビルドを成果物にし、その旨を明記する |
 | **P8 モバイル** | Tauri v2 モバイルへの展開 | Tauri v2 の Android / iOS 初期化、ネイティブ BLE プラグイン（Kotlin / Swift）、`Transport` 注入、エミュレータ / 実機確認、APK / AAB / IPA | Android 実機で BLE 読み取りが動く。iOS は macOS + Xcode が使える環境でビルドを確認する（本ホスト不可） |
 
-**状態（2026-11-23）**:
+**状態（2026-11-23、main `ed61961`）**: この計画と `apps/desktop` の P0 / P1 は **PR #32 で main にマージ済み**です。
 
 | フェーズ | 状態 |
 | --- | --- |
@@ -215,7 +215,7 @@ graph TD
 | **入力モニターの描画性能** | React の再描画で 60fps を割る可能性 | Rust 側で最新値に間引く。描画は `requestAnimationFrame` と canvas を使い、イベントはデバイスの通知間隔（20 ms）に合わせてバッチ化する |
 | **Tauri / Web ツールチェーンの更新** | major 更新で破壊的変更を受ける | バージョンを固定して lockfile をコミットする。更新は独立した PR で行い、この文書の前提バージョンを更新する |
 | **ビルド・配布の複雑化** | Rust と Node の 2 ツールチェーンで CI 時間と手順が増える | Web と Rust の job を分け、キャッシュを使う。バージョンと手順は README に集約する |
-| **用語の揺れ** | 移行中は egui 版の文言（凍結）と Tauri 版の用語集（§8）が併存する | Tauri 版は §8 と [DESIGN_TAURI.md](DESIGN_TAURI.md) §6.3 の用語集に従う。egui 版は凍結のため文言を変えない。移行完了時に統一する |
+| **用語の揺れ** | Tauri 版が全画面を実装するまで、egui 版（凍結）の文言と Tauri 版の用語集（§8）が併存する | Tauri 版は §8 と [DESIGN_TAURI.md](DESIGN_TAURI.md) §6.3 の用語集に従う。egui 版は凍結のため文言を変えない。egui 版を削除・統合する時点で整理する |
 
 ---
 

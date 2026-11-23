@@ -3,10 +3,10 @@
 - 作成: 2026-11-23
 - 目的: 「量産的」「AI が作った感じ」を**主観で争わず**、判断と検証の手順に落とす
 - 位置づけ: 本文書は**推奨（非規範）**。レビュー checklist・Tier 判定の正本は [docs/REVIEW_TIERS.md](REVIEW_TIERS.md) です。本文書はレビューの義務や差し戻し条件を課しません（§4 の 3 項）。以下の「推奨基準」は判断の目安で、満たさない画面を自動的に不合格にはしません。
-- 適用対象: 本リポジトリのデスクトップ GUI。**main の GUI は egui 版（`crates/eightbitdo-gui`）が正本**で、**Tauri v2 版は `feat/tauri-gui` ブランチで再構築中**です。**Tauri 版がマージされた時点で、本文書の Tauri 記述が有効**になります。モバイル（Kotlin / Swift）はネイティブ UI のため、§2.1 の CSS / DOM 前提の検出手段はそのままは使えません（色定数・フォントサイズ定数の静的検査と目視で代替します）。
-- main との関係: main の `AGENTS.md` §3・`README.md` の GUI 節・`crates/eightbitdo-gui/README.md`・`docs/IMPLEMENTATION_PLAN.md` は **egui 前提**（「Tauri を使わない」と明記）です。Tauri v2 の許可と **Padbench** への改名は `feat/tauri-gui` で**実施済み**、**GUI 再構築は進行中（画面骨格まで）**です（いずれも main 未反映）。**本文書は main の技術スタック記述を変更しない**。
-- 正本の関係: 方向 5 行・見せ場（Moments）・署名・トークン・用語集・8 状態の正本は、**マージ後の `feat/tauri-gui` の `docs/DESIGN_TAURI.md`**（§3.4 / §4 / §5 / §6.3 / §8.2）です。本文書は方法論だけを扱い、その内容を要約・再定義しません（§5）。egui 版（main）は Tauri 版の方向・用語集の対象外です。
-- `feat/tauri-gui` は未マージのため、本文書ではパス名の言及にとどめ、リンクしません（マージ後に参照してください）。
+- 適用対象: 本リポジトリのデスクトップ GUI。**正式な GUI は Tauri v2 版（`apps/desktop`）**で、PR #32 により main にマージ済みです（**P0 / P1 完了、P2 以降未着手**。画面骨格とデザイントークンまでで、BLE 接続・デバイス読み書きは未実装）。**egui 版（`crates/eightbitdo-gui`）は凍結**（比較・撤退用。既知バグ修正と実機検証の記録のみ。新機能は Tauri 版だけに入れます）。モバイル（Kotlin / Swift）はネイティブ UI（UniFFI 版。Tauri v2 モバイルは計画のみ）のため、§2.1 の CSS / DOM 前提の検出手段はそのままは使えません（色定数・フォントサイズ定数の静的検査と目視で代替します）。
+- main との関係: main の `AGENTS.md` §3・`README.md` の GUI 節・`crates/eightbitdo-gui/README.md`・`docs/IMPLEMENTATION_PLAN.md` は **Tauri v2 を正式、egui 版を凍結**として記述しています（PR #32 と本 docs 整合で更新済み）。**Padbench** への表示名・識別子の統一も main に反映済みです（`io.github.haruki0420.padbench`）。**本文書は GUI の技術スタックの正本ではありません**（正本は [AGENTS.md](../AGENTS.md) §3 と [docs/TAURI_PLAN.md](TAURI_PLAN.md)）。
+- 正本の関係: 方向 5 行・見せ場（Moments）・署名・トークン・用語集・8 状態の正本は、**main にマージ済みの [docs/DESIGN_TAURI.md](DESIGN_TAURI.md)**（§3.4 / §4 / §5 / §6.3 / §8.2）です。本文書は方法論だけを扱い、その内容を要約・再定義しません（§5）。egui 版（凍結）は Tauri 版の方向・用語集の対象外です。
+- Tauri 版のパス（`apps/desktop`）と `docs/DESIGN_TAURI.md` は main にあるため、本文書から参照できます。
 
 ## 適用のトリアージ（どこまでやるか）
 
@@ -42,11 +42,11 @@ unslop の判断に倣い、適用量を 3 段階で決めます。
 
 ## 2. 検出チェックリスト（兆候と検出手段）
 
-以下は**機械検出できるもの**と**目視で見るもの**に分ける。検出手段は、Tauri v2 / Web UI（`feat/tauri-gui` で追加中）と main の egui 版の両方で書く。**推奨基準**は目安であり、判定を機械的に強制しない。
+以下は**機械検出できるもの**と**目視で見るもの**に分ける。検出手段は、Tauri v2 / Web UI（`apps/desktop`。main に実装済み）と egui 版（`crates/eightbitdo-gui`、凍結）の両方で書く。**推奨基準**は目安であり、判定を機械的に強制しない。
 
 ### 2.1 機械で検出できる兆候（推奨）
 
-| 兆候 | 検出方法（Tauri v2 / Web UI。`feat/tauri-gui` で追加中） | 検出方法（egui 版・main） | 推奨基準 |
+| 兆候 | 検出方法（Tauri v2 / Web UI。`apps/desktop` に実装済み） | 検出方法（egui 版・凍結） | 推奨基準 |
 | --- | --- | --- | --- |
 | 色相グラデーション（面・文字・光彩） | `gradient` の grep、`tokens.ts` と `tokens.css` の変数一致テスト | 【grep/目視】`Painter` のグラデ呼び出しと多段色定数の grep | 0 件（同一色相内の微小な明度差のみ許容） |
 | アクセント色の乱立 | 色トークンの列挙と CSS 変数の一致テスト | 【grep】色定数（`pub const ... Color32`）の列挙（トークン単一性テストは無い） | クロームのアクセントは 1 色のみ |
@@ -60,9 +60,9 @@ unslop の判断に倣い、適用量を 3 段階で決めます。
 | 用語の不統一・禁止語 | 用語集テスト（`VOCAB` / `terminology.test.ts`） | 【grep/目視】`i18n.rs` の文字列を**対象 UI の用語集**と突き合わせ（egui 用の用語集テストは無い） | 対象 UI の用語集に照らして旧語 0 件 |
 | 未検証の主張 | コピーのレビュー + grep | 【レビュー/grep】コピーのレビュー + grep | 「完全」「絶対」「10x」等の断定なし |
 
-> **Tauri 側は導入予定**: main には Tauri 版のコードもテストもありません。`feat/tauri-gui` で `apps/desktop` に `tokens.test.ts` / `terminology.test.ts` 等を追加中で、実装後は `apps/desktop/src/**/*.test.ts(x)` の同じテスト群へ画面追加分を足します。`apps/desktop` のテストは root の CI では走りません（手動 `pnpm test`）。
+> **Tauri 側のテスト実体**: `apps/desktop` には `tokens.test.ts` / `terminology.test.ts` / `style-audit.test.ts` 等のテストがあり、`Desktop` ワークフロー（advisory。root の `ci.yml` には含まれない）の `desktop-web` ジョブで `pnpm test` が走ります。画面を追加したら `apps/desktop/src/**/*.test.ts(x)` の同じテスト群へ足します。
 
-> **egui 版（main）のテスト実体**: `theme.rs` 8 件・`i18n.rs` 9 件。既存テストで担保されるのは文字スケール・行高と字間・コントラスト・面の明度階段・状態色の可読性・幾何（角丸 4 種を含む）・フォント同梱で、4px 倍数・トークン単一性・禁止語突き合わせのテストはありません（表で【grep/目視】とした項目）。egui 版は Tauri 版の P2 以降に凍結予定です（`docs/TAURI_PLAN.md`。移行完了時に再判断）。
+> **egui 版（凍結）のテスト実体**: `theme.rs` 8 件・`i18n.rs` 9 件。既存テストで担保されるのは文字スケール・行高と字間・コントラスト・面の明度階段・状態色の可読性・幾何（角丸 4 種を含む）・フォント同梱で、4px 倍数・トークン単一性・禁止語突き合わせのテストはありません（表で【grep/目視】とした項目）。egui 版は凍結済みです（[docs/TAURI_PLAN.md](TAURI_PLAN.md) §4。既知バグ修正と実機検証の記録のみ。）
 
 > **用語**: egui 版の現行語（`i18n.rs` の「ライブ入力」「設定値」等）は、Tauri 版の用語集を遡って適用しません。推奨基準は常に**対象 UI の用語集**に対して判定します。
 
@@ -117,7 +117,7 @@ unslop の判断に倣い、適用量を 3 段階で決めます。
 ## 4. このリポジトリでの推奨運用
 
 1. **画面追加・変更時（推奨）**: 方向のどこに属するか、見せ場、署名の当てはまりを PR 本文に書く（**義務ではない**）。
-2. **検査の追加（導入時に検討・推奨）**: 画面ごとに、検出できる兆候のいずれかを自動テストに含めることを検討する（main では未実装。`feat/tauri-gui` で追加中）。
+2. **検査の追加（導入時に検討・推奨）**: 画面ごとに、検出できる兆候のいずれかを自動テストに含めることを検討する（`apps/desktop` では `tokens.test.ts` / `terminology.test.ts` / `style-audit.test.ts` 等が実装済み。画面追加分は同じテスト群へ追加する）。
 3. **レビュー**: [docs/REVIEW_TIERS.md](REVIEW_TIERS.md) が正本。本文書は推奨で、レビューの義務や差し戻し条件を課さない。REVIEW_TIERS に本文書への参照を足す場合は別 PR で行う。
 4. **日本語**: 用語集（正本: Tauri 版の `docs/DESIGN_TAURI.md` §6.3）に従い、推敲は別途行う。`nihongo` は選択肢の 1 つ（スキル名）であり、規範根拠にはしない。
 5. **非推奨リスト（推奨）**: 色相グラデーション、紫・ネオン、絵文字アイコン、ガラスモーフィズム、過剰な角丸カード、意味のないバッジ（`PRO` `New`）、挨拶見出し、`Welcome back!`、`seamless` 等の誇張、未検証の数値主張、全プロパティ遷移、ループアニメーション。
@@ -128,9 +128,9 @@ unslop の判断に倣い、適用量を 3 段階で決めます。
 
 ## 5. GUI への適用（正本を参照）
 
-main の GUI は **egui 版が正本**です。**Tauri v2 版は `feat/tauri-gui` ブランチで再構築中**で、**マージ後に本文書の Tauri 記述が有効**になります。表示名 **Padbench** への改名も同ブランチで**実施済み（main 未反映）**です。
+GUI の正式実装は **Tauri v2 版（`apps/desktop`）**です（PR #32 で main にマージ済み。P0 / P1 完了・P2 以降未着手）。**egui 版（`crates/eightbitdo-gui`）は凍結**（比較・撤退用。既知バグ修正と実機検証の記録のみ）です。表示名 **Padbench** は main に反映済みです。
 
-方向 5 行・見せ場・署名・不採用案・トークン・用語集・8 状態は `docs/DESIGN_TAURI.md`（§3.4 / §4 / §5 / §6.3 / §8.2）を参照し、**本文書では要約しない**（正本の二重化を避ける）。egui 版（main）は Tauri 版の方向・用語集の対象外です。main の egui 前提の記述の更新も同ブランチで行います。
+方向 5 行・見せ場・署名・不採用案・トークン・用語集・8 状態は [docs/DESIGN_TAURI.md](DESIGN_TAURI.md)（§3.4 / §4 / §5 / §6.3 / §8.2）を参照し、**本文書では要約しない**（正本の二重化を避ける）。egui 版（凍結）は Tauri 版の方向・用語集の対象外です。main の egui 前提だった記述は、Tauri 前提へ更新済みです。
 
 ---
 
