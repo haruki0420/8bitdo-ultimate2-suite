@@ -8,8 +8,18 @@ import {
   type StickVector,
 } from "../input/input-report";
 
-/** SVG 内でスティックの点が動く半径（スティック外周 16px より内側）。 */
-const STICK_DOT_RADIUS = 12;
+/** スティック図の一辺（SVG viewBox）。 */
+const PAD_SIZE = 160;
+/** 外周円の半径。 */
+const PAD_RADIUS = 79;
+/** 現在位置ドットが動ける半径（外周と重ならない値）。 */
+const STICK_DOT_RADIUS = 72;
+/** 現在位置ドットの半径。 */
+const DOT_RADIUS = 5;
+/** 軌跡として残す過去位置の比率（中心 → 現在位置）。 */
+const TRAIL_STEPS = [0.4, 0.6, 0.8] as const;
+/** 押下中のボタン（見本）。 */
+const PRESSED = ["A", "L1"] as const;
 
 /**
  * 画面の見本データ。実機の入力は次のフェーズで接続する。
@@ -20,193 +30,84 @@ const SAMPLE = {
   right: normalizeStick(117, 88),
   leftTrigger: normalizeTrigger(158),
   rightTrigger: normalizeTrigger(31),
-  pressed: "A / L1",
 } as const;
 
-interface PadGraphicProps {
-  left: StickVector;
-  right: StickVector;
+interface StickPadProps {
+  label: string;
+  vector: StickVector;
 }
 
 /**
- * コントローラの線画。押されたボタンだけを LED（--stage-led）で塗る。
- * 非押下は輪郭のみ（--stage-line-strong）。色だけに頼らないよう、
- * 押下ボタン名は下の数値一覧にもテキストで出す。
+ * スティック 1 本の図。外周・中央十字・現在位置ドット・軌跡だけで組み、
+ * コントローラの線画や装飾（グロー多重・影）は置かない。
+ * Y の符号は `screenOffset`（アダプタ層の `Y_SIGN` を反映）で 1 回だけ反転する。
  */
-function PadGraphic({ left, right }: PadGraphicProps) {
-  const leftDot = screenOffset(left, STICK_DOT_RADIUS);
-  const rightDot = screenOffset(right, STICK_DOT_RADIUS);
+function StickPad({ label, vector }: StickPadProps) {
+  const center = PAD_SIZE / 2;
+  const dot = screenOffset(vector, STICK_DOT_RADIUS);
+  const trail = TRAIL_STEPS.map((step) =>
+    screenOffset(
+      { x: vector.x * step, y: vector.y * step },
+      STICK_DOT_RADIUS,
+    ),
+  )
+    .map((point) => `${center + point.x},${center + point.y}`)
+    .join(" ");
 
   return (
-    <svg
-      viewBox="0 0 300 180"
-      role="img"
-      aria-label="コントローラの見本（左スティックは右上、右スティックは左下、A と L1 を押下）"
-      className="block w-full"
+    <figure
+      data-testid="stick-pad"
+      className="flex min-w-0 flex-col items-center gap-1.5"
     >
-      <g
-        className="fill-none stroke-stage-line-strong"
-        strokeWidth={1.5}
-        strokeLinecap="round"
-        strokeLinejoin="round"
+      <svg
+        viewBox={`0 0 ${PAD_SIZE} ${PAD_SIZE}`}
+        aria-hidden="true"
+        className="block size-40"
       >
-        {/* グリップ */}
-        <rect
-          x={44}
-          y={96}
-          width={70}
-          height={66}
-          rx={30}
-          transform="rotate(14 79 129)"
-        />
-        <rect
-          x={186}
-          y={96}
-          width={70}
-          height={66}
-          rx={30}
-          transform="rotate(-14 221 129)"
-        />
-        {/* 本体 */}
-        <rect x={62} y={52} width={176} height={66} rx={33} />
-        {/* R1 は未押下 */}
-        <rect x={156} y={44} width={52} height={12} rx={6} />
-        {/* 背面パドル */}
-        <rect
-          x={48}
-          y={112}
-          width={16}
-          height={26}
-          rx={6}
-          transform="rotate(14 56 125)"
-        />
-        <rect
-          x={236}
-          y={112}
-          width={16}
-          height={26}
-          rx={6}
-          transform="rotate(-14 244 125)"
-        />
-      </g>
-
-      {/* L1 押下 */}
-      <rect
-        x={92}
-        y={44}
-        width={52}
-        height={12}
-        rx={6}
-        strokeWidth={1.5}
-        className="stage-lit fill-stage-led stroke-stage-led"
-      />
-
-      {/* 十字キー */}
-      <path
-        d="M84 76h20M94 66v20"
-        strokeWidth={1}
-        className="fill-none stroke-stage-line"
-      />
-      <path
-        d="M82 74h24v4H82zM92 64h4v24h-4z"
-        strokeWidth={1.5}
-        className="fill-none stroke-stage-line-strong"
-      />
-
-      {/* フェイスボタン（A だけ押下） */}
-      <circle
-        cx={216}
-        cy={74}
-        r={6}
-        strokeWidth={1.5}
-        className="stage-lit fill-stage-led stroke-stage-led"
-      />
-      <g
-        className="fill-none stroke-stage-line-strong"
-        strokeWidth={1.5}
-      >
-        <circle cx={230} cy={86} r={5} />
-        <circle cx={216} cy={98} r={5} />
-        <circle cx={202} cy={86} r={5} />
-      </g>
-
-      {/* 左スティック */}
-      <g
-        className="fill-none stroke-stage-line-strong"
-        strokeWidth={1.5}
-      >
-        <circle cx={116} cy={92} r={16} />
+        {/* 外枠 */}
         <circle
-          cx={116}
-          cy={92}
-          r={10}
+          cx={center}
+          cy={center}
+          r={PAD_RADIUS}
+          strokeWidth={1.5}
+          className="fill-none stroke-stage-line-strong"
+        />
+        {/* 中央十字 */}
+        <path
+          d={`M${center - 12} ${center}H${center + 12}M${center} ${center - 12}V${center + 12}`}
           strokeWidth={1}
           className="stroke-stage-line"
         />
-      </g>
-      <path
-        d="M116 78v6M116 100v6M102 92h6M124 92h6"
-        strokeWidth={1}
-        className="stroke-stage-line"
-      />
-      <circle
-        cx={116 + leftDot.x}
-        cy={92 + leftDot.y}
-        r={4.5}
-        className="stage-lit fill-stage-led"
-      />
-
-      {/* 右スティック */}
-      <g
-        className="fill-none stroke-stage-line-strong"
-        strokeWidth={1.5}
-      >
-        <circle cx={184} cy={92} r={16} />
-        <circle
-          cx={184}
-          cy={92}
-          r={10}
-          strokeWidth={1}
-          className="stroke-stage-line"
+        {/* 軌跡（中心 → 現在位置） */}
+        <polyline
+          points={`${center},${center} ${trail}`}
+          strokeWidth={1.5}
+          strokeOpacity={0.3}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className="fill-none stroke-stage-led"
         />
-      </g>
-      <path
-        d="M184 78v6M184 100v6M170 92h6M192 92h6"
-        strokeWidth={1}
-        className="stroke-stage-line"
-      />
-      <circle
-        cx={184 + rightDot.x}
-        cy={92 + rightDot.y}
-        r={4}
-        className="stage-lit fill-stage-led"
-      />
-    </svg>
-  );
-}
-
-function StickReadout({
-  label,
-  vector,
-}: {
-  label: string;
-  vector: StickVector;
-}) {
-  return (
-    <div className="flex items-baseline justify-between gap-2">
-      <dt className="text-caption whitespace-nowrap text-stage-text-muted">
+        {/* 現在位置 */}
+        <circle
+          cx={center + dot.x}
+          cy={center + dot.y}
+          r={DOT_RADIUS}
+          className="fill-stage-led"
+        />
+      </svg>
+      <figcaption className="text-caption font-medium text-stage-text-2">
         {label}
-      </dt>
-      <dd className="font-mono text-data tracking-data whitespace-nowrap text-stage-text">
+      </figcaption>
+      <p className="font-mono text-data tracking-data whitespace-nowrap text-stage-text">
         X {formatSigned(vector.x)}
         <span className="px-1 text-stage-line-strong">/</span>
         Y {formatSigned(vector.y)}
-      </dd>
-    </div>
+      </p>
+    </figure>
   );
 }
 
-function TriggerReadout({ label, value }: { label: string; value: number }) {
+function TriggerBar({ label, value }: { label: string; value: number }) {
   return (
     <div className="flex items-center gap-2">
       <dt className="w-6 text-caption text-stage-text-muted">{label}</dt>
@@ -226,8 +127,8 @@ function TriggerReadout({ label, value }: { label: string; value: number }) {
 }
 
 /**
- * 入力モニター画面。ダークステージの見本（スティック 2 つ・トリガー 2 本）。
- * 静止プレビューなので、描画と数値は同じ正規化値から作る（§5.6.1）。
+ * 入力モニター画面。ダークステージの見本（スティック図 2 つ・トリガーバー 2 本・
+ * 押下ボタンのチップ）。静止プレビューなので、図と数値は同じ正規化値から作る（§5.6.1）。
  */
 export function InputMonitorScreen() {
   return (
@@ -259,12 +160,9 @@ export function InputMonitorScreen() {
           data-surface="stage"
           className="rounded-lg border border-stage-line bg-stage-bg p-5 text-stage-text"
         >
-          <div className="mb-2 flex items-center justify-between gap-2">
+          <div className="mb-4 flex items-center justify-between gap-2">
             <span className="inline-flex items-center gap-2 text-caption font-medium text-stage-text-2">
-              <span
-                aria-hidden="true"
-                className="size-2 rounded-full bg-stage-led shadow-led"
-              />
+              <span aria-hidden="true" className="size-2 rounded-full bg-stage-led" />
               見本の値
             </span>
             <span className="font-mono text-caption tracking-caption text-stage-text-muted">
@@ -272,20 +170,26 @@ export function InputMonitorScreen() {
             </span>
           </div>
 
-          <div className="mx-auto w-full max-w-md">
-            <PadGraphic left={SAMPLE.left} right={SAMPLE.right} />
+          <div className="mx-auto w-full max-w-lg">
+            <div className="grid grid-cols-2 gap-4">
+              <StickPad label="左スティック" vector={SAMPLE.left} />
+              <StickPad label="右スティック" vector={SAMPLE.right} />
+            </div>
 
-            <dl className="mt-2 grid gap-1.5">
-              <StickReadout label="左スティック" vector={SAMPLE.left} />
-              <StickReadout label="右スティック" vector={SAMPLE.right} />
-              <TriggerReadout label="L2" value={SAMPLE.leftTrigger} />
-              <TriggerReadout label="R2" value={SAMPLE.rightTrigger} />
-              <div className="flex items-baseline justify-between gap-2">
-                <dt className="text-caption whitespace-nowrap text-stage-text-muted">
-                  押下
-                </dt>
-                <dd className="font-mono text-data tracking-data whitespace-nowrap text-stage-text">
-                  {SAMPLE.pressed}
+            <dl className="mt-4 grid gap-2 border-t border-stage-line pt-4">
+              <TriggerBar label="L2" value={SAMPLE.leftTrigger} />
+              <TriggerBar label="R2" value={SAMPLE.rightTrigger} />
+              <div className="flex items-center justify-between gap-2">
+                <dt className="text-caption text-stage-text-muted">押下</dt>
+                <dd className="flex flex-wrap justify-end gap-1.5">
+                  {PRESSED.map((button) => (
+                    <span
+                      key={button}
+                      className="inline-flex h-5 min-w-6 items-center justify-center rounded-xs border border-stage-led px-1.5 font-mono text-caption text-stage-led"
+                    >
+                      {button}
+                    </span>
+                  ))}
                 </dd>
               </div>
             </dl>

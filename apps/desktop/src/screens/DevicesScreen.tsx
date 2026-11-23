@@ -21,14 +21,13 @@ const CONNECTION_ROWS: readonly ConnectionRow[] = [
 export interface DevicesScreenProps {
   /** Rust バックエンド（app_info）に届かなかったときの 1 文 */
   ipcError: string | null;
-  onScan: () => void;
 }
 
 /**
  * デバイス画面（未接続）。空状態 + スキャン / 接続の操作 + 接続情報の表。
- * 実接続は次のフェーズなので、接続ボタンは理由つきで無効にする。
+ * 実接続は次のフェーズなので、スキャンと接続は無効の理由をボタン直下に添える。
  */
-export function DevicesScreen({ ipcError, onScan }: DevicesScreenProps) {
+export function DevicesScreen({ ipcError }: DevicesScreenProps) {
   return (
     <div>
       <h1 className="text-display font-bold text-balance text-ink">デバイス</h1>
@@ -46,8 +45,15 @@ export function DevicesScreen({ ipcError, onScan }: DevicesScreenProps) {
 
       <EmptyState
         message="まだ接続していません。"
-        instruction="コントローラを設定モードにして、「スキャン」を押します。"
-        action={<Button onClick={onScan}>スキャン</Button>}
+        instruction="コントローラを設定モードにしてから接続します。"
+        action={
+          <Button
+            disabled
+            disabledReason="スキャンは次のフェーズで追加します。"
+          >
+            スキャン
+          </Button>
+        }
       />
 
       <section className="mt-8" aria-labelledby="connection-info-title">
@@ -62,7 +68,7 @@ export function DevicesScreen({ ipcError, onScan }: DevicesScreenProps) {
             variant="secondary"
             size="sm"
             disabled
-            disabledReason="先にデバイスをスキャンして選びます。"
+            disabledReason="先にスキャンでデバイスを選びます。"
           >
             接続する
           </Button>

@@ -287,6 +287,12 @@ describe("寸法（§5.3.2）", () => {
     );
   });
 
+  it("1200px でコンテンツを中央寄せにする", () => {
+    expect(remToPx(cssVar(themeCss, "--breakpoint-wide"))).toBe(
+      LAYOUT.breakpointWide,
+    );
+  });
+
   it("最小ウィンドウは 900×620", () => {
     expect(LAYOUT.windowMinWidth).toBe(900);
     expect(LAYOUT.windowMinHeight).toBe(620);

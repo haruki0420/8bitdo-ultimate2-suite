@@ -78,6 +78,10 @@ describe("日本語の用語（§6.3）", () => {
       "ログ",
     ]);
   });
+
+  it("デバイス名を UI にハードコードしない（接続後は Rust の値だけを使う）", () => {
+    expect(SOURCE_TEXT).not.toContain("8BitDo Ultimate 2");
+  });
 });
 
 describe("絵文字禁止", () => {

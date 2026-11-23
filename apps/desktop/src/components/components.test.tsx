@@ -17,17 +17,20 @@ import {
 } from "./index";
 
 describe("Button", () => {
-  it("無効の理由をボタンの上に出し、押せなくする", () => {
+  it("無効の理由をボタンの直下に出し、押せなくする", () => {
     render(
       <Button disabled disabledReason="接続すると書き込めます。">
         実機に書き込む
       </Button>,
     );
 
-    expect(screen.getByText("接続すると書き込めます。")).toBeInTheDocument();
+    const button = screen.getByRole("button", { name: "実機に書き込む" });
+    const reason = screen.getByText("接続すると書き込めます。");
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-describedby", reason.id);
     expect(
-      screen.getByRole("button", { name: "実機に書き込む" }),
-    ).toBeDisabled();
+      button.compareDocumentPosition(reason) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   it("loading はラベルを変えず aria-busy を付ける", () => {

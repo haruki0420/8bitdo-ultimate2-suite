@@ -9,6 +9,8 @@
   /* 1180px 未満で右レールを下部へ、1100px 未満で表の補足列を落とす（§5.4 / §5.5.6） */
   --breakpoint-cols: 68.75rem;
   --breakpoint-rail: 73.75rem;
+  /* 1200px 以上はコンテンツ列を中央寄せにする（§5.4.2） */
+  --breakpoint-wide: 75rem;
 
   /* 角丸（§5.3.3）: 4 / 6 / 8 / 12。Tailwind 既定値も同じ名前で上書きする */
   --radius-xs: 4px;
@@ -45,7 +47,6 @@
     0 0 0 2px var(--surface-panel), 0 0 0 4px var(--accent);
   --shadow-nav-current: inset 2px 0 0 var(--accent);
   --shadow-row-selected: inset 2px 0 0 var(--accent);
-  --shadow-led: 0 0 12px rgba(111, 231, 216, 0.28);
 
   /* 曲線は 1 本だけ（§5.7.1）。時間は duration-90 / 160 / 240 を使う */
   --ease-standard: cubic-bezier(0.2, 0, 0, 1);
@@ -164,12 +165,6 @@
 
   .app-dialog[data-size="lg"] {
     width: min(var(--dialog-w-lg), calc(100vw - 3rem));
-  }
-
-  /* 入力モニターの光は 1 層のぼかしだけ（§5.1.1 ルール 5）。
-   * SVG 要素には box-shadow が効かないため drop-shadow を 1 回だけ使う。 */
-  .stage-lit {
-    filter: drop-shadow(0 0 6px rgba(111, 231, 216, 0.45));
   }
 }
 

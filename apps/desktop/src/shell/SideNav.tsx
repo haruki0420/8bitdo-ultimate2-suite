@@ -1,10 +1,13 @@
 import { cn } from "../lib/cn";
+import type { ConnectionInfo } from "../lib/connection";
 import { VIEWS, type ViewId } from "./views";
 
 export interface SideNavProps {
   activeView: ViewId;
   onSelect: (view: ViewId) => void;
   onOpenLicenses: () => void;
+  /** 接続中のデバイス。未接続は `null`（Rust 側の接続状態が正） */
+  connection: ConnectionInfo | null;
 }
 
 /**
@@ -15,6 +18,7 @@ export function SideNav({
   activeView,
   onSelect,
   onOpenLicenses,
+  connection,
 }: SideNavProps) {
   return (
     <nav
@@ -47,13 +51,24 @@ export function SideNav({
 
       <div aria-hidden="true" className="mx-1.5 my-4 h-px bg-line" />
 
-      {/* 接続状態は上部バーに 1 つだけ置く（§5.4.1）。ここは接続先の要約だけ。 */}
+      {/* 接続状態は上部バーに 1 つだけ置く（§5.4.1）。ここは接続先の要約だけ。
+       * 未接続ではデバイス名・アドレス・MTU を出さない。接続後は Rust が返す値だけを出す。 */}
       <p className="mb-1 px-2.5 text-meta font-medium text-muted">接続先</p>
-      <p className="px-2.5 text-ui font-medium text-ink">8BitDo Ultimate 2</p>
-      <p className="mt-0.5 px-2.5 font-mono text-data tracking-data text-muted">
-        —
-      </p>
-      <p className="mt-0.5 px-2.5 text-meta text-muted">MTU —</p>
+      {connection === null ? (
+        <p className="px-2.5 text-ui font-medium text-muted">未接続</p>
+      ) : (
+        <>
+          <p className="truncate px-2.5 text-ui font-medium text-ink">
+            {connection.name}
+          </p>
+          <p className="mt-0.5 truncate px-2.5 font-mono text-data tracking-data text-muted">
+            {connection.address}
+          </p>
+          <p className="mt-0.5 px-2.5 text-meta text-muted">
+            MTU {connection.mtu}
+          </p>
+        </>
+      )}
 
       <div className="mt-auto pt-4">
         <button

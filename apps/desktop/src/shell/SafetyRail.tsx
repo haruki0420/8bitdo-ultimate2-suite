@@ -1,8 +1,9 @@
-import { Button, EmptyState } from "../components";
+import { Button } from "../components";
 
 /**
  * 右レールの常設プレースホルダ「書き込み前の確認」（§5.4.1）。
- * 書き込みが実装されるまでは、変更が無いことと、無効の理由だけを出す。
+ * 幅 344 で内側は約 254 px のため、1 行 20 文字前後で折り返さない短文にする。
+ * 空状態は余白を 4px グリッド（8 / 12 / 16）で詰め、縦に間延びさせない。
  */
 export function SafetyRail() {
   return (
@@ -10,7 +11,7 @@ export function SafetyRail() {
       aria-labelledby="safety-rail-title"
       className="rounded-lg border border-line bg-panel p-5"
     >
-      <div className="mb-3 flex items-center justify-between gap-2">
+      <div className="mb-2 flex items-center justify-between gap-2">
         <h2
           id="safety-rail-title"
           className="text-heading font-medium text-ink"
@@ -22,18 +23,21 @@ export function SafetyRail() {
         </span>
       </div>
 
-      <EmptyState
-        message="まだ変更はありません。"
-        instruction="設定画面で変更すると、現在値との差分がここに出ます。"
-        action={
-          <Button disabled disabledReason="接続して変更すると、ここから書き込めます。">
-            実機に書き込む
-          </Button>
-        }
-      />
+      <p className="text-body text-ink-2">まだ変更はありません。</p>
+      <p className="mt-2 text-meta font-medium text-muted">次にすること</p>
+      <ul className="mt-1 list-disc pl-4 text-meta text-muted">
+        <li>設定の変更は差分で表示します。</li>
+        <li>接続後に書き込みできます。</li>
+      </ul>
 
-      <p className="mt-4 border-t border-line pt-3 text-meta text-muted">
-        書き込みの前にバックアップを保存します。
+      <div className="mt-3">
+        <Button disabled disabledReason="接続すると書き込めます。">
+          実機に書き込む
+        </Button>
+      </div>
+
+      <p className="mt-3 border-t border-line pt-3 text-meta text-muted">
+        書き込み前にバックアップします。
       </p>
     </section>
   );

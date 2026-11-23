@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 
-import { Button, Dialog, Toast, type ToastTone } from "./components";
+import { Button, Dialog } from "./components";
 import { getAppInfo, type AppInfo } from "./lib/app-info";
 import { DevicesScreen } from "./screens/DevicesScreen";
 import { InputMonitorScreen } from "./screens/InputMonitorScreen";
@@ -9,12 +9,6 @@ import { SafetyRail } from "./shell/SafetyRail";
 import { SideNav } from "./shell/SideNav";
 import { TopBar } from "./shell/TopBar";
 import type { ViewId } from "./shell/views";
-
-interface ToastState {
-  tone: ToastTone;
-  title: string;
-  meta?: string;
-}
 
 type PlaceholderView = Exclude<ViewId, "devices" | "monitor">;
 
@@ -43,16 +37,14 @@ const PLACEHOLDERS: Record<
 function Screen({
   view,
   ipcError,
-  onScan,
   onOpenDevices,
 }: {
   view: ViewId;
   ipcError: string | null;
-  onScan: () => void;
   onOpenDevices: () => void;
 }) {
   if (view === "devices") {
-    return <DevicesScreen ipcError={ipcError} onScan={onScan} />;
+    return <DevicesScreen ipcError={ipcError} />;
   }
 
   if (view === "monitor") {
@@ -74,7 +66,6 @@ export default function App() {
   const [activeView, setActiveView] = useState<ViewId>("devices");
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [ipcError, setIpcError] = useState<string | null>(null);
-  const [toast, setToast] = useState<ToastState | null>(null);
   const [licensesOpen, setLicensesOpen] = useState(false);
 
   useEffect(() => {
@@ -99,20 +90,8 @@ export default function App() {
     };
   }, []);
 
-  const closeToast = useCallback(() => {
-    setToast(null);
-  }, []);
-
   const openDevices = useCallback(() => {
     setActiveView("devices");
-  }, []);
-
-  const handleScan = useCallback(() => {
-    setToast({
-      tone: "warning",
-      title: "スキャンはまだ実装していません",
-      meta: "BLE 接続は次のフェーズで追加します",
-    });
   }, []);
 
   const closeLicenses = useCallback(() => {
@@ -131,10 +110,12 @@ export default function App() {
       <TopBar appInfo={appInfo} />
 
       <div className="flex min-h-0 flex-1">
+        {/* 接続後は Rust が返す ConnectionInfo を渡す。BLE 接続は未実装なので未接続。 */}
         <SideNav
           activeView={activeView}
           onSelect={setActiveView}
           onOpenLicenses={() => setLicensesOpen(true)}
+          connection={null}
         />
 
         {/* 1180px 未満では右レールをコンテンツの下へ回す（§5.4.2） */}
@@ -144,11 +125,10 @@ export default function App() {
             tabIndex={-1}
             className="min-w-0 flex-1 px-6 py-6 focus-visible:outline-hidden rail:overflow-y-auto"
           >
-            <div className="mx-auto max-w-content">
+            <div className="max-w-content wide:mx-auto">
               <Screen
                 view={activeView}
                 ipcError={ipcError}
-                onScan={handleScan}
                 onOpenDevices={openDevices}
               />
             </div>
@@ -162,17 +142,6 @@ export default function App() {
           </aside>
         </div>
       </div>
-
-      {toast !== null && (
-        <div className="pointer-events-none absolute right-5 bottom-5 z-30">
-          <Toast
-            tone={toast.tone}
-            title={toast.title}
-            meta={toast.meta}
-            onClose={closeToast}
-          />
-        </div>
-      )}
 
       <Dialog
         open={licensesOpen}

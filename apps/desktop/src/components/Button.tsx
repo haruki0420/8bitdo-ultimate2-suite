@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import { useId, type ButtonHTMLAttributes, type ReactNode } from "react";
 
 import { cn } from "../lib/cn";
 import { Spinner } from "./icons";
@@ -29,7 +29,7 @@ export interface ButtonProps
   size?: ButtonSize;
   /** 処理中はラベルを変えず、スピナーと aria-busy だけを足す。 */
   loading?: boolean;
-  /** 無効の理由を 1 行上に出す。押せると誤読させない（§5.5.1）。 */
+  /** 無効の理由をボタンの直下に 1 行で出す。押せると誤読させない（§5.5.1）。 */
   disabledReason?: string;
   children: ReactNode;
 }
@@ -45,6 +45,7 @@ export function Button({
   type = "button",
   ...rest
 }: ButtonProps) {
+  const reasonId = useId();
   const isDisabled = disabled || loading;
 
   const button = (
@@ -52,6 +53,7 @@ export function Button({
       type={type}
       disabled={isDisabled}
       aria-busy={loading || undefined}
+      aria-describedby={disabledReason === undefined ? undefined : reasonId}
       className={cn(
         "inline-flex items-center justify-center gap-1.5 rounded-sm border font-medium whitespace-nowrap transition-colors duration-90 ease-standard focus-visible:shadow-focus focus-visible:outline-hidden disabled:cursor-not-allowed disabled:border-transparent disabled:bg-sunken disabled:text-disabled",
         VARIANT_CLASS[variant],
@@ -71,8 +73,10 @@ export function Button({
 
   return (
     <span className="inline-flex flex-col items-start gap-1">
-      <span className="text-meta text-muted">{disabledReason}</span>
       {button}
+      <span id={reasonId} className="text-meta text-muted">
+        {disabledReason}
+      </span>
     </span>
   );
 }
