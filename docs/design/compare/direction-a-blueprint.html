@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>A / 製図 — Padbench デバイス画面</title>
+<style>
+  :root {
+    --page: #E3E0D7;
+    --sheet: #FAF9F4;
+    --rule: #C9C6BC;
+    --frame: #8FA0AB;
+    --grid: #A8B4BC;
+    --ink: #22282C;
+    --ink2: #46525A;
+    --muted: #5F6B73;
+    --accent: #1E4F7A;
+    --stage: #10222D;
+    --stage-panel: #0D1B24;
+    --stage-ink: #E7EEF2;
+    --stage-muted: #93A8B4;
+    --stage-accent: #8FC4E8;
+    --stage-line: #2A4453;
+    --stage-line-strong: #3A5A6E;
+    --mono: ui-monospace, "SFMono-Regular", Menlo, Hack, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--page);
+    color: var(--ink);
+    font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Yu Gothic", "Noto Sans JP", system-ui, sans-serif;
+    padding: 40px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; letter-spacing: 0.01em; }
+  .page { width: 1180px; margin: 0 auto; }
+  .sheet {
+    position: relative;
+    width: 1180px;
+    height: 760px;
+    background: var(--sheet);
+    border: 1px solid #B9B5A8;
+    overflow: hidden;
+  }
+  .frame {
+    position: absolute;
+    inset: 12px;
+    border: 1px solid var(--frame);
+    display: grid;
+    grid-template-rows: 48px 20px 1fr 32px;
+  }
+
+  /* 上部バー */
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 0 20px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .brand { font-size: 13px; font-weight: 700; letter-spacing: 0.02em; }
+  .brand-sub { font-size: 11px; color: var(--muted); }
+  .vrule { width: 1px; height: 16px; background: var(--rule); }
+  .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 16px; }
+  .status { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  .dot { width: 8px; height: 8px; border: 1px solid var(--muted); border-radius: 50%; }
+  .version { font-size: 11px; color: var(--ink2); }
+
+  /* 寸法線 */
+  .dimstrip { display: block; }
+
+  /* 本体 */
+  .app { display: grid; grid-template-columns: 208px 636px 312px; min-height: 0; }
+  .nav {
+    display: flex;
+    flex-direction: column;
+    padding: 16px 20px 12px;
+    border-right: 1px solid var(--rule);
+    min-height: 0;
+  }
+  .nav-list { list-style: none; margin: 0; padding: 0; }
+  .nav-item {
+    position: relative;
+    display: grid;
+    grid-template-columns: 24px 1fr;
+    align-items: center;
+    height: 36px;
+    font-size: 13px;
+    color: var(--ink2);
+  }
+  .nav-num { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .nav-item[aria-current="page"] { color: var(--ink); font-weight: 700; }
+  .nav-item[aria-current="page"]::before {
+    content: "";
+    position: absolute;
+    left: -20px;
+    top: 8px;
+    bottom: 8px;
+    width: 2px;
+    background: var(--accent);
+  }
+  .nav-item[aria-current="page"] .nav-num { color: var(--accent); }
+  .nav-foot { margin-top: auto; border-top: 1px solid var(--rule); padding-top: 12px; }
+  .nav-foot-label { font-size: 11px; color: var(--muted); }
+  .nav-foot-name { margin-top: 4px; font-size: 13px; font-weight: 700; }
+  .nav-foot-meta { margin-top: 4px; font-size: 11px; color: var(--ink2); }
+  .nav-license { margin-top: 16px; font-size: 11px; color: var(--muted); }
+
+  .main { min-width: 0; padding: 12px 20px; overflow: hidden; }
+  h1 { margin: 0; font-size: 24px; line-height: 28px; font-weight: 700; display: flex; align-items: baseline; gap: 8px; }
+  .sec-mark { font-family: var(--mono); font-size: 11px; font-weight: 400; color: var(--accent); letter-spacing: 0.06em; }
+  .lead { margin: 8px 0 0; font-size: 13px; line-height: 20px; color: var(--ink2); }
+
+  .connect { margin-top: 8px; border-top: 1px solid var(--rule); padding-top: 8px; }
+  .connect-state { margin: 0; font-size: 13px; line-height: 18px; font-weight: 700; }
+  .next-label {
+    margin: 8px 0 0;
+    font-size: 11px;
+    line-height: 14px;
+    font-weight: 700;
+    color: var(--ink2);
+    letter-spacing: 0.02em;
+  }
+  .next-text { margin: 4px 0 0; font-size: 12px; line-height: 18px; color: var(--ink2); }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    height: 28px;
+    padding: 0 12px;
+    border: 1px solid var(--ink);
+    border-radius: 0;
+    background: var(--ink);
+    color: var(--sheet);
+    font: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+  }
+  .btn:hover { background: #2E363B; border-color: #2E363B; }
+  .btn:active { background: #0F1215; border-color: #0F1215; }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .btn[disabled] { background: var(--sheet); border: 1px solid var(--grid); color: var(--muted); cursor: not-allowed; }
+  .btn svg { display: block; }
+  .btn-scan { margin-top: 8px; }
+
+  .info { margin-top: 12px; }
+  .info-head { display: flex; align-items: flex-end; gap: 12px; min-height: 24px; }
+  .h2 { margin: 0; font-size: 13px; line-height: 20px; font-weight: 700; display: flex; align-items: baseline; gap: 8px; }
+  .h2 .idx { font-family: var(--mono); font-size: 11px; font-weight: 400; color: var(--accent); }
+  .info-side { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+  .info-note { font-size: 11px; color: var(--muted); }
+  .btn-connect { height: 24px; padding: 0 12px; font-size: 11px; letter-spacing: 0.02em; }
+  .table-wrap { margin-top: 8px; border-top: 1px solid var(--frame); border-left: 1px solid var(--rule); border-right: 1px solid var(--rule); }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  col.c1 { width: 136px; }
+  col.c2 { width: 104px; }
+  thead th {
+    height: 24px;
+    padding: 0 12px;
+    text-align: left;
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--muted);
+    letter-spacing: 0.04em;
+    border-bottom: 1px solid var(--frame);
+    border-left: 1px solid var(--rule);
+  }
+  thead th:first-child { border-left: 0; }
+  tbody td {
+    height: 28px;
+    padding: 0 12px;
+    font-size: 12px;
+    border-bottom: 1px solid var(--rule);
+    border-left: 1px solid var(--rule);
+    vertical-align: middle;
+  }
+  tbody td:first-child { border-left: 0; }
+  tbody tr:last-child td { border-bottom: 1px solid var(--frame); }
+  td.num, td.mono { font-family: var(--mono); font-size: 11px; }
+  td.val { color: var(--ink); font-weight: 700; }
+  td.note { color: var(--muted); font-size: 11px; }
+  .table-foot { margin: 8px 0 0; font-size: 11px; line-height: 16px; color: var(--muted); }
+
+  /* 入力モニター（暗いステージ） */
+  .stage { margin-top: 8px; }
+  .stage-head { display: flex; align-items: baseline; gap: 8px; }
+  .stage-head .h2 { font-size: 13px; }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    height: 16px;
+    padding: 0 8px;
+    border: 1px solid var(--grid);
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink2);
+  }
+  .stage-note { margin-left: auto; font-size: 11px; color: var(--muted); }
+  .stage-panel {
+    position: relative;
+    margin-top: 8px;
+    height: 132px;
+    background: var(--stage);
+    border: 1px solid var(--stage-line-strong);
+    overflow: hidden;
+  }
+  .stage-grid { position: absolute; inset: 0; }
+  .stage-body {
+    position: relative;
+    display: grid;
+    grid-template-columns: 156px 1fr 168px;
+    gap: 16px;
+    padding: 12px 16px;
+    height: 100%;
+  }
+  .sticks { display: flex; gap: 12px; }
+  .stick-cell { width: 72px; }
+  .stick-svg { display: block; width: 60px; height: 60px; margin: 0 auto; }
+  .stick-label { margin: 4px 0 0; font-size: 11px; line-height: 12px; color: var(--stage-muted); text-align: center; }
+  .stick-values { margin: 4px 0 0; font-family: var(--mono); font-size: 11px; line-height: 13px; color: var(--stage-ink); text-align: center; }
+  .stick-values span { display: block; }
+  .triggers { display: flex; flex-direction: column; justify-content: center; gap: 12px; }
+  .trig { display: flex; align-items: center; gap: 8px; }
+  .trig-label { width: 20px; font-family: var(--mono); font-size: 11px; color: var(--stage-muted); }
+  .trig-track { position: relative; flex: 1; height: 4px; background: var(--stage-line); }
+  .trig-fill { position: absolute; inset: 0 auto 0 0; background: var(--stage-accent); }
+  .trig-val { width: 40px; text-align: right; font-family: var(--mono); font-size: 11px; color: var(--stage-ink); }
+  .trig-axis-note { margin: 4px 0 0; font-size: 11px; line-height: 14px; color: var(--stage-muted); }
+  .chips-axis { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  .axis { display: flex; align-items: center; gap: 8px; }
+  .axis svg { display: block; color: var(--stage-accent); }
+  .axis-label { font-family: var(--mono); font-size: 11px; color: var(--stage-accent); }
+  .axis-note { margin-left: auto; font-size: 11px; color: var(--stage-muted); }
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    height: 20px;
+    padding: 0 8px;
+    border: 1px solid var(--stage-line-strong);
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--stage-muted);
+  }
+  .chip[data-on="true"] { background: var(--stage-accent); border-color: var(--stage-accent); color: var(--stage); font-weight: 700; }
+  .chips-note { margin: 0; font-size: 11px; color: var(--stage-muted); }
+
+  /* 右レール */
+  .rail { border-left: 1px solid var(--rule); padding: 16px 20px 12px; display: flex; flex-direction: column; min-height: 0; }
+  .rail-head { display: flex; align-items: baseline; gap: 8px; border-bottom: 1px solid var(--frame); padding-bottom: 8px; }
+  .rail-head .h2 { font-size: 13px; }
+  .rail-count { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--ink2); }
+  .rail-total { margin: 12px 0 0; display: flex; align-items: baseline; gap: 8px; }
+  .rail-total .n { font-family: var(--mono); font-size: 32px; line-height: 32px; font-weight: 400; letter-spacing: -0.02em; }
+  .rail-total .u { font-size: 12px; color: var(--ink2); }
+  .rail-empty { margin: 4px 0 0; font-size: 12px; line-height: 18px; color: var(--ink2); }
+  .rail-next { margin-top: 16px; border-top: 1px solid var(--rule); padding-top: 8px; }
+  .rail-next .next-label { margin-top: 0; }
+  .rail-btn { margin-top: 12px; width: 100%; }
+  .rail-reason { margin: 0 0 8px; font-size: 11px; line-height: 16px; color: var(--muted); }
+  .rail-foot { margin: 12px 0 0; font-size: 11px; line-height: 16px; color: var(--muted); }
+  .memo { flex: 1; display: flex; flex-direction: column; margin-top: 16px; min-height: 0; }
+  .memo-label { font-size: 11px; color: var(--muted); letter-spacing: 0.06em; border-bottom: 1px solid var(--frame); padding-bottom: 4px; }
+  .memo-lines { flex: 1; display: flex; flex-direction: column; justify-content: space-between; padding-top: 4px; }
+  .memo-lines span { display: block; height: 1px; background: var(--rule); }
+
+  /* 表題欄 */
+  .titleblock {
+    display: grid;
+    grid-template-columns: 476px 210px 160px 100px 100px 110px;
+    border-top: 1px solid var(--frame);
+  }
+  .tb-cell {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 31px;
+    padding: 0 12px;
+    border-left: 1px solid var(--rule);
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  .tb-cell:first-child { border-left: 0; }
+  .tb-label { color: var(--muted); }
+  .tb-value { font-family: var(--mono); color: var(--ink); }
+  .tb-brand { font-weight: 700; font-size: 12px; }
+  .tb-sep { color: var(--rule); }
+
+  .caption {
+    width: 1180px;
+    margin: 12px auto 0;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: 11px;
+    color: #5F5A4D;
+  }
+  .caption .mono { letter-spacing: 0.02em; }
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="sheet">
+    <div class="frame">
+      <header class="topbar">
+        <span class="brand" translate="no">Padbench</span>
+        <span class="vrule"></span>
+        <span class="brand-sub">書き込み対応版</span>
+        <div class="topbar-right">
+          <span class="status"><span class="dot"></span>未接続</span>
+          <span class="vrule"></span>
+          <span class="version mono" translate="no">v0.1.0</span>
+        </div>
+      </header>
+
+      <svg class="dimstrip" viewBox="0 0 1156 20" width="1156" height="20" aria-hidden="true">
+        <g stroke="#8FA0AB" stroke-width="1" fill="none">
+          <path d="M2 18V12M2 14H1154M1154 18V12"/>
+          <path d="M208 18V12M844 18V12"/>
+          <path d="M204 18l4-4M212 18l-4-4"/>
+          <path d="M840 18l4-4M848 18l-4-4"/>
+          <path d="M1150 18l4-4M1158 18l-4-4"/>
+        </g>
+        <g fill="#46525A" font-family="ui-monospace, SFMono-Regular, Menlo, Hack, Consolas, monospace" font-size="11" text-anchor="middle">
+          <text x="104" y="10">208</text>
+          <text x="526" y="10">636</text>
+          <text x="1000" y="10">312</text>
+        </g>
+      </svg>
+
+      <div class="app">
+        <nav class="nav" aria-label="画面">
+          <ul class="nav-list">
+            <li class="nav-item" aria-current="page"><span class="nav-num">01</span>デバイス</li>
+            <li class="nav-item"><span class="nav-num">02</span>入力モニター</li>
+            <li class="nav-item"><span class="nav-num">03</span>現在値</li>
+            <li class="nav-item"><span class="nav-num">04</span>設定</li>
+            <li class="nav-item"><span class="nav-num">05</span>マクロ</li>
+            <li class="nav-item"><span class="nav-num">06</span>ログ</li>
+          </ul>
+          <div class="nav-foot">
+            <div class="nav-foot-label">接続先</div>
+            <div class="nav-foot-name" translate="no">8BitDo Ultimate 2</div>
+            <div class="nav-foot-meta mono" translate="no">MTU —</div>
+            <div class="nav-license">ライセンス</div>
+          </div>
+        </nav>
+
+        <main class="main">
+          <h1><span class="sec-mark" aria-hidden="true">§1</span>デバイス</h1>
+          <p class="lead">コントローラを設定モードにして接続します。接続すると現在値を読み込みます。</p>
+
+          <section class="connect" aria-label="接続状態">
+            <p class="connect-state">まだ接続していません。</p>
+            <p class="next-label">次にすること</p>
+            <p class="next-text">コントローラを設定モードにして、「スキャン」を押します。</p>
+            <button class="btn btn-scan" type="button">
+              <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="square" aria-hidden="true">
+                <path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4"/>
+                <circle cx="8" cy="8" r="2.5"/>
+              </svg>
+              スキャン
+            </button>
+          </section>
+
+          <section class="info" aria-labelledby="info-h">
+            <div class="info-head">
+              <h2 class="h2" id="info-h"><span class="idx" aria-hidden="true">§2</span>接続情報</h2>
+              <div class="info-side">
+                <span class="info-note">先にデバイスをスキャンして選びます。</span>
+                <button class="btn btn-connect" type="button" disabled>接続する</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <colgroup><col class="c1"><col class="c2"><col></colgroup>
+                <thead>
+                  <tr><th scope="col">項目</th><th scope="col">値</th><th scope="col">補足</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>デバイス</td><td class="val mono" translate="no">—</td><td class="note">BLE / USB</td></tr>
+                  <tr><td>アドレス</td><td class="val mono">—</td><td class="note">設定モード</td></tr>
+                  <tr><td>ファームウェア</td><td class="val mono">—</td><td class="note">—</td></tr>
+                  <tr><td>MTU</td><td class="val mono" translate="no">—</td><td class="note">—</td></tr>
+                  <tr><td>バッテリー</td><td class="val mono">—</td><td class="note">生値（% 未換算）</td></tr>
+                  <tr><td>受信レート</td><td class="val mono">—</td><td class="note">20 ms 間隔</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="table-foot">接続すると現在値（設定 2768 バイト）を読み込みます。</p>
+          </section>
+
+          <section class="stage" aria-labelledby="stage-h">
+            <div class="stage-head">
+              <h2 class="h2" id="stage-h">入力モニター</h2>
+              <span class="badge">表示例</span>
+              <span class="stage-note">接続すると値が動きます。</span>
+            </div>
+            <div class="stage-panel">
+              <svg class="stage-grid" width="100%" height="100%" aria-hidden="true">
+                <defs>
+                  <pattern id="grid-a" width="24" height="24" patternUnits="userSpaceOnUse">
+                    <path d="M24 0H0V24" fill="none" stroke="#1E3A4A" stroke-width="1"/>
+                  </pattern>
+                </defs>
+                <rect width="100%" height="100%" fill="url(#grid-a)"/>
+              </svg>
+              <div class="stage-body">
+                <div class="sticks">
+                  <div class="stick-cell">
+                    <svg class="stick-svg" viewBox="0 0 64 64" width="64" height="64" aria-hidden="true">
+                      <circle cx="32" cy="32" r="30" fill="none" stroke="#3A5A6E"/>
+                      <line x1="32" y1="2" x2="32" y2="62" stroke="#2A4453"/>
+                      <line x1="2" y1="32" x2="62" y2="32" stroke="#2A4453"/>
+                      <circle cx="32" cy="32" r="8" fill="none" stroke="#3A5A6E" stroke-dasharray="2 3"/>
+                      <g stroke="#3A5A6E">
+                        <line x1="58" y1="32" x2="62" y2="32"/>
+                        <line x1="2" y1="32" x2="6" y2="32"/>
+                        <line x1="32" y1="2" x2="32" y2="6"/>
+                        <line x1="32" y1="58" x2="32" y2="62"/>
+                        <line x1="50.4" y1="50.4" x2="53.2" y2="53.2"/>
+                        <line x1="13.6" y1="13.6" x2="10.8" y2="10.8"/>
+                        <line x1="50.4" y1="13.6" x2="53.2" y2="10.8"/>
+                        <line x1="13.6" y1="50.4" x2="10.8" y2="53.2"/>
+                      </g>
+                      <circle cx="42.9" cy="23.9" r="3.2" fill="#8FC4E8"/>
+                    </svg>
+                    <p class="stick-label">左スティック</p>
+                    <p class="stick-values"><span>X +0.42</span><span>Y +0.31</span></p>
+                  </div>
+                  <div class="stick-cell">
+                    <svg class="stick-svg" viewBox="0 0 64 64" width="64" height="64" aria-hidden="true">
+                      <circle cx="32" cy="32" r="30" fill="none" stroke="#3A5A6E"/>
+                      <line x1="32" y1="2" x2="32" y2="62" stroke="#2A4453"/>
+                      <line x1="2" y1="32" x2="62" y2="32" stroke="#2A4453"/>
+                      <circle cx="32" cy="32" r="8" fill="none" stroke="#3A5A6E" stroke-dasharray="2 3"/>
+                      <g stroke="#3A5A6E">
+                        <line x1="58" y1="32" x2="62" y2="32"/>
+                        <line x1="2" y1="32" x2="6" y2="32"/>
+                        <line x1="32" y1="2" x2="32" y2="6"/>
+                        <line x1="32" y1="58" x2="32" y2="62"/>
+                        <line x1="50.4" y1="50.4" x2="53.2" y2="53.2"/>
+                        <line x1="13.6" y1="13.6" x2="10.8" y2="10.8"/>
+                        <line x1="50.4" y1="13.6" x2="53.2" y2="10.8"/>
+                        <line x1="13.6" y1="50.4" x2="10.8" y2="53.2"/>
+                      </g>
+                      <circle cx="27.3" cy="48.1" r="3.2" fill="#8FC4E8"/>
+                    </svg>
+                    <p class="stick-label">右スティック</p>
+                    <p class="stick-values"><span>X -0.18</span><span>Y -0.62</span></p>
+                  </div>
+                </div>
+                <div class="triggers">
+                  <div class="trig">
+                    <span class="trig-label">L2</span>
+                    <span class="trig-track"><span class="trig-fill" style="width:0%"></span></span>
+                    <span class="trig-val">0.00</span>
+                  </div>
+                  <div class="trig">
+                    <span class="trig-label">R2</span>
+                    <span class="trig-track"><span class="trig-fill" style="width:62%"></span></span>
+                    <span class="trig-val">0.62</span>
+                  </div>
+                  <p class="trig-axis-note">トリガーは 0.00〜1.00</p>
+                </div>
+                <div class="chips-axis">
+                  <div class="axis">
+                    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="square" aria-hidden="true">
+                      <path d="M8 14V2M4 6l4-4 4 4"/>
+                    </svg>
+                    <span class="axis-label">+Y</span>
+                    <span class="axis-note">上が正</span>
+                  </div>
+                  <div class="chips">
+                    <span class="chip" data-on="true">B</span>
+                    <span class="chip" data-on="true">ZR</span>
+                    <span class="chip" data-on="true">十字キー上</span>
+                  </div>
+                  <p class="chips-note mono">押下 3 / 22</p>
+                </div>
+              </div>
+            </div>
+          </section>
+        </main>
+
+        <aside class="rail" aria-labelledby="rail-h">
+          <div class="rail-head">
+            <h2 class="h2" id="rail-h">書き込み前の確認</h2>
+            <span class="rail-count mono">0 件</span>
+          </div>
+          <p class="rail-total"><span class="n mono">0</span><span class="u">件</span></p>
+          <p class="rail-empty">まだ変更はありません。</p>
+          <div class="rail-next">
+            <p class="next-label">次にすること</p>
+            <p class="next-text">設定画面で変更すると、現在値との差分がここに出ます。</p>
+          </div>
+          <p class="rail-reason">接続して変更すると、ここから書き込めます。</p>
+          <button class="btn rail-btn" type="button" disabled>実機に書き込む</button>
+          <p class="rail-foot">書き込みの前にバックアップを保存します。</p>
+          <div class="memo">
+            <div class="memo-label">備考</div>
+            <div class="memo-lines"><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+          </div>
+        </aside>
+      </div>
+
+      <footer class="titleblock">
+        <div class="tb-cell"><span class="tb-brand" translate="no">Padbench</span><span class="tb-sep">/</span><span>デバイス</span></div>
+        <div class="tb-cell"><span class="tb-label">図番</span><span class="tb-value">PB-DEV-001</span></div>
+        <div class="tb-cell"><span class="tb-label">画面</span><span class="tb-value">1180 × 760</span></div>
+        <div class="tb-cell"><span class="tb-label">尺度</span><span class="tb-value">1:1</span></div>
+        <div class="tb-cell"><span class="tb-label">Rev</span><span class="tb-value">0</span></div>
+        <div class="tb-cell"><span class="tb-value">2026-11-23</span></div>
+      </footer>
+    </div>
+  </div>
+  <p class="caption"><span>A / 製図（Blueprint）</span><span class="mono">1180 × 760 · 静的モックアップ · 1 ファイル</span></p>
+</div>
+</body>
+</html>

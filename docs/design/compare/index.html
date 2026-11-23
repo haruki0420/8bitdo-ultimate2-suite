@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Padbench — デスクトップ UI 3 方向比較</title>
+<style>
+  :root {
+    --page: #ECEBE7;
+    --ink: #1B1D1F;
+    --ink2: #4C4F52;
+    --muted: #6B6E71;
+    --rule: #C9C7C0;
+    --link: #1E4F7A;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--page);
+    color: var(--ink);
+    font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Yu Gothic", "Noto Sans JP", system-ui, sans-serif;
+    padding: 32px 24px 64px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .mono { font-family: ui-monospace, "SFMono-Regular", Menlo, Hack, Consolas, monospace; }
+  .wrap { width: 1260px; margin: 0 auto; }
+  .top {
+    display: flex;
+    align-items: flex-end;
+    gap: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--rule);
+  }
+  h1 { margin: 0; font-size: 20px; line-height: 28px; font-weight: 700; letter-spacing: 0.01em; }
+  .top p { margin: 4px 0 0; font-size: 12px; line-height: 18px; color: var(--ink2); }
+  .top nav { margin-left: auto; display: flex; gap: 16px; font-size: 12px; align-items: baseline; }
+  a { color: var(--link); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  a:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+  .list { display: flex; flex-direction: column; gap: 40px; margin-top: 24px; }
+  figure { margin: 0; }
+  figcaption {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 16px;
+    margin-bottom: 8px;
+    font-size: 12px;
+    line-height: 18px;
+  }
+  figcaption .name { font-weight: 700; }
+  figcaption .meta { color: var(--muted); }
+  iframe {
+    display: block;
+    width: 1260px;
+    height: 866px;
+    border: 1px solid var(--rule);
+    background: #FFFFFF;
+  }
+  .foot {
+    margin-top: 24px;
+    padding-top: 12px;
+    border-top: 1px solid var(--rule);
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    font-size: 11px;
+    line-height: 16px;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <h1>Padbench — デスクトップ UI 3 方向比較</h1>
+      <p>同じ情報構成（デバイス画面・未接続）を 3 つの造形言語で作った静的モックアップ。各枠 1180 × 760。</p>
+    </div>
+    <nav aria-label="ファイル">
+      <a href="direction-a-blueprint.html">A 製図</a>
+      <a href="direction-b-industrial.html">B 機器ラベル</a>
+      <a href="direction-c-graphite.html">C 暗い計測器</a>
+      <a href="README.md">README</a>
+    </nav>
+  </header>
+
+  <main class="list">
+    <figure>
+      <figcaption>
+        <span class="name">A / 製図（Blueprint）</span>
+        <span class="meta mono">明るい紙面・寸法線・図面枠・等幅の測定値</span>
+      </figcaption>
+      <iframe src="direction-a-blueprint.html" title="A / 製図（Blueprint）のモックアップ" width="1260" height="866"></iframe>
+    </figure>
+
+    <figure>
+      <figcaption>
+        <span class="name">B / 機器ラベル（Industrial）</span>
+        <span class="meta mono">オフホワイト＋黒・安全橙・ラベル片ブロック・太い見出し</span>
+      </figcaption>
+      <iframe src="direction-b-industrial.html" title="B / 機器ラベル（Industrial）のモックアップ" width="1260" height="866"></iframe>
+    </figure>
+
+    <figure>
+      <figcaption>
+        <span class="name">C / 暗い計測器（Graphite）</span>
+        <span class="meta mono">黒鉛の面・彫り込みラベル・等幅数値・信号色 1 つ・ヘアライン枠</span>
+      </figcaption>
+      <iframe src="direction-c-graphite.html" title="C / 暗い計測器（Graphite）のモックアップ" width="1260" height="866"></iframe>
+    </figure>
+  </main>
+
+  <footer class="foot">
+    <span>各 HTML は単体で開けます（外部リソース 0・script 0）。iframe の表示にはローカル HTTP を推奨します。</span>
+    <span class="mono">docs/design/compare/ · base origin/main 81b0ac1</span>
+  </footer>
+</div>
+</body>
+</html>
