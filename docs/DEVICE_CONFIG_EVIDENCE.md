@@ -1,8 +1,8 @@
-# 実機 config ダンプ証跡（2768B `1dca47fa…`）
+# 実機 config ダンプ・プロファイル切替の証跡（2768B `1dca47fa…`）
 
-BLE 接続した 8BitDo Ultimate 2 から取得した 2768 バイト設定ブロックの実バイト証跡です。`PROTOCOL_SPEC.md` / `STRUCT_BT2_2768B.md` の実機記述（特に `slot_flags` と `map_key.flag` の非 0/1 値）の根拠として参照します。
+BLE 接続した 8BitDo Ultimate 2 から取得した 2768 バイト設定ブロックの実バイト証跡です。`PROTOCOL_SPEC.md` / `STRUCT_BT2_2768B.md` の実機記述（特に `slot_flags` と `map_key.flag` の非 0/1 値）の根拠として参照します。§7 には `0x0015`（`WriteSLOT`）の実機 wire と `cur_slot` 更新の証跡を追加しています。
 
-> **証跡ファイルの扱い**: 生の `config.bin`（および同じディレクトリの `config.json` / マクロダンプ）はローカルの `.tmp/restore-baseline/` にのみ置かれ、リポジトリにはコミットしていません（`.tmp/` は `.gitignore` 済み）。本ドキュメントは、値と SHA-256 を固定して再現可能にするための記録です。デバイスを特定できる情報は含みません。
+> **証跡ファイルの扱い**: 生の `config.bin`（および同じディレクトリの `config.json` / マクロダンプ）はローカルの `.tmp/restore-baseline/` にのみ置かれ、リポジトリにはコミットしていません（`.tmp/` は `.gitignore` 済み）。本ドキュメントは、値と SHA-256 を固定して再現可能にするための記録です。§1〜§6 はデバイスを特定できる情報を含みません。§7 のみ、観測個体を再現するために BLE アドレスを記録しています。
 
 ---
 
@@ -132,7 +132,74 @@ error: I/O error: configuration file has invalid known fields; refusing to write
 
 ---
 
-## 7. 再現コマンド
+## 7. `0x0015` (`WriteSLOT`) の実機証跡
+
+プロファイル切替 `cmd=0x0015` を Linux BLE・MTU 200 で実行したときの記録です（2026-11-23 JST）。**1 回の観測**であり、環境（MTU / chunk / timeout）と未確認事項をセットで残します。要求 wire の RE 根拠は [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §6.2。
+
+### 7.1 環境
+
+| 項目 | 値 |
+| --- | --- |
+| 日時 | 2026-11-23 JST |
+| ホスト | Linux（BlueZ / btleplug、BLE GATT App Mode `80ND`） |
+| 個体 | 8BitDo Ultimate 2 Bluetooth Controller（PID `0x600F`）、BLE アドレス `E4:17:D8:55:xx:xx`（個体識別を避けるため下位 2 バイトを伏字） |
+| MTU | 200（App Mode の観測値） |
+| 操作 | CLI `eightbitdo config profile 1`（REPL は `profile switch 1`）。接続・サービス探索の `--timeout` は 15 秒 |
+| 応答 | ACK 待ちはコアの per-frame timeout（既定 5 秒）。ACK は即時（体感 1 秒未満）に返り、タイムアウトにはならなかった。往復時間の正確な計測はしていない |
+
+### 7.2 要求フレーム（17B）
+
+`-v` の生ログで観測した送信フレーム:
+
+```text
+04 15 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00
+```
+
+- `04` は BLE App Mode の送信 prefix。続く 16B ヘッダは `cmd=0x0015`（`15 00`）、`subcmd=0x0001`（slot 1）、`chunk_len=0`、`crc16=0x0000`、`total_len=0`、`offset=0`。
+- ペイロードなし。RE で確定していた wire（`cmd=0x0015, subcmd=slot, total_len=0, offset=0`）と一致する。
+
+### 7.3 ACK フレーム（16B、prefix なし）
+
+同時に観測した受信フレーム:
+
+```text
+04 00 15 00 00 00 00 81 00 00 00 00 00 00 00 00
+```
+
+- 先頭 2B は `cmd=0x0004`（RESPONSE 封筒）、続く 2B は `subcmd=0x0015`。**要求 `cmd` をそのまま返す直接応答（`cmd=0x0015`）は観測されず、封筒 `cmd=0x0004/subcmd=0x0015` のみ**だった（1 回の観測）。
+- 残り 12B は `00 00 00 81 00 00 00 00 00 00 00 00`。[PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §4.1 のヘッダ定義（`+0x04` `chunk_len` / `+0x06` `crc16` / `+0x08` `total_len` / `+0x0C` `offset`）に当てはめると `chunk_len=0`、`crc16` 位置の 2B は `00 81`（LE で `0x8100`）、`total_len=0`、`offset=0` になる。payload が無いため payload CRC としては意味を持たず、この 2B を `crc16=0x0081` と読む解釈もあるが、**フィールド位置・バイト順・意味はいずれも解釈であり未確定**である（断定しない）。
+- **ACK 形状は 1 回の観測結果であり、常にこの形で返るとは限らない。** 直接 ACK を返す条件も未確認。
+
+### 7.4 `cur_slot` の変化（Save なし）
+
+- `0x0015` の前後で `eightbitdo config dump` を実行したところ、`cur_slot`（`+0x012`、`u16`）が **6 → 1** に変化した。`subcmd=0x0001`（slot 1）と一致する。
+- `Save` (`0x0006`) は**送っていない**（`-v` の送信ログに `0x0006` が無い）。それでも直後の read-back に反映された。
+- 同一接続内の read-back SHA-256: **`7a9838e8…`（切替前）→ `e3a84da2…`（切替後）**。
+- したがって「`0x0015` は `cur_slot` を更新し、少なくとも同一接続内の read-back には反映される」ことは確認できた。**Save が不要と断定はしない**（永続性は未確認）。
+
+### 7.5 復元
+
+切替前の `cur_slot=6` に戻す手順:
+
+1. `eightbitdo config dump --raw <file>` で切替前の 2768B を取得。
+2. `<file>` の `+0x012`（`u16` LE）を `6`（`06 00`）に戻す。
+3. `eightbitdo config write --file <file> --yes` で書き戻す（pre-write backup・確認・read-back 検証付き。**39 packets** = 38 write + 1 Save）。
+4. read-back で `cur_slot=6` を確認。read-back SHA-256 は **`af897618…`**。
+
+> 復元後の read-back SHA-256 `af897618…` は切替前の `7a9838e8…` と一致しない。`cur_slot` は 6 に戻っているが、同一バイト列に戻らなかった理由は未確認であり、**SHA 一致による復元確認はしていない**（`cur_slot` の値で確認した）。
+
+### 7.6 未確認事項
+
+- **再接続・電源断を跨ぐ永続性**: 同一接続内の read-back のみ確認した。`Save` なしで再起動後も slot 1 のままかは未確認。
+- **プロファイルの実効**: `0x0015` が実際にプロファイルの振る舞い（Switch 側の入力・マッピング）を切り替えるかは未確認。
+- **`crc16` とみられる 2B の意味**: `0x8100` / `0x0081` の解釈を含めて未確定。
+- **直接 `cmd=0x0015` ACK を返す条件**: 今回は封筒のみを観測。条件は未確認。
+- **ACK 形状の再現性**: 1 回の観測のみで、常に同じ形とは限らない。
+- **`cur_slot` の 6 の意味**: enum（`0..=2`, `4`）外の値で未確定（[STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md) §2.3）。
+
+---
+
+## 8. 再現コマンド
 
 生ダンプは `.tmp/restore-baseline/config.bin` に置いた状態で実行する。以下のパスは**ローカル作業ツリーのリポジトリルート基準**（`.tmp/` は gitignore されたローカル作業ディレクトリ）。別の worktree から確認する場合は、親リポジトリの絶対パスに読み替える。
 
@@ -190,7 +257,7 @@ sha256sum before.bin after.bin
 
 ---
 
-## 8. 注意
+## 9. 注意
 
 - `flag` の意味（有効 / 無効、bitfield の各ビット）は未確定である。本ドキュメントの値を「有効フラグ」と断定しない。
 - slot 2 の `0xFFFFFFFF` は消去状態と考えられるが、typed な `KeyMap` として解釈・書込してはならない。
@@ -199,8 +266,9 @@ sha256sum before.bin after.bin
 
 ---
 
-## 9. 関連ドキュメント
+## 10. 関連ドキュメント
 
-- [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §6.2（mapKey 書込・raw 検証・実機 flag の注記）
-- [STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md) §1.2 / §5.1（レコード配置・mapKey 実機確認）
+- [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §6.2（mapKey 書込・raw 検証・実機 flag の注記。`0x0015` の実機 wire 注記も同節）
+- [STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md) §1.2 / §2.3 / §5.1（レコード配置・`cur_slot` の実機値・mapKey 実機確認）
 - [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) §5 Phase 2d（実機確認範囲と既知の不整合）
+- [FEATURE_MATRIX.md](FEATURE_MATRIX.md) §8（プロファイル節の実機検証状況）
