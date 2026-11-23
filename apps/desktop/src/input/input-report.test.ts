@@ -23,12 +23,14 @@ describe("スティックの正規化（§5.6.1）", () => {
   });
 
   it("Y は上が正の座標系で、Y_SIGN の適用は 1 回だけ", () => {
-    expect(Y_SIGN).toBe(1);
+    // 実機で生値の向きを確認するまで符号は固定しない（TODO(input) 参照）。
+    // どちらの値でも「Y_SIGN を 1 回だけ掛ける」ことだけを固定する。
+    expect([1, -1]).toContain(Y_SIGN);
 
     const rawY = 140;
     const vector = normalizeStick(127, rawY);
     expect(vector.y).toBeCloseTo(normalizeAxis(rawY) * Y_SIGN, 10);
-    expect(vector.y).toBeGreaterThan(0);
+    expect(Math.sign(vector.y)).toBe(Math.sign(normalizeAxis(rawY)) * Y_SIGN);
   });
 
   it("ダミー値が表示用の数値になる（+0.42 / +0.10 など）", () => {

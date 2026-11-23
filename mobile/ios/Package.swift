@@ -10,7 +10,11 @@ let packageDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent
 let rustLibsDirectory = "\(packageDirectory)/libs"
 
 let package = Package(
-    name: "EightBitDo",
+    // The SwiftPM package, library product and app bundle are Padbench. The
+    // target/module stays `EightBitDo` so the generated UniFFI bindings and the
+    // `Sources/EightBitDo` paths do not change (same policy as the Android
+    // Kotlin package namespace).
+    name: "Padbench",
     platforms: [
         // Matches the deployment target the UniFFI scaffolding and CoreBluetooth
         // usage were checked against.
@@ -19,7 +23,7 @@ let package = Package(
     products: [
         // An xtool project must contain exactly one library product: the app.
         .library(
-            name: "EightBitDo",
+            name: "Padbench",
             targets: ["EightBitDo"]
         ),
     ],

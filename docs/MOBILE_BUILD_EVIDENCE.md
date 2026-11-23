@@ -3,7 +3,43 @@
 - 対象 main: `c169392`
 - ホスト: Arch Linux x86_64、rustc/cargo 1.100.0、JDK 21.0.13、Android SDK `/opt/android-sdk`
 - この文書は **ビルド・リンク・パッケージ内容の確認** の記録です。実機 BLE の動作確認は含みません。
-- **注（2026-11-23）**: 以下の識別子は表示名・識別子を Padbench に統一する前の実測値です。現行の `applicationId` / `bundleID` は `io.github.haruki0420.padbench`、表示名は Padbench。以下の値は当時の記録として保持します。
+- **注（2026-11-23）**: §1〜§2 の識別子は表示名・識別子を Padbench に統一する前の実測値です。以下の値は当時の記録として保持します。**統一後の再ビルド結果は §0**（`applicationId` / `bundleID` = `io.github.haruki0420.padbench`、Android の `namespace` / iOS の内部名も Padbench）。
+
+## 0. 2026-11-23 再ビルド（識別子を Padbench に統一した後）
+
+`apps/desktop` の Tauri 移行 PR で、Android の `namespace` / `applicationId` と iOS の `bundleID` / 内部名（`xtool.yml` の `product`、SwiftPM の product）を `io.github.haruki0420.padbench` / `Padbench` に変更しました。同一ホストで再ビルドした結果です。
+
+### 0.1 Android（JNI 同梱 APK）
+
+| 項目 | 値 |
+| --- | --- |
+| NDK | `29.0.14206865`（`/opt/android-sdk/ndk`） |
+| コマンド | `PATH="$HOME/.cargo/bin:$PATH" ANDROID_NDK_HOME=/opt/android-sdk/ndk/29.0.14206865 ./scripts/mobile/build-android.sh` |
+| APK | `mobile/android/app/build/outputs/apk/debug/app-debug.apk` |
+| サイズ / SHA-256 | **14,692,156 bytes（14.0 MiB）** / `c71505fdf0701f3eeadeec8fee1dae7f9a5356ba630f4a757374d5320b98fc0a` |
+| package / version | **`io.github.haruki0420.padbench`** / versionCode 1, versionName 0.1.0 |
+| min / target SDK | 26 / 36 |
+| 同梱 .so（`unzip -l`） | `arm64-v8a/libeightbitdo_uniffi.so` 1,266,296 bytes / `x86_64/libeightbitdo_uniffi.so` 1,193,928 bytes / `libjnidispatch.so` / `libandroidx.graphics.path.so` |
+
+- `aapt2 dump badging` で `package: name='io.github.haruki0420.padbench'` を確認。
+- JVM ユニットテスト（`./gradlew testDebugUnitTest --rerun`）は **8 件成功 / failures 0**（RustCore 2、AppWriteMode 3、FrameQueue 3。`app/build/test-results/testDebugUnitTest/*.xml` で確認）。
+- **未確認**: 実機 / エミュレータでの起動と JNI ロード（§4）。
+
+### 0.2 iOS（unsigned IPA）
+
+| 項目 | 値 |
+| --- | --- |
+| ツール | xtool 1.24 系（Darwin SDK 27.2 artifact bundle）/ Rust target `aarch64-apple-ios` |
+| コマンド | `./scripts/mobile/build-ios.sh` |
+| IPA | `mobile/ios/xtool/Padbench.ipa`（旧 `EightBitDo.ipa` から改名） |
+| サイズ / SHA-256 | **1,550,798 bytes（1.48 MiB）** / `ff98369bd22611f5db3b0aae0312da460c7053c3ad4e8e0b3fe1c66b935cab7b` |
+| 内部名 | `Payload/Padbench.app/Padbench`（Mach-O 64-bit arm64） |
+| Info.plist | `CFBundleIdentifier=io.github.haruki0420.padbench`, `CFBundleName/CFBundleDisplayName=Padbench`, `MinimumOSVersion=17.0`, `NSBluetoothAlwaysUsageDescription` あり, `UIBackgroundModes=[bluetooth-central]` |
+| UniFFI シンボル | `llvm-nm -gU Payload/Padbench.app/Padbench \| grep -c uniffi` = **55**（Rust staticlib がリンクされている） |
+| 署名 | なし（Linux では署名不可） |
+
+- `xtool.yml` の `product: Padbench` と `Package.swift` の package / library product 名を `Padbench` に変更しました。Swift の target / module 名は `EightBitDo` のままです（生成済み UniFFI バインディングの `import` を変えないため。Android の Kotlin パッケージ `dev.eightbitdo.mobile` を据え置いたのと同じ方針）。
+- **未確認**: 実機インストール・起動、署名、App Store 配布（§4）。
 
 ## 1. Android（JNI 同梱 APK）
 

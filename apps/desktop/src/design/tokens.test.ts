@@ -12,6 +12,7 @@ import {
   FILL_ACCENTS,
   LAYOUT,
   MOTION,
+  OVERLAY,
   RADIUS,
   SPACE,
   TYPE_SCALE,
@@ -92,6 +93,10 @@ describe("色トークン（Imported style: Hyperstudio）", () => {
     // 白ピル以外に signal-white を面の塗りとして使わない運用は style-audit.test.ts で検査する。
     expect(COLORS["--signal-white"]).toBe("#ffffff");
     expect(COLORS["--pulse-green"]).toBe("#98ff38");
+  });
+
+  it("スクリム --overlay は tokens.css / tokens.ts で一致する", () => {
+    expect(cssVar(tokensCss, "--overlay")).toBe(OVERLAY);
   });
 
   it("グラデーションを使わない", () => {
@@ -322,16 +327,39 @@ describe("モーション", () => {
     expect(ms(cssVar(tokensCss, "--dur-3"))).toBe(MOTION.durations[2]);
   });
 
-  it("曲線は 1 本だけ", () => {
+  it("曲線は 1 本だけ（index.css の @theme にだけ置く）", () => {
     expect(cssVar(themeCss, "--ease-standard").replace(/\s+/g, " ")).toBe(
       MOTION.easeStandard,
     );
+    // 値の重複定義を作らない: tokens.css 側では宣言しない（コメントでの言及は可）。
+    expect(tokensCss).not.toMatch(/--ease-standard\s*:/);
+    expect(themeCss.match(/--ease-standard\s*:/g)).toHaveLength(1);
   });
 
   it("prefers-reduced-motion で 0ms にする", () => {
     expect(tokensCss).toMatch(
       /@media\s*\(prefers-reduced-motion:\s*reduce\)[\s\S]*?--dur-1:\s*0ms/,
     );
+  });
+});
+
+describe("写しの完全性", () => {
+  it("tokens.css の CSS 変数はすべて tokens.ts の写しにある", () => {
+    const known = new Set<string>([
+      ...Object.keys(COLORS),
+      ...Object.keys(DIMENSIONS),
+      "--overlay",
+      "--font-ui",
+      "--font-data",
+      "--dur-1",
+      "--dur-2",
+      "--dur-3",
+    ]);
+    const declared = [
+      ...tokensCss.matchAll(/^\s*(--[a-z0-9-]+)\s*:/gm),
+    ].map((match) => match[1] ?? "");
+    const unknown = [...new Set(declared)].filter((name) => !known.has(name));
+    expect(unknown).toEqual([]);
   });
 });
 

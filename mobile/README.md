@@ -193,19 +193,26 @@ cp target/aarch64-apple-ios/release/libeightbitdo_uniffi.a mobile/ios/libs/
 cd mobile/ios && xtool dev build -c release --ipa
 ```
 
-出力: `mobile/ios/xtool/EightBitDo.ipa`（**署名なし**、実機には入りません）。
+出力: `mobile/ios/xtool/Padbench.ipa`（**署名なし**、実機には入りません）。
 
-### 実測結果（2026-11-23、この環境・レビュー反映後）
+### 実測結果（2026-11-23、Padbench 識別子への統一後）
 
-* `xtool dev build --ipa`: `Build complete! (7.44 secs)` → IPA 生成
-* IPA サイズ: 1,550,522 bytes（SHA-256 `e63d7822…b804f`）
-* `Payload/EightBitDo.app/EightBitDo`: `Mach-O 64-bit arm64 executable`
-* `llvm-nm` で `_uniffi_eightbitdo_uniffi_fn_constructor_mobilesession_new` など
-  UniFFI シンボル 61 個を確認（Rust staticlib が実際にリンクされている）
-* `Info.plist`: `CFBundleIdentifier=dev.eightbitdo.mobile`（当時の値。現行は `io.github.haruki0420.padbench`、表示名 Padbench）,
+* `xtool dev build --ipa`: `Build complete! (6.96 secs)` → IPA 生成
+* IPA: `mobile/ios/xtool/Padbench.ipa`、1,550,798 bytes（SHA-256 `ff98369b…cab7b`）
+* `Payload/Padbench.app/Padbench`: `Mach-O 64-bit arm64 executable`
+* `llvm-nm -gU` で `_uniffi_eightbitdo_uniffi_fn_constructor_mobilesession_new` など
+  UniFFI シンボル 55 個を確認（Rust staticlib が実際にリンクされている）
+* `Info.plist`: `CFBundleIdentifier=io.github.haruki0420.padbench`,
+  `CFBundleName` / `CFBundleDisplayName=Padbench`,
   `NSBluetoothAlwaysUsageDescription`（"read its settings and enable live
   input"）, `UIBackgroundModes=[bluetooth-central]`, `MinimumOSVersion=17.0`
 * Rust staticlib サイズ: 20,899,048 bytes（release、LTO なし）
+* 内部名は `xtool.yml` の `product: Padbench` と `Package.swift` の product 名で指定。
+  Swift の target / module 名は `EightBitDo` のまま（生成される UniFFI バインディングの
+  `import` を変えないため）
+
+> 旧値（`EightBitDo.ipa` 1,550,522 bytes / `CFBundleIdentifier=dev.eightbitdo.mobile`）は
+> [docs/MOBILE_BUILD_EVIDENCE.md](../docs/MOBILE_BUILD_EVIDENCE.md) §1〜§2 に当時の記録として残しています。
 
 ### 書き込みモード（without-response / with-response）
 

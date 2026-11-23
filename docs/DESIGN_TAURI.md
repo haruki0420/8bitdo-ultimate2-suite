@@ -522,6 +522,7 @@ sRGB 相対輝度から計算した実測値です。本文・UI 文字は **AA 
 - 幅 480（確認用 560）、`max-height: calc(100dvh - 64px)` で本文だけスクロール。閉じるボタンは右上 32×32（`aria-label="閉じる"`）
 - フォーカス: 開いたらキャンセル側に初期フォーカス、フォーカスを閉じ込め、Esc で閉じ、閉じたら元の要素へ戻す。ネイティブ `<dialog>` + `showModal()` を使えば、トップレイヤー・Esc・フォーカス移動の基本動作が得られる（追加依存を増やさない）
 - **書き込み確認の中身**（順序を固定）: ①何をするか 1 文 ②変更点の一覧（現在値 → 変更後、危険な変更だけ `--danger`）③バックアップの保存先（Hack 12 で折り返し）④チェックボックス「バックアップの内容を確認しました」⑤キャンセル / 書き込む
+- **ライセンスダイアログ（現状と P6 の到達点）**: 現在はアプリの `MIT OR Apache-2.0` と「依存クレート・フォントの全文表示は P6 で追加」「フォントは未同梱」の注記だけを出す（`apps/desktop/src/App.tsx`）。P6 で egui 版 #24 と同水準（アプリの MIT / Apache-2.0 全文 + 同梱フォントの全文・著作権者行）にする。フォントを同梱するまで同梱フォントの全文表示は無い
 - 破壊的操作（復元・初期化）は危険色の塗りボタン + 「元に戻せません」の 1 文 + 対象名（プロファイル 1 / マクロ M2 など）を必ず入れる。チェックボックスの確認だけでは足りないため、対象名をタイトルに含める
 
 #### 5.5.8 トースト
@@ -733,14 +734,18 @@ y_screen = cy − ny * r        // ny が +1 のとき画面の上端
 
 ## 7. 実装規約
 
+> **注意（2026-11-23）**: この節と §8.2 は案 C「昼の作業台と夜のステージ」当時の規約です。現在の実装は **Imported style: Hyperstudio** に置換済みで、正本は §12 と [design/IMPORTED_STYLE_HYPERSTUDIO.md](design/IMPORTED_STYLE_HYPERSTUDIO.md) です。旧ライト面のトークン、`color-scheme: light`、`mockup.html` に触れている箇所は **廃止（Hyperstudio で置換済み）** です。現行値・現行手順は §12 と §11 を参照してください。
+
 ### 7.1 技術前提
 
-- React + TypeScript + Vite + Tailwind CSS（TAURI_PLAN.md §2。P0 雛形は React 19 / Tailwind v4 / vitest）。スタイルは Tailwind のユーティリティだけにせず、**デザイントークンを CSS 変数**（`apps/desktop/src/styles/tokens.css` に分離する予定。現状は `apps/desktop/src/index.css` の `@theme`）に置き、Tailwind v4 の `@theme` で同じ名前を参照する
+- React + TypeScript + Vite + Tailwind CSS（TAURI_PLAN.md §2。P0 雛形は React 19 / Tailwind v4 / vitest）。スタイルは Tailwind のユーティリティだけにせず、**デザイントークンを CSS 変数**（`apps/desktop/src/styles/tokens.css` が値の正本）に置き、Tailwind v4 の `@theme`（`apps/desktop/src/index.css`）で同じ名前を参照する
 - 画面の状態は Rust 側を正とする。Web UI は表示用のモデルだけを持つ（TAURI_PLAN.md §3.1）
 - 入力モニターは events を受けて `useRef` + canvas に描く。React の state 更新を毎通知で行わない
 - 書き込みの確認状態を IPC で受け取らない（TAURI_PLAN.md §3.2）。UI のチェックボックスは操作の補助で、Rust 側が最終判断する
 
-### 7.2 Tailwind への写像（例）
+### 7.2 Tailwind への写像（例）— **廃止（Hyperstudio で置換済み）**
+
+以下はライト面時代の例です。現行の `@theme` は `apps/desktop/src/index.css`（`--color-obsidian` などの色と `--text-*` のスケール）で、値は `apps/desktop/src/styles/tokens.css` を参照します。
 
 ```css
 @import "tailwindcss";
@@ -779,20 +784,20 @@ y_screen = cy − ny * r        // ny が +1 のとき画面の上端
 
 - ランドマーク: `<header>`（上部バー）、`<nav aria-label="画面">`、`<main>`、`<aside aria-label="入力モニター">`
 - 現在の画面は `aria-current="page"`。見出しは `h1` → `h2` → `h3` の順を飛ばさない
-- フォーカスは常に見える（`:focus-visible` + `--focus-ring`）。`outline: none` を単独で使わない
+- フォーカスは常に見える（`:focus-visible` + `outline: 1px solid var(--chalk)`。旧案 C の `--focus-ring` トークンは廃止）。`outline: none` を単独で使わない
 - タブ・スイッチ・ダイアログはネイティブ要素 + ARIA パターンで実装する。追加の UI プリミティブ依存を入れる場合は、ライセンス表記（[THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md) と [NOTICE](../NOTICE)）を同じ PR で更新する
 - トーストとバナーは `aria-live="polite"`。エラーは操作した場所の直下に出す
 - 画像・図形は `alt` か `aria-hidden` を明示する。アイコンだけのボタンには `aria-label` を付ける
 - キーボード: Tab 移動、Enter 確定、Esc で閉じる、矢印キーでタブ。フォーカスを永久に失う操作を作らない
-- `color-scheme: light` を `:root` に宣言する（OS のダーク設定でネイティブ部品が暗転するのを防ぐ）
+- `color-scheme: dark` を `:root` に宣言する（Hyperstudio の暗色面に合わせる。実装は `apps/desktop/src/styles/tokens.css`。旧ライトテーマ時代は `light` だった）
 
 ### 7.4 検証
 
-- コントラスト: §5.1.5 の値をテストで固定する（例: `apps/desktop/src/tokens.test.ts`（vitest）で `contrast(text, surface) >= 4.5`、`contrast(lineStrong, surface) >= 3`）。値の変更はテストの変更を伴う
+- コントラスト: 値をテストで固定する（`apps/desktop/src/design/tokens.test.ts`（vitest）で `contrast(text, surface) >= 4.5`、`contrast(lineStrong, surface) >= 3`。現行の実測は [design/IMPORTED_STYLE_HYPERSTUDIO.md](design/IMPORTED_STYLE_HYPERSTUDIO.md) §8）。値の変更はテストの変更を伴う
 - レイアウト: 900×620 / 1024×768 / 1280×800 / 1920×1080 / 200% ズームで、横スクロールが出ないことを確認する
 - キーボード: 主要操作（接続、読み込み、設定変更、書き込み確認、ダイアログ、トースト）を Tab だけで完了できる
 - reduce-motion: OS 設定を `reduce` にして、点滅・スライド・補間が止まり、状態が残ることを確認する
-- モックアップ: [docs/design/mockup.html](design/mockup.html) を `file://` で開き、2 状態が崩れないことを確認する（[design/README.md](design/README.md)）
+- モックアップ: [docs/design/mockup.html](design/mockup.html) は**案 C 時代の経緯資料**（現在の実装とは一致しない。[design/README.md](design/README.md) の注記を参照）。現行の確認は `pnpm --dir apps/desktop build` / `test` と X11 起動のスクリーンショットで行う
 
 ---
 
@@ -819,7 +824,7 @@ y_screen = cy − ny * r        // ny が +1 のとき画面の上端
 - 入力モニターに Y 軸の向き、正規化式、60fps 補間、reduce-motion、a11y が定義されている
 - モーションの時間・曲線・reduce-motion が定義されている
 - 用語集があり、「録音」を入力記録に使わないことが明記されている。TAURI_PLAN.md §8 との差分が列挙されている
-- 静的モックアップが `file://` で単体表示できる（外部リソースなし）
+- 静的モックアップが `file://` で単体表示できる（外部リソースなし）— **廃止（Hyperstudio で置換済み）**。`mockup.html` は経緯資料で、P1 の受け入れは現行実装（`apps/desktop`）とテスト、X11 起動のスクリーンショットで確認する
 - 前回の Must Fix（ログの破綻、空状態、太字 1 種類、色と光）を持ち込まない設計になっている
 
 ---
@@ -842,9 +847,26 @@ y_screen = cy − ny * r        // ny が +1 のとき画面の上端
 - [docs/FEATURE_MATRIX.md](FEATURE_MATRIX.md) — 機能範囲と実装状況
 - [docs/PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §7.2 — 12 バイト入力レポートの定義
 - [crates/eightbitdo-gui/src/theme.rs](../crates/eightbitdo-gui/src/theme.rs) — 前回のトークンとコントラスト検証の実装（凍結）
-- [docs/design/mockup.html](design/mockup.html) — 2 状態の静的モックアップ
+- [docs/design/mockup.html](design/mockup.html) — 案 C 時代の静的モックアップ（**経緯資料。現在の実装とは一致しない**）
 - [docs/design/README.md](design/README.md) — モックアップの開き方とトークンの対応
 - [docs/REVIEW_TIERS.md](REVIEW_TIERS.md) — この文書を変更するときのレビュー Tier（docs のみのため Tier 1。ただし P1 の決定を変える場合は実装 PR と分ける）
+
+---
+
+## 11. 案 C（ライトテーマ）の廃止
+
+2026-11-23 に、§3〜§5・§7・§8.2 の案 C「昼の作業台と夜のステージ」は **Imported style: Hyperstudio** に置換されました。この節は、廃止した内容と読み替え先を記録します（欠番だった §11 をここで埋めます）。
+
+| 廃止したもの | 読み替え先 |
+| --- | --- |
+| §5.1〜§5.3 のライト面トークン（`--surface-*` / `--line*` / `--text*` / accent） | §12.1 の対応表と [design/IMPORTED_STYLE_HYPERSTUDIO.md](design/IMPORTED_STYLE_HYPERSTUDIO.md) §2 |
+| ダークステージ `[data-surface="stage"]` | 廃止。ステージは `carbon` 地 + 1px `graphite` のパネル（実装は `data-testid="input-stage"`） |
+| `--shadow-pop` | 削除。影は一切使わない（フォーカスは 1px `chalk` の outline） |
+| §5.5 のコンポーネント仕様（ライト面前提） | 寸法・状態の考え方は維持し、色・影・角丸は §12.1 に読み替え |
+| §7.2 の `@theme` 例、`color-scheme: light`、`mockup.html` 前提の検証 | §7.2 は履歴。`color-scheme` は `dark`。検証は `tokens.test.ts` / `style-audit.test.ts` と X11 起動のスクリーンショット |
+| §8.2 の「静的モックアップが `file://` で単体表示できる」 | `mockup.html` は経緯資料（[design/README.md](design/README.md)）。P1 の受け入れは現行実装 + テストで確認 |
+
+現行の正本: [docs/design/IMPORTED_STYLE_HYPERSTUDIO.md](design/IMPORTED_STYLE_HYPERSTUDIO.md)。実装値は `apps/desktop/src/styles/tokens.css` と `apps/desktop/src/index.css` の `@theme`、テストは `apps/desktop/src/design/tokens.test.ts` と `apps/desktop/src/design/style-audit.test.ts` です。
 
 ---
 
@@ -887,7 +909,7 @@ y_screen = cy − ny * r        // ny が +1 のとき画面の上端
 
 - `pnpm --dir apps/desktop build` / `pnpm --dir apps/desktop test`（全件）
 - X11 で起動し、1280×800 と 900×620 のスクリーンショットを取得
-- 自己監査: グラデ 0 / 絵文字 0 / 影 0 / 色付きの塗りは白ピルと pulse-green ドットのみ / アイコン色は chalk か compass-gold のみ / 角丸は 4・8・99・9999 のみ / 見出し weight 400 / 本文・UI 文字は AA
+- 自己監査: グラデ 0 / 絵文字 0 / 影 0 / 色付きの塗りは白ピルと pulse-green（ドットと軌跡線）のみ / アイコン色は chalk か compass-gold のみ / 角丸は 4・8・99・9999 のみ / 見出し weight 400 / 本文・UI 文字は AA
 
 ### 12.4 用語
 

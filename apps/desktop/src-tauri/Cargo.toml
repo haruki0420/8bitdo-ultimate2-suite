@@ -3,6 +3,9 @@ name = "padbench-desktop"
 version = "0.1.0"
 description = "Tauri v2 desktop shell for Padbench (8BitDo Ultimate 2 support)"
 edition = "2021"
+# `tauri` 2.12.7 requires Rust 1.90.  The root workspace crate set is still
+# pinned to 1.85, but this standalone workspace pins the stricter requirement.
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/haruki0420/8bitdo-ultimate2-suite"
 authors = ["haruki0420"]
@@ -21,6 +24,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+
+[lints.rust]
+# This crate is a standalone workspace root, so it does not inherit the root
+# `[workspace.lints]` table.  Keep the same `unsafe_code` policy locally.
+unsafe_code = "forbid"
 
 [lints.cargo]
 # `eightbitdo-core` is a deliberate forward dependency for the next phase

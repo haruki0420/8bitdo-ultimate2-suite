@@ -27,13 +27,16 @@ function rawSource(key: string): string {
 
 const INDEX_HTML = rawSource("../index.html");
 
-/** `src/` 配下の実装ファイル（テスト自身は除く）。 */
-const SOURCE_TEXT = Object.keys(RAW_SOURCES)
+/** `src/` 配下の実装ファイル（テスト自身と index.html を除く）。 */
+const SOURCES = Object.keys(RAW_SOURCES)
   .filter(
     (path) => path !== "../index.html" && !/\.test\.tsx?$/.test(path),
   )
-  .map((path) => `/* ${path} */\n${rawSource(path)}`)
-  .join("\n");
+  .map((path) => ({ path, text: rawSource(path) }));
+
+const SOURCE_TEXT = SOURCES.map(({ path, text }) => `/* ${path} */\n${text}`).join(
+  "\n",
+);
 
 const BANNED_TERMS = [
   "ライブ入力",
@@ -51,6 +54,11 @@ const EMOJI_PATTERN =
   /[\u{1f000}-\u{1faff}\u{2600}-\u{27bf}\u{fe0f}\u{1f1e6}-\u{1f1ff}]/u;
 
 describe("日本語の用語（§6.3）", () => {
+  it("実装ファイルを 1 件以上走査している", () => {
+    // glob の解決に失敗すると以下の検査がすべて空振りで通るため、先に固定する。
+    expect(SOURCES.length).toBeGreaterThan(0);
+  });
+
   it("使わない表記が実装に残っていない", () => {
     for (const term of BANNED_TERMS) {
       expect(SOURCE_TEXT, `banned term: ${term}`).not.toContain(term);

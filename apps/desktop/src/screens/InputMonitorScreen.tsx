@@ -167,7 +167,7 @@ export function InputMonitorScreen() {
         </div>
 
         <div
-          data-surface="stage"
+          data-testid="input-stage"
           className="rounded-md border border-graphite bg-carbon p-6 text-chalk"
         >
           <div className="mb-5 flex items-center justify-between gap-2">
@@ -208,7 +208,7 @@ export function InputMonitorScreen() {
         </div>
 
         <div className="mt-2 flex justify-between gap-2 font-mono text-micro tracking-meta text-smoke">
-          <span>Y 軸は上が正</span>
+          <span>画面表示では上が正（生値の向きは実機確認前）</span>
           <span>実機の入力は未接続</span>
         </div>
       </section>

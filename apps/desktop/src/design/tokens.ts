@@ -5,7 +5,8 @@
  * 実装上の値は `src/styles/tokens.css` と `src/index.css` の `@theme` にあります。
  * このファイルはテストとコンポーネントから同じ値を参照するための写しで、
  * `tokens.test.ts` が CSS との一致を検査します。
- * 値を変えるときは CSS とこのファイルとテストを同時に直してください。
+ * 値を変えるときは 4 か所（`styles/tokens.css` / `index.css` の `@theme` /
+ * このファイル / `tokens.test.ts`）を同時に直してください。
  */
 
 /** CSS 変数名 → HEX。tokens.css の `:root` と一致していることをテストで確認する。 */
@@ -24,6 +25,12 @@ export const COLORS = {
   "--paper-ink": "#1a1a1a",
   "--danger": "#b42318",
 } as const;
+
+/**
+ * ダイアログの背面スクリム。HEX ではなく alpha 付きのため COLORS とは分ける
+ * （コントラスト計算の対象外）。
+ */
+export const OVERLAY = "rgba(8, 8, 8, 0.72)" as const;
 
 /**
  * 色付きの塗りは 2 つだけ（白ピルと pulse-green の 6px ドット）。

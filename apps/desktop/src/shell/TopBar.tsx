@@ -15,9 +15,8 @@ export function TopBar({ appInfo }: TopBarProps) {
       <div className="flex min-w-0 items-baseline gap-3">
         <BrandRing className="self-center text-compass-gold" />
         <span className="text-body whitespace-nowrap text-chalk">Padbench</span>
-        <span className="font-mono text-micro tracking-meta whitespace-nowrap text-smoke">
-          書き込み対応版
-        </span>
+        {/* TODO(p6): 書き込み機能を載せた配布物だけ、副題に
+            「書き込み対応版」（VOCAB.writeCapable）を出す。現状は表示しない。 */}
       </div>
 
       <div className="flex min-w-0 items-center gap-4">

@@ -122,6 +122,8 @@ Tier 3 のパスに対する変更は、原則として Tier 3 のままです�
 - `Cargo.toml` / `Cargo.lock` / `rust-toolchain.toml`
   - 書き込み経路またはセキュリティに影響しうる依存・ツールチェーン更新（例: `btleplug` / `hidapi` の更新で BLE/USB の write timing・MTU/chunking・retry・error handling が変わるもの、TLS/crypto/auth に影響する更新）は Tier 3。影響しない更新のみ Tier 2。build script / native dependency / feature flag が書き込みコードに影響する場合も Tier 3。
 - `.gitignore`（公式バイナリ `.apk` / `.exe` / `.dll` / `.so` / firmware の除外を削除・弱体化する変更は Tier 3。それ以外は Tier 2）
+- `apps/desktop/src/**`（Tauri の**表示のみ**の UI: React コンポーネント・画面・シェル・トークン・文言）
+  - 表示のみは Tier 2。ただし write-path / セキュリティ / ゲートに関わる変更は §2 の content-based override で Tier 3。**表示専用でも、書き込み確認ダイアログのチェック項目・安全手順の文言を変える変更は Tier 3**（レビュアーが確認する内容の変更）。
 - `.github/dependabot.yml`
   - セキュリティ更新の方針（対象 ecosystem、無視・保留、自動マージ条件など）を変える変更は **Tier 3**。それ以外の設定（スケジュール、グループ化、ラベル等）は Tier 2。
 
@@ -143,6 +145,8 @@ Tier 3 のパスに対する変更は、原則として Tier 3 のままです�
 - `crates/eightbitdo-uniffi/**` の書き込み / OTA 公開 API
 - `mobile/ios/**` / `mobile/android/**` の native write path
 - `packaging/**` / リリース設定 / 署名
+- `apps/desktop/src-tauri/**`（Tauri の commands / capability / `tauri.conf.json` / IPC 境界 / CSP）
+  - IPC 境界・権限・CSP の実装なので、差分の大小にかかわらず Tier 3（§2 security behavior rule）。`apps/desktop/src/**`（表示のみ）は Tier 2（表示専用でも書き込み確認・安全手順の文言変更は Tier 3）。
 - `unsafe` / FFI / ファームウェアのダウンロード・検証 / secrets / build script
 - 認証 / 認可 / 暗号 / 署名検証 / secret の扱い / trust-boundary の入力検証 / 権限変更 / これらに影響する依存
 - `AGENTS.md` / `CONTRIBUTING.md` / `docs/REVIEW_TIERS.md` / `docs/BRANCH_PROTECTION.md` / PR テンプレートの **安全-critical なチェックリスト項目・手順**（Flash 順序、backup/restore、OTA 復旧、マクロ Flash、ゲート手順）
@@ -162,6 +166,8 @@ Tier 3 のパスに対する変更は、原則として Tier 3 のままです�
 | `docs/PROTOCOL_SPEC.md` の offset 変更 | 3 | 安全-critical な仕様変更 |
 | `config_bt2.rs` の読み取り専用 builder | 2 | 読み取り専用コード |
 | mock transport の変更 | 3 | write-path rule |
+| `apps/desktop/src/**` の表示・文言の変更 | 2 | 表示のみ（write-path / セキュリティ / 安全手順の文言変更は 3） |
+| `apps/desktop/src-tauri/**` の capability / CSP / command 変更 | 3 | IPC 境界・権限（security behavior rule） |
 
 ## 4. Tier 1（軽量・振る舞いを変えない）
 

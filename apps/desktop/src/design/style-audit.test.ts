@@ -38,6 +38,11 @@ function filesMatching(pattern: RegExp): string[] {
 }
 
 describe("自己監査: 色・影・グラデーション", () => {
+  it("実装ファイルを 1 件以上走査している", () => {
+    // glob の解決に失敗すると以下の監査がすべて空振りで通るため、先に固定する。
+    expect(SOURCES.length).toBeGreaterThan(0);
+  });
+
   it("旧ライト面のユーティリティを残さない", () => {
     for (const banned of [
       "bg-panel",
@@ -90,6 +95,74 @@ describe("自己監査: 色・影・グラデーション", () => {
   it("影の代替である focus ring は outline で描く", () => {
     expect(ALL_TEXT).toContain(":focus-visible");
     expect(ALL_TEXT).toContain("outline: 1px solid var(--chalk)");
+  });
+});
+
+describe("自己監査: 値の許可リスト", () => {
+  /** コメントを除いた本文（コメント中の色名・例示を検査対象にしない）。 */
+  function withoutComments(text: string): string {
+    return text
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+  }
+
+  it("スケール外の任意値ユーティリティ（p-[13px] / bg-[#...] / text-[13px]）を書かない", () => {
+    const arbitrary = ALL_TEXT.match(/[a-z0-9]-\[[^\]]*\]/g) ?? [];
+    expect(arbitrary).toEqual([]);
+  });
+
+  /** glob のキーは `./tokens.ts` や `../styles/tokens.css` の形で返る。 */
+  function isAllowedPath(path: string, allowed: readonly string[]): boolean {
+    const normalized = path.replace(/^\.\//, "");
+    return allowed.some(
+      (name) => normalized === name || normalized.endsWith(`/${name}`),
+    );
+  }
+
+  it("生の色は tokens.css / tokens.ts だけ（HEX を散らかさない）", () => {
+    const allowed = ["styles/tokens.css", "tokens.ts"] as const;
+    const offenders = SOURCES.filter(
+      ({ path, text }) =>
+        !isAllowedPath(path, allowed) &&
+        /#[0-9a-fA-F]{3,8}\b/.test(withoutComments(text)),
+    ).map(({ path }) => path);
+    expect(offenders).toEqual([]);
+  });
+
+  it("rgb() / hsl() は tokens.css と tokens.ts のスクリムだけ", () => {
+    const allowed = ["styles/tokens.css", "tokens.ts"] as const;
+    const offenders = SOURCES.filter(
+      ({ path, text }) =>
+        !isAllowedPath(path, allowed) &&
+        /\b(?:rgba?|hsla?)\(/i.test(withoutComments(text)),
+    ).map(({ path }) => path);
+    expect(offenders).toEqual([]);
+  });
+
+  it("インライン style はトリガーバーの幅指定だけ", () => {
+    const inline = [...ALL_TEXT.matchAll(/style=\{\{([\s\S]*?)\}\}/g)].map(
+      (match) => match[1] ?? "",
+    );
+    // 許容しているのは 1 か所だけ。増やすときはこのリストに追記する。
+    expect(inline).toHaveLength(1);
+    for (const body of inline) {
+      const keys = [
+        ...body.matchAll(/([A-Za-z][A-Za-z-]*)\s*:/g),
+      ].map((match) => match[1]);
+      expect(keys).toEqual(["width"]);
+    }
+  });
+
+  it("font-weight は 400 だけ（ユーティリティ以外の直書きも検出する）", () => {
+    const weights = [...ALL_TEXT.matchAll(/font-weight\s*:\s*([^;}\n]+)/gi)].map(
+      (match) => (match[1] ?? "").trim(),
+    );
+    for (const weight of weights) {
+      expect(["400", "normal"]).toContain(weight);
+    }
+    expect(ALL_TEXT).not.toMatch(
+      /fontWeight\s*:\s*["']?(?:[5-9]\d\d|bold|semibold|medium|extrabold|black)\b/,
+    );
   });
 });
 

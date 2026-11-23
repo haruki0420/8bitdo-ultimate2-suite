@@ -39,9 +39,8 @@ export function SafetyRail() {
         </Button>
       </div>
 
-      <p className="mt-5 border-t border-graphite pt-4 text-meta text-smoke">
-        書き込み前にバックアップします。
-      </p>
+      {/* TODO(p3): 書き込み経路（pre-write backup + read-back）を実装したら、
+          「書き込み前にバックアップします。」の 1 行をここへ戻す。 */}
     </section>
   );
 }

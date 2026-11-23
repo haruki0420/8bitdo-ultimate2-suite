@@ -1,7 +1,7 @@
 # Tauri v2 GUI 移行計画とクロスプラットフォーム方針
 
 - 決定日: **2026-11-23**
-- 状態: **計画**（この文書はコードを含まない。`apps/desktop` の雛形は P0 で追加する）
+- 状態: **計画 + P0/P1 実装済み**（2026-11-23。`apps/desktop` の雛形・デザイン・CI・CSP まで追加済み。P2 以降は未着手。詳細は §5 の状態注記）
 - 対象: デスクトップ GUI とモバイル GUI の実装方式、配布形式、検証方針、日本語 UI の用語
 - 正本の範囲: この文書は **GUI の実装方式と移行手順** の正本です。ライセンス・配布の決定は [DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md)、レビュー Tier は [REVIEW_TIERS.md](REVIEW_TIERS.md)、プロトコルは [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) を正本とし、この文書では変更しません。
 
@@ -106,9 +106,9 @@ graph TD
 
 ### 3.2 セキュリティ境界
 
-- Tauri v2 の capability は最小限にする。コマンドは画面の用途ごとに分け、汎用の「任意の BLE 操作」コマンドを作らない。
-- CSP を設定し、外部 URL を WebView に読み込まない。外部リンクは OS のブラウザで開く。
-- ファイル選択・保存は Rust 側のダイアログ API を使い、WebView に任意のパスを渡さない。
+- Tauri v2 の capability は最小限にする。コマンドは画面の用途ごとに分け、汎用の「任意の BLE 操作」コマンドを作らない。現状は `apps/desktop/src-tauri/capabilities/default.json` の `core:default` だけ（P0 雛形）で、P2 以降に用途別 capability へ分割する。
+- **`fs` / `shell` / `http` プラグインは P2 以降も追加しない。** ファイル選択・保存は Rust 側のダイアログ API（`tauri-plugin-dialog` を使う場合も増やす権限はダイアログに限定）に閉じ、HTTP は Rust 側で行う。WebView に任意パス・任意 URL を渡さない方針を維持する（capability を広げる変更はレビュー Tier 3）。
+- CSP を設定し、外部 URL を WebView に読み込まない。外部リンクは OS のブラウザで開く。**P0 で設定済み**: `apps/desktop/src-tauri/tauri.conf.json` の `app.security.csp` は `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost`（`ipc:` と `http://ipc.localhost` は Tauri v2 の IPC 用）。
 - 書き込みコマンドは、Web UI の確認状態にかかわらず Rust 側で再度検証する（確認済みフラグを IPC で受け取らない）。
 
 ---
@@ -140,7 +140,7 @@ graph TD
 ```
 
 - **`apps/desktop` を `crates/` に置かない理由**: Web ツールチェーン（Node / pnpm / Vite）と Rust クレートを同居させず、Cargo workspace のビルド対象と配布物を分けるため。
-- **`src-tauri` は独立クレート**: `apps/desktop/src-tauri` は**独立クレート**とし、ルート workspace には追加しない。Tauri の依存・MSRV・ビルド時間を既存 5 クレートの CI に混ぜないため。`eightbitdo-core` / `eightbitdo-protocol` は path 依存で参照する（`src-tauri` 側で空の `[workspace]` を宣言し、ルート workspace のメンバーにならないようにする）。CI では desktop 専用のジョブを別途実行する（P0）。
+- **`src-tauri` は独立クレート**: `apps/desktop/src-tauri` は**独立クレート**とし、ルート workspace には追加しない。Tauri の依存・MSRV・ビルド時間を既存 5 クレートの CI に混ぜないため。`eightbitdo-core` / `eightbitdo-protocol` は path 依存で参照する（`src-tauri` 側で空の `[workspace]` を宣言し、ルート workspace のメンバーにならないようにする）。CI では desktop 専用のジョブを別途実行する（P0 で `.github/workflows/desktop.yml` を追加済み）。
 - **`mobile/` の扱い**: すぐには削除しない。Tauri v2 モバイルが実機で動くまで、モバイルの正本は既存の UniFFI + SwiftUI / Compose 版とする。P8 の結果を見て、統合・凍結・削除を別途判断する。
 - **egui 版の扱い**: P2 以降は凍結する。バグ修正と実機検証の記録だけを行い、新機能は Tauri 版にだけ入れる。
 
@@ -159,6 +159,14 @@ graph TD
 | **P6 ライセンス / i18n** | 法務表示と言語 | ライセンス画面（アプリの MIT / Apache-2.0 全文と同梱 5 フォントの全文・著作権者行）、用語集の適用、翻訳キーの整備、英語表示 | ライセンス画面の内容が egui 版（#24）と一致する。未翻訳キーが 0。依存追加時は [THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md) と [NOTICE](../NOTICE) を更新する |
 | **P7 パッケージ / CI** | 配布物の生成 | Linux AppImage / deb、macOS dmg（署名・公証）、Windows MSI / NSIS、CI matrix、既存 Rust テストの維持 | 各 OS でインストールと起動を確認する。署名・公証の資格情報が無い間は未署名ビルドを成果物にし、その旨を明記する |
 | **P8 モバイル** | Tauri v2 モバイルへの展開 | Tauri v2 の Android / iOS 初期化、ネイティブ BLE プラグイン（Kotlin / Swift）、`Transport` 注入、エミュレータ / 実機確認、APK / AAB / IPA | Android 実機で BLE 読み取りが動く。iOS は macOS + Xcode が使える環境でビルドを確認する（本ホスト不可） |
+
+**状態（2026-11-23）**:
+
+| フェーズ | 状態 |
+| --- | --- |
+| P0 決定・足場 | **完了**。`apps/desktop` の雛形（Vite + React + TS + Tailwind、独立クレートの `src-tauri`、`capabilities/default.json`、CSP、アイコン）、`.github/workflows/desktop.yml`（web / rust の 2 ジョブ）、バージョン固定（Node `^20.19.0 || >=22.12.0` / pnpm 12.22.0 / Rust 1.90+）を追加済み |
+| P1 デザイン | **完了**。案 C を経て Imported style: Hyperstudio を採用し、トークン・共通コンポーネント・シェル・2 画面（デバイス / 入力モニター）を実装済み。[DESIGN_TAURI.md](DESIGN_TAURI.md) §12 |
+| P2 以降 | **未着手**（BLE 接続・読み取り・入力モニターの実データ・書き込み・OTA・パッケージ・モバイル） |
 
 補足:
 

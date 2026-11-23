@@ -153,7 +153,11 @@ export default function App() {
       >
         <p>アプリのライセンスは MIT または Apache-2.0 です。</p>
         <p className="mt-2">
-          同梱フォントのライセンス全文の表示は次のフェーズで追加します。
+          依存クレートとフォントのライセンス全文の表示は P6 で追加します（egui 版
+          #24 と同水準）。
+        </p>
+        <p className="mt-2">
+          フォントはまだ同梱しておらず、OS のフォントで表示しています。
         </p>
         <p className="mt-3 font-mono text-meta text-smoke">MIT OR Apache-2.0</p>
       </Dialog>

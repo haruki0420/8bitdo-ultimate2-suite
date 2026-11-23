@@ -2,5 +2,5 @@ version: 1
 # Every App ID is permanent in Apple Developer Services; pick the final reverse
 # DNS name before the first signed build.
 bundleID: io.github.haruki0420.padbench
-product: EightBitDo
+product: Padbench
 infoPath: Info.plist

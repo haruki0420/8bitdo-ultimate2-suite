@@ -126,12 +126,10 @@ describe("App", () => {
       screen.getByRole("heading", { level: 1, name: "入力モニター" }),
     ).toBeInTheDocument();
 
-    const stage = document.querySelector('[data-surface="stage"]');
-    expect(stage).not.toBeNull();
-    expect(stage).toHaveAttribute("data-surface", "stage");
+    const stage = screen.getByTestId("input-stage");
     // 全体が暗いため、ステージは carbon 地 + 1px graphite のパネルで表す。
-    expect(stage?.className).toContain("bg-carbon");
-    expect(stage?.className).toContain("border-graphite");
+    expect(stage.className).toContain("bg-carbon");
+    expect(stage.className).toContain("border-graphite");
 
     // コントローラの線画は置かず、スティック図 2 つだけを描く。
     expect(document.querySelector('[aria-label*="コントローラの見本"]')).toBeNull();
@@ -147,7 +145,7 @@ describe("App", () => {
     expect(screen.getByText("0.62")).toBeInTheDocument();
     expect(screen.getByText("0.12")).toBeInTheDocument();
     expect(screen.getByText(/−0\.31/)).toBeInTheDocument();
-    expect(screen.getByText("Y 軸は上が正")).toBeInTheDocument();
+    expect(screen.getByText(/画面表示では上が正/)).toBeInTheDocument();
 
     const scope = within(stage as HTMLElement);
     expect(scope.getByText("A")).toBeInTheDocument();

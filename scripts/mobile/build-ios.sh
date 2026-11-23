@@ -45,7 +45,7 @@ echo "==> xtool dev build --ipa"
 cd "$IOS_DIR"
 xtool dev build -c release --ipa
 
-IPA="$IOS_DIR/xtool/EightBitDo.ipa"
+IPA="$IOS_DIR/xtool/Padbench.ipa"
 if [ -f "$IPA" ]; then
   echo
   echo "unsigned IPA: $IPA"
