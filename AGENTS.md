@@ -34,6 +34,8 @@
    - 常駐 `session` の運用（per-user BLE 単一所有者ロック、degraded 終了コード 3、SIGINT 範囲、`scan --check` と `scripts/session-loop.sh`）
 6. **[docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)**
    - BLE OTA の実機 btsnoop 採取（Linux `btmon` / Android HCI snoop）・確認項目と判定・EVIDENCE への追記方法、Phase A / Phase B の安全手順。OTA の実機検証前に必ず読む。
+7. **[docs/TAURI_PLAN.md](docs/TAURI_PLAN.md)**
+   - Tauri v2 GUI への移行計画とクロスプラットフォーム方針（決定日 2026-11-23）。アーキテクチャ、`apps/desktop` 構成、P0〜P8 のフェーズ、クロスプラットフォーム表、リスク、日本語 UI 用語集、受け入れ条件。GUI に着手する前に必ず読む。
 
 ---
 
@@ -46,11 +48,12 @@
   - `eightbitdo-core` は `Transport` トレイト経由で BLE / USB HID / モックを差し替え可能にする。
   - **クレート名の注意**: Cargo のパッケージ名は数字で開始できないため、`8bitdo-*` ではなく **`eightbitdo-*`** を正式名とする（ディレクトリ名も同様）。
 - **デスクトップ (Linux / macOS / Windows)**:
-  - **Pure Rust** で実装する（Electron / Tauri / Node.js / WebView は使わない）。
-  - BLE: `btleplug`、USB/2.4G HID: `hidapi`、CLI: `clap`、GUI: **`egui` (`eframe`)**（または `iced`）。
+  - **Pure Rust** を基本とする。**例外として Tauri v2 のみ許可する（2026-11-23 決定）**。Electron / Node.js 単体 / 汎用 WebView は引き続き使わない。理由: GUI のデザイン品質と反復速度を優先するため（[docs/TAURI_PLAN.md](docs/TAURI_PLAN.md)）。
+  - BLE: `btleplug`、USB/2.4G HID: `hidapi`、CLI: `clap`。
+  - **GUI**: 正式は **Tauri v2（Web UI: TypeScript + Vite + React + Tailwind CSS、pnpm）**。BLE は WebView から触らず `eightbitdo-core` で実行し、Tauri commands / events で公開する。既存の egui 版（`crates/eightbitdo-gui`、`eframe`）は比較・撤退用に残す（凍結。新機能は Tauri 版のみ）。
 - **モバイル (iOS / Android)**:
-  - 各 OS の**ネイティブ UI**（**iOS: SwiftUI**, **Android: Jetpack Compose**）から Rust コアを **`UniFFI` (`eightbitdo-uniffi`)** 経由で呼び出す。
-  - モバイルの BLE / USB OTG トランスポートは OS ネイティブ API（CoreBluetooth / Android BluetoothGatt & UsbManager）で実装し、UniFFI の Callback Interface で `eightbitdo-core` に注入する。
+  - 方針は **Tauri v2 モバイル（同じ Web UI）+ ネイティブ BLE プラグイン**（Kotlin BluetoothGatt / Swift CoreBluetooth）とし、プラグインから `eightbitdo-core` へ transport を注入する（[docs/TAURI_PLAN.md](docs/TAURI_PLAN.md) P8）。
+  - iOS / macOS は本ホストでビルド検証できないため、**既存の UniFFI + ネイティブ UI 版**（**iOS: SwiftUI**, **Android: Jetpack Compose**、`eightbitdo-uniffi` 経由）を代替として維持する。モバイルの BLE / USB OTG トランスポートは OS ネイティブ API（CoreBluetooth / Android BluetoothGatt & UsbManager）で実装し、UniFFI の Callback Interface で `eightbitdo-core` に注入する経路も残す。
 - **機能要件**:
   - マクロエディタは **リアルタイム入力録音 + GUI ステップ編集 + JSON/TOML インポート・エクスポート** に対応し、1ms 解像度とフル 8-bit アナログスティック／トリガー値を開放する。
   - コントローラ設定は 2768 バイト構造体の全機能（プロファイル、リマップ、スティック/トリガー、振動、6軸ジャイロ、RGB、マクロ）を公式同等にサポートする。
@@ -108,9 +111,9 @@
 | 2b | BLE マクロ読み書き（3 slot × 4 macro、backup / write / restore） | 完了。実機で slot S1 の M1/M2 の書込・読み戻し・復元を確認（M3/M4・S2/S3 は外挿）。**Switch 側でのマクロ発動は未確認** |
 | 2c | BLE OTA 状態機械（`crates/eightbitdo-core/src/ota.rs`） | **core 実装済み・Mock 52 テスト（既定）/ 55（`mobile-boot`）/ 58（`ota-bench`）/ 61（`--all-features`）。#20 で実機採取用の `ota-bench` 段階実行 API（既定 OFF、`write_firmware_with_checkpoint` / `OtaCheckpoint::AfterFirstErase` 等、`OtaBenchOutcome.write_state` / `phase`）を追加。実機 btsnoop の採取計画は [docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)（#19）。CLI / GUI / UniFFI 未配線、実機 btsnoop 未取得・実機書込未検証** |
 | 2d | 2768B 設定書き込み / `config set` / `config remap`（BLE のみ） | 完了。実機（BLE・MTU 200・74B chunk）で full write → Save → read-back 一致、remap A→B→A を確認。**実機確認は full write / remap のみ（`config set` 各フィールド・`--force-raw`・MTU 200 以外は未確認）**。#17 で実機 flag を opaque 値として扱う検証に修正。`slot_flags` の観測値 allowlist を追加し、gyro key_map の erasure sentinel 例外を削除したうえで flag の `0x20190000` は raw allowlist で受理を継続し、実 dump を使う `#[ignore]` E2E を追加して docs を整合させた |
-| 3a | 読み取り専用 GUI（egui、日本語、燻しスレート、デバイス / ライブ入力 / 設定値 / ログ） | 完了（PR #9）。読み取り専用の 4 タブ |
-| 3b / 3d | GUI 書込 UI（設定タブ / 22 ボタンリマップ / マクロエディタ・録音） | 実装済み・main にマージ（PR #16）。確認ダイアログ、pre-write backup、read-back、TOCTOU 付き。**実機未検証・Tier 3** |
-| 3c | GUI OTA 画面 | 未着手（Phase 2c の実機 wire 確定後） |
+| 3a | 読み取り専用 GUI（egui、日本語、燻しスレート、デバイス / ライブ入力 / 設定値 / ログ） | 完了（PR #9）。読み取り専用の 4 タブ。**Tauri 版へ移行中**（[docs/TAURI_PLAN.md](docs/TAURI_PLAN.md)） |
+| 3b / 3d | GUI 書込 UI（設定タブ / 22 ボタンリマップ / マクロエディタ・録音） | 実装済み・main にマージ（PR #16）。確認ダイアログ、pre-write backup、read-back、TOCTOU 付き。**実機未検証・Tier 3**。**Tauri 版へ移行中**（egui 版は凍結。新機能は Tauri 版のみ） |
+| 3c | GUI OTA 画面 | 未着手（Phase 2c の実機 wire 確定後）。**Tauri 版へ移行中** |
 | 4 | USB OTA | **保留**（USB Boot TX フレーミング未文書化） |
 | 5 | `eightbitdo-uniffi` + iOS SwiftUI / Android Compose | **JNI 同梱 APK / unsigned IPA のビルド成功まで（#21、実機未検証）**。Android JNI 同梱 APK 14,551,011 bytes（`libeightbitdo_uniffi.so` を arm64-v8a / x86_64 に同梱）、iOS unsigned IPA 1,550,522 bytes。実機 BLE・JNI ロード・インストール・App Store / TestFlight 配布は未着手。証跡は [docs/MOBILE_BUILD_EVIDENCE.md](docs/MOBILE_BUILD_EVIDENCE.md) |
 | — | ライセンス文書（LICENSE-MIT / LICENSE-APACHE / NOTICE / THIRD_PARTY_LICENSES / TRADEMARKS） | 完了（PR #13）。リポジトリ公開・コードライセンス・商標・同梱フォント・ストア配布・マネタイズの決定は [docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md)（#22、決定日 2026-11-23）が正本 |

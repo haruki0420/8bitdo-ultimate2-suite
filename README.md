@@ -17,7 +17,7 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 - **BLE 設定モード（`80ND`）への接続と読み取り**: Switch に接続したまま Profile ボタン約 3 秒で設定モードに入り、version / 2768B 設定 / マクロ 3 slot × 4 / リアルタイム入力 / keepalive を取得。20ms `0x0003` keepalive、per-user BLE 単一所有ロック、degraded 時の終了コード 3。
 - **設定の書き込みとボタンリマップ（BLE）**: `config write` / `config set` / `config remap` / `config map show`。予約バイト保持、CRC 再計算、必須 pre-write backup、前後 SHA-256、TOCTOU 再読込、read-back 検証。**実機確認済み**（full write / remap のみ。`config set` 各フィールドは未確認）。
 - **マクロのバックアップ・書き込み・復元（BLE）**: `macro backup` / `macro write` / `macro restore`。公式順序（Header `0xD8` → Save → Erase → Write → Save）と Write `total_len` の**絶対終端**。**実機確認済み**（slot S1 の M1/M2。**Switch 側の発動は未確認**）。
-- **GUI**: egui / Pure Rust。日本語 UI、燻しスレートのテーマ、Noto Sans JP 同梱。読み取り 4 タブ（デバイス / ライブ入力 / 設定値 / ログ）に加え、PR #16 で設定・ボタンリマップ・マクロの書き込み UI を追加（確認ダイアログ、pre-write backup、read-back 検証）。**GUI 書込は実機未検証**。左レール下部の「ライセンス」画面（#24、main にマージ済み）で、アプリの MIT / Apache-2.0 全文と同梱 5 フォントのライセンス全文・著作権者行を閲覧できる。
+- **GUI**: egui / Pure Rust（Tauri v2 版へ移行中。[docs/TAURI_PLAN.md](docs/TAURI_PLAN.md)）。日本語 UI、燻しスレートのテーマ、Noto Sans JP 同梱。読み取り 4 タブ（デバイス / ライブ入力 / 設定値 / ログ）に加え、PR #16 で設定・ボタンリマップ・マクロの書き込み UI を追加（確認ダイアログ、pre-write backup、read-back 検証）。**GUI 書込は実機未検証**。左レール下部の「ライセンス」画面（#24、main にマージ済み）で、アプリの MIT / Apache-2.0 全文と同梱 5 フォントのライセンス全文・著作権者行を閲覧できる。
 - **セッション REPL**: 1 接続で `info` / `config dump` / `backup` / `monitor` / `macro backup` / `config map show` などを実行。書込系は `--allow-macro-write` / `--allow-config-write` と確認が必須。
 - **マクロ・設定の JSON / TOML I/O**: `MacroFile` のインポート / エクスポート。1ms 解像度・8-bit スティック / トリガー値を保持。
 - **モバイル雛形**: `eightbitdo-uniffi` 経由の読み取り API、iOS SwiftUI + CoreBluetooth、Android Compose + BluetoothGatt。iOS は unsigned IPA、Android は JNI 同梱 APK（arm64-v8a / x86_64）を生成可能。
@@ -119,7 +119,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 
 ## GUI
 
-`eightbitdo-gui` は egui / eframe のネイティブ GUI です。Node.js / WebView / Electron / Tauri は使いません。
+`eightbitdo-gui` は egui / eframe のネイティブ GUI です。**デスクトップ GUI は Tauri v2（Rust backend + Web frontend）へ移行中**で、egui 版は比較・撤退用に残します（決定日 2026-11-23）。Tauri 版のフロントは TypeScript + Vite + React + Tailwind CSS（pnpm）で、BLE は WebView から触らず Rust コア（`eightbitdo-core`）で実行し、Tauri commands / events で公開します。手順とフェーズは [docs/TAURI_PLAN.md](docs/TAURI_PLAN.md) を参照してください。
 
 - **6 タブ**: デバイス（接続・情報）、ライブ入力、設定値（2768B の要約）、設定（書き込み）、マクロ（録音・編集・書き込み）、ログ。
 - 日本語 UI と英語表示の切り替え、燻しスレートのテーマ、Noto Sans JP（OFL）を同梱。
@@ -155,6 +155,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 | **[docs/DEVICE_CONFIG_EVIDENCE.md](docs/DEVICE_CONFIG_EVIDENCE.md)** | 実機 2768B ダンプの実バイト証跡（2026-11-22 時点の dump は SHA-256 `1dca47fa…`。現在の実機 config はプロファイル名の変更により `95b87bb0…` と異なると考えられる）: `slot_flags` / `map_key.flag` の非 0/1 値、`config remap` の差分、raw 検証エラーと再現コマンド。§7 に `0x0015`（`WriteSLOT`）の実機 wire・ACK・`cur_slot` 6→1 と復元（39 packets）の証跡 |
 | **[docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md)** | 公式 Windows / Android ソフトの機能ごとのカバレッジ: RE 証拠ラベル、本リポジトリの実装状況（core / CLI / GUI）、実機検証状況（Linux BLE のみ）、残作業と追加 RE 項目 |
 | **[docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)** | Rust + SwiftUI + Jetpack Compose のアーキテクチャ設計、ワークスペース構成、Phase 1〜5 ロードマップ、現在の状態・残課題、安全検証手順 |
+| **[docs/TAURI_PLAN.md](docs/TAURI_PLAN.md)** | Tauri v2 GUI への移行計画とクロスプラットフォーム方針（決定日 2026-11-23）: 背景、アーキテクチャ、`apps/desktop` 構成、P0〜P8 のフェーズ、プラットフォーム別の UI / BLE / 配布 / 本ホスト検証可否、リスク、日本語 UI 用語集、受け入れ条件 |
 | **[docs/OTA_BLE_EVIDENCE.md](docs/OTA_BLE_EVIDENCE.md)** | BLE OTA の解析証跡（確定した順序・タイムアウト・`.dat` ヘッダ）と未確認事項の優先順 |
 | **[docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)** | クロスプラットフォームのビルド確認状況（Windows クロス `check` の結果と警告 4 件、MSRV 1.85 が Windows で通らない理由、iOS target check、macOS 未確認の理由、CI 追加提案） |
 | **[docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)** | BLE OTA 実機検証の準備: btsnoop 採取（Linux `btmon` / Android HCI snoop）、確認項目と判定、EVIDENCE への追記、Phase A / B の安全手順 |
