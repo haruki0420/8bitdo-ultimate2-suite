@@ -17,16 +17,13 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 - **BLE 設定モード（`80ND`）への接続と読み取り**: Switch に接続したまま Profile ボタン約 3 秒で設定モードに入り、version / 2768B 設定 / マクロ 3 slot × 4 / リアルタイム入力 / keepalive を取得。20ms `0x0003` keepalive、per-user BLE 単一所有ロック、degraded 時の終了コード 3。
 - **設定の書き込みとボタンリマップ（BLE）**: `config write` / `config set` / `config remap` / `config map show`。予約バイト保持、CRC 再計算、必須 pre-write backup、前後 SHA-256、TOCTOU 再読込、read-back 検証。**実機確認済み**（full write / remap のみ。`config set` 各フィールドは未確認）。
 - **マクロのバックアップ・書き込み・復元（BLE）**: `macro backup` / `macro write` / `macro restore`。公式順序（Header `0xD8` → Save → Erase → Write → Save）と Write `total_len` の**絶対終端**。**実機確認済み**（slot S1 の M1/M2。**Switch 側の発動は未確認**）。
-- **GUI**: egui / Pure Rust。日本語 UI、燻しスレートのテーマ、Noto Sans JP 同梱。読み取り 4 タブ（デバイス / ライブ入力 / 設定値 / ログ）に加え、PR #16 で設定・ボタンリマップ・マクロの書き込み UI を追加（確認ダイアログ、pre-write backup、read-back 検証）。**GUI 書込は実機未検証**。
+- **GUI**: egui / Pure Rust。日本語 UI、燻しスレートのテーマ、Noto Sans JP 同梱。読み取り 4 タブ（デバイス / ライブ入力 / 設定値 / ログ）に加え、PR #16 で設定・ボタンリマップ・マクロの書き込み UI を追加（確認ダイアログ、pre-write backup、read-back 検証）。**GUI 書込は実機未検証**。左レール下部の「ライセンス」画面（#24、main にマージ済み）で、アプリの MIT / Apache-2.0 全文と同梱 5 フォントのライセンス全文・著作権者行を閲覧できる。
 - **セッション REPL**: 1 接続で `info` / `config dump` / `backup` / `monitor` / `macro backup` / `config map show` などを実行。書込系は `--allow-macro-write` / `--allow-config-write` と確認が必須。
 - **マクロ・設定の JSON / TOML I/O**: `MacroFile` のインポート / エクスポート。1ms 解像度・8-bit スティック / トリガー値を保持。
 - **モバイル雛形**: `eightbitdo-uniffi` 経由の読み取り API、iOS SwiftUI + CoreBluetooth、Android Compose + BluetoothGatt。iOS は unsigned IPA、Android は JNI 同梱 APK（arm64-v8a / x86_64）を生成可能。
 
 ### 計画中・未提供
 
-- **GUI からの書き込み**: PR #16 で設定 2768B・リマップ・マクロを実装し main にマージ済み。確認ダイアログ、pre-write backup、read-back 検証、TOCTOU 検出付き。**実機未検証・Tier 3**。
-- **GUI ライセンス画面**: PR #24 でレビュー中・未マージ。現 main の GUI にはライセンス表示画面がありません。
-- **プロファイル切替 API**: PR #26 で core `Session::switch_profile` + CLI `config profile <N>` + REPL `profile switch <N>` を実装し、レビュー中・未マージ。[docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md) の残作業「`0x0015` 切替のセッション API 化」に対応。
 - **ファームウェア更新（BLE OTA）**: core の状態機械と `ota-bench` 段階実行 API（#20）、実機 btsnoop 採取計画（#19）まで用意済み。実機 wire 未確定・CLI / GUI / UniFFI 未配線。USB OTA は USB Boot TX フレーミング未文書化のため保留。
 - **モバイルの書き込み・OTA**: バックアップ UI と Tier 3 レビュー待ちで未公開。Android の JNI 同梱 APK と iOS unsigned IPA はビルド成功（#21、実機未検証）、iOS / Android 実機確認、App Store 配布は未着手。
 - **USB HID / 2.4G transport**: 未実装・保留。
@@ -35,9 +32,9 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 
 ## 実装状況
 
-main は `0582e9a`（2026-11-23）時点。フェーズの詳細・残課題は [AGENTS.md](AGENTS.md) §6 と [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) §5。
+main は `a8e3e2b`（2026-11-23）時点。フェーズの詳細・残課題は [AGENTS.md](AGENTS.md) §6 と [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) §5。
 
-2026-11-23 に main へマージ済みの追加分: **#17** raw config の実機 flag 対応（`slot_flags` allowlist、gyro key_map の erasure sentinel 例外を削除しつつ flag の `0x20190000` は raw allowlist で受理を継続、実 dump を使う `#[ignore]` E2E、docs 整合）、**#18** クロスプラットフォーム・ビルド確認（[docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)）、**#19** OTA 実機 btsnoop 採取計画（[docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)）、**#20** `ota-bench` 段階実行 API、**#21** モバイルビルド証跡（[docs/MOBILE_BUILD_EVIDENCE.md](docs/MOBILE_BUILD_EVIDENCE.md)）、**#22** 配布・ライセンス・マネタイズ方針（[docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md)）、**#23** 公式機能カバレッジ・マトリクス（[docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md)）。**GUI ライセンス画面は PR #24、プロファイル切替（`0x0015`）の core / CLI 配線は PR #26 として、いずれもレビュー中で未マージ（#24 は main へ未マージ）**。
+2026-11-23 に main へマージ済みの追加分: **#17** raw config の実機 flag 対応（`slot_flags` allowlist、gyro key_map の erasure sentinel 例外を削除しつつ flag の `0x20190000` は raw allowlist で受理を継続、実 dump を使う `#[ignore]` E2E、docs 整合）、**#18** クロスプラットフォーム・ビルド確認（[docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)）、**#19** OTA 実機 btsnoop 採取計画（[docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)）、**#20** `ota-bench` 段階実行 API、**#21** モバイルビルド証跡（[docs/MOBILE_BUILD_EVIDENCE.md](docs/MOBILE_BUILD_EVIDENCE.md)）、**#22** 配布・ライセンス・マネタイズ方針（[docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md)）、**#23** 公式機能カバレッジ・マトリクス（[docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md)）、**#24** GUI ライセンス画面、**#25** 状態 docs の更新、**#26** プロファイル切替（`0x0015`）の core / CLI / REPL 配線（`Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`、Save 送信なし・実機未検証）。
 
 | Phase | 内容 | 状態 |
 | --- | --- | --- |
@@ -52,8 +49,8 @@ main は `0582e9a`（2026-11-23）時点。フェーズの詳細・残課題は 
 | 3d | GUI 設定タブ / 22 ボタンリマップ | 実装・main にマージ（PR #16）。**実機未検証・Tier 3** |
 | 4 | USB OTA | 保留（USB Boot TX 未文書化） |
 | 5 | UniFFI + iOS / Android | **JNI 同梱 APK / unsigned IPA ビルド成功、実機未検証**（#21） |
-| — | GUI ライセンス画面 | **PR #24（レビュー中・未マージ）**。実装予定 |
-| — | プロファイル切替 API（`0x0015`） | **PR #26（レビュー中・未マージ）**。core `Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`。実機未検証（ACK 形状・Save 要否・永続性は未確認） |
+| — | GUI ライセンス画面 | **main にマージ済み（#24）**。左レール下部の「ライセンス」画面。アプリ MIT / Apache-2.0 全文＋同梱 5 フォント全文・著作権者行、Esc / × / 「閉じる」で閉じる。書込確認中はボタンを無効化 |
+| — | プロファイル切替 API（`0x0015`） | **main にマージ済み（#26）**。core `Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`、Save 送信なし。実機未検証（ACK 形状・Save 要否・永続性は未確認） |
 
 **実機で確認済み（Linux・BLE・MTU 200、2026-11-21〜23）**: version / 2768B dump / マクロ backup、マクロ書込（絶対終端 `total_len`）と復元、設定 full write（38 write + 1 Save = 合計 39 packets・74B chunk・read-back SHA 一致）、remap A→B→A。2026-11-23 に再接続後に再確認し、version `0xC8`、config full write → read-back、`config remap A B` → read-back で `A A` の往復（read-back SHA `fae1de6…` / `7a9838e…`）、`macro restore`（slot 0 の M1/M2、read-back SHA `7ebbfde…` / `c6f2419…`、22 packets）を確認した。**実機 config の SHA は 2026-11-22 時点（`1dca47fa…`）と異なる**（プロファイル名 `za` / `Profile2` を設定したためと考えられ、現在は `95b87bb0…`）ので、固定値の一致ではなく、**各操作後の read-back が期待状態と一致し、復帰後は書込前の read-back と一致する**ことで検証している。**設定の実機確認範囲は full write / remap のみ**（`config set` 各フィールド・`--force-raw`・MTU 200 以外は未確認）。
 
@@ -191,8 +188,8 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 - [x] Phase 3d: GUI 設定タブ / 22 ボタンリマップ（PR #16。**実機未検証・Tier 3**）
 - [ ] Phase 4: USB OTA（保留）
 - [ ] Phase 5: `eightbitdo-uniffi` + iOS (SwiftUI) / Android (Jetpack Compose) アプリ（雛形完了・PR #12。JNI 同梱 APK / unsigned IPA はビルド成功（#21、[docs/MOBILE_BUILD_EVIDENCE.md](docs/MOBILE_BUILD_EVIDENCE.md)）。実機確認・App Store 配布は未着手）
-- [ ] GUI ライセンス画面（PR #24、レビュー中・未マージ。実装予定）
-- [ ] プロファイル切替 API（PR #26、レビュー中・未マージ。core `Session::switch_profile` + CLI `config profile <N>` + REPL `profile switch <N>`。FEATURE_MATRIX の残作業「`0x0015` 切替のセッション API 化」に対応）
+- [x] GUI ライセンス画面（#24、main にマージ済み。アプリ MIT / Apache-2.0 全文＋同梱 5 フォント全文・著作権者行、Esc / × / 「閉じる」、書込確認中は無効化）
+- [x] プロファイル切替 API（#26、main にマージ済み。core `Session::switch_profile` + CLI `config profile <N>` + REPL `profile switch <N>`。Save 送信なし・実機未検証。FEATURE_MATRIX の残作業「`0x0015` 切替のセッション API 化」に対応）
 - [x] クロスプラットフォーム・ビルド確認（[docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)、#18。実機は Linux のみ。Windows は `cargo check` のみ、macOS は未確認）
 - [x] 配布・ライセンス・マネタイズ方針（[docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md)、#22）
 - [x] 公式機能カバレッジ・マトリクス（[docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md)、#23）
@@ -213,7 +210,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 - **ドキュメント**（`docs/` 以下と `README.md` など）: 特記がない限り、コードと同じ `MIT OR Apache-2.0` です。将来 CC BY 4.0 などの別ライセンスへ変更する場合は、変更時に本文へ明記します。ただし、第三者に由来する部分（同梱フォントの OFL、第三者コードの BSD / Unicode / MPL 表示、引用・出典）は、それぞれの権利者のライセンス条件に従います。
 - **同梱フォント**（GUI に同梱済み）: Noto Sans JP のサブセットは SIL Open Font License 1.1 です。`crates/eightbitdo-gui/assets/licenses/OFL-NotoSansJP.txt` を同梱しています。egui 既定フォント（Ubuntu-Light / NotoEmoji / Hack / emoji-icon-font）は OFL 1.1・Ubuntu Font Licence 1.0・MIT で、帰属は [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) §3.6.1 に整理しています。全文は GUI の「ライセンス」画面（左レール下部）から閲覧できます。
 - **Gradle wrapper**（`mobile/android/gradle/wrapper/gradle-wrapper.jar` など、ビルド再現性のためコミット済み）: Apache-2.0（jar 内 `META-INF/LICENSE`、manifest の `SPDX-License-Identifier`）。帰属は [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) §3.6.3 を参照してください。
-- 依存ソフトウェアのライセンスは [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) を参照してください。**THIRD_PARTY_LICENSES.md の基準 SHA は `6b39e23` のまま**です（同ファイルは GUI / モバイル依存を含む形で `6b39e23` 時点の `cargo metadata` を集計しており、#17〜#23 では dependency の追加・削除はありません。今回の main `0582e9a` の `Cargo.lock` も 502 パッケージで `6b39e23` と同数、第三者クレート **497**（全 502 パッケージ − workspace 5）です。`Cargo.lock` の差分は workspace 内クレート `eightbitdo-cli` への `serde` 依存追加 1 行のみ）。大半は MIT または Apache-2.0 で、代表的な依存は `eframe`/`egui`（MIT OR Apache-2.0）、`uniffi`（MPL-2.0、ファイル単位コピーレフト）、`btleplug`（MIT/Apache-2.0/BSD-3-Clause）です。Cargo 管理外では Noto Sans JP（OFL 1.1）と Gradle wrapper（Apache-2.0）を同梱しています。同ファイルは要約と参照であり、全クレートの著作権表示・ライセンス本文を網羅しません。バイナリ配布時は `cargo-about` 等で完全な第三者通知を生成して同梱してください。配布・ストア申請前の再確認要否は [docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md) §5 を参照してください。
+- 依存ソフトウェアのライセンスは [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) を参照してください。**THIRD_PARTY_LICENSES.md の基準 SHA は `6b39e23` のまま**です（同ファイルは GUI / モバイル依存を含む形で `6b39e23` 時点の `cargo metadata` を集計しており、#17〜#26 では dependency の追加・削除はありません。今回の main `a8e3e2b` の `Cargo.lock` も 502 パッケージで `6b39e23` と同数、第三者クレート **497**（全 502 パッケージ − workspace 5）です。`Cargo.lock` の差分は workspace 内クレート `eightbitdo-cli` への `serde` 依存追加 1 行のみ）。大半は MIT または Apache-2.0 で、代表的な依存は `eframe`/`egui`（MIT OR Apache-2.0）、`uniffi`（MPL-2.0、ファイル単位コピーレフト）、`btleplug`（MIT/Apache-2.0/BSD-3-Clause）です。Cargo 管理外では Noto Sans JP（OFL 1.1）と Gradle wrapper（Apache-2.0）を同梱しています。同ファイルは要約と参照であり、全クレートの著作権表示・ライセンス本文を網羅しません。バイナリ配布時は `cargo-about` 等で完全な第三者通知を生成して同梱してください。配布・ストア申請前の再確認要否は [docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md) §5 を参照してください。
 - 商標・非公式に関する方針は [TRADEMARKS.md](TRADEMARKS.md) を参照してください。
 - リポジトリ公開・コードライセンス・商標・同梱フォント・ストア配布・マネタイズの方針は、[docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md) に決定事項としてまとめています（決定日 2026-11-23）。未決定の項目は同ファイル §7 に「要判断」として列挙しています。
 

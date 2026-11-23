@@ -151,7 +151,7 @@
 
 ### 4.3 帰属の実装状況（実装済み・配布時に確認）
 
-- **実装済み（2026-11-23）**: フォント本体は `include_bytes!` で GUI バイナリに同梱済み（`crates/eightbitdo-gui/src/theme.rs`）。ライセンス全文は `crates/eightbitdo-gui/assets/licenses/` とリポジトリ直下の `LICENSE-MIT` / `LICENSE-APACHE` に置き、`crates/eightbitdo-gui/src/licenses.rs` の `include_str!` でバイナリに埋め込む。GUI の左レール下部「ライセンス」ボタンから開く画面（`App::licenses_dialog`）で、このアプリの MIT / Apache-2.0 全文と、Noto Sans JP (subset)（OFL 1.1）・NotoEmoji（OFL 1.1）・Ubuntu-Light（UFL 1.0）・Hack（MIT + Bitstream Vera + DejaVu）・emoji-icon-font（MIT）の全文をユーザーが閲覧できる。**上流の OFL.txt / UFL.txt はライセンス本文のみで著作権者行を含まない**ため、各フォントの `name` テーブル（name ID 0）から取得した著作権表示を画面に併記する（`licenses::ATTRIBUTIONS`）。
+- **実装済み（2026-11-23）**: フォント本体は `include_bytes!` で GUI バイナリに同梱済み（`crates/eightbitdo-gui/src/theme.rs`）。ライセンス全文は `crates/eightbitdo-gui/assets/licenses/` とリポジトリ直下の `LICENSE-MIT` / `LICENSE-APACHE` に置き、`crates/eightbitdo-gui/src/licenses.rs` の `include_str!` でバイナリに埋め込む。GUI の左レール下部「ライセンス」ボタンから開く画面（`App::licenses_dialog`）で、このアプリの MIT / Apache-2.0 全文と、Noto Sans JP (subset)（OFL 1.1）・NotoEmoji（OFL 1.1）・Ubuntu-Light（UFL 1.0）・Hack（MIT + Bitstream Vera + DejaVu）・emoji-icon-font（MIT）の全文をユーザーが閲覧できる。**`epaint_default_fonts` 0.29.1 同梱の OFL.txt / UFL.txt はライセンス本文のみで著作権者行を含まない**ため、egui 既定フォントの著作権表示は画面に併記する（`licenses::ATTRIBUTIONS`）。著作権表示は各フォントの `name` テーブル（name ID 0）から取得し、無い場合は同梱ライセンス原文のヘッダを使う（emoji-icon-font は nameID 0 が無いので MIT 本文から）。Noto Sans JP はこれとは別系統で、同梱している上流 Google Fonts の OFL は冒頭行に著作権者行を含むため、その行（`Copyright 2014-2021 Adobe ...`）を著作権表示として取得する。
 - **決定**: 帰属表示の欠落は**バイナリ配布（ストア配布を含む）のリリース blocker** とする。§4.4 を満たすまでバイナリを配布しない。
 
 ### 4.4 バイナリ配布前のリリースチェックリスト
@@ -165,6 +165,8 @@
 - [x] Ubuntu Light（UFL-1.0）の帰属と UFL 全文を、閲覧できる形で含める。
 - [x] ライセンス画面から、上記をユーザーが閲覧できる（`crates/eightbitdo-gui/src/app.rs` の `licenses_dialog`）。
 - [ ] `THIRD_PARTY_LICENSES.md` の記載と実際の同梱物が一致している（リリース時に再確認）。
+- [ ] **依存クレートの完全な第三者通知を `cargo-about` で生成し、配布物へ同梱する。** リポジトリの `THIRD_PARTY_LICENSES.md` は要約・非網羅であり、これ自体を完全な通知として配布しない（[THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md) 冒頭・§5.3）。
+- [x] 同梱する OFL 2 コピー（[`assets/fonts/OFL.txt`](../crates/eightbitdo-gui/assets/fonts/OFL.txt) と [`assets/licenses/OFL-NotoSansJP.txt`](../crates/eightbitdo-gui/assets/licenses/OFL-NotoSansJP.txt)）が上流 Google Fonts の OFL と**バイト一致**（4,388 B、git blob `1c9f4328…`）であることを確認した。上流は固定 commit [`295d98a7a0c17c68f1341eaeea354e7960ea70d3`](https://github.com/google/fonts/commit/295d98a7a0c17c68f1341eaeea354e7960ea70d3) の [`ofl/notosansjp/OFL.txt`](https://github.com/google/fonts/blob/295d98a7a0c17c68f1341eaeea354e7960ea70d3/ofl/notosansjp/OFL.txt)（blob [`1c9f43281b8f216c5461fe9ac729afbade7724e4`](https://api.github.com/repos/google/fonts/git/blobs/1c9f43281b8f216c5461fe9ac729afbade7724e4)）。`crates/eightbitdo-gui/src/licenses.rs` のテストがバイト長・先頭行・末尾改行・2 コピー一致を固定している。
 - [x] CI が `cargo test -p eightbitdo-gui licenses` を常設で実行している（`cargo test --workspace --all-features` に含まれる）。リリース時は最新の CI が green であることを確認する。
 
 OFL / UFL の条文解釈と同梱方法の最終判断は、専門家に確認すること（法的助言ではない）。
