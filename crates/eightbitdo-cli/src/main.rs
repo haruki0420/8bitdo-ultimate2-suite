@@ -2169,11 +2169,7 @@ async fn config_profile_switch(
     best_effort_disconnect(session.transport(), CLEANUP_TIMEOUT).await;
     if let Err(error) = result {
         if matches!(error, Error::Timeout { .. }) {
-            eprintln!(
-                "warning: no WriteSLOT acknowledgement arrived. The 0x0015 ACK shape is \
-                 unconfirmed, so the switch may still have happened; check the active profile \
-                 on the controller."
-            );
+            eprintln!("{PROFILE_SWITCH_TIMEOUT_WARNING}");
         }
         return Err(error);
     }
@@ -2274,6 +2270,14 @@ const CONFIG_CONFIRM_PROMPT: &str = "Type 'yes' to write the 2768-byte configura
 /// write wording.
 const PROFILE_CONFIRM_PROMPT: &str =
     "Type 'yes' to switch the controller's active profile (cmd 0x0015, no Save): ";
+
+/// Warning printed when a profile switch ends in an ACK timeout.
+///
+/// Shared by the top-level `config profile` command and the REPL `profile
+/// switch` command so the wording cannot drift between them.
+const PROFILE_SWITCH_TIMEOUT_WARNING: &str =
+    "warning: no WriteSLOT acknowledgement arrived. The 0x0015 ACK shape is unconfirmed, \
+     so the switch may still have happened; check the active profile on the controller.";
 
 /// Top-level `yes/no` confirmation that is assembled lazily.
 ///
@@ -6690,11 +6694,7 @@ async fn execute_session_command_with_io<T: Transport + 'static>(
             drop(guard);
             if let Err(error) = result {
                 if matches!(error, Error::Timeout { .. }) {
-                    eprintln!(
-                        "warning: no WriteSLOT acknowledgement arrived. The 0x0015 ACK shape is \
-                         unconfirmed, so the switch may still have happened; check the active \
-                         profile on the controller."
-                    );
+                    eprintln!("{PROFILE_SWITCH_TIMEOUT_WARNING}");
                 }
                 return Err(error);
             }

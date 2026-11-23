@@ -47,6 +47,14 @@ impl<T: Transport> Session<T> {
     /// ignores drain errors, because the switch already succeeded. Only this
     /// operation pays that cost; ordinary reads are unaffected.
     ///
+    /// The post-success drain stops after a 1 ms idle gap, so a duplicate
+    /// `0x0015` frame that arrives later is not resynchronised. Ordinary reads
+    /// skip it on the `cmd` mismatch, but a later `switch_profile` accepts any
+    /// direct `cmd = 0x0015` frame without comparing `subcmd`, so such a late
+    /// frame could be mistaken for that call's acknowledgement; this is a known
+    /// limitation of the unconfirmed ACK shape, not a guarantee that the wait
+    /// is stale-free.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Timeout`] when no matching ACK arrives within the
@@ -292,6 +300,36 @@ mod tests {
             .switch_profile(Slot::S3)
             .await
             .expect("an input report is skipped, not mistaken for the ACK");
+    }
+
+    #[tokio::test]
+    async fn drains_a_duplicate_ack_after_a_successful_switch() {
+        // The 0x0015 ACK shape is unconfirmed, so a duplicate acknowledgement
+        // can stay queued. Queue two direct ACKs: the first confirms the S1
+        // switch, the second must be discarded by the post-success drain. A
+        // follow-up switch then finds an empty queue and fails closed instead
+        // of treating the stale ACK as its own.
+        let mock = MockTransport::new();
+        mock.push_incoming(&direct_ack(Slot::S1));
+        mock.push_incoming(&direct_ack(Slot::S2));
+        let session = Session::new(&mock).with_timeout(Duration::from_millis(20));
+
+        session
+            .switch_profile(Slot::S1)
+            .await
+            .expect("the first switch is confirmed by the first ACK");
+
+        let result = session.switch_profile(Slot::S2).await;
+        assert!(
+            matches!(result, Err(Error::Disconnected | Error::Timeout { .. })),
+            "the second switch must fail: the success drain must have discarded the \
+             duplicate ACK, got {result:?}"
+        );
+        assert_eq!(
+            mock.sent_frames().len(),
+            2,
+            "both requests were sent; no ACK was fabricated for the second one"
+        );
     }
 
     #[tokio::test]
