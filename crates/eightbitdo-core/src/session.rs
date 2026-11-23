@@ -622,14 +622,19 @@ impl<T: Transport> Session<T> {
         output
     }
 
-    /// Mark the session as possibly holding a stale frame.
+    /// Bounded best-effort drain used before operations whose acknowledgement
+    /// shape is unconfirmed (see `switch_profile`).
     ///
-    /// Used by operations whose acknowledgement shape is **unconfirmed**: even
-    /// after a successful wait, the controller may have sent (or may still
-    /// send) a second response, and a later operation must not mistake it for
-    /// its own. The next [`prepare_read`](Self::prepare_read) drains it.
-    pub(crate) fn note_possible_stale_frame(&self) {
-        self.needs_resync.store(true, Ordering::SeqCst);
+    /// Unlike a failed read, exhaustion is **not** an error here: the pending
+    /// frames are input reports / notices, and the caller has not yet sent its
+    /// request, so there is no response to lose. Returns the number of drained
+    /// frames for tests.
+    pub(crate) async fn drain_before_unconfirmed_write(&self) -> Result<u64, Error> {
+        let outcome = self.drain_pending(DrainPolicy::RESYNC).await?;
+        Ok(match outcome {
+            DrainOutcome::Quiesced => 0,
+            DrainOutcome::Exhausted => 0,
+        })
     }
 
     /// Clear the resync flag, failing closed when the drain budget runs out.

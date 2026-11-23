@@ -41,9 +41,11 @@ impl<T: Transport> Session<T> {
     /// The call is recorded as an in-flight write, so a failed or dropped
     /// attempt marks the session for a stale-frame drain before the next read.
     /// A **successful** call also marks the session: the acknowledgement shape
-    /// is unconfirmed, so a second or late `0x0015` frame must not be taken as
-    /// the answer of a later operation. The next read drains for at most one
-    /// idle tick, so the cost is a best-effort 1 ms wait, not a failure.
+    /// is unconfirmed, so a duplicate `0x0015` frame must not be taken as the
+    /// answer of a later operation. A successful call therefore drains the
+    /// queued frames immediately (bounded: 64 frames / 50 ms / 1 ms idle) and
+    /// ignores drain errors, because the switch already succeeded. Only this
+    /// operation pays that cost; ordinary reads are unaffected.
     ///
     /// # Errors
     ///
@@ -53,13 +55,17 @@ impl<T: Transport> Session<T> {
     /// [`Error::Disconnected`]).
     pub async fn switch_profile(&self, slot: Slot) -> Result<(), Error> {
         self.start_input_keepalive().await;
+        // Drains leftovers from a failed earlier operation before sending.
         self.prepare_read().await?;
         let result = self.run_write(self.switch_profile_inner(slot)).await;
         if result.is_ok() {
-            // The 0x0015 acknowledgement shape is unconfirmed. A second
-            // response (or a late one) must not be taken as the answer of a
-            // later operation, so the next read drains first.
-            self.note_possible_stale_frame();
+            // The 0x0015 acknowledgement shape is unconfirmed, so a duplicate
+            // ACK may still be queued. Drain it immediately and boundedly
+            // instead of flagging the whole session: a session-wide flag would
+            // make ordinary reads fail closed on a long input backlog, which is
+            // a worse trade. Errors are ignored: the switch already succeeded
+            // and the next operation has its own fail-closed path.
+            let _ = self.drain_before_unconfirmed_write().await;
         }
         result
     }

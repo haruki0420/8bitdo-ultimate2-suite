@@ -154,9 +154,11 @@ enum Command {
         #[arg(long)]
         allow_macro_write: bool,
 
-        /// Enable `config set` / `config remap` / `config write` inside the
-        /// REPL. Each write still needs `--yes` or the interactive `yes`
-        /// confirmation, and a pre-write backup is always taken.
+        /// Enable `config set` / `config remap` / `config write` and
+        /// `profile switch` inside the REPL. Each write still needs `--yes` or
+        /// the interactive `yes` confirmation, and a pre-write backup is always
+        /// taken for the configuration writes. `profile switch` is the
+        /// exception: it sends one `0x0015` request and takes no backup.
         #[arg(long)]
         allow_config_write: bool,
 
