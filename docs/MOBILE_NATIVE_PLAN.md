@@ -1,13 +1,13 @@
 # モバイルネイティブ フル機能ギャップ監査 / 実装計画
 
-- 対象ブランチ: `feat/native-mobile`（base `81b0ac1` = `origin/main`）
+- 対象ブランチ: `feat/native-mobile`（監査時点の `origin/main` = `81b0ac1`）
 - 監査日: 2026-11-23
 - 種別: **調査ドキュメントのみ**（この文書の追加以外にコード差分はない）
 - 目的: iOS（SwiftUI）と Android（Jetpack Compose）のネイティブアプリを、デスクトップ CLI / GUI と同等のフル機能まで仕上げるための不足（UniFFI API・画面・検証・工数・順序・リスク）を確定する
 
 > 前提: モバイルは Tauri の Web UI ではなく、**各 OS のネイティブ UI + `eightbitdo-uniffi` 経由の Rust コア**で作る（[AGENTS.md](../AGENTS.md) §3）。プロトコル・構造体・書き込み順序の正本は [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) / [STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md) とし、この文書はそれらを再定義しない。
 >
-> デスクトップ側の移行: デスクトップ GUI は別ブランチ `feat/tauri-gui` で Tauri v2 へゼロベース移行中で、表示名は `Padbench` にする予定（ユーザー方針。本ブランチ `feat/native-mobile` には未反映）。この文書で「デスクトップ / GUI」と書くときは、比較基準として base `81b0ac1` の egui GUI と CLI を指す。Tauri 版に移っても共有する正本は Rust コア（`eightbitdo-core` / `eightbitdo-protocol`）であり、**モバイル向け UniFFI の契約・不足 API・書き込み安全手順・用語集はそのまま適用できる**。モバイルの表示名も `Padbench` 系列に揃えるか別名にするかは §10 #1 で決める。
+> デスクトップ側の移行: デスクトップ GUI は別ブランチ `feat/tauri-gui` で Tauri v2 へゼロベース移行中で、表示名は `Padbench` にする予定（ユーザー方針。本ブランチ `feat/native-mobile` には未反映）。この文書で「デスクトップ / GUI」と書くときは、比較基準として監査時点の base `81b0ac1` の egui GUI と CLI を指す。Tauri 版に移っても共有する正本は Rust コア（`eightbitdo-core` / `eightbitdo-protocol`）であり、**モバイル向け UniFFI の契約・不足 API・書き込み安全手順・用語集はそのまま適用できる**。モバイルの表示名も `Padbench` 系列に揃えるか別名にするかは §10 #1 で決める。
 
 ---
 
@@ -34,7 +34,7 @@
 | Android | Compose 1 画面。スキャン / 接続 / バージョン / 設定概要 / 12 マクロ一覧。GATT transport（CCCD 必須、MTU 200 要求・失敗時フォールバックなし、write-without-response / with-response 両対応、`FrameQueue`、再接続時に旧セッション破棄） | [DeviceViewModel.kt](../mobile/android/app/src/main/java/dev/eightbitdo/mobile/DeviceViewModel.kt)、[HomeScreen.kt](../mobile/android/app/src/main/java/dev/eightbitdo/mobile/ui/HomeScreen.kt)、[BluetoothGattTransport.kt](../mobile/android/app/src/main/java/dev/eightbitdo/mobile/ble/BluetoothGattTransport.kt) |
 | iOS | SwiftUI 1 画面。CoreBluetooth で同じ読み取り。`WriteAckTracker`（with-response の遅延 ACK 誤帰属防止） | [AppModel.swift](../mobile/ios/Sources/EightBitDo/AppModel.swift)、[ContentView.swift](../mobile/ios/Sources/EightBitDo/Views/ContentView.swift)、[CoreBluetoothTransport.swift](../mobile/ios/Sources/EightBitDo/BLE/CoreBluetoothTransport.swift) |
 | ビルド | JNI 同梱 debug APK 14,551,011 bytes、unsigned IPA 1,550,522 bytes | [MOBILE_BUILD_EVIDENCE.md](MOBILE_BUILD_EVIDENCE.md) |
-| テスト | Rust 14 件（`#[test]`）、Android JVM 8 件、Swift ホスト純ロジック 6 チェック | コード件数と、本監査で再実行した結果（§6.2。14 / 8 / 6 すべて成功） |
+| テスト | Rust 14 件（`#[test]`）、Android JVM 8 件、Swift ホスト純ロジック 5 チェック | コード件数と、本監査で再実行した結果（§6.2。14 / 8 / 5 すべて成功） |
 | 原稿 | `mobile/README.md` に API・MTU・書き込みモード・署名制約が整理済み | [mobile/README.md](../mobile/README.md) |
 
 ### 1.2 不足（機能単位）
@@ -50,7 +50,7 @@
 | 5 | 型付き設定編集 | あり（`ConfigEdit` 13 種） | `config set` | 設定タブ | **なし**（raw バッファ編集のみ） | 不足 |
 | 6 | 22 ボタン割り当ての読み取り | あり | `config map show` | リマップ UI | **なし** | 不足 |
 | 7 | ボタンリマップ書き込み | あり（`ConfigEdit::ButtonRemap`） | `config remap` | リマップ UI | **なし** | 不足 |
-| 8 | プロファイル切替 | あり（`switch_profile`） | `config profile` | 画面なし | **なし** | 不足 |
+| 8 | プロファイル切替 | あり（`switch_profile`） | `config profile` | 専用切替画面なし（`cur_slot` 編集は GUI にあり） | **なし** | 不足 |
 | 9 | プロファイル copy / delete | protocol ヘルパのみ | — | — | **なし** | 不足 |
 | 10 | マクロ読み取り（backup） | あり | `macro backup` | マクロタブ | **あり（表示用の概要のみ）** | 実装済み |
 | 11 | マクロ書き込み | あり（`write_macro` / `write_macro_slot`） | `macro write` | マクロタブ | **なし** | 不足 |
@@ -66,7 +66,7 @@
 
 補足:
 
-- 3・5〜9・11〜13・17・19 は「デスクトップにあり、モバイルに無い」もの。2・10・14・15 は API の一部はあるが画面・配線が無い。
+- 3〜9・11〜13・17〜19 は「デスクトップにあり、モバイルに無い」もの。2・10・14・15 は API の一部はあるが画面・配線が無い。
 - `read_config_json` / `read_macro_backup_json` / `describe_config` / `prepare_config_write` / `config_write_chunk_len` は **Android / iOS から一度も呼ばれていない**（Rust のテストのみ）。「次に作る読み取り UI」の下準備だけが存在する状態。
 - `read_macro_backup` は内部で毎回 config を読み直す（`read_backup` は private）。設定とマクロを同時に取得する公開 API が無い。
 - **空スロットへのマクロ新規作成は core で未実装**: `Session::write_macro` / `write_macro_slot` は対象マクロが空（`max_steps == 0` / `0xFFFF`）だと `Error::EmptyMacroWrite`（step-data clear 未実装）で拒否する。モバイルのマクロエディタは当面「既存の非空マクロの編集・記録による上書き」に限定される（§9 R19）。
@@ -342,6 +342,7 @@ pub fn prepare_config_edits(
 - 既存 `prepare_config_write(snapshot, edited)` は raw 編集用に残す。
 - copy / delete は core に helper があるが CLI / GUI 未露出。モバイルで出すなら **同時にデスクトップ側の `ConfigEdit` へも追加**して 3 実装の意味を揃える（本監査の範囲外だが、片側だけ出すと用語・挙動がずれる）。
 - rumble の消去 slot は `f32` が NaN のため、typed edit（`left_level: u8`）では復元できない。**NaN を含む raw をそのまま戻す場合は raw 経路**（`prepare_config_write(snapshot, edited)`）を使う。typed 編集は「現在値が有効な範囲のとき」に限定し、UI でその旨を示す。
+- 列挙名の `Gyro` はこの文書の便宜名で、**core の `ConfigEdit` では `SixAxis`**（`SixAxisRecord`、`+0x92C + slot * 0x0C`）。3 実装で名称を揃えるときは core 側の `SixAxis` に合わせ、UniFFI の enum だけ別名にしない。
 
 #### API-4: 設定書き込み（二段階 + 構造的バックアップ + TOCTOU）
 
@@ -579,6 +580,7 @@ pub fn validate_backup_files(files: Vec<BackupFile>) -> Result<(), MobileError>;
 - `export_backup_files` の入力は `MacroBackupData` 1 つにする。設定とマクロを別引数で渡すと、両者の SHA-256 が食い違う余地ができるため。
 - 1 ファイルにまとめたい場合の拡張は「v1 ディレクトリを zip した 1 ファイル」。中身のパス構成は変えない（デスクトップで展開すればそのまま読める）。
 - マクロ 1 本の入出力は core / CLI の `MacroFile`（`name` / `gamepad_mode` / `key_map` / `cycles_num` / `interval_ms` / `steps`）に合わせる。
+- `path` は**正規化してから検証**する: `..` を含む親参照、絶対パス（先頭 `/`・`\`、Windows のドライブ表記）、重複パス（同一パスが複数 entry）、v1 の許容集合（`config.bin` / `config.json` / `macros.json` / `macros.toml` / `slot{0..2}-macro{0..3}.bin`）外を拒否する。`import_backup_files` / `validate_backup_files` はアーカイブ内の相対パスとしてのみ扱い、実ファイルの書き込み先決定はプラットフォーム側に任せる。
 
 #### API-9: 入力レポート（`request_input`）と記録ヘルパ
 
@@ -688,7 +690,7 @@ pub fn write_firmware(
 ```
 
 - `OtaConfig::with_unverified_wire_allowed` は**公開 API に出さない**（既定 false のゲートを維持）。
-- ファームウェアの取得・SHA-256 / 署名検証・ダウングレード判定はアプリ側に置かない（[DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md) §5.5 の 3 条件を満たす設計にする）。
+- ファームウェアの取得・SHA-256 / 署名検証・ダウングレード判定はアプリ側に置かない（[DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md) §5.5 の「署名検証・公式配布元・デバイス宛のみ」の 3 条件を満たす設計にする）。
 
 #### API-13: 補助
 
@@ -714,7 +716,7 @@ impl MobileSession { pub fn resync(&self) -> Result<(), MobileError>; }         
 | `read_macro_backup` の再読み | 既存 API は毎回 config を読み直す。`read_macro_backup_data`（API-5）を追加し、既存は互換のため残す |
 | `0x0007` の副作用 | 公式実装は `set_report_enable(true)` の時点でクライアント側 `MAX_ATT_MTU` を `0x3F`（63）へ切り替える（[PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §7）。既存の 161 バイト読み取りと干渉しないか、MTU 交渉後のセッションで `0x0007` を有効化して実機確認する |
 | `uniffi` の生成物 | `mobile/ios/RustCore/`・`Generated/`・`mobile/android/.../core/` は **生成物でコミットしない**。`scripts/mobile/gen-bindings.sh` で再生成 |
-| 生成物が無い worktree | **クリーンな worktree では `gen-bindings.sh` を先に実行しないと Gradle / xtool がコンパイルできない**（Kotlin は `Unresolved reference 'core'` / `stepCount`、iOS は `EightBitdoFFI` 未解決）。本監査でも再現した（§3.4・§6.3） |
+| 生成物が無い worktree | **クリーンな worktree では `gen-bindings.sh` を先に実行しないと Gradle / xtool がコンパイルできない**（Kotlin は `Unresolved reference 'core'` / `stepCount`、iOS は `EightBitdoFFI` 未解決）。本監査でも再現した（§3.4・§6.2） |
 | `scripts/mobile/gen-bindings.sh` のコメント | 冒頭コメントが「`uniffi` 0.32.2」のまま（実際は 0.31.2 固定）。ドキュメント齟齬として別途修正候補（本監査では変更しない） |
 
 ---

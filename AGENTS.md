@@ -36,6 +36,8 @@
    - BLE OTA の実機 btsnoop 採取（Linux `btmon` / Android HCI snoop）・確認項目と判定・EVIDENCE への追記方法、Phase A / Phase B の安全手順。OTA の実機検証前に必ず読む。
 
 > **UI を追加・変更するとき（推奨）**: [docs/ANTI_SLOP.md](docs/ANTI_SLOP.md) に、量産的に見える原因・検出チェックリスト・回避手順をまとめています（必読ではない。レビュー checklist の正本は [docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)）。
+>
+> **モバイル（iOS / Android）を触るとき（推奨）**: [docs/MOBILE_NATIVE_PLAN.md](docs/MOBILE_NATIVE_PLAN.md) に、ネイティブアプリとデスクトップの機能ギャップ監査・不足 UniFFI API の契約案・画面 / 工数 / 実装順序をまとめています（必読ではない。プロトコル・書き込み順序の正本は [docs/PROTOCOL_SPEC.md](docs/PROTOCOL_SPEC.md) と [docs/STRUCT_BT2_2768B.md](docs/STRUCT_BT2_2768B.md)）。
 
 ---
 
