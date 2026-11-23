@@ -129,7 +129,7 @@ define_keys! {
     LicensesIntro => "この配布物に含まれる第三者ソフトウェアとフォントのライセンス全文です。リポジトリの THIRD_PARTY_LICENSES.md も参照してください。" | "Full license texts for the third-party software and fonts bundled with this build. See THIRD_PARTY_LICENSES.md in the repository as well.",
     LicensesAppHeading => "このアプリ" | "This application",
     LicensesAppBody => "eightbitdo-suite は MIT License または Apache License 2.0 のいずれかを選択して利用できます（MIT OR Apache-2.0）。全文はリポジトリの LICENSE-MIT / LICENSE-APACHE にあります。" | "eightbitdo-suite is available under either the MIT License or the Apache License 2.0 (MIT OR Apache-2.0). The full texts are in LICENSE-MIT / LICENSE-APACHE in the repository.",
-    LicensesNotoHeading => "Noto Sans JP（同梱フォント）" | "Noto Sans JP (bundled font)",
+    LicensesNotoHeading => "Noto Sans JP (subset) — 同梱フォント" | "Noto Sans JP (subset) — bundled font",
     LicensesNotoNote => "SIL Open Font License 1.1。サブセットを同梱しています。" | "SIL Open Font License 1.1. A subset is bundled.",
     LicensesEguiHeading => "egui 既定フォント" | "egui default fonts",
     LicensesEguiNote => "NotoEmoji（OFL 1.1）、Ubuntu-Light（Ubuntu Font Licence 1.0）、Hack（MIT + Bitstream Vera + DejaVu）、emoji-icon-font（MIT）。各全文を以下に収録しています。" | "NotoEmoji (OFL 1.1), Ubuntu-Light (Ubuntu Font Licence 1.0), Hack (MIT + Bitstream Vera + DejaVu), emoji-icon-font (MIT). The full texts follow.",
@@ -860,6 +860,8 @@ mod tests {
             Key::ErrorDetails,
             Key::Dismiss,
             Key::CopySha256,
+            Key::OpenLicenses,
+            Key::LicensesClose,
         ] {
             let ja = t(Lang::Ja, key);
             assert!(!ja.ends_with('。'), "{key:?} ends with a period: {ja}");
