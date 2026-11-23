@@ -1,0 +1,68 @@
+# デザインモックアップ
+
+> **2026-11-23 更新**: 現在の実装は **Imported style: Hyperstudio** に置換済みです。現行実装の実スクリーンショットは [screenshots/](screenshots/)（1280×800 / 900×620）にあります。色・タイポグラフィ・コンポーネントの正本は [IMPORTED_STYLE_HYPERSTUDIO.md](IMPORTED_STYLE_HYPERSTUDIO.md) と [../DESIGN_TAURI.md](../DESIGN_TAURI.md) §12 です。この README と `mockup.html` は案 C「昼の作業台と夜のステージ」時代の**経緯資料**で、現在の実装とは一致しません。
+
+`mockup.html` は Tauri v2 + Web UI 版 GUI のデザイン確認用の**静的モックアップ**です。デザインの正本は [../DESIGN_TAURI.md](../DESIGN_TAURI.md) で、このファイルはその見た目を 1 枚で確認するための資料です。
+
+## 開き方
+
+```bash
+# 方法 1: デスクトップ環境で開く（サーバー不要）
+xdg-open docs/design/mockup.html
+
+# 方法 2: ローカルサーバー経由（任意。ヘッドレス環境向け）
+python3 -m http.server -d docs/design 8000
+# → http://localhost:8000/mockup.html
+```
+
+- **JS なし・外部リソースなし**（Tailwind CDN もフォント CDN も読み込みません）。HTML 1 枚で完結します
+- `file://` の直接表示は検証環境のブラウザ制限で使えません。**`xdg-open docs/design/mockup.html` で開いてください**（GUI のあるデスクトップ環境が必要）。GUI のない環境では方法 2 のローカルサーバー経由で確認します
+- 日本語フォントは OS の Noto Sans JP / 游ゴシック / ヒラギノで代替されます。実装では Noto Sans JP の woff2 サブセットを同梱します
+- レイアウトは **1180 × 760** の枠を 2 つ並べたものです。画面幅が 1240 px 未満のときは横スクロールになります（枠を縮小しないため）
+
+## 何が並んでいるか
+
+| 状態 | 内容 | 確認できること |
+| --- | --- | --- |
+| 1. 接続（デバイス） | 接続情報の表、警告バナー、読み込み操作、右レールの入力モニター（ダークステージ）、完了トースト | ライト面の階層、ステージのコントラスト、状態色、トーストの位置 |
+| 2. 設定（書き込み前の確認） | サブタブ、プロファイル / スイッチ、スティックの数値入力、ボタン割り当て表、右レールの確認パネル | 入力・スイッチ・タブ・表・差分表示・危険操作の分離 |
+
+## トークンの対応
+
+`mockup.html` の `:root` と `[data-surface="stage"]` は [../DESIGN_TAURI.md](../DESIGN_TAURI.md) §5.1（案 C）のトークンと 1 対 1 です。**このモックアップは案 C 時代の経緯資料**で、`[data-surface="stage"]` と `--surface-*` 系トークンは**現行実装には存在しません**（現行のステージは `data-testid="input-stage"` の `carbon` パネル。値は `apps/desktop/src/styles/tokens.css`、Tailwind 写像は `apps/desktop/src/index.css`）。
+
+| mockup の変数 | DESIGN_TAURI.md |
+| --- | --- |
+| `--surface-bg` / `--surface-panel` / `--surface-sunken` / `--surface-hover` / `--surface-active` | §5.1.2 ライト面 |
+| `--line` / `--line-strong` | §5.1.2 境界 |
+| `--text` / `--text-2` / `--text-muted` / `--text-disabled` | §5.1.2 文字 |
+| `--accent` / `--accent-soft` / `--ink-fill` / `--on-ink` | §5.1.2 アクセントと主キー |
+| `--warning*` / `--danger*` / `--success*` | §5.1.3 状態色 |
+| `--stage-*` | §5.1.4 ダークステージ |
+| `--space-*` / `--radius-*` / `--shadow-pop` / `--dur-*` / `--ease-standard` | §5.3 / §5.7 |
+
+## 確認できること・できないこと
+
+確認できること:
+
+- ライト面とダークステージの明度差、文字の読みやすさ（実測は §5.1.5）
+- 主キー（墨の塗り）・副キー・危険キーの使い分け
+- 表・差分・チェックリストの密度と余白
+- Tab キーによるフォーカスリング（`:focus-visible` を実装済み）
+- OS の「視差効果を減らす」設定時の遷移停止（`prefers-reduced-motion`）
+
+確認できないこと（文書側で規定）:
+
+- **最小 900×620 の崩れ方**: モックアップは 1180×760 の 1 サイズのみ。900〜1179 では右レールがコンテンツの下へ移動します（DESIGN_TAURI.md §5.4.3）
+- **ホバー・押下・無効・エラーの各状態**: 色と形は CSS に定義済みですが、静止画では 1 状態しか見えません（仕様は §5.5）
+- **入力モニターの動き**: 60fps 補間・軌跡・入力停止の表示は静止モックでは動きません（仕様は §5.6）
+- **実データ**: 表示している値は固定の例です。実際の値はデバイスから読み込みます
+
+## 変更するとき
+
+1. 先に [../DESIGN_TAURI.md](../DESIGN_TAURI.md) のトークン表を変える
+2. `mockup.html` の `:root` を同じ値に合わせる
+3. コントラストを再計算し、§5.1.5 の表を更新する（本文・UI 文字は 4.5:1 以上、操作の輪郭は 3:1 以上）
+4. この README の対応表に差分があれば直す
+
+モックアップはデザインの説明資料であり、実装コードではありません。実装は `apps/desktop` に行います。

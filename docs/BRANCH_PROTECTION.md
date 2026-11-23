@@ -22,6 +22,18 @@ ruleset の **canonical copy** は [`.github/rulesets/main-protection.json`](../
 | Branch deletion | 禁止（`deletion`） |
 | Bypass actors | canonical: `bypass_actors: []` / live: `current_user_can_bypass: never` |
 
+### desktop ワークフロー（advisory）
+
+`Desktop` ワークフロー（`.github/workflows/desktop.yml` の `desktop-web` / `desktop-rust`）は、
+`apps/desktop` とその path 依存だけを検証する **advisory（必須ではない）** check です。現行の
+required status checks は上表の 5 つ（`fmt` / `clippy` / `test` / `msrv` / `review-gate`）だけで、
+desktop の 2 ジョブは ruleset に含めていません。
+
+- required に昇格する場合は **ruleset を変更する別 PR**（`.github/rulesets/main-protection.json`
+  の `required_status_checks` と live ruleset の更新）で行います。この PR では変えません。
+- そのため desktop ジョブが失敗しても、`review-gate` と上記 5 つが揃えば GitHub の必須条件は
+  満たされます。**マージ判断では desktop ジョブの結果も確認してください**（手続き上の必須）。
+
 `review-gate` は **required status check** です。PR の head SHA に context `review-gate` の **commit status** または **check run** の成功があれば満たされます（ruleset に `integration_id` が無いため）。新しいコミットを push すると SHA が変わり、どちらも無い新しいコミットは自動的にマージできなくなります。
 
 レビューの深度（Tier 1〜3）と故障リストの要件は **[docs/REVIEW_TIERS.md](REVIEW_TIERS.md)** を参照してください。

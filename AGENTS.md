@@ -6,7 +6,7 @@
 
 ## 1. プロジェクト概要
 
-- **目的**: **8BitDo Ultimate 2 Bluetooth Controller**（内部 PID `0x600F` / 2.4G レシーバー `0x6011`）を、Nintendo Switch と接続したまま **Linux / macOS / Windows / Android / iOS** から BLE GATT（および USB/2.4G HID）でフル設定・マクロ編集・ファームウェアアップデートできるクロスプラットフォーム OSS ツール群を構築する。
+- **目的**: **Padbench**（表示名。識別子は `io.github.haruki0420.padbench`。リポジトリ名は `8bitdo-ultimate2-suite` のまま）は、**8BitDo Ultimate 2 Bluetooth Controller**（内部 PID `0x600F` / 2.4G レシーバー `0x6011`）を、Nintendo Switch と接続したまま **Linux / macOS / Windows / Android / iOS** から BLE GATT（および USB/2.4G HID）でフル設定・マクロ編集・ファームウェアアップデートできるクロスプラットフォーム OSS ツール群を構築する。
 - **現在のフェーズ（2026-11-23、main `0af60a3`）**: **Phase 1・2a・2b（マクロ）・2d（設定書き込み / リマップ）・3a（読み取り専用 GUI）完了。PR #16 で GUI の Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）を実装し main にマージ済みだが、GUI 書込は実機未検証・Tier 3。** Phase 2c は core 実装済みで、#20 で実機採取用の `ota-bench` 段階実行 API を追加（実機 wire 未確定・CLI / GUI / UniFFI 未配線）。Phase 3c（OTA 画面）は未着手。Phase 5 は UniFFI と iOS / Android の雛形に加え、#21 で **Android JNI 同梱 APK と iOS unsigned IPA のビルド成功まで記録**（実機未検証）。Phase 2e / 4（USB / 2.4G）は保留。**#17〜#26（実機 flag 対応 / クロスプラットフォーム確認 / OTA 採取計画 / `ota-bench` / モバイル証跡 / 配布方針 / 機能マトリクス / GUI ライセンス画面 #24 / 状態 docs 更新 #25 / プロファイル切替 #26）は main にマージ済み。GUI ライセンス画面（#24）はアプリの MIT / Apache-2.0 全文と同梱 5 フォント全文・著作権者行を表示し、プロファイル切替（`0x0015`）は core / CLI / REPL 配線（`Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`、Save 送信なし）として実装済み。**`0x0015` は実機で ACK（`cmd=0x0004/subcmd=0x0015` の 16B 封筒を 1 回観測）と `cur_slot` 6→1 の更新を確認済み**（再接続/電源断を跨ぐ永続性・プロファイル実効・`crc16` とみられる 2B の意味・直接 ACK の条件・ACK 形状の再現性は未確認。`Save 不要` は断定しない。証跡は [docs/DEVICE_CONFIG_EVIDENCE.md](docs/DEVICE_CONFIG_EVIDENCE.md) §7）。** 詳細と残課題は §6 と [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) を参照。
 - **ライセンス／公開方針**: パブリックリポジトリ。公式バイナリ（`.apk`, `.exe`, `.dll`, `.so` 等）や公式ファームウェアファイル自体は `.gitignore` で除外しており、**絶対にコミットしないこと**。リポジトリ公開・コードライセンス（`MIT OR Apache-2.0`）・商標・同梱フォント・ストア配布・マネタイズの決定は [docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md)（決定日 2026-11-23）を正本とする。
 
@@ -34,6 +34,8 @@
    - 常駐 `session` の運用（per-user BLE 単一所有者ロック、degraded 終了コード 3、SIGINT 範囲、`scan --check` と `scripts/session-loop.sh`）
 6. **[docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)**
    - BLE OTA の実機 btsnoop 採取（Linux `btmon` / Android HCI snoop）・確認項目と判定・EVIDENCE への追記方法、Phase A / Phase B の安全手順。OTA の実機検証前に必ず読む。
+7. **[docs/TAURI_PLAN.md](docs/TAURI_PLAN.md)**
+   - Tauri v2 GUI への移行計画とクロスプラットフォーム方針（決定日 2026-11-23）。アーキテクチャ、`apps/desktop` 構成、P0〜P8 のフェーズ、クロスプラットフォーム表、リスク、日本語 UI 用語集、受け入れ条件。GUI に着手する前に必ず読む。
 
 > **UI を追加・変更するとき（推奨）**: [docs/ANTI_SLOP.md](docs/ANTI_SLOP.md) に、量産的に見える原因・検出チェックリスト・回避手順をまとめています（必読ではない。レビュー checklist の正本は [docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)）。
 >
@@ -52,11 +54,12 @@
   - `eightbitdo-core` は `Transport` トレイト経由で BLE / USB HID / モックを差し替え可能にする。
   - **クレート名の注意**: Cargo のパッケージ名は数字で開始できないため、`8bitdo-*` ではなく **`eightbitdo-*`** を正式名とする（ディレクトリ名も同様）。
 - **デスクトップ (Linux / macOS / Windows)**:
-  - **Pure Rust** で実装する（Electron / Tauri / Node.js / WebView は使わない）。
-  - BLE: `btleplug`、USB/2.4G HID: `hidapi`、CLI: `clap`、GUI: **`egui` (`eframe`)**（または `iced`）。
+  - **Pure Rust** を基本とする。**例外として Tauri v2 のみ許可する（2026-11-23 決定）**。Electron / Node.js 単体 / 汎用 WebView は引き続き使わない。理由: GUI のデザイン品質と反復速度を優先するため（[docs/TAURI_PLAN.md](docs/TAURI_PLAN.md)）。
+  - BLE: `btleplug`、USB/2.4G HID: `hidapi`、CLI: `clap`。
+  - **GUI**: 正式は **Tauri v2（Web UI: TypeScript + Vite + React + Tailwind CSS、pnpm）**。BLE は WebView から触らず `eightbitdo-core` で実行し、Tauri commands / events で公開する。既存の egui 版（`crates/eightbitdo-gui`、`eframe`）は比較・撤退用に残す（凍結。新機能は Tauri 版のみ）。
 - **モバイル (iOS / Android)**:
-  - 各 OS の**ネイティブ UI**（**iOS: SwiftUI**, **Android: Jetpack Compose**）から Rust コアを **`UniFFI` (`eightbitdo-uniffi`)** 経由で呼び出す。
-  - モバイルの BLE / USB OTG トランスポートは OS ネイティブ API（CoreBluetooth / Android BluetoothGatt & UsbManager）で実装し、UniFFI の Callback Interface で `eightbitdo-core` に注入する。
+  - 方針は **Tauri v2 モバイル（同じ Web UI）+ ネイティブ BLE プラグイン**（Kotlin BluetoothGatt / Swift CoreBluetooth）とし、プラグインから `eightbitdo-core` へ transport を注入する（[docs/TAURI_PLAN.md](docs/TAURI_PLAN.md) P8）。
+  - iOS / macOS は本ホストでビルド検証できないため、**既存の UniFFI + ネイティブ UI 版**（**iOS: SwiftUI**, **Android: Jetpack Compose**、`eightbitdo-uniffi` 経由）を代替として維持する。モバイルの BLE / USB OTG トランスポートは OS ネイティブ API（CoreBluetooth / Android BluetoothGatt & UsbManager）で実装し、UniFFI の Callback Interface で `eightbitdo-core` に注入する経路も残す。
 - **機能要件**:
   - マクロエディタは **リアルタイム入力録音 + GUI ステップ編集 + JSON/TOML インポート・エクスポート** に対応し、1ms 解像度とフル 8-bit アナログスティック／トリガー値を開放する。
   - コントローラ設定は 2768 バイト構造体の全機能（プロファイル、リマップ、スティック/トリガー、振動、6軸ジャイロ、RGB、マクロ）を公式同等にサポートする。
@@ -114,11 +117,11 @@
 | 2b | BLE マクロ読み書き（3 slot × 4 macro、backup / write / restore） | 完了。実機で slot S1 の M1/M2 の書込・読み戻し・復元を確認（M3/M4・S2/S3 は外挿）。**Switch 側でのマクロ発動は未確認** |
 | 2c | BLE OTA 状態機械（`crates/eightbitdo-core/src/ota.rs`） | **core 実装済み・Mock 52 テスト（既定）/ 55（`mobile-boot`）/ 58（`ota-bench`）/ 61（`--all-features`）。#20 で実機採取用の `ota-bench` 段階実行 API（既定 OFF、`write_firmware_with_checkpoint` / `OtaCheckpoint::AfterFirstErase` 等、`OtaBenchOutcome.write_state` / `phase`）を追加。実機 btsnoop の採取計画は [docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)（#19）。CLI / GUI / UniFFI 未配線、実機 btsnoop 未取得・実機書込未検証** |
 | 2d | 2768B 設定書き込み / `config set` / `config remap`（BLE のみ） | 完了。実機（BLE・MTU 200・74B chunk）で full write → Save → read-back 一致、remap A→B→A を確認。**実機確認は full write / remap のみ（`config set` 各フィールド・`--force-raw`・MTU 200 以外は未確認）**。#17 で実機 flag を opaque 値として扱う検証に修正。`slot_flags` の観測値 allowlist を追加し、gyro key_map の erasure sentinel 例外を削除したうえで flag の `0x20190000` は raw allowlist で受理を継続し、実 dump を使う `#[ignore]` E2E を追加して docs を整合させた |
-| 3a | 読み取り専用 GUI（egui、日本語、燻しスレート、デバイス / ライブ入力 / 設定値 / ログ） | 完了（PR #9）。読み取り専用の 4 タブ |
-| 3b / 3d | GUI 書込 UI（設定タブ / 22 ボタンリマップ / マクロエディタ・録音） | 実装済み・main にマージ（PR #16）。確認ダイアログ、pre-write backup、read-back、TOCTOU 付き。**実機未検証・Tier 3** |
-| 3c | GUI OTA 画面 | 未着手（Phase 2c の実機 wire 確定後） |
+| 3a | 読み取り専用 GUI（egui、日本語、燻しスレート、デバイス / ライブ入力 / 設定値 / ログ） | 完了（PR #9）。読み取り専用の 4 タブ。**Tauri 版へ移行中**（[docs/TAURI_PLAN.md](docs/TAURI_PLAN.md)） |
+| 3b / 3d | GUI 書込 UI（設定タブ / 22 ボタンリマップ / マクロエディタ・録音） | 実装済み・main にマージ（PR #16）。確認ダイアログ、pre-write backup、read-back、TOCTOU 付き。**実機未検証・Tier 3**。**Tauri 版へ移行中**（egui 版は凍結。新機能は Tauri 版のみ） |
+| 3c | GUI OTA 画面 | 未着手（Phase 2c の実機 wire 確定後）。**Tauri 版へ移行中** |
 | 4 | USB OTA | **保留**（USB Boot TX フレーミング未文書化） |
-| 5 | `eightbitdo-uniffi` + iOS SwiftUI / Android Compose | **JNI 同梱 APK / unsigned IPA のビルド成功まで（#21、実機未検証）**。Android JNI 同梱 APK 14,551,011 bytes（`libeightbitdo_uniffi.so` を arm64-v8a / x86_64 に同梱）、iOS unsigned IPA 1,550,522 bytes。実機 BLE・JNI ロード・インストール・App Store / TestFlight 配布は未着手。証跡は [docs/MOBILE_BUILD_EVIDENCE.md](docs/MOBILE_BUILD_EVIDENCE.md) |
+| 5 | `eightbitdo-uniffi` + iOS SwiftUI / Android Compose | **JNI 同梱 APK / unsigned IPA のビルド成功まで（#21、実機未検証）**。Android JNI 同梱 APK 14,692,156 bytes（`libeightbitdo_uniffi.so` を arm64-v8a / x86_64 に同梱）、iOS unsigned IPA 1,550,798 bytes（`Padbench.ipa`）。実機 BLE・JNI ロード・インストール・App Store / TestFlight 配布は未着手。証跡は [docs/MOBILE_BUILD_EVIDENCE.md](docs/MOBILE_BUILD_EVIDENCE.md) |
 | — | ライセンス文書（LICENSE-MIT / LICENSE-APACHE / NOTICE / THIRD_PARTY_LICENSES / TRADEMARKS） | 完了（PR #13）。リポジトリ公開・コードライセンス・商標・同梱フォント・ストア配布・マネタイズの決定は [docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md)（#22、決定日 2026-11-23）が正本 |
 | — | クロスプラットフォーム・ビルド確認 | [docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)（#18）。Windows は `cargo check` 成功（リンク・実行・テストは未確認、実効 MSRV 1.88+）、macOS は本ホストで確認不能、iOS target の `cargo check` 成功。**実機は Linux のみ** |
 | — | 公式機能カバレッジ・マトリクス | [docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md)（#23）。公式 Windows / Android ソフトとの機能比較、RE / 実装 / 実機検証のラベル定義 |
@@ -142,7 +145,7 @@
 1. **BLE OTA の実機 wire 確定（Tier 3・最優先 blocker）**: 採取手順と判定基準は [docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)（#19、Phase A / Phase B）、段階実行 API は `ota-bench` feature（#20）で用意済み。実機 btsnoop を取得し、[docs/PROTOCOL_SPEC.md](docs/PROTOCOL_SPEC.md) §8.5「未検証事項」のうち wire 関連の 1〜13 を確定する（14 は trust boundary、15 はバッテリー / 取得検証で別課題）。特に (a) **ACK の `offset` / `total_len` 照合の追加**（現状は cmd/subcmd のみで遅延・重複 ACK を区別しない）、(b) **マルチセクション `.dat` 対応**（現実装は単一セクションのみで、公式 `.dat` がマルチセクションなら更新を拒否する）、(c) `readPID` / ready ACK / Erase・Write のアドレス規約 / `WriteVersion` payload / `WriteFirmware` フレーム長 / Bootloader MTU。確定まで CLI / GUI / UniFFI に OTA を配線しない。
 2. **OTA の配線と安全機構**: 確定後、CLI / GUI / UniFFI に OTA を追加し、バッテリー警告、バージョン / ダウングレード判定、ファームウェア取得・SHA-256 検証、成功時の `"80ND"` 再接続 + バージョン確認を実装する。Tier 3。
 3. **GUI 書き込み UI**（PR #16）: config write / remap / マクロエディタは main にマージ済み。残るのは実機確認（Tier 3、pre-write backup + read-back 前提）と、backup 復元 UI / JSON・TOML 入出力。**GUI ライセンス画面（#24）とプロファイル切替（`0x0015`）の core / CLI / REPL 配線（#26）は main にマージ済み**。`0x0015` は実機で ACK と `cur_slot` 6→1 の更新を確認済み（Save 送信なし。再接続/電源断を跨ぐ永続性・プロファイル実効・`crc16` とみられる 2B の意味・直接 ACK の条件・ACK 形状の再現性は未確認）。
-4. **モバイルの仕上げ**: **ビルド証跡は [docs/MOBILE_BUILD_EVIDENCE.md](docs/MOBILE_BUILD_EVIDENCE.md)（#21）に記録済み**（Android JNI 同梱 APK 14,551,011 bytes / iOS unsigned IPA 1,550,522 bytes。いずれもビルド・パッケージ確認のみ）。残るのは iOS / Android 実機での BLE 読み取りと JNI ロード、エミュレータ起動確認、署名・App Store / TestFlight 配布（macOS + Xcode が必要）。書き込み・OTA の公開は Tier 3 レビューとバックアップ UI が揃うまで行わない（[mobile/README.md](mobile/README.md)）。
+4. **モバイルの仕上げ**: **ビルド証跡は [docs/MOBILE_BUILD_EVIDENCE.md](docs/MOBILE_BUILD_EVIDENCE.md)（#21）に記録済み**（Android JNI 同梱 APK 14,692,156 bytes / iOS unsigned IPA 1,550,798 bytes。いずれもビルド・パッケージ確認のみ）。残るのは iOS / Android 実機での BLE 読み取りと JNI ロード、エミュレータ起動確認、署名・App Store / TestFlight 配布（macOS + Xcode が必要）。書き込み・OTA の公開は Tier 3 レビューとバックアップ UI が揃うまで行わない（[mobile/README.md](mobile/README.md)）。
 5. **クロスプラットフォーム実機確認**: macOS / Windows の BLE（btleplug）と Linux BlueZ の回帰、Android / iOS。現状の実機証跡は Linux のみ。**ビルド/コンパイルの確認状況は [docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)（#18）**: Windows は `cargo check`（リンク・実行は未確認、MinGW 必要）のみ確認済みで、**Windows ビルドは Rust 1.88 以上が必要**（`btleplug` の Windows バックエンドの let チェーン由来。宣言 MSRV 1.85 では `E0658`）、macOS は target / SDK 不在のため Linux からは確認不能。
 6. **`status` のリンク断検知バグの修正**: 上記の既知バグ（切断後も `connected: true` と keepalive カウンタが残る）を直し、`status` を実リンク状態に追従させる。session / keepalive に触れるため **Tier 3**。テストで固定してから直す。
 7. **USB HID / 2.4G（Phase 2e / 4）**: USB App Mode の実機証跡と USB Boot の TX フレーミングが未文書化のため保留。`docs/PROTOCOL_SPEC.md` に証跡が追加されるまで実装しない。

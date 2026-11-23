@@ -1,4 +1,4 @@
-# 実装計画書（8BitDo Ultimate 2 Cross-Platform Suite）
+# 実装計画書（Padbench — 8BitDo Ultimate 2 対応）
 
 ## 1. プロジェクト目標
 
@@ -152,6 +152,8 @@ graph TD
 
 > **2026-11-23 改訂（現状反映、main `0af60a3`）**: Phase 1 / 2a / 2b / 2d / 3a は main にマージ済み。PR #16（`feat/gui-write`）で Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）の GUI 書込を実装し **main にマージ済み**（実機未検証・Tier 3）。Phase 2c は core のみマージ済みで、#20 で `ota-bench` 段階実行 API、#19 で実機 btsnoop 採取計画を追加。実機 wire 未確定のため CLI / GUI / UniFFI に未配線。Phase 3c（OTA 画面）は未着手。Phase 5 は UniFFI と iOS / Android の雛形に加え、#21 で **JNI 同梱 APK / unsigned IPA のビルド成功まで記録**（実機未検証）。#17 で raw config の実機 flag 検証を opaque 値対応に修正、#18 でクロスプラットフォーム・ビルド確認、#22 で配布方針、#23 で機能マトリクスを追加。GUI ライセンス画面は #24 で main にマージ済み（左レール下部の「ライセンス」画面でアプリの MIT / Apache-2.0 全文と同梱 5 フォント全文・著作権者行を表示）。プロファイル切替（`0x0015`）の core / CLI / REPL 配線は #26 で main にマージ済み（`Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`、Save 送信なし）。実機では `cmd=0x0004/subcmd=0x0015` の 16B 封筒の ACK を 1 回観測し、`Save` を送らずに `cur_slot` が 6→1 へ更新されることを read-back で確認済み（未確認: 再接続/電源断を跨ぐ永続性、プロファイルの実効、`crc16` とみられる 2B の意味、直接 ACK の条件、ACK 形状の再現性。詳細は [docs/DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) §7）。[docs/FEATURE_MATRIX.md](FEATURE_MATRIX.md) の残作業「`0x0015` 切替のセッション API 化」に対応する。USB OTA（Phase 4）は USB Boot TX フレーミングが未文書化のため保留を継続する。詳細な残課題は §5.4。
 
+> **2026-11-23 追記（GUI 移行）**: デスクトップ GUI は Tauri v2（Rust backend + Web frontend）へゼロベース移行する方針を決定した（[TAURI_PLAN.md](TAURI_PLAN.md)）。egui 版（`eightbitdo-gui`）は比較・撤退用に残し、Phase 3 の各画面は Tauri 版で再実装する。以下の Phase 3 の記述は egui 版の実績として読む。
+
 ### 5.1 トラック構成（2026-11-23）
 
 ```text
@@ -164,7 +166,7 @@ Track A: コア / CLI（Linux・デスクトップ）
   プロファイル切替 0x0015           完了（#26、core + CLI + REPL 配線。Save 送信なし。実機で ACK と cur_slot 6→1 を確認、永続性・実効は未確認）
   Phase 2e USB / 2.4G transport     保留
 
-Track B: GUI（egui / Pure Rust）
+Track B: GUI（egui / Pure Rust。Tauri v2 へ移行中）
   Phase 3a read-only GUI            完了（PR #9）
   Phase 3b macro editor             実装・main にマージ済み（PR #16。実機未検証・Tier 3）
   Phase 3c OTA screen               2c の wire 確定後（未着手）
@@ -190,7 +192,7 @@ Track C: モバイル
 | Phase 3c | 未着手。Phase 2c の実機 wire 確定後に OTA 画面を実装 |
 | Phase 3d | **実装・main にマージ済み（PR #16）**。設定タブ／22 ボタンリマップ／振動／スティック・トリガー／ジャイロ／LED。確認ダイアログ・pre-write backup・read-back。**実機未検証・Tier 3** |
 | Phase 4 | 保留（USB Boot TX 未文書化） |
-| Phase 5 | **JNI 同梱 APK / unsigned IPA のビルド成功、実機未検証（#21）**。UniFFI 公開 API（PR #12）、iOS unsigned IPA 1,550,522 bytes、Android Kotlin-only APK に続き、NDK r29 + cargo-ndk で `libeightbitdo_uniffi.so` を同梱した APK 14,551,011 bytes を生成（ビルド・パッケージ内容の確認のみ）。iOS / Android 実機での BLE・JNI ロード、署名・App Store 配布は未着手。書き込み・OTA は意図的に未公開。証跡は [docs/MOBILE_BUILD_EVIDENCE.md](MOBILE_BUILD_EVIDENCE.md) |
+| Phase 5 | **JNI 同梱 APK / unsigned IPA のビルド成功、実機未検証（#21）**。UniFFI 公開 API（PR #12）、iOS unsigned IPA 1,550,522 bytes、Android Kotlin-only APK に続き、NDK r29 + cargo-ndk で `libeightbitdo_uniffi.so` を同梱した APK 14,551,011 bytes を生成（ビルド・パッケージ内容の確認のみ）。iOS / Android 実機での BLE・JNI ロード、署名・App Store 配布は未着手。書き込み・OTA は意図的に未公開。証跡は [docs/MOBILE_BUILD_EVIDENCE.md](MOBILE_BUILD_EVIDENCE.md)（**Padbench 識別子統一後の再ビルドは §0**: APK 14,692,156 bytes / IPA 1,550,798 bytes） |
 | ライセンス | 完了（PR #13）。LICENSE-MIT / LICENSE-APACHE / NOTICE / THIRD_PARTY_LICENSES / TRADEMARKS。公開範囲・コードライセンス・商標・同梱フォント・ストア配布・マネタイズの決定は [docs/DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md)（#22、決定日 2026-11-23）が正本 |
 | クロスプラットフォーム | ビルド確認のみ（#18、[docs/CROSS_PLATFORM.md](CROSS_PLATFORM.md)）。Linux ホスト / Windows `cargo check` / iOS target check は成功、macOS は本ホストで確認不能、Windows の実効 MSRV は 1.88 以上。**実機は Linux のみ** |
 | 機能カバレッジ | 公式 Windows / Android ソフトとの比較表 [docs/FEATURE_MATRIX.md](FEATURE_MATRIX.md)（#23） |
@@ -296,8 +298,11 @@ Track C: モバイル
 - **ゴール**: USB 有線 / 2.4G レシーバ経由の App Mode。
 - **状態**: 保留。USB App Mode の実機証跡と、USB Boot の TX フレーミング（`EraseFlash` / `WriteFirmware` 等）が未文書化のため、BLE 経路を優先する。
 
-### Phase 3: `eightbitdo-gui`（デスクトップ ネイティブ GUI：Linux / macOS / Windows）
-- **技術**: `egui` (`eframe`)、Pure Rust。Node.js / WebView / Electron / Tauri は使わない。
+### Phase 3: `eightbitdo-gui`（デスクトップ GUI：Linux / macOS / Windows）
+
+> **移行注記（2026-11-23）**: GUI は Tauri v2（Web UI）へ移行中（[TAURI_PLAN.md](TAURI_PLAN.md)）。以下は egui 版（`crates/eightbitdo-gui`、比較・撤退用に維持）の実績と計画として読む。
+
+- **技術（egui 版）**: `egui` (`eframe`)、Pure Rust。Tauri v2 版は TypeScript + Vite + React + Tailwind CSS（pnpm）で、BLE は Rust コアに置く。
 - **Phase 3a（read-only GUI、完了）**: 接続パネル、デバイス情報、ライブ入力、設定ビューア、マクロ一覧、バックアップ、ログの読み取り専用 GUI。日本語 UI・燻しスレートのテーマ・同梱 Noto Sans JP（OFL）。デバイス書込は行わない。**2026-11-22 に PR #9 で main にマージ済み**。既定は **Tier 2**、ただし `crates/eightbitdo-core/**`（`session` / transport / mock を含む）の変更を伴う場合は **Tier 3**。GUI 側だけで完結する場合も、`session` の読み取り契約（ドレインの fail-closed、応答 `total_len` / `crc16` 照合、`Instant` 上限）を検証するテストを変えるなら Tier 3。
 - **Phase 3b（マクロエディタ、Phase 2b 後）**: タイムライン / テーブル、リアルタイム録音、1ms、8bit スティック、トリガー、JSON/TOML。Tier 3。**現状: PR #16 で実装済み・main にマージ済み（実機未検証）。** 20ms ライブ録音、ステップ編集（削除・待ち時間挿入・値変更）、既存非空マクロへの Header → Save → Erase → Write → Save、read-back 検証、pre-write macro backup、TOCTOU（expected SHA-256 不一致で中止）。空マクロ作成は拒否。録音中は書込不可（確認ダイアログは非モーダルだが確定時に再検証、録音中のロードは停止通知）。**実機未検証。JSON/TOML 入出力は未実装。**
 - **Phase 3c（OTA 画面、Phase 2c 後）**: バージョン確認、進捗、復旧モード。Tier 3。**Phase 2c の実機 wire 確定まで着手しない**。
@@ -317,8 +322,8 @@ Track C: モバイル
   - `mobile/android`: Kotlin + Jetpack Compose UI + Android BLE GATT トランスポート + `cargo-ndk` ビルド構成（`scripts/mobile/build-android.sh`）。USB OTG は未実装。
 - **現状（2026-11-23、PR #12 で main にマージ済み）**:
   - `eightbitdo-uniffi`: `NativeTransport` callback、同期 `MobileSession`（version / config / macro backup / input / disconnect）、`describeConfig`、`prepareConfigWrite`（送信なしの書き込み準備のみ）。`cargo test -p eightbitdo-uniffi` は 14 テスト。
-  - iOS: SwiftUI 雛形 + CoreBluetooth transport。Linux の xtool で **署名なし IPA の生成まで成功（#21: 1,550,522 bytes、SHA-256 `e63d7822…b804f`）**。実機インストール・App Store / TestFlight 配布は macOS + Xcode が必要で未実施。
-  - Android: Compose 雛形 + GATT transport。**JNI 同梱 APK をビルド成功（#21、[docs/MOBILE_BUILD_EVIDENCE.md](MOBILE_BUILD_EVIDENCE.md)）**。NDK 29.0.14206865 + cargo-ndk 4.1.2 で `libeightbitdo_uniffi.so`（arm64-v8a / x86_64）を同梱した debug APK **14,551,011 bytes**（SHA-256 `879e894c…a351f1`）を生成し、JVM unit test 8 件も成功。**実機 / エミュレータでの JNI ロードは未確認**（ホストの emulator 実行ファイルに実行権限が無く、エミュレータ起動も未実施）。
+  - iOS: SwiftUI 雛形 + CoreBluetooth transport。Linux の xtool で **署名なし IPA の生成まで成功（#21: 1,550,522 bytes、SHA-256 `e63d7822…b804f`）**。実機インストール・App Store / TestFlight 配布は macOS + Xcode が必要で未実施。**Padbench 識別子統一後の再ビルドは §0（1,550,798 bytes、`Padbench.ipa`）**。
+  - Android: Compose 雛形 + GATT transport。**JNI 同梱 APK をビルド成功（#21、[docs/MOBILE_BUILD_EVIDENCE.md](MOBILE_BUILD_EVIDENCE.md)）**。NDK 29.0.14206865 + cargo-ndk 4.1.2 で `libeightbitdo_uniffi.so`（arm64-v8a / x86_64）を同梱した debug APK **14,551,011 bytes**（SHA-256 `879e894c…a351f1`）を生成し、JVM unit test 8 件も成功。**実機 / エミュレータでの JNI ロードは未確認**（ホストの emulator 実行ファイルに実行権限が無く、エミュレータ起動も未実施）。**Padbench 識別子統一後の再ビルドは [docs/MOBILE_BUILD_EVIDENCE.md](MOBILE_BUILD_EVIDENCE.md) §0（APK 14,692,156 bytes、package `io.github.haruki0420.padbench` の新 namespace）**。
   - 設定書き込み・OTA は UniFFI に公開していない（バックアップ UI・Tier 3 レビュー待ち）。Android USB OTG は未実装。
 - **完了条件**: iOS / Android 実機で `"80ND"` 接続・設定変更・マクロ編集・BLE OTA が動作すること（現状は実機未確認）。
 - **Tier**: 3。

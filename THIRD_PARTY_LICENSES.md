@@ -6,7 +6,7 @@
 >
 > また、依存バージョンと各プロジェクトのライセンスは将来変更され得ます。**依存を追加・更新するたびに再生成・再確認**してください。
 
-> 本ファイルは**要約と参照**です。497 クレート全件の著作権表示・ライセンス本文を網羅するものではありません。現時点で全文を収録しているのは、追加義務のある BSD-3-Clause（btleplug）、Unicode-3.0、SIL OFL 1.1（同梱フォント）です。MPL-2.0（uniffi）・Apache-2.0（Gradle wrapper）・Ubuntu Font Licence（egui 既定フォント）の全文は各クレート／資産に同梱されたライセンスファイルにあります。**バイナリとして配布する場合は、`cargo-about` 等で依存グラフ全体の著作権表示とライセンス本文を生成し、standalone の通知ファイルとして配布物へ同梱してください（§4）。本ファイル（要約）を完全な通知として同梱しないでください。** 一方、**同梱フォントのライセンス全文**は、配布物に個別のテキストを置くのではなく、バイナリ内に埋め込んだライセンス画面（§5.3）でユーザーが閲覧できる形にします。
+> 本ファイルは**要約と参照**です。497 クレート（ルート workspace）+ `apps/desktop` の 435 クレート + npm 157 パッケージの全件の著作権表示・ライセンス本文を網羅するものではありません。デスクトップ（Tauri）は独立ワークスペースで依存グラフが別なので、§2.1 と §3.10 に要約を分けて置いています。現時点で全文を収録しているのは、追加義務のある BSD-3-Clause（btleplug）、Unicode-3.0、SIL OFL 1.1（同梱フォント）です。MPL-2.0（uniffi）・Apache-2.0（Gradle wrapper）・Ubuntu Font Licence（egui 既定フォント）の全文は各クレート／資産に同梱されたライセンスファイルにあります。**バイナリとして配布する場合は、`cargo-about` 等で依存グラフ全体の著作権表示とライセンス本文を生成し、standalone の通知ファイルとして配布物へ同梱してください（§4）。本ファイル（要約）を完全な通知として同梱しないでください。** 一方、**同梱フォントのライセンス全文**は、配布物に個別のテキストを置くのではなく、バイナリ内に埋め込んだライセンス画面（§5.3）でユーザーが閲覧できる形にします。
 
 ## 1. サマリ
 
@@ -16,6 +16,8 @@
 - **GPL / AGPL / SSPL / EUPL / CDDL / EPL は 0 件。** ライセンス式に MIT を含むクレート（MIT を選択可能）は **444**、Apache-2.0 を含むクレート（Apache-2.0 を選択可能）は **345**。どちらも選択できない **37 クレート**は §3.5 に列挙します（`MPL-2.0` 9、`Unicode-3.0` 単独 18、`Zlib` 3、`BSD-3-Clause` 2、`BSL-1.0` 2、`BSD-2-Clause` / `ISC` / `CC0-1.0` 各 1 など）。
 - 直接依存のうち **`uniffi` 0.31.2 だけが MPL-2.0**（唯一の非 MIT/Apache 直接依存）。ほかは MIT または Apache-2.0 を選択可能です（`btleplug` は BSD-3-Clause を含む三択、`uuid` は Apache-2.0/MIT、`nix` は MIT、`fs2` は MIT/Apache-2.0、`rustix` は Apache-2.0 WITH LLVM-exception / Apache-2.0 / MIT）。
 - Cargo 管理外の同梱資産も本ファイルで扱います: GUI 同梱の **Noto Sans JP**（OFL-1.1、§5）、**egui 既定フォント**（OFL-1.1 / Ubuntu Font Licence 1.0、§3.6.1）、**Gradle wrapper**（Apache-2.0、§3.6.3）。
+- **`apps/desktop`（Tauri v2）は独立した Cargo ワークスペース**のため、上の 497 とは別に集計します（§2.1）。`apps/desktop/src-tauri/Cargo.lock` の `cargo metadata --locked --all-features` で **436 パッケージ（workspace 1 + 第三者 435）**、`license` フィールドが空のクレートは **0**。内訳の上位は `MIT OR Apache-2.0` 198 / `MIT` 104 / `Apache-2.0 OR MIT` 34 / `Unicode-3.0` 18 / `Zlib OR Apache-2.0 OR MIT` 17 / `Unlicense OR MIT` 14 / `MIT/Apache-2.0` 12。`MPL-2.0` は 7 クレート（§3.3。上位 7 種類には入りません）。**GPL / AGPL / SSPL / EUPL は 0**。
+- **npm（`apps/desktop`）** は `pnpm licenses list --json` で **157 パッケージ / 9 種類**（MIT 132、`Apache-2.0 OR MIT` 3、Apache-2.0 6、ISC 7、BSD-2-Clause 2、BSD-3-Clause 2、BlueOak-1.0.0 2、MPL-2.0 2、CC-BY-4.0 1）。直接依存のライセンスは §2.1、注意点は §3.10。
 - 参考: Linux x86_64 ホストで実際にビルドされる第三者クレートは `cargo tree --locked --workspace --all-features` のユニーク **315**（dev 依存を含む。既定 feature では **298**）。`cargo metadata` の 497 は Cargo.lock 全体＝全ターゲット・全 feature・optional 依存を含む集合です。
 
 | SPDX 式 | 件数 |
@@ -81,6 +83,42 @@
 | `unicode-ident` | 1.0.27 | `(MIT OR Apache-2.0) AND Unicode-3.0` | 推移的（`proc-macro2` 経由） | 本プロジェクトのコードから直接使用していない。**Unicode-3.0 の帰属義務が加算される**（§3.2） |
 
 > 利用箇所は workspace メンバーの `Cargo.toml` に基づきます。Linux で実際にビルドされる集合は全ターゲット集計より小さくなります（§1 の参考値を参照）。macOS / Windows / Android / iOS 向けのクレート（`objc2*` / `windows*` / `jni*` など）は同梱物に応じて帰属表示が必要です。
+
+### 2.1 `apps/desktop`（Tauri v2）の直接依存
+
+`apps/desktop` の Rust 側は独立ワークスペース（`apps/desktop/src-tauri/Cargo.lock`）、フロントエンドは pnpm（`apps/desktop/pnpm-lock.yaml`）で管理しています。解決バージョンは各 lockfile に基づきます（2026-11-23 時点）。
+
+**Rust（`apps/desktop/src-tauri`）**
+
+| クレート | バージョン | SPDX | 備考 |
+| --- | --- | --- | --- |
+| `tauri` | 2.12.7 | `Apache-2.0 OR MIT` | アプリ本体。MSRV 1.90（§2.2） |
+| `tauri-build` | 2.7.6 | `Apache-2.0 OR MIT` | build script。codegen のみ |
+| `serde` | 1.0.229 | `MIT OR Apache-2.0` | `app_info` のシリアライズ |
+| `eightbitdo-core` | path 依存（自プロジェクト） | `MIT OR Apache-2.0` | `default-features = false`（`ble` OFF）で参照 |
+| 推移: `wry` / `tao` / `tauri-runtime*` | 0.57.3 / 0.37.3 / 2.12.x | `Apache-2.0 OR MIT` / `Apache-2.0` | WebView とウィンドウ。Linux は WebKitGTK / GTK にリンク（§3.9） |
+| 推移: `webkit2gtk` / `gtk` / `glib` / `soup3` / `javascriptcore-rs`（Rust バインディング） | 2.0.2 / 0.18.2 / 0.18.5 / 0.5.0 / 1.1.2 | `MIT` | **Rust クレートは MIT**。リンク先の C ライブラリは別ライセンス（§3.9） |
+
+**npm（`apps/desktop/package.json` の直接依存）**
+
+| パッケージ | バージョン | SPDX | 備考 |
+| --- | --- | --- | --- |
+| `@tauri-apps/api` | 2.12.5 | `Apache-2.0 OR MIT` | IPC の呼び出し |
+| `react` / `react-dom` | 19.3.1 | `MIT` | UI |
+| `@tauri-apps/cli` | 2.12.6 | `Apache-2.0 OR MIT` | ビルド・dev の CLI（配布物には含めない） |
+| `vite` | 7.3.8 | `MIT` | ビルド |
+| `vitest` | 4.1.12 | `MIT` | テスト |
+| `tailwindcss` / `@tailwindcss/vite` | 4.3.5 | `MIT` | スタイル |
+| `typescript` | 5.9.3 | `Apache-2.0` | 型チェック（配布物には含めない） |
+| `jsdom` / `@testing-library/*` / `@vitejs/plugin-react` / `@types/*` | 31.0.1 ほか | `MIT` | テスト・型（配布物には含めない） |
+
+> npm 依存のうち配布物（`dist/`）に入るのはバンドル後のコードだけです。ビルド時のみの依存（CLI / テスト / 型）は再配布時の帰属義務を生じませんが、リリース時の通知には一覧として残してください（§4）。
+
+### 2.2 `apps/desktop` の MSRV とツールチェーン
+
+- Rust: **1.90+**（`tauri` 2.12.7 の `rust-version`。`apps/desktop/src-tauri/Cargo.toml` に `rust-version = "1.90"` を明記）。ルート workspace の MSRV **1.85** とは別です。
+- Node.js: **`^20.19.0 || >=22.12.0`**（Vite 7 の `engines`。`apps/desktop/package.json` の `engines.node` で固定）。pnpm は `packageManager: pnpm@12.22.0` で固定。
+- ツールチェーン（CLI / テスト / 型）は配布物に含めませんが、再現性のためバージョンを固定しています（§4 の生成手順もこの前提）。
 
 ## 3. 帰属・ライセンス全文の扱い
 
@@ -204,11 +242,12 @@ MPL-2.0 は **ファイル単位の弱コピーレフト**です。本プロジ�
 ### 3.4 選択式ライセンス（OR）の扱い
 
 - `Unlicense OR MIT` / `Unlicense/MIT`（`memchr`, `same-file`, `walkdir`, `winapi-util` など 6）: 本プロジェクトは **MIT** を選択します。MIT の著作権表示は各クレートの `LICENSE` に従います。
+- `apps/desktop`（Tauri）のグラフにも **MPL-2.0 が 7 クレート**入ります（`cssparser` 2 / `selectors` 2 / `cssparser-macros` / `dtoa-short` は `dom_query` → `tauri-utils` 経由、`option-ext` は `dirs` → `dirs-sys` 経由の**実行時依存**。ビルド時だけの依存ではありません）。扱いは §3.3 のとおりで、**Executable Form（バイナリ）を配布するときは、改変の有無にかかわらず MPL-2.0 対象クレートとソース入手先（crates.io の該当バージョン）を通知**します（MPL-2.0 §3.2）。
 - `Zlib OR Apache-2.0 OR MIT`（`bytemuck`, `objc2-*` など 8）: **MIT または Apache-2.0** を選択します。Zlib の帰属義務は生じません。
 - `MIT OR Apache-2.0 OR Zlib` / `MIT OR Zlib OR Apache-2.0`（`glow`, `raw-window-handle`, `miniz_oxide` など 7）: MIT または Apache-2.0 を選択します。
 - `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`（`rustix` 2 バージョン, `wasi` など 7）: Apache-2.0 を選択します。
 - `BSD-3-Clause OR Apache-2.0`（`moxcms`, `pxfm`）、`BSD-3-Clause OR MIT OR Apache-2.0`（`num_enum`, `num_enum_derive`）、`BSD-2-Clause OR Apache-2.0 OR MIT`（`zerocopy`, `zerocopy-derive`）: MIT または Apache-2.0 を選択します。
-- `MIT OR Apache-2.0 OR LGPL-2.1-or-later`（`r-efi` 2）: MIT または Apache-2.0 を選択し、**LGPL の義務は生じません**。
+- `MIT OR Apache-2.0 OR LGPL-2.1-or-later`（`r-efi` 2。`apps/desktop` のグラフにも 2 クレート入る）: MIT または Apache-2.0 を選択し、**LGPL の義務は生じません**。
 - `0BSD OR MIT OR Apache-2.0`（`adler2`）、`Apache-2.0/MIT`（4）、`MIT/Apache-2.0`（18）: MIT または Apache-2.0 を選択します。
 - `Apache-2.0 AND MIT`（`dpi`）: 両方の条件を満たす必要があります（Apache-2.0 の NOTICE 義務を含む）。
 - `MIT/Apache-2.0/BSD-3-Clause`（`btleplug`）: §3.1。
@@ -291,6 +330,34 @@ GUI は `eframe` を既定 feature で使うため、`egui` の `default_fonts` 
 | X11 / xcb / libxkbcommon / Wayland client | MIT 系 | GUI（`winit` / `glutin`、x11 / wayland feature） | 通常はシステム提供。同梱する場合は各ライブラリの帰属を追加 |
 | GPU ドライバ（OpenGL / Vulkan / Metal） | 各ベンダ | GUI 描画 | 通常は同梱しない |
 | Android SDK / NDK / Gradle / Kotlin ツールチェーン | Apache-2.0 等 | モバイルのビルド時にのみ使用 | 配布物に同梱しない（Gradle wrapper は §3.6.3） |
+| **WebKitGTK**（`libwebkit2gtk-4.1`） | **LGPL-2.1-or-later**（一部 BSD 系） | `apps/desktop` の WebView（Tauri v2 / wry）。Linux では動的リンク | **動的リンクなので LGPL のソース開示義務はアプリ本体に及ばない**。配布物には LGPL 全文と WebKitGTK の著作権表示を含め、ライブラリを差し替え可能な形（動的リンク）を保つ。バンドルする場合は §3.9.1 |
+| **GTK 3**（`libgtk-3`） | LGPL-2.1-or-later | WebKitGTK の UI 基盤 | 動的リンク。WebKitGTK と同じ扱い |
+| **libsoup 3** | LGPL-2.1-or-later | WebKitGTK の HTTP | 動的リンク。同上 |
+| **librsvg** | LGPL-2.1-or-later | GTK の SVG 読み込み | 動的リンク。同上 |
+| **OpenSSL**（`libssl` / `libcrypto`） | Apache-2.0 | WebKitGTK / Tauri の TLS（Linux） | 通常はシステム提供。AppImage に同梱する場合は Apache-2.0 の通知を追加 |
+| HarfBuzz / FreeType / fontconfig / Pango / cairo / gdk-pixbuf | MIT 系 / LGPL-2.1+ / FTL 等 | WebKitGTK の文字描画 | 通常はシステム提供。バンドル時は各ライセンスを追加 |
+
+### 3.9.1 Linux の WebKitGTK（LGPL-2.1+）と AppImage の扱い
+
+- **Tauri v2 の Linux ビルドは WebKitGTK 4.1 に動的リンクします**（`webkit2gtk-4.1` の `pkg-config` 経由）。アプリ本体（`apps/desktop` の Rust バイナリと `dist/`）は MIT / Apache-2.0 のまま配布でき、**WebKitGTK 側の LGPL-2.1+ は動的リンクとして満たします**。アプリのコードを LGPL にする必要はありません。
+- 配布物（deb / AppImage）では、**LGPL-2.1 の全文**と WebKitGTK / GTK / libsoup / librsvg の著作権表示を同梱し、ユーザーがライブラリを差し替えられることを妨げないでください（LGPL-2.1 §6。動的リンクを維持し、静的リンクに切り替えない）。
+- **AppImage の扱い（P7 で確定）**: Tauri の AppImage は `linuxdeploy` で依存ライブラリを同梱することがあります。WebKitGTK を同梱する場合は、LGPL-2.1 の条件（全文の同梱、動的リンクの維持、差し替え可能性の明示）を満たす必要があります。**現時点のリポジトリは `--no-bundle` でビルド確認しており、AppImage はまだ生成していません**。P7 で「OS 提供の WebKitGTK を使う（deb 依存にする）/ AppImage に同梱する」を決め、同梱する場合はこの節に実測（`ldd` の結果と同梱ライブラリ一覧）を追記してください。
+- 参考: Tauri v2 の Linux 依存は `libwebkit2gtk-4.1-dev` / `libgtk-3-dev` / `libsoup-3.0-dev` / `librsvg2-dev`（ビルド時）。実行時は各 `-0` パッケージに依存します。
+
+### 3.10 npm 依存（`apps/desktop`）の注意
+
+`pnpm licenses list --json`（2026-11-23）で 157 パッケージ・9 種類でした。MIT が大半で、追加の注意が必要なのは次だけです。
+
+| ライセンス | パッケージ | 注意 |
+| --- | --- | --- |
+| `MPL-2.0` | `lightningcss`, `lightningcss-linux-x64-gnu`（Tailwind v4 の CSS 変換） | ビルド時のみ使用。配布物（`dist/`）には含まれません。ソースを改変して再配布する場合のみ MPL のファイル単位コピーレフトが及ぶ |
+| `CC-BY-4.0` | `caniuse-lite`（ブラウザ対応データ） | ビルド時のみ使用。データを再配布する場合は帰属が必要（本アプリの配布物には含めない） |
+| `BlueOak-1.0.0` | `graceful-fs`, `lru-cache` | ビルド・テスト時のみ |
+| `Apache-2.0` | `typescript`, `aria-query`, `expect-type` ほか | 開発ツール。配布物には含めない |
+| `ISC` / `BSD-2-Clause` / `BSD-3-Clause` | `semver` / `entities` / `source-map-js` ほか | ビルド・テスト時のみ |
+
+- **配布物に入るのは `vite build` 後の `dist/` のみ**で、ここに含まれるのは React / React DOM / scheduler（MIT）と `@tauri-apps/api`（`Apache-2.0 OR MIT` の MIT を選択。`invoke` / `__TAURI_INTERNALS__` の接着コード）、アプリ自身のコードです。ただしリリース時の完全な通知には npm の全依存（ビルド時を含む）を `pnpm licenses list` から生成して含めてください（§4）。
+- npm の依存は再生成可能です（`pnpm-lock.yaml` を固定）。通知ファイルはリリース時に生成し、リポジトリには要約だけを置きます。
 
 ## 4. 生成・更新方法
 
@@ -311,6 +378,24 @@ PY
 ```
 
 - `cargo metadata` の件数は Cargo.lock 全体（全ターゲット・全 feature・optional 依存を含む）です。Linux ホストで実際にビルドされる範囲は `cargo tree --locked --workspace --all-features` で確認できます。
+- **`apps/desktop`（Tauri）は独立ワークスペースなので別に集計します**（§2.1）:
+
+```sh
+# Rust（apps/desktop/src-tauri）— ルート workspace とは別の Cargo.lock を使う
+cd apps/desktop/src-tauri
+cargo metadata --locked --all-features --format-version 1 > /tmp/desktop-meta.json
+# → §1 と同じ python3 手順で第三者クレート数と SPDX 式を集計する
+
+# npm（apps/desktop）
+pnpm --dir apps/desktop licenses list --json > /tmp/npm-licenses.json
+# → ライセンスごとのパッケージ数を集計する（jq でも可）
+```
+
+- **リリース時の完全な通知**: 本ファイル（要約）をそのまま通知として同梱せず、リリース時に生成した standalone の通知ファイルを配布物へ同梱します。
+  - Rust: `cargo about generate about.hbs`（ルート workspace と `apps/desktop/src-tauri` の 2 回。後者は `--manifest-path apps/desktop/src-tauri/Cargo.toml`）
+  - npm: `pnpm --dir apps/desktop licenses list` の出力を表形式に変換（ビルド時依存も含める）
+  - Linux: §3.9 / §3.9.1 のとおり LGPL-2.1 全文と WebKitGTK 系の著作権表示を追加する
+  - 生成した通知はリポジトリにコミットせず、リリース成果物にだけ含める（更新頻度が高く、要約との二重管理を避けるため）
 - 旧版との差分は `git diff <旧 base>..<新 base> -- Cargo.lock` と本ファイルの件数で確認します。
 - 未マージのブランチが追加する依存は本一覧に反映されません。依存を追加する PR では、その PR 内で本ファイルの該当行（§2 の直接依存表、§3 の特殊ライセンス）を更新してください。
 

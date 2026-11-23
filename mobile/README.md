@@ -1,5 +1,6 @@
 # モバイルアプリ（iOS / Android）
 
+**Padbench**（表示名。識別子は `io.github.haruki0420.padbench`）は、
 8BitDo Ultimate 2 Bluetooth Controller（BLE `80ND` / PID `0x600F`）を、
 Nintendo Switch 接続したまま設定の読み出し・バックアップを行う
 **非公式**モバイルクライアントです。
@@ -192,19 +193,26 @@ cp target/aarch64-apple-ios/release/libeightbitdo_uniffi.a mobile/ios/libs/
 cd mobile/ios && xtool dev build -c release --ipa
 ```
 
-出力: `mobile/ios/xtool/EightBitDo.ipa`（**署名なし**、実機には入りません）。
+出力: `mobile/ios/xtool/Padbench.ipa`（**署名なし**、実機には入りません）。
 
-### 実測結果（2026-11-23、この環境・レビュー反映後）
+### 実測結果（2026-11-23、Padbench 識別子への統一後）
 
-* `xtool dev build --ipa`: `Build complete! (7.44 secs)` → IPA 生成
-* IPA サイズ: 1,550,522 bytes（SHA-256 `e63d7822…b804f`）
-* `Payload/EightBitDo.app/EightBitDo`: `Mach-O 64-bit arm64 executable`
-* `llvm-nm` で `_uniffi_eightbitdo_uniffi_fn_constructor_mobilesession_new` など
-  UniFFI シンボル 61 個を確認（Rust staticlib が実際にリンクされている）
-* `Info.plist`: `CFBundleIdentifier=dev.eightbitdo.mobile`,
+* `xtool dev build --ipa`: `Build complete! (6.96 secs)` → IPA 生成
+* IPA: `mobile/ios/xtool/Padbench.ipa`、1,550,798 bytes（SHA-256 `ff98369b…cab7b`）
+* `Payload/Padbench.app/Padbench`: `Mach-O 64-bit arm64 executable`
+* `llvm-nm -gU` で `_uniffi_eightbitdo_uniffi_fn_constructor_mobilesession_new` など
+  UniFFI シンボル 55 個を確認（Rust staticlib が実際にリンクされている）
+* `Info.plist`: `CFBundleIdentifier=io.github.haruki0420.padbench`,
+  `CFBundleName` / `CFBundleDisplayName=Padbench`,
   `NSBluetoothAlwaysUsageDescription`（"read its settings and enable live
   input"）, `UIBackgroundModes=[bluetooth-central]`, `MinimumOSVersion=17.0`
-* Rust staticlib サイズ: 20,899,048 bytes（release、LTO なし）
+* Rust staticlib サイズ: 20,923,544 bytes（release、LTO なし）
+* 内部名は `xtool.yml` の `product: Padbench` と `Package.swift` の product 名で指定。
+  Swift の target / module 名は `EightBitDo` のまま（生成される UniFFI バインディングの
+  `import` を変えないため）
+
+> 旧値（`EightBitDo.ipa` 1,550,522 bytes / `CFBundleIdentifier=dev.eightbitdo.mobile`）は
+> [docs/MOBILE_BUILD_EVIDENCE.md](../docs/MOBILE_BUILD_EVIDENCE.md) §1〜§2 に当時の記録として残しています。
 
 ### 書き込みモード（without-response / with-response）
 
@@ -263,7 +271,7 @@ with-response しか広告しない実装があります。フレーム自体は
 | App Store / TestFlight 配布 | **不可** | macOS + Xcode / Transporter（または macOS CI ランナー） |
 
 * `bundleID` は Apple Developer Services 上で永続なので、最初に確定させる
-  （`mobile/ios/xtool.yml` の `bundleID: dev.eightbitdo.mobile`）。
+  （`mobile/ios/xtool.yml` の `bundleID: io.github.haruki0420.padbench`）。
 * 実機では初回起動後に「設定 > 一般 > VPN とデバイス管理」で開発者を信頼する。
 * 無料 Apple ID では配布用証明書・App Store 配布はできない。
 
@@ -287,8 +295,8 @@ with-response しか広告しない実装があります。フレーム自体は
 | ツールチェーン | AGP **9.5.0** / Gradle **9.8.2**（wrapper 同梱）/ Kotlin **2.4.21**（AGP 9 の built-in Kotlin）/ JDK 21 |
 | Android SDK | `/opt/android-sdk`（platforms;android-36, build-tools;36.0.0） |
 | `./gradlew testDebugUnitTest` | **BUILD SUCCESSFUL**（`FrameQueueTest` 3 + `AppWriteModeTest` 3 + `RustCoreTest` 2 = 8 テスト、失敗 0） |
-| `./gradlew assembleDebug` | **BUILD SUCCESSFUL**（`app/build/outputs/apk/debug/app-debug.apk` = 14,551,011 bytes、JNI 同梱） |
-| Rust JNI ライブラリ | **同梱済み**（`lib/arm64-v8a/libeightbitdo_uniffi.so` 1,266,288 bytes / `lib/x86_64/...` 1,193,896 bytes。NDK r29 + cargo-ndk 4.1.2） |
+| `./gradlew assembleDebug` | **BUILD SUCCESSFUL**（`app/build/outputs/apk/debug/app-debug.apk` = 14,692,156 bytes、JNI 同梱。Padbench 識別子統一後の再ビルド） |
+| Rust JNI ライブラリ | **同梱済み**（`lib/arm64-v8a/libeightbitdo_uniffi.so` 1,266,296 bytes / `lib/x86_64/...` 1,193,928 bytes。NDK r29 + cargo-ndk 4.1.2） |
 
 注意: 上記は Kotlin / Compose / リソース / manifest のコンパイル検証です。
 **2026-11-23 に NDK r29 と cargo-ndk 4.1.2 を導入し、`libeightbitdo_uniffi.so` を
@@ -408,7 +416,7 @@ mobile/android/app/src/main/jniLibs/        # cargo-ndk の .so
    マクロ読み出しは実機で確認していない。iOS は `xtool devices` が空。
 2. **Android の Rust JNI はビルド済み・実機未検証**。NDK 29.0.14206865 と
    cargo-ndk 4.1.2 を導入し、`libeightbitdo_uniffi.so` を同梱した
-   APK（14,551,011 bytes、arm64-v8a / x86_64）の生成に成功しています。
+   APK（14,692,156 bytes、arm64-v8a / x86_64）の生成に成功しています。
    JNI ロードの実機/エミュレータ確認は未実施です。
 3. **設定書き込み・OTA は未公開**。`prepareConfigWrite` まで。
 4. **バックグラウンド書き込み不可**（設計上、前景専用）。

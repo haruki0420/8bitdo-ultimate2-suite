@@ -1,0 +1,195 @@
+@import "tailwindcss";
+@import "./styles/tokens.css";
+
+/* Tailwind への写像（docs/DESIGN_TAURI.md §12 / docs/design/IMPORTED_STYLE_HYPERSTUDIO.md）。
+ * 値は styles/tokens.css で定義した変数を参照するだけで、ここには書きません。 */
+@theme {
+  /* 1180px 未満で右レールを下部へ、1100px 未満で表の補足列を落とす */
+  --breakpoint-cols: 68.75rem;
+  --breakpoint-rail: 73.75rem;
+  /* 1200px 以上はコンテンツ列を中央寄せにする */
+  --breakpoint-wide: 75rem;
+
+  /* 角丸: tags 4 / cards・secondary 8 / icon 99 / 白ピル 9999 */
+  --radius-xs: 4px;
+  --radius-md: 8px;
+  --radius-icon: 99px;
+  --radius-full: 9999px;
+
+  /* タイポグラフィ: 63 / 44 / 34 / 23 / 21 / 18 / 17 / 16 / 14 / 13。
+   * micro 12 はステータスピルと表ヘッダーの mono 専用（Imported style の部品仕様）。 */
+  --text-hero: 3.9375rem;
+  --text-hero--line-height: 4.125rem;
+  --text-display: 2.75rem;
+  --text-display--line-height: 2.875rem;
+  --text-title: 2.125rem;
+  --text-title--line-height: 2.25rem;
+  --text-heading: 1.4375rem;
+  --text-heading--line-height: 1.75rem;
+  --text-subheading: 1.3125rem;
+  --text-subheading--line-height: 1.625rem;
+  --text-lead: 1.125rem;
+  --text-lead--line-height: 1.5rem;
+  --text-dialog: 1.0625rem;
+  --text-dialog--line-height: 1.375rem;
+  --text-body: 1rem;
+  --text-body--line-height: 1.4rem;
+  --text-ui: 0.875rem;
+  --text-ui--line-height: 1.25rem;
+  --text-meta: 0.8125rem;
+  --text-meta--line-height: 1.125rem;
+  --text-micro: 0.75rem;
+  --text-micro--line-height: 1rem;
+
+  /* 字間: 大きい見出しだけ負。小さい文字は 0（メタの大文字だけ僅かに開く） */
+  --tracking-hero: -0.011em;
+  --tracking-display: -0.007em;
+  --tracking-title: -0.004em;
+  --tracking-none: 0em;
+  --tracking-meta: 0.02em;
+
+  /* 曲線は 1 本だけ。時間は duration-90 / 160 / 240 を使う */
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+}
+
+@theme inline {
+  --font-sans: var(--font-ui);
+  --font-mono: var(--font-data);
+
+  /* 寸法 */
+  --spacing-topbar: var(--topbar-h);
+  --spacing-nav: var(--nav-w);
+  --spacing-rail: var(--rail-w);
+  --spacing-rail-min: var(--rail-w-min);
+  --spacing-content: var(--content-max);
+  --spacing-control: var(--control-h);
+  --spacing-control-sm: var(--control-h-sm);
+  --spacing-row: var(--row-h);
+  --spacing-row-header: var(--row-header-h);
+  --spacing-tab: var(--tab-h);
+  --spacing-nav-row: var(--nav-row-h);
+  --spacing-stage: var(--stage-h);
+  --spacing-stage-short: var(--stage-h-short);
+
+  /* 色 — Imported style の色名をそのままユーティリティにする */
+  --color-obsidian: var(--obsidian);
+  --color-carbon: var(--carbon);
+  --color-graphite: var(--graphite);
+  --color-card-slate: var(--card-slate);
+  --color-iron: var(--iron);
+  --color-smoke: var(--smoke);
+  --color-ash: var(--ash);
+  --color-chalk: var(--chalk);
+  --color-signal-white: var(--signal-white);
+  --color-compass-gold: var(--compass-gold);
+  --color-pulse-green: var(--pulse-green);
+  --color-paper-ink: var(--paper-ink);
+  --color-danger: var(--danger);
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100dvh;
+  }
+
+  body {
+    margin: 0;
+    overflow: hidden;
+    background-color: var(--obsidian);
+    color: var(--smoke);
+    font-family: var(--font-ui);
+    font-size: 1rem;
+    line-height: 1.4rem;
+    font-weight: 400;
+    /* 和文の折り返しを行頭・行末の禁則で制御する */
+    line-break: strict;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    margin: 0;
+    color: var(--chalk);
+    font-weight: 400;
+  }
+
+  /* 見出しの階層はサイズとトラッキングだけで作る（weight 400 固定） */
+  h1 {
+    font-size: 2.75rem;
+    line-height: 2.875rem;
+    letter-spacing: -0.007em;
+  }
+
+  ::selection {
+    background-color: var(--chalk);
+    color: var(--obsidian);
+  }
+
+  /* キーボードフォーカスは 1px chalk の輪郭で必ず見せる（影は使わない） */
+  :focus-visible {
+    outline: 1px solid var(--chalk);
+    outline-offset: 2px;
+  }
+
+  /* 数値は等幅で桁を揃える */
+  .font-mono {
+    font-variant-numeric: tabular-nums;
+  }
+
+  :root {
+    caret-color: var(--chalk);
+    scrollbar-width: thin;
+    scrollbar-color: var(--iron) transparent;
+  }
+
+  dialog::backdrop {
+    background: var(--overlay);
+  }
+}
+
+@layer components {
+  /* ネイティブ <dialog> の寸法だけをここで計算する。
+   * 幅 480 / 確認用 560、高さは画面 - 64px、本文だけスクロール、影なし。 */
+  .app-dialog {
+    margin: auto;
+    border: 0;
+    padding: 0;
+    background: transparent;
+    width: min(var(--dialog-w), calc(100vw - 3rem));
+    max-height: calc(100dvh - 4rem);
+  }
+
+  .app-dialog[data-size="lg"] {
+    width: min(var(--dialog-w-lg), calc(100vw - 3rem));
+  }
+}
+
+/* 入場アニメーションはダイアログとトーストだけ。opacity と translateY のみを動かす。 */
+@keyframes padbench-pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.toast-enter,
+.dialog-enter {
+  animation: padbench-pop-in var(--dur-3) var(--ease-standard);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0ms !important;
+    animation-duration: 0ms !important;
+  }
+}

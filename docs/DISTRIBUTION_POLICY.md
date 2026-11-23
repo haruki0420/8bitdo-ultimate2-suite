@@ -111,13 +111,13 @@
 - ロゴ・アイコン・ワードマーク画像、公式アプリのスクリーンショット・UI 素材。
 - `.gitignore` による除外を維持する。CI での資産スキャン（`scripts/check-proprietary-assets.sh` 相当）は未導入で、導入には workflow の変更が必要（[THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md) 付録 C）。
 
-### 3.3 アプリ名に商標・製品名を使わない（決定）
+### 3.3 アプリ名に商標・製品名を使わない（決定・適用済み）
 
-- モバイルの表示名は現在 **"Ultimate2 Mobile"**（iOS `CFBundleDisplayName` / Android `app_name`、2026-11-23 確認）。8BitDo を含まないが、**同社の製品名 "Ultimate 2" を含む**ため、下記の決定に適合しない。
-- **決定**: ストア掲載名・アプリ表示名に、第三者の商標（8BitDo）だけでなく**同社の製品名 "Ultimate 2" も使わない**。自前の名称を使い、製品名は「対応機種」の説明文に限る（例: 説明文の "for 8BitDo Ultimate 2" は説明的使用）。
+- 旧表示名は **"Ultimate2 Mobile"**（iOS `CFBundleDisplayName` / Android `app_name`）。8BitDo を含まないが、同社の製品名 "Ultimate 2" を含むため本節の決定に適合せず、2026-11-23 に自前名称 **Padbench** へ変更した。
+- **決定（2026-11-23 適用）**: ストア掲載名・アプリ表示名に、第三者の商標（8BitDo）だけでなく**同社の製品名 "Ultimate 2" も使わない**。自前の名称（表示名 **Padbench**）を使い、製品名は「対応機種」の説明文に限る（例: 説明文の "for 8BitDo Ultimate 2" は説明的使用）。
   - 理由: Apple 5.2.1 では、アプリ名・サブタイトル・アイコンでの第三者のブランド利用が典型的な拒否理由になるとされる。Google Play も知的財産・なりすましポリシーでメタデータを審査する。製品名を名前に含めると、非公式の明記だけでは公式アプリとの混同リスクが残る。
-  - **未実施**: 現行表示名はこの決定に適合しないため、ストア申請前に自前名称へ変更する（§7 #1）。
-- 識別子: Android の `applicationId` と iOS の `bundleID` はいずれも `dev.eightbitdo.mobile`（2026-11-23 確認。iOS は `mobile/ios/xtool.yml`）。ユーザーに表示されない識別子だが、最終名称の決定時に applicationId / bundle identifier / プロジェクト名を再確認し、必要なら変更する。
+  - **適用範囲**: Tauri デスクトップの `productName` / ウィンドウタイトル / `identifier`、egui 版の表示名とウィンドウタイトル、Android の `app_name` / `applicationId` / `namespace`、iOS の `CFBundleDisplayName` / `CFBundleName` / `bundleID`。リポジトリ名 `8bitdo-ultimate2-suite` は既存の GitHub URL を維持するため変更しない。
+- 識別子: デスクトップ・モバイル共通で **`io.github.haruki0420.padbench`** に統一した（2026-11-23。iOS は `mobile/ios/xtool.yml`、Android は `applicationId`）。Apple Developer Services 上で永続なので以後変更しない。Android の Kotlin ソースパッケージ `dev.eightbitdo.mobile` と UniFFI の `dev.eightbitdo.mobile.core` は内部コード名前空間であり、表示名・識別子ではないため据え置く。
 - iOS の `NSBluetoothAlwaysUsageDescription` は "your 8BitDo Ultimate 2 controller" と記述している。用途説明は説明的使用として維持し、審査ノートで非公式・非提携を説明する（§3.4）。
 
 ### 3.4 ストア審査向けの扱い（決定）
@@ -273,7 +273,7 @@ tip IAP（1 商品 300〜600 円・機能解放なし）や有料アプリは、
 
 | # | 項目 | 現状 | 決めるタイミング |
 | --- | --- | --- | --- |
-| 1 | プロダクト名・ストア掲載名の最終決定 | 現行表示名 "Ultimate2 Mobile" は製品名 "Ultimate 2" を含むため §3.3 に適合しない（自前名称へ変更が必要）。applicationId / bundle identifier（`dev.eightbitdo.mobile`）の再確認も含む | ストア申請前 |
+| 1 | プロダクト名・ストア掲載名の最終決定 | **決定済み（2026-11-23）**: 表示名 **Padbench**、識別子 `io.github.haruki0420.padbench`（desktop / mobile 共通）。ストアのメタデータもこの名前で申請する（§3.3） | — |
 | 2 | CLA の要否 | 導入しない（§2.3）。将来デュアルライセンス / source-available へ転換する場合のみ必要 | 最初の外部貢献を受け入れる前、または有料化を決めた時点 |
 | 3 | 有料化の時期・内容 | 初期は寄付・サポート・bounty（§6.1）。tip IAP・有料アプリは条件付きの将来案（§6.2） | 無料配布 6 か月後の実績レビュー時 |
 | 4 | App Store 審査方針 | 非公式・説明的使用で申請する方針は決定（§3.4）。OTA をストア版に含めるか、審査ノートの文面は未決定。リジェクト時は §5.4 の代替方針（OTA をデスクトップ限定）に従う | OTA の実機検証完了後、申請前 |

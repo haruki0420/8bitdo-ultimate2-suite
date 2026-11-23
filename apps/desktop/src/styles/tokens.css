@@ -1,0 +1,82 @@
+/* Padbench design tokens — Imported style: Hyperstudio
+ *
+ * 正本: docs/design/IMPORTED_STYLE_HYPERSTUDIO.md
+ *       （出典 https://styles.refero.design/style/8eb9c53e-d69c-497a-b640-610856cf3a60）
+ * 出典は参考であり、Refero / Hyperstudio との提携・推奨関係はありません。
+ *
+ * このファイルは色・寸法・モーションの値を定義します。Tailwind の `@theme`
+ * （index.css）はここで定義した変数を参照し、タイポグラフィ・角丸・ブレークポイント・
+ * `--ease-standard` は index.css の `@theme` 側にあります。`src/design/tokens.ts` は
+ * テストと TypeScript から同じ値を参照するための写しで、tokens.test.ts が一致を
+ * 検査します。値を変えるときは 4 か所（ここ・index.css の `@theme`・tokens.ts・
+ * テスト）を同時に直します。
+ *
+ * 概念: 「黒曜石に刻んだ青写真」。near-black のキャンバス、1px のヘアライン、
+ * 白 1 色のピル、compass-gold のアイコン線。影・グラデーション・色付きの塗りはありません。
+ */
+
+:root {
+  color-scheme: dark;
+
+  /* 色 — 11 色 + 派生 2 色。名前は Imported style の定義をそのまま使う */
+  --obsidian: #101010; /* ページ canvas */
+  --carbon: #080808; /* 最深部・ダイアログ・トースト・ステージ */
+  --graphite: #212121; /* 1px 境界線・区切り */
+  --card-slate: #3b3d45; /* カード/パネルの境界アクセント */
+  --iron: #474747; /* 二次境界・ストローク */
+  --smoke: #9c9c9c; /* 副次テキスト・キャプション・本文 */
+  --ash: #c1c1c1; /* 中間境界・三次テキスト */
+  --chalk: #f3f3f3; /* 主テキスト・見出し・本文 */
+  --signal-white: #ffffff; /* 唯一の主アクション = 白ピルの塗り */
+  --compass-gold: #6f6759; /* アイコンのストローク専用 */
+  --pulse-green: #98ff38; /* ライブ/接続中のドットと入力モニターの軌跡線専用 */
+
+  /* 派生: ステータスピルと選択行の地、危険の 1px 枠（色は 1 色だけ追加） */
+  --paper-ink: #1a1a1a;
+  --danger: #b42318;
+  --overlay: rgba(8, 8, 8, 0.72);
+
+  /* 書体
+   * TODO(fonts): Inter / JetBrains Mono / IBM Plex Mono の woff2 サブセットは未同梱です。
+   * apps/desktop/public/fonts/ に置いたら @font-face（font-display: swap）と preload を
+   * 追加し、このスタックの先頭に実在する状態にしてください。日本語は Noto Sans JP を
+   * Inter の後ろに置きます。現状は OS フォールバックです。 */
+  --font-ui:
+    "Inter", "Noto Sans JP", "Noto Sans CJK JP", "Hiragino Kaku Gothic ProN",
+    "Yu Gothic UI", "Yu Gothic", system-ui, sans-serif;
+  --font-data:
+    "JetBrains Mono", "IBM Plex Mono", "SFMono-Regular", "Cascadia Mono",
+    ui-monospace, "DejaVu Sans Mono", monospace;
+
+  /* 寸法: 200% ズームでも崩れないよう rem で持つ（52px = 3.25rem など） */
+  --topbar-h: 3.25rem;
+  --nav-w: 13.5rem;
+  --rail-w: 21.5rem;
+  --rail-w-min: 20rem;
+  --content-max: 75rem;
+  --control-h: 2.5rem;
+  --control-h-sm: 2.25rem;
+  --row-h: 2.75rem;
+  --row-header-h: 2.25rem;
+  --tab-h: 2.5rem;
+  --nav-row-h: 2.25rem;
+  --stage-h: 15rem;
+  --stage-h-short: 12.5rem;
+  --dialog-w: 30rem;
+  --dialog-w-lg: 35rem;
+
+  /* モーション: 曲線は 1 本だけ（index.css の @theme の `--ease-standard`）。
+   * アニメーションはダイアログとトーストの入場だけ */
+  --dur-1: 90ms;
+  --dur-2: 160ms;
+  --dur-3: 240ms;
+}
+
+/* reduce-motion: 動きだけを止め、状態は残す */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-1: 0ms;
+    --dur-2: 0ms;
+    --dur-3: 0ms;
+  }
+}

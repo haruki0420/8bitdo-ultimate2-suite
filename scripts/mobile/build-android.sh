@@ -39,7 +39,7 @@ echo "==> UniFFI bindings"
 
 if [ "$KOTLIN_ONLY" -eq 0 ]; then
   command -v cargo-ndk >/dev/null 2>&1 || {
-    echo "cargo-ndk not found; install it or run with --kotlin-only" >&2
+    echo "cargo-ndk not found; install it (or add \$HOME/.cargo/bin to PATH) or run with --kotlin-only" >&2
     exit 1
   }
   if [ -z "${ANDROID_NDK_HOME:-}" ] && [ ! -d "${ANDROID_HOME}/ndk" ]; then

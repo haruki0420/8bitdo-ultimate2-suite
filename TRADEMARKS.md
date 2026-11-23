@@ -13,6 +13,8 @@
 English summary:
 
 > "8BitDo" is a registered trademark of Shenzhen Bestodo Tech Co., Ltd. "Ultimate 2" is a product name of the same company; its standalone trademark registration has not been verified by this project. This project is an unofficial, independent open-source project and is not affiliated with, endorsed by, or sponsored by 8BitDo or Shenzhen Bestodo Tech Co., Ltd. We do not use 8BitDo logos, icons, official screenshots, or other brand assets. Compatibility statements are descriptive only and do not imply endorsement.
+>
+> Our product name is "Padbench", and the application identifiers are "io.github.haruki0420.padbench". Statements such as "supports 8BitDo Ultimate 2" are descriptive only.
 
 ## その他の第三者の商標
 
@@ -26,6 +28,8 @@ English notice:
 
 ## 本プロジェクト名の扱い
 
+- 本プロジェクトの表示名は **Padbench**（2026-11-23 決定）、識別子は `io.github.haruki0420.padbench` です。アプリ名・ウィンドウタイトル・ストア掲載名に、第三者の商標（"8BitDo"）や製品名（"Ultimate 2"）は使いません。
+- 対応機種の説明（例: 「8BitDo Ultimate 2 対応」）は説明的使用であり、アプリ名としての使用とは区別します。
 - fork や再配布では、本プロジェクト名・ロゴ・メンテナ名を、推奨・提携・公式性を示す形で使用しないでください。
 - 改変版を配布する場合は別の名称を使用し、改変されていることを明記してください。
 - 本プロジェクトの名称・ロゴに関する権利は留保します。

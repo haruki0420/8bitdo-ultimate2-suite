@@ -62,8 +62,8 @@ macro_rules! define_keys {
 
 define_keys! {
     // Window and top bar.
-    WindowTitle => "8BitDo Ultimate 2" | "8BitDo Ultimate 2",
-    AppTitle => "8BitDo Ultimate 2" | "8BitDo Ultimate 2",
+    WindowTitle => "Padbench" | "Padbench",
+    AppTitle => "Padbench" | "Padbench",
     WriteCapable => "書き込み対応ビルド" | "Write-capable build",
     LangJapanese => "日本語" | "日本語",
     LangEnglish => "English" | "English",
@@ -740,6 +740,10 @@ mod tests {
         assert_eq!(t(Lang::Ja, Key::NavConfig), "設定値");
         assert_eq!(t(Lang::Ja, Key::SectionActions), "読み取り操作");
         assert_eq!(t(Lang::Ja, Key::SectionDevice), "デバイス");
+        assert_eq!(t(Lang::Ja, Key::WindowTitle), "Padbench");
+        assert_eq!(t(Lang::En, Key::WindowTitle), "Padbench");
+        assert_eq!(t(Lang::Ja, Key::AppTitle), "Padbench");
+        assert_eq!(t(Lang::En, Key::AppTitle), "Padbench");
     }
 
     #[test]
