@@ -19,8 +19,10 @@
 | 最大の不足 | ①設定の**全フィールド読み取り**、②型付き**設定編集**（`ConfigEdit` 相当）、③**設定書き込み**（pre-write backup + TOCTOU + read-back）、④**リマップ**、⑤**マクロ書き込み / 復元**、⑥**プロファイル切替**、⑦**`request_input`（0x0003）と `0x0007` の副作用**、⑧**バックアップ / 復元のファイル形式**、⑨**構造化エラー**、⑩**空スロットへのマクロ新規作成**（core が `EmptyMacroWrite` で拒否） |
 | 画面数 | Android / iOS とも **16 項目**（A1–A16 / I1–I16。画面 14 + OTA + 共通基盤。うち既存は 1）。Android はナビゲーション自体が無く、iOS は `NavigationStack` の器だけあって画面遷移が無い |
 | 工数（概算） | 共有 Rust / UniFFI **19–32 人日**、Android **25–41 人日**、iOS **27–43 人日**、合計 **71–116 人日**（OTA とストア準備を除く。S/M/L の素点は §8.1）。1 人なら約 3.5–6 か月、2 人並行で約 2.5–4 か月。OTA は wire 確定後に **+9–14 人日** |
-| 必須ブロッカー | **BLE 実機**（このホストに無い）、**iOS の署名 / ストアは macOS + Xcode 必須**（unsigned IPA までは Linux で可）、**OTA は core の wire 未確定**、**プロファイル切替の永続性・実効が未確認**、**マクロ書込の実機証跡が S1 / M1・M2 のみ**、**表示名が商標方針に不適合**（[DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md) §3.3） |
+| 必須ブロッカー | **Android / iPhone の実機**（このホストに無い）、**iOS の署名 / ストアは macOS + Xcode 必須**（unsigned IPA までは Linux で可）、**OTA は core の wire 未確定**、**プロファイル切替の永続性・実効が未確認**（Linux + CLI で検証可）、**マクロ書込の実機証跡が S1 / M1・M2 のみ**、**表示名が商標方針に不適合**（[DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md) §3.3） |
 | 公開順序 | 読み取り完成 → 書き込み基盤（安全フロー）→ 実機検証 → 書き込み公開（Tier 3）→ マクロ → ファイル互換 → OTA → ストア配布 |
+
+> **実機の所在（2026-11-23 実測）**: このホストには **BLE アダプタ（`F0:68:E3:CF:82:29`）と 8BitDo Ultimate 2（`80ND` / `E4:17:D8:55:BD:AA`）があり、Linux + CLI で共有 Rust の読み取り / 書き込みは検証済み**（[DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md)、[AGENTS.md](../AGENTS.md) §6、`config-backup-*` の残存）。実機待ちなのは **Android / iPhone の端末**、iOS の署名 / ストア（macOS + Xcode）、表示名の決定。**共有 Rust / UniFFI の書き込み安全フローの検証はモバイル実機を待たずに先行できる**。
 
 ---
 
@@ -76,7 +78,7 @@
 
 | 項目 | 状態 |
 | --- | --- |
-| Android / iOS 実機での BLE スキャン・接続・読み取り | **未実施**（実機なし） |
+| Android / iOS 実機での BLE スキャン・接続・読み取り | **未実施**（Android / iPhone の端末が無い。Linux の BLE アダプタとコントローラはあり、CLI では実機検証済み） |
 | JNI ロード（実機 / エミュレータ） | **未実施**（ホストの emulator 実行ファイルが実行不可。§6.2） |
 | 書き込み・リマップ・マクロ書き込み | **モバイルでは未公開**。デスクトップでも GUI 書込は実機未検証（AGENTS.md §6） |
 | iOS 署名・実機インストール・TestFlight / App Store | **未実施**（実機と macOS が必要） |
@@ -139,7 +141,7 @@
 
 | デスクトップ側の機能 | 実体 | モバイルに必要な API |
 | --- | --- | --- |
-| `config write` / GUI 設定タブ | `ConfigWritePlan` + `Session::write_full_config`（pre-write backup / TOCTOU / Save / read-back は呼び出し側） | API-4 |
+| `config write` / GUI 設定タブ | `ConfigWritePlan` + `Session::write_full_config`（chunk 送信 → Save → 待機 → read-back 比較まで **core 内**で実施。呼び出し側の責務は pre-write backup / TOCTOU / 確認 UI のみ） | API-4 |
 | `config set` / GUI 設定タブ | `ConfigEdit` 13 種 + `prepare` | API-3 |
 | `config remap` / GUI リマップ | `ConfigEdit::ButtonRemap` + `button_mappings` | API-2 / API-3 |
 | `config map show` | `button_mappings` / `button_mapping` | API-2 |
@@ -490,6 +492,38 @@ pub struct MacroWriteReport {
     pub packets_sent: u32,
     pub read_back: MacroEntryView,
     pub read_back_matches: bool,
+}
+
+/// 復元（slot 単位バッチ）の準備結果。`commit_macro_restore` にのみ渡す不透明型。
+#[derive(uniffi::Object)]
+pub struct MacroRestorePreparation;
+
+/// `write_macro_slot`（`MacroSlotWriteOutcome`）の slot 単位の結果。
+#[derive(uniffi::Record)]
+pub struct SlotRestoreReport {
+    pub slot: u8,                 // 1..=3
+    pub written: u8,              // 書いたマクロ数（0..=4）
+    pub packets_sent: u32,        // ヘッダ + 最初の Save + Erase/Write + 最後の Save
+    pub read_back_matches: bool,
+    pub flag: u32,                // 書込後のスロット有効化フラグ（core の flag）
+    pub total_cnt: u8,            // 書込後の登録マクロ数（core の total_cnt）
+}
+
+#[derive(uniffi::Record)]
+pub struct MacroRestoreReport {
+    pub backup: BackupRefView,
+    pub slots: Vec<SlotRestoreReport>,   // 書いた slot のみ（slot 単位バッチ）
+    pub config_crc_valid: bool,          // core の config_crc_valid と同じ意味
+}
+
+/// `write_macro_header`（`MacroHeaderOutcome`、`0x0001` + `0x0006`）の結果。
+#[derive(uniffi::Record)]
+pub struct MacroHeaderReport {
+    pub slot: u8,                 // 1..=3
+    pub packets_sent: u32,        // ヘッダ chunk + Save
+    pub config_crc_valid: bool,
+    pub flag: u32,                // 書込後のスロット有効化フラグ
+    pub total_cnt: u8,            // 書込後の登録マクロ数
 }
 
 impl MobileSession {
@@ -1027,16 +1061,16 @@ mobile/ios/                      # 画面・transport・Files・署名
 | Android JVM ユニットテスト（8 件） | **可能**（`gen-bindings.sh` 後） | — | — | SDK 36 / JDK 21 / wrapper。生成物が無いとコンパイルできない（§3.4） |
 | Android debug APK（JNI 同梱）ビルド | **可能** | — | — | NDK 29 + cargo-ndk 4.1.2（実績 #21） |
 | Android APK の起動 / JNI ロード | **現状不可**（emulator 実行ファイルが root 所有で `o+x` 無し） | **可能** | — | KVM と AVD（android-34 x86_64）は存在。権限修正で起動確認の余地あり |
-| Android BLE スキャン / 接続 / 読み書き | 不可 | **必須** | — | エミュレータは BLE 非対応 |
+| Android BLE スキャン / 接続 / 読み書き | 不可（Android アプリ経由。デバイスとの BLE 自体は Linux + CLI で検証済み） | **必須** | — | エミュレータは BLE 非対応。共有 Rust の BLE 経路は Linux で先行検証できる |
 | iOS unsigned IPA ビルド | **可能** | — | — | xtool + Darwin SDK（実績 #21） |
 | Swift 純ロジックテスト（`WriteAckTracker`） | **可能** | — | — | `scripts/mobile/test-write-ack-tracker.sh` |
 | iOS シミュレータ起動 / デバッグ | 不可 | — | **必須** | Xcode |
 | iOS 実機インストール | 条件付きで可能（USB + Apple ID + `xtool --sign`） | **必須** | （Xcode でも可） | このホストは `xtool auth status` ログイン済み。端末未接続 |
 | TestFlight / App Store 提出 | 不可 | — | **必須** | macOS + Xcode / Transporter |
 | Android ストア提出 | 可能（AAB + keystore + Play Console） | — | — | Google Play は Web から申請 |
-| 実機 BLE 書き込み（設定 / リマップ / マクロ） | 不可 | **必須** | — | Tier 3 + pre-write backup + read-back |
-| プロファイル切替の永続性 / 実効 | 不可 | **必須** | — | 再接続・電源断を跨ぐ確認 |
-| OTA | 不可 | **必須**（wire 確定後） | — | btsnoop 取得が前提 |
+| 実機 BLE 書き込み（設定 / リマップ / マクロ） | **可能（共有 Rust の write path は CLI で検証済み。モバイル経由は未実施）** | **必須**（モバイルアプリ経由） | — | Tier 3 + pre-write backup + read-back。Linux + CLI の実績は [DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) と [AGENTS.md](../AGENTS.md) §6 |
+| プロファイル切替の永続性 / 実効 | **可能（未実施）**（Linux + CLI の `config profile`） | **必須**（モバイルアプリ経由） | — | 再接続・電源断を跨ぐ確認。[DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) §7 は ACK と `cur_slot` 6→1 まで確認済み |
+| OTA | **可能（未実施）**（`btmon` で btsnoop 採取。`/usr/bin/btmon` 実在。ファームイメージは未取得） | **必須**（Android HCI snoop / wire 確定後） | — | btsnoop 取得が前提（[OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md)） |
 | ストア審査（メタデータ・Review Note） | 不可 | — | **必須**（iOS） | Android は Web |
 
 ### 6.2 このホストの実測状態（2026-11-23）
@@ -1052,7 +1086,8 @@ mobile/ios/                      # 画面・transport・Files・署名
 | `xtool devices` | 応答なし（本監査では `timeout 12` でも出力なし。端末未接続と推測。**ハングするので必ず timeout を付ける**） |
 | Android エミュレータ | `/opt/android-sdk/emulator/emulator` は `-rwxr--r-- root root` で一般ユーザー実行不可。`/dev/kvm` あり。AVD `ut2`（android-34 / x86_64）あり。system-image `android-34 / google_apis` あり。**BLE はエミュレータで不可** |
 | xcodebuild / gradle（グローバル） | 無し（Gradle は wrapper 同梱） |
-| Swift ホストテスト | `scripts/mobile/test-write-ack-tracker.sh` = `WriteAckTrackerTests: all checks passed`（本監査で再実行） |
+| Swift ホストテスト | `scripts/mobile/test-write-ack-tracker.sh` = `WriteAckTrackerTests: all checks passed`（5 チェック。本監査で再実行） |
+| BLE アダプタ / コントローラ | Controller `F0:68:E3:CF:82:29`（default）。`bluetoothctl info` で `80ND`（`E4:17:D8:55:BD:AA`）が `Connected: yes`。`config-backup-*`（実機バックアップ）が worktree に残存。`/usr/bin/btmon` 実在。**Linux + CLI で実機の読み取り / 書き込み / マクロ復元を検証できる**（[DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md)、[AGENTS.md](../AGENTS.md) §6） |
 | 本監査での再実行（2026-11-23） | `cargo test -p eightbitdo-uniffi --locked` = **14 passed**、`gen-bindings.sh` = **uniffi 0.31.2（Kotlin / Swift bindgen 一致）**、`./gradlew --no-daemon testDebugUnitTest` = **BUILD SUCCESSFUL（8 テスト）**、`test-write-ack-tracker.sh` = **all checks passed**。IPA / JNI APK の再ビルドはしていない（[MOBILE_BUILD_EVIDENCE.md](MOBILE_BUILD_EVIDENCE.md) の #21 を参照） |
 
 ### 6.3 検証コマンド
@@ -1151,20 +1186,21 @@ EOF
 - 1 人で進める場合: **約 3.5–6 か月**（71–116 人日、OTA・ストア除く）。2 人（共有 Rust → Android / iOS 並行）で **約 2.5–4 か月**（共有 19–32 人日の後に、27–43 人日のプラットフォーム側を並行）。
 - 見積りは「経験者が連続作業した場合」の粗い値。Tier 3 レビュー待ち・実機待ち・ストア審査待ちは含まない。
 - 最も重いのは **設定編集画面（L）とマクロエディタ（L）**。どちらもプラットフォームごとに UI を作り直す必要がある（ロジックは Rust）。共有側の L は **API-4（設定書き込み）と API-6（マクロ書き込み）**で、ここが安全手順・TOCTOU・バックアップを含むため Tier 3 の中心になる。
+- **未計上（注記）**: 上の 19–32 人日は API 実装のみで、共有基盤の §5.1（日本語文言 / 用語集）、§5.4（共有テストベクタの整備）、§5.6（配置・雛形の一本化）と §9 R17（CI への Android / iOS ビルド追加）を含んでいない。実装時は **+3–7 人日程度**を別枠で見込み、CI は nightly 運用のコストも別途見る。
 
 ### 8.2 クリティカルパス
 
 1. API-1〜4（設定ビュー・編集・書き込み安全フロー）→ M2 → 実機検証 → M3
 2. API-5〜6（マクロ）→ M4 → 実機検証（S2/S3・M3/M4）
-3. 実機の調達（このホストに無い）
+3. **Android / iPhone 実機**の調達（コントローラと Linux BLE アダプタはこのホストにあるため、共有 Rust の読み取り / 書き込み検証は先行できる）
 4. iOS の macOS 環境（ストア配布）
 
 ### 8.3 ブロッカー（工数に含めない外部依存）
 
 | ブロッカー | 影響する作業 | 必要なもの / 現状 |
 | --- | --- | --- |
-| **BLE 実機**（Android 端末 + 8BitDo Ultimate 2） | M2 後半〜M6 の検証、書き込み公開（M3） | このホストに無い。読み取り → 書き込みの順で 1 台から |
-| **iPhone 実機 + Apple ID** | iOS の実機インストール / BLE 検証 | このホストは `xtool auth status` ログイン済みだが端末未接続。無料 Apple ID では配布証明書なし |
+| **Android / iPhone 実機**（コントローラはこのホストにある） | M3 以降のモバイル検証（アプリ経由の BLE・JNI ロード・インストール） | このホストに無い。**Linux BLE アダプタ + 8BitDo Ultimate 2 はあり、共有 Rust の読み取り / 書き込みは CLI で検証済み**。端末は 1 台から、読み取り → 書き込みの順で |
+| **iPhone 実機 + Apple ID** | iOS の署名付き実機インストール | このホストは `xtool auth status` ログイン済みだが端末未接続。無料 Apple ID では配布証明書なし |
 | **macOS + Xcode** | iOS シミュレータ、TestFlight / App Store 提出、プライバシーマニフェスト検証 | 無し（Linux では unsigned IPA まで） |
 | **ファームウェアイメージ + btsnoop 採取環境** | OTA（M6）の wire 確定 | Android の HCI snoop または Linux `btmon`。公式 `.dat` はリポジトリに置かない |
 | **表示名の決定** | ストア申請（M7） | `Padbench` 系列に揃えるか別名か（§10 #1）。`applicationId` / `bundleID` の再確認も |
@@ -1176,7 +1212,7 @@ EOF
 
 | # | リスク | 影響 | 対策 | 検出方法 |
 | --- | --- | --- | --- | --- |
-| R1 | **実機 BLE が無い**（このホストにデバイスが無い） | 読み取り以降の全検証が止まる | 実機を調達し、読み取り → 書き込みの順で検証。M3 まで書き込みを公開しない | 実機テスト |
+| R1 | **モバイル実機（Android / iPhone）が無い**（コントローラと Linux BLE アダプタはこのホストにある） | **モバイルアプリ経由**の読み取り以降の検証が止まる。共有 Rust の書き込み検証は Linux + CLI で先行可 | 端末を調達し、読み取り → 書き込みの順で検証。M3 までモバイルの書き込みを公開しない | 実機テスト |
 | R2 | iOS の MTU 推定が with-response 専用機種で誤る（`.withoutResponse` の最大書込長が 0 になる可能性） | 接続失敗（リンク切断） | 実機で properties と `maximumWriteValueLength` を記録。必要なら with-response 側の値も見るフォールバック | 実機ログ / btsnoop |
 | R3 | write-without-response のフロー制御・キュー溢れ | フレーム欠落 → 読み取り失敗 / 書き込み失敗 | 既存の fail-closed（部分成功にしない）を維持。74B cap を守る | 実機 + Rust テスト |
 | R4 | Android OEM 差（MTU 200 要求失敗、CCCD 失敗、GATT 切断） | 接続不可 / 読み取り不可 | エラー文言の整備、機種別の記録、再試行 1 回 | 実機マトリクス |
