@@ -5,7 +5,7 @@
 - 位置づけ: 本文書は**推奨（非規範）**。レビュー checklist・Tier 判定の正本は [docs/REVIEW_TIERS.md](REVIEW_TIERS.md) です。本文書はレビューの義務や差し戻し条件を課しません（§4 の 3 項）。以下の「推奨基準」は判断の目安で、満たさない画面を自動的に不合格にはしません。
 - 適用対象: 本リポジトリのデスクトップ GUI。**main の GUI は egui 版（`crates/eightbitdo-gui`）が正本**で、**Tauri v2 版は `feat/tauri-gui` ブランチで再構築中**です。**Tauri 版がマージされた時点で、本文書の Tauri 記述が有効**になります。モバイル（Kotlin / Swift）はネイティブ UI のため、§2.1 の CSS / DOM 前提の検出手段はそのままは使えません（色定数・フォントサイズ定数の静的検査と目視で代替します）。
 - main との関係: main の `AGENTS.md` §3・`README.md` の GUI 節・`crates/eightbitdo-gui/README.md`・`docs/IMPLEMENTATION_PLAN.md` は **egui 前提**（「Tauri を使わない」と明記）です。Tauri v2 の許可・GUI 再構築・表示名 **Padbench** への改名は `feat/tauri-gui` で**実施済み（main 未反映）**で、**本文書は main の技術スタック記述を変更しない**。
-- 正本の関係: 方向 5 行・見せ場（Moments）・署名・トークン・用語集・8 状態の正本は、**マージ後の `feat/tauri-gui` の `docs/DESIGN_TAURI.md`**（§4 / §6.3 / §8.2）です。本文書は方法論だけを扱い、その内容を要約・再定義しません（§5）。egui 版（main）は Tauri 版の方向・用語集の対象外です。
+- 正本の関係: 方向 5 行・見せ場（Moments）・署名・トークン・用語集・8 状態の正本は、**マージ後の `feat/tauri-gui` の `docs/DESIGN_TAURI.md`**（§4 / §5 / §6.3 / §8.2）です。本文書は方法論だけを扱い、その内容を要約・再定義しません（§5）。egui 版（main）は Tauri 版の方向・用語集の対象外です。
 - `feat/tauri-gui` は未マージのため、本文書ではパス名の言及にとどめ、リンクしません（マージ後に参照してください）。
 
 ## 適用のトリアージ（どこまでやるか）
@@ -53,16 +53,16 @@ unslop の判断に倣い、適用量を 3 段階で決めます。
 | 絵文字をアイコン代わりに使用 | 絵文字コードポイントのテスト（`terminology.test.ts`） | 【grep】`i18n.rs` と画面コードの絵文字スキャン | 0 件（Tauri 版は 16px・1.5 stroke の線画。egui 版はアイコンを描画せず、× も線分で描画） |
 | 紫・ネオンの使用 | 色相の検査 | 【grep/目視】色定数の色相検査 | 使用しない |
 | 過剰な影・グロー・カラーブラー | `box-shadow` / `filter: blur` の検査 | 【grep】`Shadow` / `Stroke` の使用箇所 | 影は Tauri の `--shadow-pop` の 1 種のみ（ポップオーバー・ダイアログ・トースト） |
-| 4px グリッド外の余白 | 任意値（`[...px]`）の grep | 【grep】`SPACE_*` と直書きの余白値 | 原則 4px 倍数（2px の微調整・中央寄せの奇数値は許容） |
-| 角丸の量産（`rounded-full` の多用） | クラス集計と `RADIUS` トークン外の値の grep | 【テスト】`geometry_fits_the_minimum_window_with_one_content_column` が `RADIUS_*` の 4 種を検査 | 角丸は限られた段（4 種程度）に限定し、ピル化しない |
-| 11px 未満の文字 | サイズトークン検査 | 【grep】`FONT_*` 定数と 11px 未満の検出 | 11px 未満は作らない（11px はデータ補助のみ） |
+| 4px グリッド外の余白 | 任意値（`[...px]`）の grep | 【grep】`SPACE_*` と直書きの余白値 | 4px グリッド。意味で固定した値以外を `margin` に書かない（正本 §5.3.1） |
+| 角丸の量産（`rounded-full` の多用） | クラス集計と `RADIUS` トークン外の値の grep | 【テスト】`geometry_fits_the_minimum_window_with_one_content_column` が `RADIUS_*` の 4 種を検査 | 角丸は 4 段 + 全円（正本 §5.3.3）。全円はスイッチ・進捗バー・リングのみ |
+| 11px 未満の文字 | サイズトークン検査 | 【grep】`FONT_*` 定数と 11px 未満の検出 | 11px 未満は作らない（11px は caption / バッジ、データは 12px） |
 | コントラスト不足 | 実測計算（`contrastRatio`） | 【テスト】`theme.rs` の `contrast_ratio` テスト | AA: 本文 4.5:1、大文字 3:1、操作輪郭 3:1 |
 | 用語の不統一・禁止語 | 用語集テスト（`VOCAB` / `terminology.test.ts`） | 【grep/目視】`i18n.rs` の文字列を**対象 UI の用語集**と突き合わせ（egui 用の用語集テストは無い） | 対象 UI の用語集に照らして旧語 0 件 |
 | 未検証の主張 | コピーのレビュー + grep | 【レビュー/grep】コピーのレビュー + grep | 「完全」「絶対」「10x」等の断定なし |
 
 > **Tauri 側は導入予定**: main には Tauri 版のコードもテストもありません。`feat/tauri-gui` で `apps/desktop` に `tokens.test.ts` / `terminology.test.ts` 等を追加中で、実装後は `apps/desktop/src/**/*.test.ts(x)` の同じテスト群へ画面追加分を足します。`apps/desktop` のテストは root の CI では走りません（手動 `pnpm test`）。
 
-> **egui 版（main）のテスト実体**: `theme.rs` 8 件・`i18n.rs` 9 件。既存テストで担保されるのは文字スケール・コントラスト・幾何（角丸 4 種）・フォント同梱で、4px 倍数・トークン単一性・禁止語突き合わせのテストはありません（表で【grep/目視】とした項目）。egui 版は Tauri 版の P2 以降に凍結予定です（`docs/TAURI_PLAN.md`）。
+> **egui 版（main）のテスト実体**: `theme.rs` 8 件・`i18n.rs` 9 件。既存テストで担保されるのは文字スケール・行高と字間・コントラスト・面の明度階段・状態色の可読性・幾何（角丸 4 種を含む）・フォント同梱で、4px 倍数・トークン単一性・禁止語突き合わせのテストはありません（表で【grep/目視】とした項目）。egui 版は Tauri 版の P2 以降に凍結予定です（`docs/TAURI_PLAN.md`。移行完了時に再判断）。
 
 > **用語**: egui 版の現行語（`i18n.rs` の「ライブ入力」「設定値」等）は、Tauri 版の用語集を遡って適用しません。推奨基準は常に**対象 UI の用語集**に対して判定します。
 
@@ -75,7 +75,7 @@ unslop の判断に倣い、適用量を 3 段階で決めます。
 - **署名**がアプリ全体で 1 つに絞られ、必要な場所にだけ現れているか（画面ごとに足さない）。
 - クローム（ナビ・ボタン・枠）が静かか。内容より目立っていないか。
 - **8 状態**が設計されているか（定義は Tauri 版の `docs/DESIGN_TAURI.md` §8.2。egui 版は対象外）。
-- 数値の桁揃え（Tauri 版は `tabular-nums`、egui 版は等幅フォント）と書式の統一。
+- 数値の桁揃え（Tauri 版は Hack で組む。`tabular-nums` は使わない。egui 版は等幅フォント）と書式の統一。
 - 見出しが「何の画面か」を言っているか（`ようこそ！` 等の挨拶は避ける）。
 - モーションが意味を説明しているか（ループ・跳ね・全プロパティ遷移は避ける）。
 - 日本語: 直訳調でないか、助詞が抜けていないか、用語が統一されているか。
@@ -121,7 +121,7 @@ unslop の判断に倣い、適用量を 3 段階で決めます。
 3. **レビュー**: [docs/REVIEW_TIERS.md](REVIEW_TIERS.md) が正本。本文書は推奨で、レビューの義務や差し戻し条件を課さない。REVIEW_TIERS に本文書への参照を足す場合は別 PR で行う。
 4. **日本語**: 用語集（正本: Tauri 版の `docs/DESIGN_TAURI.md` §6.3）に従い、推敲は別途行う。`nihongo` は選択肢の 1 つ（スキル名）であり、規範根拠にはしない。
 5. **非推奨リスト（推奨）**: 色相グラデーション、紫・ネオン、絵文字アイコン、ガラスモーフィズム、過剰な角丸カード、意味のないバッジ（`PRO` `New`）、挨拶見出し、`Welcome back!`、`seamless` 等の誇張、未検証の数値主張、全プロパティ遷移、ループアニメーション。
-6. **本文書の変更**: docs のみの変更。Tier は [docs/REVIEW_TIERS.md](REVIEW_TIERS.md) に従う（**本 PR は Tier 3 として扱った**）。外部資料の引用は帰属を確認する。
+6. **本文書の変更**: docs のみの変更。**本 PR は Tier 3 として扱った**（Tier は [docs/REVIEW_TIERS.md](REVIEW_TIERS.md) に従う）。外部資料の引用は帰属を確認する。
 7. **正本を 1 つに**: 方向・値・用語を変えるときは、先に正本（Tauri 版の `docs/DESIGN_TAURI.md`）を更新する。
 
 ---
@@ -130,13 +130,13 @@ unslop の判断に倣い、適用量を 3 段階で決めます。
 
 main の GUI は **egui 版が正本**です。**Tauri v2 版は `feat/tauri-gui` ブランチで再構築中**で、**マージ後に本文書の Tauri 記述が有効**になります。表示名 **Padbench** への改名も同ブランチで**実施済み（main 未反映）**です。
 
-方向 5 行・見せ場・署名・不採用案・トークン・用語集・8 状態は `docs/DESIGN_TAURI.md`（§4 / §6.3 / §8.2）を参照し、**本文書では要約しない**（正本の二重化を避ける）。egui 版（main）は Tauri 版の方向・用語集の対象外です。main の egui 前提の記述の更新も同ブランチで行います。
+方向 5 行・見せ場・署名・不採用案・トークン・用語集・8 状態は `docs/DESIGN_TAURI.md`（§4 / §5 / §6.3 / §8.2）を参照し、**本文書では要約しない**（正本の二重化を避ける）。egui 版（main）は Tauri 版の方向・用語集の対象外です。main の egui 前提の記述の更新も同ブランチで行います。
 
 ---
 
 ## 6. 参考
 
-- [unslop（作者 Damir Sokolovsky、CC BY 4.0）](https://github.com/heydamir/unslop) — 方向 5 行・9 パス・トリアージ・チェックリスト。本文書の骨格。原典は https://heydamir.design/unslop 、ライセンスは [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)（GitHub の skill リポジトリ `heydamir/unslop` の LICENSE）。本文書のうち原典を**翻案して作成**した部分も CC BY 4.0 で提供し、作者名・ライセンス・出典を表示する。
+- [unslop（作者 Damir Sokolovsky、CC BY 4.0）](https://github.com/heydamir/unslop) — 方向 5 行・9 パス・トリアージ・チェックリスト。本文書の骨格。原典は https://heydamir.design/unslop 、ライセンスは [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)（GitHub の skill リポジトリ `heydamir/unslop` の LICENSE）。本文書のうち原典に由来する部分は **CC BY 4.0 の条件に従う（作者名・ライセンス・出典の帰属表示）**。
 - [AI Slop Design: Why AI-Generated UI Looks Generic](https://vibecodekit.dev/ai-slop-design) — 原因は判断の不在。
 - [AI Slop and UI Homogenization: Measuring Design Convergence](https://design-agent.dev/blog/2026-10-15-ai-slop-measuring-design-homogenization/) — 生成的均質性の測定。
 - [How to Fix a Vibe-Coded UI: The AI-Slop Checklist](https://standoutmcp.io/guides/fix-vibe-coded-ui-checklist) — 兆候別チェックリスト。
