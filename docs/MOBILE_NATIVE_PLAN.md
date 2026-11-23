@@ -19,10 +19,10 @@
 | 最大の不足 | ①設定の**全フィールド読み取り**、②型付き**設定編集**（`ConfigEdit` 相当）、③**設定書き込み**（pre-write backup + TOCTOU + read-back）、④**リマップ**、⑤**マクロ書き込み / 復元**、⑥**プロファイル切替**、⑦**`request_input`（0x0003）と `0x0007` の副作用**、⑧**バックアップ / 復元のファイル形式**、⑨**構造化エラー**、⑩**空スロットへのマクロ新規作成**（core が `EmptyMacroWrite` で拒否） |
 | 画面数 | Android / iOS とも **16 項目**（A1–A16 / I1–I16。画面 14 + OTA + 共通基盤。うち既存は 1）。Android はナビゲーション自体が無く、iOS は `NavigationStack` の器だけあって画面遷移が無い |
 | 工数（概算） | 共有 Rust / UniFFI **19–32 人日**、Android **25–41 人日**、iOS **27–43 人日**、合計 **71–116 人日**（OTA とストア準備を除く。S/M/L の素点は §8.1）。1 人なら約 3.5–6 か月、2 人並行で約 2.5–4 か月。OTA は wire 確定後に **+9–14 人日** |
-| 必須ブロッカー | **Android / iPhone の実機**（このホストに無い）、**iOS の署名 / ストアは macOS + Xcode 必須**（unsigned IPA までは Linux で可）、**OTA は core の wire 未確定**、**プロファイル切替の永続性・実効が未確認**（Linux + CLI で検証可）、**マクロ書込の実機証跡が S1 / M1・M2 のみ**、**表示名が商標方針に不適合**（[DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md) §3.3） |
+| 必須ブロッカー | **Android / iPhone の実機**（このホストに無い）、**iOS の署名 / ストアは macOS + Xcode 必須**（unsigned IPA までは Linux で可）、**OTA は core の wire 未確定**、**マクロ書込の実機証跡が S1 / M1・M2 のみ**、**表示名が商標方針に不適合**（[DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md) §3.3） |
 | 公開順序 | 読み取り完成 → 書き込み基盤（安全フロー）→ 実機検証 → 書き込み公開（Tier 3）→ マクロ → ファイル互換 → OTA → ストア配布 |
 
-> **実機の所在（2026-11-23 実測）**: このホストには **BLE アダプタ（`F0:68:E3:CF:82:29`）と 8BitDo Ultimate 2（`80ND` / `E4:17:D8:55:BD:AA`）があり、Linux + CLI で共有 Rust の読み取り / 書き込みは検証済み**（[DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md)、[AGENTS.md](../AGENTS.md) §6、`config-backup-*` の残存）。実機待ちなのは **Android / iPhone の端末**、iOS の署名 / ストア（macOS + Xcode）、表示名の決定。**共有 Rust / UniFFI の書き込み安全フローの検証はモバイル実機を待たずに先行できる**。
+> **実機の所在（2026-11-23 実測）**: このホストには **BLE アダプタ（`F0:68:E3:••:••:••`）と 8BitDo Ultimate 2（`80ND` / `E4:17:D8:••:••:••`）があり、Linux + CLI で共有 Rust の読み取り / 書き込みは検証済み**（[DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md)、[AGENTS.md](../AGENTS.md) §6）。実機待ちなのは **Android / iPhone の端末**、iOS の署名 / ストア（macOS + Xcode）、表示名の決定。**共有 Rust / UniFFI の書き込み安全フローの検証はモバイル実機を待たずに先行できる**。プロファイル切替の永続性・実効はブロッカーではなく、**Linux + CLI で検証できる残作業**（§6.1、§9 R5）。
 
 ---
 
@@ -507,13 +507,16 @@ pub struct SlotRestoreReport {
     pub read_back_matches: bool,
     pub flag: u32,                // 書込後のスロット有効化フラグ（core の flag）
     pub total_cnt: u8,            // 書込後の登録マクロ数（core の total_cnt）
+    pub config_crc_valid: bool,   // この slot の read-back 直後の 2768B CRC 整合（core の config_crc_valid）
 }
 
 #[derive(uniffi::Record)]
 pub struct MacroRestoreReport {
     pub backup: BackupRefView,
     pub slots: Vec<SlotRestoreReport>,   // 書いた slot のみ（slot 単位バッチ）
-    pub config_crc_valid: bool,          // core の config_crc_valid と同じ意味
+    /// 複数 slot を書いたときは **全 slot の AND**（1 つでも false なら false）。
+    /// 単一 slot ならその slot の `SlotRestoreReport::config_crc_valid` と同値。
+    pub config_crc_valid: bool,
 }
 
 /// `write_macro_header`（`MacroHeaderOutcome`、`0x0001` + `0x0006`）の結果。
@@ -1087,7 +1090,7 @@ mobile/ios/                      # 画面・transport・Files・署名
 | Android エミュレータ | `/opt/android-sdk/emulator/emulator` は `-rwxr--r-- root root` で一般ユーザー実行不可。`/dev/kvm` あり。AVD `ut2`（android-34 / x86_64）あり。system-image `android-34 / google_apis` あり。**BLE はエミュレータで不可** |
 | xcodebuild / gradle（グローバル） | 無し（Gradle は wrapper 同梱） |
 | Swift ホストテスト | `scripts/mobile/test-write-ack-tracker.sh` = `WriteAckTrackerTests: all checks passed`（5 チェック。本監査で再実行） |
-| BLE アダプタ / コントローラ | Controller `F0:68:E3:CF:82:29`（default）。`bluetoothctl info` で `80ND`（`E4:17:D8:55:BD:AA`）が `Connected: yes`。`config-backup-*`（実機バックアップ）が worktree に残存。`/usr/bin/btmon` 実在。**Linux + CLI で実機の読み取り / 書き込み / マクロ復元を検証できる**（[DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md)、[AGENTS.md](../AGENTS.md) §6） |
+| BLE アダプタ / コントローラ | **BLE アダプタ**（`bluetoothctl list` の Controller、`F0:68:E3:••:••:••`）。`bluetoothctl info` で `80ND`（`E4:17:D8:••:••:••`）が `Connected: yes`。実機バックアップは**ローカルに作成済み（未追跡。リポジトリには含めない）**。`/usr/bin/btmon` 実在。**Linux + CLI で実機の読み取り / 書き込み / マクロ復元を検証できる**（[DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md)、[AGENTS.md](../AGENTS.md) §6） |
 | 本監査での再実行（2026-11-23） | `cargo test -p eightbitdo-uniffi --locked` = **14 passed**、`gen-bindings.sh` = **uniffi 0.31.2（Kotlin / Swift bindgen 一致）**、`./gradlew --no-daemon testDebugUnitTest` = **BUILD SUCCESSFUL（8 テスト）**、`test-write-ack-tracker.sh` = **all checks passed**。IPA / JNI APK の再ビルドはしていない（[MOBILE_BUILD_EVIDENCE.md](MOBILE_BUILD_EVIDENCE.md) の #21 を参照） |
 
 ### 6.3 検証コマンド
