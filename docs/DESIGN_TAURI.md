@@ -1,8 +1,7 @@
 # デスクトップ GUI デザイン設計 — Tauri v2 + Web UI
 
-- 対象: `apps/desktop`（予定パス。Tauri v2 + React + TypeScript + Vite + Tailwind CSS）の見た目と操作の設計
-- ブランチ: `feat/tauri-gui`
-- 状態: **デザイン決定（P1 の設計記録）。P1 の画面骨格は `apps/desktop` に実装済み**（トークン・共通コンポーネント・シェル・2 画面。実接続は次のフェーズ）
+- 対象: `apps/desktop`（Tauri v2 + React + TypeScript + Vite + Tailwind CSS）の見た目と操作の設計
+- 状態: **デザイン決定（P1 の設計記録）。PR #32 で main にマージ済み**（P0 / P1 完了・P2 以降未着手）。P1 の画面骨格は `apps/desktop` に実装済み（トークン・共通コンポーネント・シェル・2 画面。実接続は次のフェーズ）
 - 正本の関係: GUI の実装方式・フェーズ・受け入れ条件・日本語用語集は [docs/TAURI_PLAN.md](TAURI_PLAN.md) が正本です。本文書は **P1（デザイン）の決定記録**であり、トークン・レイアウト・コンポーネント・入力モニター・モーション・コピーの具体値を固定します。用語は TAURI_PLAN.md §8 に従い、本文書で新たに固定する 5 語だけを §6.3 に「§8 への差分提案」として分離しています。
 - 参照した前回設計: `.tmp/archive/design-gui-redesign/gui-redesign/DESIGN_BRIEF.md` と `DESIGN_REVIEW.md`（ローカルの未追跡 archive。リポジトリ外のためリンクにしない）
 - 参照した機能範囲: [docs/FEATURE_MATRIX.md](FEATURE_MATRIX.md)、入力レポートの定義は [docs/PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §7.2
@@ -91,7 +90,7 @@ P0 で `apps/desktop` の雛形（React 19 / Vite / Tailwind v4 / vitest）が�
 | 左ナビは デバイス / ライブ入力 / 設定 / マクロ / ログ | デバイス / 入力モニター / 現在値 / 設定 / マクロ / ログ。入力モニターは独立した画面にし、右レールは全画面で「書き込み前の確認」を常設する |
 | `src/index.css` の `@theme` が Inter / JetBrains Mono | 同梱済みの Noto Sans JP / Hack に置き換える。未同梱フォントは追加しない（ライセンス更新を避ける） |
 | `@theme` が slate の暗色のみ | ライト面 + ダークステージのトークン（§5.1）に置き換える（**その後 Hyperstudio の暗色トークンに再置換。§11 / §12**） |
-| トークンが `index.css` に直書き | `apps/desktop/src/styles/tokens.css` に分離し、`index.css` から読み込む（予定パス） |
+| トークンが `index.css` に直書き | `apps/desktop/src/styles/tokens.css` に分離し、`index.css` から読み込む（P1 で実装済み） |
 | 空状態はアイコン + 1 文 | 「状態 + 次にすること 1 つ」（§5.5.9）に統一。アイコンは飾りなので置かない |
 
 ---

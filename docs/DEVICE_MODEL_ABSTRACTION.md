@@ -36,7 +36,7 @@
 - USB HID / 2.4G トランスポートの実装（[PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §4.4 の USB Boot TX 未文書化が解消するまで保留。現行方針を維持）。
 - OTA の wire 確定（[OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md)）。
 - 他社コントローラのプロトコル解析（§11.4 の将来論に留める）。
-- GUI の実装方式そのもの（Tauri v2 への移行は**未マージの `feat/tauri-gui` ブランチで進行中**であり、本ドキュメントは「Tauri に capability descriptor をどう渡すか」だけを定義する。根拠と更新対象は §1.3 の注記）。
+- GUI の実装方式そのもの（Tauri v2 が main の正式 GUI（PR #32 でマージ済み）であり、本ドキュメントは「Tauri に capability descriptor をどう渡すか」だけを定義する。根拠と更新対象は §1.3 の注記）。
 
 ### 1.3 前提（現状認識）
 
@@ -47,11 +47,11 @@
 | 設定スロット数 | 3 slot × 4 macro、22 ボタン、24 LED | 同上 §1.1 |
 | 近い別機種の情報 | **Ultimate 2 Wireless（`0x6012`, 1592B）の `ConfigLayout` 差分は既に特定済み**（レガシー領域 A 1176B が無いだけ）。※ USB Save subcmd の差（BT2 `0x0123` / Wireless `0x0064`）はレイアウト差ではなく**コマンド差**なので、ここには含めない | [STRUCT_BT2_2768B.md](STRUCT_BT2_2768B.md) §10 |
 | Ultimate 2C（`0x301A`） | PID と `firmware_type` のみ判明。**設定サイズ・レイアウト・BLE 名は未確認** | [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §2.1 |
-| デスクトップ GUI | **main の正本は egui（`crates/eightbitdo-gui`）で「Tauri 不使用」**。Tauri v2 への移行は未マージの `feat/tauri-gui` で進行中 | [AGENTS.md](../AGENTS.md) §3、[README.md](../README.md)、[crates/eightbitdo-gui/README.md](../crates/eightbitdo-gui/README.md) の「Tauri 不使用」。main の [ANTI_SLOP.md](ANTI_SLOP.md)（#31）も同じ整理 |
-| モバイル | iOS SwiftUI / Android Compose + UniFFI（ネイティブ実装） | [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) §2 |
-| 製品名 | `Padbench` へ改名（**`feat/tauri-gui` で実施済み・main 未反映**。クレート名は `eightbitdo-*` を当面維持） | `feat/tauri-gui`。main の [ANTI_SLOP.md](ANTI_SLOP.md)（#31）にも同じ記録。§11 |
+| デスクトップ GUI | **正式は Tauri v2（`apps/desktop`）。PR #32 で main にマージ済み**（P0 / P1 完了・P2 以降未着手）。egui 版（`crates/eightbitdo-gui`）は凍結（比較・撤退用） | [AGENTS.md](../AGENTS.md) §3、[README.md](../README.md)、[TAURI_PLAN.md](TAURI_PLAN.md)、[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) §2 |
+| モバイル | iOS SwiftUI / Android Compose + UniFFI（ネイティブ実装）を、Tauri v2 モバイル実機確認までの代替・先行実装として維持（[MOBILE_NATIVE_PLAN.md](MOBILE_NATIVE_PLAN.md) §0） | [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) §2、[AGENTS.md](../AGENTS.md) §3 |
+| 製品名 | `Padbench`（main 反映済み。PR #32 で表示名・識別子 `io.github.haruki0420.padbench` を統一。クレート名は `eightbitdo-*` を当面維持） | [DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md) / [TRADEMARKS.md](../TRADEMARKS.md)。§11 |
 
-> **根拠と更新対象**: Tauri v2 の許可と **Padbench** への改名は**未マージの `feat/tauri-gui` ブランチで実施済み**で、**main には反映されていない**。main は egui が正本で「Tauri 不使用」を明記しており（[AGENTS.md](../AGENTS.md) §3、[README.md](../README.md)、[crates/eightbitdo-gui/README.md](../crates/eightbitdo-gui/README.md)）、この整理は main の [ANTI_SLOP.md](ANTI_SLOP.md)（#31 でマージ済み）と同じである。したがって本ドキュメントは「Tauri 移行が決定済み」と断定せず、**Tauri 前提の記述は `feat/tauri-gui` のマージ後に有効**になる。マージ時に更新が必要な文書は次の 5 つ: [AGENTS.md](../AGENTS.md) §3、[README.md](../README.md)、[crates/eightbitdo-gui/README.md](../crates/eightbitdo-gui/README.md)、[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) §2、[ANTI_SLOP.md](ANTI_SLOP.md)（GUI 節の egui 前提と Tauri 注記。いずれも egui 前提の記述）。
+> **根拠と更新対象**: Tauri v2 の許可と **Padbench** への改名は **PR #32 で main にマージ済み**です。main の [AGENTS.md](../AGENTS.md) §3 と [README.md](../README.md) は Tauri v2 を正式・egui 版を凍結として記述し、[crates/eightbitdo-gui/README.md](../crates/eightbitdo-gui/README.md) にも凍結注記があります。したがって本ドキュメントの Tauri 前提の記述は有効です。マージ時に更新が必要だった文書は次の 5 つで、いずれも Tauri 前提へ更新済みです: [AGENTS.md](../AGENTS.md) §3、[README.md](../README.md)、[crates/eightbitdo-gui/README.md](../crates/eightbitdo-gui/README.md)、[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) §2、[ANTI_SLOP.md](ANTI_SLOP.md)（GUI 節。egui 前提の記述を Tauri 前提へ更新）。追加で [TAURI_PLAN.md](TAURI_PLAN.md) と [DESIGN_TAURI.md](DESIGN_TAURI.md) が main に入りました。
 
 ---
 
@@ -910,7 +910,7 @@ fn device_capabilities(profile_id: Option<String>) -> Result<String, String> {
 
 **なぜ「未確認は無効」か**: 本プロジェクトの書き込みは pre-write backup・read-back・TOCTOU で守られているが、その安全機構は「レイアウトが正しい」前提で動く。レイアウトが未確認の機種に対して書き込み UI を有効にすると、安全機構ごと意味を失う。
 
-**UI 複雑化への対処（§12 のリスク）**: descriptor から**汎用フォームを自動生成しない**。機能ごとのエディタ（Rumble / Joy / Gyro / LED / Remap / Macro）は既存の実装をモジュールとして残し、**表示するかどうかだけ**をフラグで決める。汎用フォーム生成は工数・検証コストが大きく、本プロジェクトの UI（main は egui、Tauri 版は未マージの `feat/tauri-gui` で進行中）では再利用できない。
+**UI 複雑化への対処（§12 のリスク）**: descriptor から**汎用フォームを自動生成しない**。機能ごとのエディタ（Rumble / Joy / Gyro / LED / Remap / Macro）は既存の実装をモジュールとして残し、**表示するかどうかだけ**をフラグで決める。汎用フォーム生成は工数・検証コストが大きく、本プロジェクトの UI（Tauri v2 版が正式・egui 版は凍結）では再利用できない。
 
 ### 8.5 CLI の出し分け
 
@@ -1257,11 +1257,13 @@ P2 と P3 は P1 の後に並行可能。ただし P2 で descriptor の形が�
 - [FEATURE_MATRIX.md](FEATURE_MATRIX.md) — 機能ごとの RE / 実装 / 実機検証ラベル（能力三値の根拠）
 - [DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) — 実機 dump と `0x0015` の証跡
 - [OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md) — OTA の未確認事項と採取手順
-- [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) — 全体アーキテクチャと Phase（**main は egui 前提**。§2 の GUI 記述は `feat/tauri-gui` のマージ時に更新が必要）
+- [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) — 全体アーキテクチャと Phase（GUI は Tauri v2 が正式。§2 の GUI 記述は Tauri 前提に更新済み）
 - [REVIEW_TIERS.md](REVIEW_TIERS.md) — 本設計の各フェーズのレビュー Tier
 - [CROSS_PLATFORM.md](CROSS_PLATFORM.md) — ビルド確認状況
 - [SESSION_OPERATIONS.md](SESSION_OPERATIONS.md) — 常駐セッションの運用
-- [ANTI_SLOP.md](ANTI_SLOP.md) — main の GUI 記述（egui 正本・Tauri は未マージの `feat/tauri-gui`）と Padbench 改名の整理（#31）
+- [ANTI_SLOP.md](ANTI_SLOP.md) — Tauri 版 GUI の検出チェックリスト（egui 版は凍結）と Padbench 改名の整理（#31）
+- [TAURI_PLAN.md](TAURI_PLAN.md) — Tauri v2 GUI の移行計画とフェーズ（P0 / P1 完了、P2 以降未着手）
+- [DESIGN_TAURI.md](DESIGN_TAURI.md) — Tauri 版 GUI のデザイン正本
 - [DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md) / [TRADEMARKS.md](../TRADEMARKS.md) — 製品名・商標の扱い
 
 ### 15.2 コードの起点
@@ -1275,7 +1277,8 @@ P2 と P3 は P1 の後に並行可能。ただし P2 で descriptor の形が�
 - `crates/eightbitdo-core/src/ble.rs` — BLE 識別子と App Mode 判定
 - `crates/eightbitdo-uniffi/src/lib.rs` — モバイル境界（descriptor の追加先）
 - `crates/eightbitdo-cli/src/main.rs` — CLI の出し分け
-- `crates/eightbitdo-gui/src/` — 現行 egui GUI（凍結。Tauri 側は本設計の descriptor を消費）
+- `crates/eightbitdo-gui/src/` — egui 版 GUI（凍結。Tauri 版は本設計の descriptor を消費する）
+- `apps/desktop/src-tauri/` — Tauri v2 版 GUI の Rust backend（正式。descriptor の消費側）
 
 ### 15.3 更新ルール
 

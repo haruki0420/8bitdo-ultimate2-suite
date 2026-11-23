@@ -19,7 +19,7 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 - **BLE 設定モード（`80ND`）への接続と読み取り**: Switch に接続したまま Profile ボタン約 3 秒で設定モードに入り、version / 2768B 設定 / マクロ 3 slot × 4 / リアルタイム入力 / keepalive を取得。20ms `0x0003` keepalive、per-user BLE 単一所有ロック、degraded 時の終了コード 3。
 - **設定の書き込みとボタンリマップ（BLE）**: `config write` / `config set` / `config remap` / `config map show`。予約バイト保持、CRC 再計算、必須 pre-write backup、前後 SHA-256、TOCTOU 再読込、read-back 検証。**実機確認済み**（full write / remap のみ。`config set` 各フィールドは未確認）。
 - **マクロのバックアップ・書き込み・復元（BLE）**: `macro backup` / `macro write` / `macro restore`。公式順序（Header `0xD8` → Save → Erase → Write → Save）と Write `total_len` の**絶対終端**。**実機確認済み**（slot S1 の M1/M2。**Switch 側の発動は未確認**）。
-- **GUI**: egui / Pure Rust（Tauri v2 版へ移行中。[docs/TAURI_PLAN.md](docs/TAURI_PLAN.md)）。日本語 UI、燻しスレートのテーマ、Noto Sans JP 同梱。読み取り 4 タブ（デバイス / ライブ入力 / 設定値 / ログ）に加え、PR #16 で設定・ボタンリマップ・マクロの書き込み UI を追加（確認ダイアログ、pre-write backup、read-back 検証）。**GUI 書込は実機未検証**。左レール下部の「ライセンス」画面（#24、main にマージ済み）で、アプリの MIT / Apache-2.0 全文と同梱 5 フォントのライセンス全文・著作権者行を閲覧できる。
+- **GUI**: 正式は **Tauri v2 版**（[`apps/desktop`](apps/desktop/README.md)、PR #32 で main にマージ済み。**P0 / P1 完了・P2 以降未着手**）。現状はデザイントークン・共通コンポーネント・シェルと、デバイス / 入力モニターの**静的 2 画面**までで、BLE 接続・実データ・書き込みは未実装。Rust backend + TypeScript / Vite / React / Tailwind CSS（pnpm）で、BLE は WebView から触らず `eightbitdo-core` で実行する。**egui 版（`crates/eightbitdo-gui`）は凍結**（比較・撤退用。既知バグ修正と実機検証の記録のみ）で、日本語 UI・燻しスレートのテーマ・読み取り 4 タブに加え、PR #16 で設定・ボタンリマップ・マクロの書き込み UI を追加済み（確認ダイアログ、pre-write backup、read-back 検証。**GUI 書込は実機未検証**）。egui 版の左レール下部「ライセンス」画面（#24、main にマージ済み）で、アプリの MIT / Apache-2.0 全文と同梱 5 フォントのライセンス全文・著作権者行を閲覧できる。
 - **セッション REPL**: 1 接続で `info` / `config dump` / `backup` / `monitor` / `macro backup` / `config map show` などを実行。書込系は `--allow-macro-write` / `--allow-config-write` と確認が必須。
 - **マクロ・設定の JSON / TOML I/O**: `MacroFile` のインポート / エクスポート。1ms 解像度・8-bit スティック / トリガー値を保持。
 - **モバイル雛形**: `eightbitdo-uniffi` 経由の読み取り API、iOS SwiftUI + CoreBluetooth、Android Compose + BluetoothGatt。iOS は unsigned IPA、Android は JNI 同梱 APK（arm64-v8a / x86_64）を生成可能。
@@ -34,9 +34,11 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 
 ## 実装状況
 
-main は `0af60a3`（2026-11-23）時点。フェーズの詳細・残課題は [AGENTS.md](AGENTS.md) §6 と [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) §5。
+main は `ed61961`（2026-11-23）時点。フェーズの詳細・残課題は [AGENTS.md](AGENTS.md) §6 と [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) §5。
 
 2026-11-23 に main へマージ済みの追加分: **#17** raw config の実機 flag 対応（`slot_flags` allowlist、gyro key_map の erasure sentinel 例外を削除しつつ flag の `0x20190000` は raw allowlist で受理を継続、実 dump を使う `#[ignore]` E2E、docs 整合）、**#18** クロスプラットフォーム・ビルド確認（[docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)）、**#19** OTA 実機 btsnoop 採取計画（[docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)）、**#20** `ota-bench` 段階実行 API、**#21** モバイルビルド証跡（[docs/MOBILE_BUILD_EVIDENCE.md](docs/MOBILE_BUILD_EVIDENCE.md)）、**#22** 配布・ライセンス・マネタイズ方針（[docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md)）、**#23** 公式機能カバレッジ・マトリクス（[docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md)）、**#24** GUI ライセンス画面、**#25** 状態 docs の更新、**#26** プロファイル切替（`0x0015`）の core / CLI / REPL 配線（`Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`、Save 送信なし）。**`0x0015` は実機で ACK（`cmd=0x0004/subcmd=0x0015` の 16B 封筒を 1 回観測）と `cur_slot` 6→1 の更新を確認済み**（再接続/電源断を跨ぐ永続性・プロファイル実効は未確認）。
+
+さらに **#27〜#32** も main にマージ済み: **#27** 状態 docs の更新、**#28** `0x0015`（WriteSLOT）の実機証跡、**#29** 機種抽象化（`DeviceProfile` / `ConfigLayout` / 能力三値）の設計（[docs/DEVICE_MODEL_ABSTRACTION.md](docs/DEVICE_MODEL_ABSTRACTION.md)）、**#30** モバイルネイティブのギャップ監査と実装計画（[docs/MOBILE_NATIVE_PLAN.md](docs/MOBILE_NATIVE_PLAN.md)）、**#31** AI スロップ回避の運用（[docs/ANTI_SLOP.md](docs/ANTI_SLOP.md)）、**#32** Tauri v2 GUI への移行（[`apps/desktop`](apps/desktop/README.md)。表示名・識別子を **Padbench** / `io.github.haruki0420.padbench` に統一）。**Tauri v2 は P0（決定・足場）/ P1（デザイン）完了・P2 以降（実接続・書き込み・OTA・パッケージ・モバイル）未着手**で、egui 版は凍結です。
 
 | Phase | 内容 | 状態 |
 | --- | --- | --- |
@@ -45,10 +47,13 @@ main は `0af60a3`（2026-11-23）時点。フェーズの詳細・残課題は 
 | 2b | BLE マクロ backup / write / restore | 完了・実機確認済み（S1 の M1/M2。Switch 側の発動は未確認） |
 | 2c | BLE OTA 状態機械 | **core のみ**。Mock 52（既定）/ 55（`mobile-boot`）/ 58（`ota-bench`）/ 61（`--all-features`）テスト。実機未検証・CLI/GUI/UniFFI 未配線。`ota-bench` 段階実行 API（#20）と採取計画（#19）は用意済み |
 | 2d | 設定 write / set / remap（BLE） | 完了・実機確認済み（full write / remap のみ。`config set` 各フィールドは未確認）。#17 で実機 flag を opaque 値として扱う検証に修正 |
-| 3a | 読み取り専用 GUI | 完了（PR #9） |
-| 3b | GUI マクロエディタ（録音・ステップ編集・既存マクロ書込） | 実装・main にマージ（PR #16）。**実機未検証・Tier 3** |
+| 3a | 読み取り専用 GUI（egui 版・凍結） | 完了（PR #9） |
+| 3b | GUI マクロエディタ（egui 版・凍結。録音・ステップ編集・既存マクロ書込） | 実装・main にマージ（PR #16）。**実機未検証・Tier 3** |
 | 3c | OTA 画面 | 未着手（Phase 2c の wire 確定後） |
-| 3d | GUI 設定タブ / 22 ボタンリマップ | 実装・main にマージ（PR #16）。**実機未検証・Tier 3** |
+| 3d | GUI 設定タブ / 22 ボタンリマップ（egui 版・凍結） | 実装・main にマージ（PR #16）。**実機未検証・Tier 3** |
+| **Tauri P0** | デスクトップ GUI の土台（`apps/desktop`、独立 `src-tauri`、CI `desktop.yml`） | **完了（PR #32）** |
+| **Tauri P1** | デザイン（トークン・共通コンポーネント・シェル・静的 2 画面） | **完了（PR #32）**。BLE 接続・実データ・書き込みは未実装 |
+| **Tauri P2 以降** | 実接続・設定 / マクロ / OTA・パッケージ・Tauri モバイル | **未着手**（[docs/TAURI_PLAN.md](docs/TAURI_PLAN.md) §5） |
 | 4 | USB OTA | 保留（USB Boot TX 未文書化） |
 | 5 | UniFFI + iOS / Android | **JNI 同梱 APK / unsigned IPA ビルド成功、実機未検証**（#21） |
 | — | GUI ライセンス画面 | **main にマージ済み（#24）**。左レール下部の「ライセンス」画面。アプリ MIT / Apache-2.0 全文＋同梱 5 フォント全文・著作権者行、Esc / × / 「閉じる」で閉じる。書込確認中はボタンを無効化 |
@@ -121,12 +126,14 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 
 ## GUI
 
-`eightbitdo-gui` は egui / eframe のネイティブ GUI です。**デスクトップ GUI は Tauri v2（Rust backend + Web frontend）へ移行中**で、egui 版は比較・撤退用に残します（決定日 2026-11-23）。Tauri 版のフロントは TypeScript + Vite + React + Tailwind CSS（pnpm）で、BLE は WebView から触らず Rust コア（`eightbitdo-core`）で実行し、Tauri commands / events で公開します。手順とフェーズは [docs/TAURI_PLAN.md](docs/TAURI_PLAN.md) を参照してください。
+デスクトップ GUI の正式実装は **Tauri v2 版**（[`apps/desktop`](apps/desktop/README.md)、PR #32 で main にマージ済み。**P0 / P1 完了・P2 以降未着手**）です。Rust backend + Web frontend（TypeScript + Vite + React + Tailwind CSS、pnpm）で、BLE は WebView から触らず Rust コア（`eightbitdo-core`）で実行し、Tauri commands / events で公開します。現状はシェルとデバイス / 入力モニターの静的 2 画面までで、BLE 接続・デバイス読み書きは未実装です。
 
-- **6 タブ**: デバイス（接続・情報）、ライブ入力、設定値（2768B の要約）、設定（書き込み）、マクロ（録音・編集・書き込み）、ログ。
-- 日本語 UI と英語表示の切り替え、燻しスレートのテーマ、Noto Sans JP（OFL）を同梱。
-- **書き込み**: 設定 2768B（プロファイル・リマップ・振動・スティック / トリガー・ジャイロ・LED）と既存マクロの書き込みに対応。必ず確認ダイアログを経て、直前に設定 / マクロの pre-write backup を作成し、書込後に read-back 検証します。録音中は書込不可。確認後にデバイス設定が変わっていた場合は expected SHA-256 不一致で中止します。**実機未検証（Tier 3）**。バックアップ復元とファームウェア更新は未実装です。
-- 起動: `cargo run --release -p eightbitdo-gui`（または `./target/release/eightbitdo-gui`）。
+`crates/eightbitdo-gui` は egui / eframe のネイティブ GUI で、比較・撤退用に**凍結**しています（決定日 2026-11-23。既知バグ修正と実機検証の記録のみ）。以下は凍結時点の egui 版の内容です。手順とフェーズは [docs/TAURI_PLAN.md](docs/TAURI_PLAN.md)、デザインは [docs/DESIGN_TAURI.md](docs/DESIGN_TAURI.md) を参照してください。
+
+- **6 タブ（egui 版）**: デバイス（接続・情報）、ライブ入力、設定値（2768B の要約）、設定（書き込み）、マクロ（録音・編集・書き込み）、ログ。
+- 日本語 UI と英語表示の切り替え、燻しスレートのテーマ、Noto Sans JP（OFL）を同梱（egui 版）。Tauri 版のフォント同梱は P6 で対応予定です。
+- **書き込み（egui 版）**: 設定 2768B（プロファイル・リマップ・振動・スティック / トリガー・ジャイロ・LED）と既存マクロの書き込みに対応。必ず確認ダイアログを経て、直前に設定 / マクロの pre-write backup を作成し、書込後に read-back 検証します。録音中は書込不可。確認後にデバイス設定が変わっていた場合は expected SHA-256 不一致で中止します。**実機未検証（Tier 3）**。バックアップ復元とファームウェア更新は未実装です。
+- 起動（egui 版）: `cargo run --release -p eightbitdo-gui`（または `./target/release/eightbitdo-gui`）。Tauri 版は [`apps/desktop/README.md`](apps/desktop/README.md) の手順（`pnpm exec tauri dev`）を使います。
 
 ## モバイル（iOS / Android）
 
@@ -158,6 +165,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 | **[docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md)** | 公式 Windows / Android ソフトの機能ごとのカバレッジ: RE 証拠ラベル、本リポジトリの実装状況（core / CLI / GUI）、実機検証状況（Linux BLE のみ）、残作業と追加 RE 項目 |
 | **[docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)** | Rust + SwiftUI + Jetpack Compose のアーキテクチャ設計、ワークスペース構成、Phase 1〜5 ロードマップ、現在の状態・残課題、安全検証手順 |
 | **[docs/TAURI_PLAN.md](docs/TAURI_PLAN.md)** | Tauri v2 GUI への移行計画とクロスプラットフォーム方針（決定日 2026-11-23）: 背景、アーキテクチャ、`apps/desktop` 構成、P0〜P8 のフェーズ、プラットフォーム別の UI / BLE / 配布 / 本ホスト検証可否、リスク、日本語 UI 用語集、受け入れ条件 |
+| **[docs/DESIGN_TAURI.md](docs/DESIGN_TAURI.md)** | Tauri v2 版 GUI のデザイン設計（P1 の決定記録）: 方向・トークン・レイアウト・コンポーネント・入力モニター・モーション・8 状態・用語集の差分・受け入れ条件 |
 | **[docs/OTA_BLE_EVIDENCE.md](docs/OTA_BLE_EVIDENCE.md)** | BLE OTA の解析証跡（確定した順序・タイムアウト・`.dat` ヘッダ）と未確認事項の優先順 |
 | **[docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)** | クロスプラットフォームのビルド確認状況（Windows クロス `check` の結果と警告 4 件、MSRV 1.85 が Windows で通らない理由、iOS target check、macOS 未確認の理由、CI 追加提案） |
 | **[docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)** | BLE OTA 実機検証の準備: btsnoop 採取（Linux `btmon` / Android HCI snoop）、確認項目と判定、EVIDENCE への追記、Phase A / B の安全手順 |
@@ -188,10 +196,12 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
   - [x] Phase 2b: マクロ読み書き（実機確認済み。BLE・slot S1 の M1/M2。M3/M4・S2/S3 は外挿）
   - [ ] Phase 2c: BLE OTA（Linux。core 実装済み・Mock 52 テスト（既定）/ 55（`mobile-boot`）/ 58（`ota-bench`）/ 61（`--all-features`）。**単一セクション `.dat` のみ対応**で公式 `.dat` がマルチセクションの場合は未対応（公式ファーム対応の blocker）、未確認 wire ゲート既定 OFF、boot 専用 `BleBootTransport` のみ許可（App Session を切断してから `8bt` に接続。同一 BLE ロック）、type 1 application ウィンドウを暫定検証、CLI/GUI 未配線、実機書込は保留。実機採取用の `ota-bench` 段階実行 API（既定 OFF、`write_firmware_with_checkpoint` / `OtaCheckpoint::AfterFirstErase` 等）は #20 でマージ済み、採取手順は [docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)（#19）。マルチセクション対応と実機 wire 確定は次 PR の必須項目）
   - [x] Phase 2d: 設定書き込み（BLE のみ実機確認済み。`config write` / `set` / `remap` / `map show`、pre-write backup、確認、前後 SHA-256、read-back 検証。USB config write は未実装）。#17 で実機 flag を opaque 値として扱う raw 検証に修正（`slot_flags` allowlist、gyro key_map の erasure sentinel 例外を削除しつつ flag の `0x20190000` は raw allowlist で受理を継続、実 dump を使う `#[ignore]` E2E）
-- [x] Phase 3a: `eightbitdo-gui` 読み取り専用 GUI（日本語・燻しスレート。PR #9）
-- [x] Phase 3b: GUI マクロエディタ（20ms 録音・ステップ編集・既存非空マクロへの書込。PR #16。**実機未検証・Tier 3**）
+- [x] Phase 3a: `eightbitdo-gui` 読み取り専用 GUI（egui 版・凍結。日本語・燻しスレート。PR #9）
+- [x] Phase 3b: GUI マクロエディタ（egui 版・凍結。20ms 録音・ステップ編集・既存非空マクロへの書込。PR #16。**実機未検証・Tier 3**）
 - [ ] Phase 3c: GUI OTA 画面（Phase 2c の実機 wire 確定後）
-- [x] Phase 3d: GUI 設定タブ / 22 ボタンリマップ（PR #16。**実機未検証・Tier 3**）
+- [x] Phase 3d: GUI 設定タブ / 22 ボタンリマップ（egui 版・凍結。PR #16。**実機未検証・Tier 3**）
+- [x] デスクトップ GUI の Tauri v2 移行: **P0（決定・足場）/ P1（デザイン）完了**（PR #32）。デザイントークン・共通コンポーネント・シェル・静的 2 画面まで
+- [ ] デスクトップ GUI の Tauri v2 版: **P2 以降が未着手**（BLE 接続・デバイス読み書き・設定 / マクロ / OTA・パッケージ・Tauri モバイル）
 - [ ] Phase 4: USB OTA（保留）
 - [ ] Phase 5: `eightbitdo-uniffi` + iOS (SwiftUI) / Android (Jetpack Compose) アプリ（雛形完了・PR #12。JNI 同梱 APK / unsigned IPA はビルド成功（#21、[docs/MOBILE_BUILD_EVIDENCE.md](docs/MOBILE_BUILD_EVIDENCE.md)）。実機確認・App Store 配布は未着手）
 - [x] GUI ライセンス画面（#24、main にマージ済み。アプリ MIT / Apache-2.0 全文＋同梱 5 フォント全文・著作権者行、Esc / × / 「閉じる」、書込確認中は無効化）
@@ -216,7 +226,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 - **ドキュメント**（`docs/` 以下と `README.md` など）: 特記がない限り、コードと同じ `MIT OR Apache-2.0` です。将来 CC BY 4.0 などの別ライセンスへ変更する場合は、変更時に本文へ明記します。ただし、第三者に由来する部分（同梱フォントの OFL、第三者コードの BSD / Unicode / MPL 表示、引用・出典）は、それぞれの権利者のライセンス条件に従います。
 - **同梱フォント**（GUI に同梱済み）: Noto Sans JP のサブセットは SIL Open Font License 1.1 です。`crates/eightbitdo-gui/assets/licenses/OFL-NotoSansJP.txt` を同梱しています。egui 既定フォント（Ubuntu-Light / NotoEmoji / Hack / emoji-icon-font）は OFL 1.1・Ubuntu Font Licence 1.0・MIT で、帰属は [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) §3.6.1 に整理しています。全文は GUI の「ライセンス」画面（左レール下部）から閲覧できます。
 - **Gradle wrapper**（`mobile/android/gradle/wrapper/gradle-wrapper.jar` など、ビルド再現性のためコミット済み）: Apache-2.0（jar 内 `META-INF/LICENSE`、manifest の `SPDX-License-Identifier`）。帰属は [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) §3.6.3 を参照してください。
-- 依存ソフトウェアのライセンスは [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) を参照してください。**THIRD_PARTY_LICENSES.md の基準 SHA は `6b39e23` のまま**です（同ファイルは GUI / モバイル依存を含む形で `6b39e23` 時点の `cargo metadata` を集計しており、#17〜#26 では dependency の追加・削除はありません。今回の main `0af60a3` の `Cargo.lock` も 502 パッケージで `6b39e23` と同数、第三者クレート **497**（全 502 パッケージ − workspace 5）です。`Cargo.lock` の差分は workspace 内クレート `eightbitdo-cli` への `serde` 依存追加 1 行のみ）。大半は MIT または Apache-2.0 で、代表的な依存は `eframe`/`egui`（MIT OR Apache-2.0）、`uniffi`（MPL-2.0、ファイル単位コピーレフト）、`btleplug`（MIT/Apache-2.0/BSD-3-Clause）です。Cargo 管理外では Noto Sans JP（OFL 1.1）と Gradle wrapper（Apache-2.0）を同梱しています。同ファイルは要約と参照であり、全クレートの著作権表示・ライセンス本文を網羅しません。バイナリ配布時は `cargo-about` 等で完全な第三者通知を生成して同梱してください。配布・ストア申請前の再確認要否は [docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md) §5 を参照してください。
+- 依存ソフトウェアのライセンスは [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) を参照してください。**THIRD_PARTY_LICENSES.md の基準 SHA は `6b39e23` のまま**です（同ファイルは GUI / モバイル依存を含む形で `6b39e23` 時点の `cargo metadata` を集計しており、#17〜#26 では dependency の追加・削除はありません。#29〜#31 は docs のみ、#32 は独立ワークスペース `apps/desktop` の追加で、root の `Cargo.lock` は 502 パッケージのまま `6b39e23` と同数、第三者クレート **497**（全 502 パッケージ − workspace 5）です。`apps/desktop` の依存は別集計で、第三者 435 クレート + npm 157 パッケージを同ファイル §2.1 / §3.10 に記録しています）。大半は MIT または Apache-2.0 で、代表的な依存は `eframe`/`egui`（MIT OR Apache-2.0）、`tauri`（Apache-2.0 OR MIT）、`uniffi`（MPL-2.0、ファイル単位コピーレフト）、`btleplug`（MIT/Apache-2.0/BSD-3-Clause）です。Cargo 管理外では Noto Sans JP（OFL 1.1）と Gradle wrapper（Apache-2.0）を同梱しています。同ファイルは要約と参照であり、全クレートの著作権表示・ライセンス本文を網羅しません。バイナリ配布時は `cargo-about` 等で完全な第三者通知を生成して同梱してください。配布・ストア申請前の再確認要否は [docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md) §5 を参照してください。
 - 商標・非公式に関する方針は [TRADEMARKS.md](TRADEMARKS.md) を参照してください。
 - リポジトリ公開・コードライセンス・商標・同梱フォント・ストア配布・マネタイズの方針は、[docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md) に決定事項としてまとめています（決定日 2026-11-23）。未決定の項目は同ファイル §7 に「要判断」として列挙しています。
 

@@ -13,7 +13,7 @@
 
 ## 2. アーキテクチャ設計
 
-プロトコル処理・2768 バイト設定構造体・マクロシリアライザ・CRC 計算・OTA ステートマシンを単一の Rust コアライブラリ（`eightbitdo-core`）に集約し、各プラットフォームのネイティブ UI から利用する構成とする。
+プロトコル処理・2768 バイト設定構造体・マクロシリアライザ・CRC 計算・OTA ステートマシンを単一の Rust コアライブラリ（`eightbitdo-core`）に集約し、各プラットフォームの UI（デスクトップは Tauri v2、モバイルは UniFFI 経由のネイティブ UI）から利用する構成とする。
 
 ```mermaid
 graph TD
@@ -25,13 +25,15 @@ graph TD
         Core --> FFI
     end
 
-    subgraph Desktop["デスクトップ (Pure Rust・単一バイナリ)"]
+    subgraph Desktop["デスクトップ (Tauri v2 Web UI + Rust core)"]
         CLI["eightbitdo-cli<br/>(CLI / スクリプト自動化 / JSON・TOML I/O)"]
-        GUI["eightbitdo-gui<br/>(egui / iced ネイティブ GUI)"]
+        GUI["apps/desktop<br/>(Tauri v2 + React / TS / Vite。正式)"]
+        EGUI["eightbitdo-gui<br/>(egui 版・凍結。比較・撤退用)"]
         BTDesk["btleplug (BlueZ / CoreBluetooth / WinRT)"]
         HIDDesk["hidapi (hidraw / IOKit / hid.dll)"]
         CLI --> Core
         GUI --> Core
+        EGUI --> Core
         Core --> BTDesk
         Core --> HIDDesk
     end
@@ -50,7 +52,7 @@ graph TD
 | 共通プロトコル＆コア | **Rust** | メモリ安全性、厳密なバイト列・ビットマスク処理、クロスプラットフォーム、OSS コミュニティの厚さ、`UniFFI` による iOS/Android ネイティブ連携の容易さ |
 | デスクトップ BLE | `btleplug` | Linux (BlueZ D-Bus), macOS (CoreBluetooth), Windows (WinRT) を単一 API で扱える |
 | デスクトップ USB/2.4G HID | `hidapi` | Linux (`hidraw`/`libusb`), macOS (IOKit), Windows (`hid.dll`) に対応 |
-| デスクトップ GUI | **`egui` (`eframe`)** （代替候補: `iced`） | Pure Rust・Node.js/WebView 不要・軽量な単一バイナリ配布が可能・コントローラ入力のリアルタイム描画（60fps スティック/ボタンモニター・マクロタイムライン）と相性が良い |
+| デスクトップ GUI | **`tauri` v2（正式）**（Rust backend + Web frontend: TypeScript + Vite + React + Tailwind CSS、pnpm） | Web UI の表現力と反復速度を優先する（2026-11-23 決定、[TAURI_PLAN.md](TAURI_PLAN.md)）。BLE は WebView から触らず Rust コアで実行し、Tauri commands / events で公開する。egui 版（`eframe`）は比較・撤退用に凍結 |
 | デスクトップ CLI | `clap` + `serde` (`serde_json` / `toml`) | マクロやプロファイルのバージョン管理・バッチ適用・CI テストに必須 |
 | iOS アプリ | **Swift + SwiftUI + CoreBluetooth** | iOS での BLE バックグラウンド権限・GATT MTU 制御・OTA 再接続を最も安定して実装できるネイティブ構成。ロジックは `eightbitdo-uniffi` 経由 |
 | Android アプリ | **Kotlin + Jetpack Compose + Android BLE / USB Host API** | BLE GATT と USB OTG HID の両方をネイティブ API で確実に制御できる。ロジックは `eightbitdo-uniffi` 経由 |
@@ -98,9 +100,11 @@ graph TD
 │   │       ├── mock.rs         # MockTransport
 │   │       └── error.rs
 │   ├── eightbitdo-cli/             # CLI ツール（実機検証・自動化・I/O。`src/main.rs` 単一）
-│   ├── eightbitdo-gui/             # デスクトップ GUI (egui / eframe。3a 読み取り + 3b/3d 書込 UI)
+│   ├── eightbitdo-gui/             # egui 版 GUI（凍結。3a 読み取り + 3b/3d 書込 UI。比較・撤退用）
 │   └── eightbitdo-uniffi/          # Swift / Kotlin 向け UniFFI 公開レイヤー
-├── mobile/                     # モバイルアプリ（iOS / Android）
+├── apps/
+│   └── desktop/                # Tauri v2 デスクトップ GUI（正式）。src-tauri は独立 Cargo ワークスペース
+├── mobile/                     # モバイルアプリ（iOS / Android。Tauri v2 モバイル実機確認までの代替・先行実装）
 │   ├── ios/                    # SwiftUI アプリ (CoreBluetooth Transport 実装)
 │   ├── android/                # Jetpack Compose アプリ (BLE Transport 実装)
 │   ├── README.md               # ビルド手順・到達点・制約
@@ -150,9 +154,9 @@ graph TD
 
 ## 5. フェーズ別実装ロードマップ
 
-> **2026-11-23 改訂（現状反映、main `0af60a3`）**: Phase 1 / 2a / 2b / 2d / 3a は main にマージ済み。PR #16（`feat/gui-write`）で Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）の GUI 書込を実装し **main にマージ済み**（実機未検証・Tier 3）。Phase 2c は core のみマージ済みで、#20 で `ota-bench` 段階実行 API、#19 で実機 btsnoop 採取計画を追加。実機 wire 未確定のため CLI / GUI / UniFFI に未配線。Phase 3c（OTA 画面）は未着手。Phase 5 は UniFFI と iOS / Android の雛形に加え、#21 で **JNI 同梱 APK / unsigned IPA のビルド成功まで記録**（実機未検証）。#17 で raw config の実機 flag 検証を opaque 値対応に修正、#18 でクロスプラットフォーム・ビルド確認、#22 で配布方針、#23 で機能マトリクスを追加。GUI ライセンス画面は #24 で main にマージ済み（左レール下部の「ライセンス」画面でアプリの MIT / Apache-2.0 全文と同梱 5 フォント全文・著作権者行を表示）。プロファイル切替（`0x0015`）の core / CLI / REPL 配線は #26 で main にマージ済み（`Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`、Save 送信なし）。実機では `cmd=0x0004/subcmd=0x0015` の 16B 封筒の ACK を 1 回観測し、`Save` を送らずに `cur_slot` が 6→1 へ更新されることを read-back で確認済み（未確認: 再接続/電源断を跨ぐ永続性、プロファイルの実効、`crc16` とみられる 2B の意味、直接 ACK の条件、ACK 形状の再現性。詳細は [docs/DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) §7）。[docs/FEATURE_MATRIX.md](FEATURE_MATRIX.md) の残作業「`0x0015` 切替のセッション API 化」に対応する。USB OTA（Phase 4）は USB Boot TX フレーミングが未文書化のため保留を継続する。詳細な残課題は §5.4。
+> **2026-11-23 改訂（現状反映、main `ed61961`）**: Phase 1 / 2a / 2b / 2d / 3a は main にマージ済み。PR #16（`feat/gui-write`）で Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）の GUI 書込を実装し **main にマージ済み**（実機未検証・Tier 3）。Phase 2c は core のみマージ済みで、#20 で `ota-bench` 段階実行 API、#19 で実機 btsnoop 採取計画を追加。実機 wire 未確定のため CLI / GUI / UniFFI に未配線。Phase 3c（OTA 画面）は未着手。Phase 5 は UniFFI と iOS / Android の雛形に加え、#21 で **JNI 同梱 APK / unsigned IPA のビルド成功まで記録**（実機未検証）。#17 で raw config の実機 flag 検証を opaque 値対応に修正、#18 でクロスプラットフォーム・ビルド確認、#22 で配布方針、#23 で機能マトリクスを追加。GUI ライセンス画面は #24 で main にマージ済み（左レール下部の「ライセンス」画面でアプリの MIT / Apache-2.0 全文と同梱 5 フォント全文・著作権者行を表示）。プロファイル切替（`0x0015`）の core / CLI / REPL 配線は #26 で main にマージ済み（`Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`、Save 送信なし）。実機では `cmd=0x0004/subcmd=0x0015` の 16B 封筒の ACK を 1 回観測し、`Save` を送らずに `cur_slot` が 6→1 へ更新されることを read-back で確認済み（未確認: 再接続/電源断を跨ぐ永続性、プロファイルの実効、`crc16` とみられる 2B の意味、直接 ACK の条件、ACK 形状の再現性。詳細は [docs/DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) §7）。[docs/FEATURE_MATRIX.md](FEATURE_MATRIX.md) の残作業「`0x0015` 切替のセッション API 化」に対応する。USB OTA（Phase 4）は USB Boot TX フレーミングが未文書化のため保留を継続する。詳細な残課題は §5.4。**#27〜#32 も main にマージ済み**（#27 状態 docs 更新、#28 `0x0015` 実機証跡、#29 機種抽象化の設計、#30 モバイルネイティブ計画、#31 ANTI_SLOP、#32 Tauri v2 GUI）。Tauri v2 GUI は **P0（決定・足場）/ P1（デザイン）完了・P2 以降（実接続・設定 / マクロ / OTA・パッケージ・モバイル）未着手**で、egui 版（`crates/eightbitdo-gui`）は凍結。
 
-> **2026-11-23 追記（GUI 移行）**: デスクトップ GUI は Tauri v2（Rust backend + Web frontend）へゼロベース移行する方針を決定した（[TAURI_PLAN.md](TAURI_PLAN.md)）。egui 版（`eightbitdo-gui`）は比較・撤退用に残し、Phase 3 の各画面は Tauri 版で再実装する。以下の Phase 3 の記述は egui 版の実績として読む。
+> **2026-11-23 追記（GUI 移行の現状）**: デスクトップ GUI は Tauri v2（Rust backend + Web frontend）へゼロベース移行し、**PR #32 で main にマージ済み**（[TAURI_PLAN.md](TAURI_PLAN.md)）。`apps/desktop` は P0 / P1（雛形・トークン・共通コンポーネント・シェル・デバイス / 入力モニターの静的 2 画面）までで、**BLE 接続・デバイス読み書きは未実装**。egui 版（`eightbitdo-gui`）は凍結（比較・撤退用）し、Phase 3 の各画面は Tauri 版で再実装する。以下の Phase 3 の記述は egui 版の実績として読む。
 
 ### 5.1 トラック構成（2026-11-23）
 
@@ -166,19 +170,22 @@ Track A: コア / CLI（Linux・デスクトップ）
   プロファイル切替 0x0015           完了（#26、core + CLI + REPL 配線。Save 送信なし。実機で ACK と cur_slot 6→1 を確認、永続性・実効は未確認）
   Phase 2e USB / 2.4G transport     保留
 
-Track B: GUI（egui / Pure Rust。Tauri v2 へ移行中）
-  Phase 3a read-only GUI            完了（PR #9）
-  Phase 3b macro editor             実装・main にマージ済み（PR #16。実機未検証・Tier 3）
+Track B: GUI（Tauri v2 が正式。egui 版は凍結）
+  Tauri P0 足場                     完了（PR #32。Vite / React / TS / Tailwind、独立 src-tauri、CI desktop.yml）
+  Tauri P1 デザイン                 完了（PR #32。トークン・共通コンポーネント・シェル・静的 2 画面）
+  Tauri P2 以降                     未着手（実接続・設定 / マクロ / OTA・パッケージ・モバイル）
+  Phase 3a read-only GUI            完了（PR #9、egui 版。凍結）
+  Phase 3b macro editor             egui 版は実装・main にマージ済み（PR #16。実機未検証・Tier 3。凍結）
   Phase 3c OTA screen               2c の wire 確定後（未着手）
-  Phase 3d settings tabs            実装・main にマージ済み（PR #16。実機未検証・Tier 3）
-  ライセンス画面                     完了（#24、アプリ MIT / Apache-2.0 + 同梱 5 フォントの全文）
+  Phase 3d settings tabs            egui 版は実装・main にマージ済み（PR #16。実機未検証・Tier 3。凍結）
+  ライセンス画面                     完了（#24、egui 版でアプリ MIT / Apache-2.0 + 同梱 5 フォントの全文）
 
 Track C: モバイル
   Phase 5  UniFFI + iOS / Android   雛形完了（PR #12）+ JNI 同梱 APK / unsigned IPA ビルド成功（#21）。
                                     実機 BLE・JNI ロード・署名・配布は未着手
 ```
 
-### 5.2 現状（2026-11-23、main `0af60a3`）
+### 5.2 現状（2026-11-23、main `ed61961`）
 
 | 項目 | 状態 |
 | --- | --- |
@@ -187,10 +194,13 @@ Track C: モバイル
 | Phase 2b | 完了（PR #6）。実機（BLE・slot S1）でマクロ書込・読み戻し・restore を確認。Write `0x0103` の `total_len` は絶対終端が必須。2026-11-23 に再接続後に `macro restore`（slot 0 の M1/M2、22 packets、復元後の read-back が書込前の read-back と SHA-256 一致）を再確認。**Switch 側でのマクロ発動は未確認**。M3/M4・S2/S3・USB HID は未確認 |
 | Phase 2c | core 実装済み（PR #11）。Mock 52 テスト（既定）/ 55（`mobile-boot`）/ 58（`ota-bench`）/ 61（`--all-features`）。#20 で実機採取用の段階実行 API（`ota-bench`、既定 OFF）をマージ、#19 で btsnoop 採取計画（[docs/OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md)、Phase A / Phase B）を追加。**実機 btsnoop 未取得、CLI / GUI / UniFFI 未配線、実機書込未検証**。マルチセクション `.dat` 非対応が公式ファーム対応の blocker |
 | Phase 2d | 完了（PR #7、#17 で実機 flag 対応を修正）。実機（BLE・MTU 200・74B chunk）で full 2768B write → Save → read-back 一致、`config remap` A→B→A を同一接続で確認。2026-11-23 に再接続後に version `0xC8` / full write read-back / `config remap A B` → `A A` の往復を再確認し、**各操作後の read-back が期待状態と一致し、復帰後は書込前の read-back と一致する**ことで検証した（実機 config の SHA はユーザーのプロファイル名設定により変わったと考えられるため固定値では判定しない）。**実機確認は full write / remap のみ**で、`config set` 各フィールド・`--force-raw`・MTU 200 以外は未確認。USB config write は未実装 |
-| Phase 3a | 完了（PR #9）。読み取り専用 GUI、日本語、燻しスレート。デバイス / ライブ入力 / 設定値 / ログの 4 タブ。 |
-| Phase 3b | **実装・main にマージ済み（PR #16）**。マクロエディタ／20ms 録音／ステップ編集／既存非空マクロへの書込。pre-write backup・read-back・TOCTOU・録音中書込不可。**実機未検証・Tier 3** |
+| Phase 3a | 完了（PR #9）。読み取り専用 GUI（egui 版・凍結）、日本語、燻しスレート。デバイス / ライブ入力 / 設定値 / ログの 4 タブ。 |
+| Phase 3b | **egui 版は実装・main にマージ済み（PR #16）**。マクロエディタ／20ms 録音／ステップ編集／既存非空マクロへの書込。pre-write backup・read-back・TOCTOU・録音中書込不可。**実機未検証・Tier 3** |
 | Phase 3c | 未着手。Phase 2c の実機 wire 確定後に OTA 画面を実装 |
-| Phase 3d | **実装・main にマージ済み（PR #16）**。設定タブ／22 ボタンリマップ／振動／スティック・トリガー／ジャイロ／LED。確認ダイアログ・pre-write backup・read-back。**実機未検証・Tier 3** |
+| Phase 3d | **egui 版は実装・main にマージ済み（PR #16）**。設定タブ／22 ボタンリマップ／振動／スティック・トリガー／ジャイロ／LED。確認ダイアログ・pre-write backup・read-back。**実機未検証・Tier 3** |
+| Tauri P0 | **完了（PR #32、main にマージ済み）**。`apps/desktop` の雛形（Vite + React + TS + Tailwind、独立クレートの `src-tauri`、capability / CSP、アイコン）、`.github/workflows/desktop.yml`（web / rust の advisory 2 ジョブ） |
+| Tauri P1 | **完了（PR #32、main にマージ済み）**。デザイントークン・共通コンポーネント・シェル・デバイス / 入力モニターの静的 2 画面。**BLE 接続・実データ・書き込みは未実装** |
+| Tauri P2 以降 | **未着手**（実接続・設定 / マクロ / OTA・パッケージ・Tauri モバイル。[TAURI_PLAN.md](TAURI_PLAN.md) §5） |
 | Phase 4 | 保留（USB Boot TX 未文書化） |
 | Phase 5 | **JNI 同梱 APK / unsigned IPA のビルド成功、実機未検証（#21）**。UniFFI 公開 API（PR #12）、iOS unsigned IPA 1,550,522 bytes、Android Kotlin-only APK に続き、NDK r29 + cargo-ndk で `libeightbitdo_uniffi.so` を同梱した APK 14,551,011 bytes を生成（ビルド・パッケージ内容の確認のみ）。iOS / Android 実機での BLE・JNI ロード、署名・App Store 配布は未着手。書き込み・OTA は意図的に未公開。証跡は [docs/MOBILE_BUILD_EVIDENCE.md](MOBILE_BUILD_EVIDENCE.md)（**Padbench 識別子統一後の再ビルドは §0**: APK 14,692,156 bytes / IPA 1,550,798 bytes） |
 | ライセンス | 完了（PR #13）。LICENSE-MIT / LICENSE-APACHE / NOTICE / THIRD_PARTY_LICENSES / TRADEMARKS。公開範囲・コードライセンス・商標・同梱フォント・ストア配布・マネタイズの決定は [docs/DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md)（#22、決定日 2026-11-23）が正本 |
@@ -300,9 +310,9 @@ Track C: モバイル
 
 ### Phase 3: `eightbitdo-gui`（デスクトップ GUI：Linux / macOS / Windows）
 
-> **移行注記（2026-11-23）**: GUI は Tauri v2（Web UI）へ移行中（[TAURI_PLAN.md](TAURI_PLAN.md)）。以下は egui 版（`crates/eightbitdo-gui`、比較・撤退用に維持）の実績と計画として読む。
+> **移行注記（2026-11-23）**: デスクトップ GUI は Tauri v2（Web UI）へ移行し、**PR #32 で main にマージ済み**（[TAURI_PLAN.md](TAURI_PLAN.md)。P0 / P1 完了・P2 以降未着手）。以下は egui 版（`crates/eightbitdo-gui`、凍結。比較・撤退用に維持）の実績と計画として読む。
 
-- **技術（egui 版）**: `egui` (`eframe`)、Pure Rust。Tauri v2 版は TypeScript + Vite + React + Tailwind CSS（pnpm）で、BLE は Rust コアに置く。
+- **技術（egui 版・凍結）**: `egui` (`eframe`)、Pure Rust。**正式な Tauri v2 版**は TypeScript + Vite + React + Tailwind CSS（pnpm）で、BLE は Rust コアに置く。
 - **Phase 3a（read-only GUI、完了）**: 接続パネル、デバイス情報、ライブ入力、設定ビューア、マクロ一覧、バックアップ、ログの読み取り専用 GUI。日本語 UI・燻しスレートのテーマ・同梱 Noto Sans JP（OFL）。デバイス書込は行わない。**2026-11-22 に PR #9 で main にマージ済み**。既定は **Tier 2**、ただし `crates/eightbitdo-core/**`（`session` / transport / mock を含む）の変更を伴う場合は **Tier 3**。GUI 側だけで完結する場合も、`session` の読み取り契約（ドレインの fail-closed、応答 `total_len` / `crc16` 照合、`Instant` 上限）を検証するテストを変えるなら Tier 3。
 - **Phase 3b（マクロエディタ、Phase 2b 後）**: タイムライン / テーブル、リアルタイム録音、1ms、8bit スティック、トリガー、JSON/TOML。Tier 3。**現状: PR #16 で実装済み・main にマージ済み（実機未検証）。** 20ms ライブ録音、ステップ編集（削除・待ち時間挿入・値変更）、既存非空マクロへの Header → Save → Erase → Write → Save、read-back 検証、pre-write macro backup、TOCTOU（expected SHA-256 不一致で中止）。空マクロ作成は拒否。録音中は書込不可（確認ダイアログは非モーダルだが確定時に再検証、録音中のロードは停止通知）。**実機未検証。JSON/TOML 入出力は未実装。**
 - **Phase 3c（OTA 画面、Phase 2c 後）**: バージョン確認、進捗、復旧モード。Tier 3。**Phase 2c の実機 wire 確定まで着手しない**。
