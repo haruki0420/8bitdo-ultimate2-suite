@@ -37,6 +37,12 @@
 7. **[docs/TAURI_PLAN.md](docs/TAURI_PLAN.md)**
    - Tauri v2 GUI への移行計画とクロスプラットフォーム方針（決定日 2026-11-23）。アーキテクチャ、`apps/desktop` 構成、P0〜P8 のフェーズ、クロスプラットフォーム表、リスク、日本語 UI 用語集、受け入れ条件。GUI に着手する前に必ず読む。
 
+> **UI を追加・変更するとき（推奨）**: [docs/ANTI_SLOP.md](docs/ANTI_SLOP.md) に、量産的に見える原因・検出チェックリスト・回避手順をまとめています（必読ではない。レビュー checklist の正本は [docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)）。
+>
+> **モバイル（iOS / Android）を触るとき（推奨）**: [docs/MOBILE_NATIVE_PLAN.md](docs/MOBILE_NATIVE_PLAN.md) に、ネイティブアプリとデスクトップの機能ギャップ監査・不足 UniFFI API の契約案・画面 / 工数 / 実装順序をまとめています（必読ではない。プロトコル・書き込み順序の正本は [docs/PROTOCOL_SPEC.md](docs/PROTOCOL_SPEC.md) と [docs/STRUCT_BT2_2768B.md](docs/STRUCT_BT2_2768B.md)）。
+>
+> **別機種への拡張を設計・実装するとき（推奨）**: [docs/DEVICE_MODEL_ABSTRACTION.md](docs/DEVICE_MODEL_ABSTRACTION.md) に、機種抽象化（`DeviceProfile` / `ConfigLayout` / 能力三値）の設計と BT2 移行の段階計画をまとめています（必読ではない。フェーズ全体の正本は [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) §5）。
+
 ---
 
 ## 3. 確定済みの技術スタック・設計方針
