@@ -142,7 +142,7 @@ error: I/O error: configuration file has invalid known fields; refusing to write
 | --- | --- |
 | 日時 | 2026-11-23 JST |
 | ホスト | Linux（BlueZ / btleplug、BLE GATT App Mode `80ND`） |
-| 個体 | 8BitDo Ultimate 2 Bluetooth Controller（PID `0x600F`）、BLE アドレス `E4:17:D8:55:BD:AA` |
+| 個体 | 8BitDo Ultimate 2 Bluetooth Controller（PID `0x600F`）、BLE アドレス `E4:17:D8:55:xx:xx`（個体識別を避けるため下位 2 バイトを伏字） |
 | MTU | 200（App Mode の観測値） |
 | 操作 | CLI `eightbitdo config profile 1`（REPL は `profile switch 1`）。接続・サービス探索の `--timeout` は 15 秒 |
 | 応答 | ACK 待ちはコアの per-frame timeout（既定 5 秒）。ACK は即時（体感 1 秒未満）に返り、タイムアウトにはならなかった。往復時間の正確な計測はしていない |

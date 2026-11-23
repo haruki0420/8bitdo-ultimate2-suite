@@ -150,7 +150,7 @@ graph TD
 
 ## 5. フェーズ別実装ロードマップ
 
-> **2026-11-23 改訂（現状反映、main `a8e3e2b`）**: Phase 1 / 2a / 2b / 2d / 3a は main にマージ済み。PR #16（`feat/gui-write`）で Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）の GUI 書込を実装し **main にマージ済み**（実機未検証・Tier 3）。Phase 2c は core のみマージ済みで、#20 で `ota-bench` 段階実行 API、#19 で実機 btsnoop 採取計画を追加。実機 wire 未確定のため CLI / GUI / UniFFI に未配線。Phase 3c（OTA 画面）は未着手。Phase 5 は UniFFI と iOS / Android の雛形に加え、#21 で **JNI 同梱 APK / unsigned IPA のビルド成功まで記録**（実機未検証）。#17 で raw config の実機 flag 検証を opaque 値対応に修正、#18 でクロスプラットフォーム・ビルド確認、#22 で配布方針、#23 で機能マトリクスを追加。GUI ライセンス画面は #24 で main にマージ済み（左レール下部の「ライセンス」画面でアプリの MIT / Apache-2.0 全文と同梱 5 フォント全文・著作権者行を表示）。プロファイル切替（`0x0015`）の core / CLI / REPL 配線は #26 で main にマージ済み（`Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`、Save 送信なし・実機未検証）。[docs/FEATURE_MATRIX.md](FEATURE_MATRIX.md) の残作業「`0x0015` 切替のセッション API 化」に対応する。USB OTA（Phase 4）は USB Boot TX フレーミングが未文書化のため保留を継続する。詳細な残課題は §5.4。
+> **2026-11-23 改訂（現状反映、main `0af60a3`）**: Phase 1 / 2a / 2b / 2d / 3a は main にマージ済み。PR #16（`feat/gui-write`）で Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）の GUI 書込を実装し **main にマージ済み**（実機未検証・Tier 3）。Phase 2c は core のみマージ済みで、#20 で `ota-bench` 段階実行 API、#19 で実機 btsnoop 採取計画を追加。実機 wire 未確定のため CLI / GUI / UniFFI に未配線。Phase 3c（OTA 画面）は未着手。Phase 5 は UniFFI と iOS / Android の雛形に加え、#21 で **JNI 同梱 APK / unsigned IPA のビルド成功まで記録**（実機未検証）。#17 で raw config の実機 flag 検証を opaque 値対応に修正、#18 でクロスプラットフォーム・ビルド確認、#22 で配布方針、#23 で機能マトリクスを追加。GUI ライセンス画面は #24 で main にマージ済み（左レール下部の「ライセンス」画面でアプリの MIT / Apache-2.0 全文と同梱 5 フォント全文・著作権者行を表示）。プロファイル切替（`0x0015`）の core / CLI / REPL 配線は #26 で main にマージ済み（`Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`、Save 送信なし）。実機では `cmd=0x0004/subcmd=0x0015` の 16B 封筒の ACK を 1 回観測し、`Save` を送らずに `cur_slot` が 6→1 へ更新されることを read-back で確認済み（未確認: 再接続/電源断を跨ぐ永続性、プロファイルの実効、`crc16` とみられる 2B の意味、直接 ACK の条件、ACK 形状の再現性。詳細は [docs/DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) §7）。[docs/FEATURE_MATRIX.md](FEATURE_MATRIX.md) の残作業「`0x0015` 切替のセッション API 化」に対応する。USB OTA（Phase 4）は USB Boot TX フレーミングが未文書化のため保留を継続する。詳細な残課題は §5.4。
 
 ### 5.1 トラック構成（2026-11-23）
 
@@ -161,7 +161,7 @@ Track A: コア / CLI（Linux・デスクトップ）
   Phase 2b macro write              完了・実機確認済み（S1 の M1/M2。M3/M4・S2/S3 は外挿）
   Phase 2c BLE OTA                  core のみ完了（Mock 52/55/58/61）。実機 wire 未確定・未配線
   Phase 2d config apply             完了・実機確認済み（BLE・MTU 200・74B chunk）
-  プロファイル切替 0x0015           完了（#26、core + CLI + REPL 配線。Save 送信なし・実機未検証）
+  プロファイル切替 0x0015           完了（#26、core + CLI + REPL 配線。Save 送信なし。実機で ACK と cur_slot 6→1 を確認、永続性・実効は未確認）
   Phase 2e USB / 2.4G transport     保留
 
 Track B: GUI（egui / Pure Rust）
@@ -176,7 +176,7 @@ Track C: モバイル
                                     実機 BLE・JNI ロード・署名・配布は未着手
 ```
 
-### 5.2 現状（2026-11-23、main `a8e3e2b`）
+### 5.2 現状（2026-11-23、main `0af60a3`）
 
 | 項目 | 状態 |
 | --- | --- |
@@ -195,7 +195,7 @@ Track C: モバイル
 | クロスプラットフォーム | ビルド確認のみ（#18、[docs/CROSS_PLATFORM.md](CROSS_PLATFORM.md)）。Linux ホスト / Windows `cargo check` / iOS target check は成功、macOS は本ホストで確認不能、Windows の実効 MSRV は 1.88 以上。**実機は Linux のみ** |
 | 機能カバレッジ | 公式 Windows / Android ソフトとの比較表 [docs/FEATURE_MATRIX.md](FEATURE_MATRIX.md)（#23） |
 | GUI ライセンス画面 | **main にマージ済み（#24）**。左レール下部の「ライセンス」画面でアプリの MIT / Apache-2.0 全文と同梱 5 フォント全文・著作権者行を表示。Esc / × / 「閉じる」で閉じ、書込確認中は無効化。ヘッドレステストで開閉・描画を検証 |
-| プロファイル切替 API | **main にマージ済み（#26）**。core `Session::switch_profile` + CLI `config profile <N>` + REPL `profile switch <N>`、Save 送信なし。FEATURE_MATRIX の残作業「`0x0015` 切替のセッション API 化」に対応。実機未検証（ACK 形状・Save 要否・永続性は未確認） |
+| プロファイル切替 API | **main にマージ済み（#26）**。core `Session::switch_profile` + CLI `config profile <N>` + REPL `profile switch <N>`、Save 送信なし。FEATURE_MATRIX の残作業「`0x0015` 切替のセッション API 化」に対応。実機で `cmd=0x0004/subcmd=0x0015` の 16B 封筒の ACK を 1 回観測し、`Save` を送らずに `cur_slot` が 6→1 へ更新されることを read-back で確認。**未確認**: 再接続/電源断を跨ぐ永続性、プロファイルの実効、`crc16` とみられる 2B の意味、直接 `cmd=0x0015` ACK の条件、ACK 形状の再現性（`Save 不要` は断定しない）。詳細は [docs/DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) §7 |
 | レビュー | 2a / 2b / 2c / 2d と書き込み系 GUI は **Tier 3**（3 セッション）。3a の表示のみの変更は Tier 2、`eightbitdo-core/**` に触れる場合は Tier 3 |
 
 ### Phase 1: `eightbitdo-protocol`（純粋プロトコル＆バイナリ層）
@@ -279,7 +279,7 @@ Track C: モバイル
 - **実装状況（2026-11-23、BLE のみ。実機 write / remap 確認済み）**:
   - core `config_ops`: デバイス snapshot に型付き編集を適用し、予約バイト（`0x1F4..0x68C` / `0x914..0x92C`）を保持、`ANSI_CRC_16_sh` を再計算して **2768B 全体を `0x0001` 分割送信 → `0x0006/0x0067` Save → `0x0002` read-back 検証**。CRC 不一致・ACK 失敗は `ConfigWriteStage`（Write/Save/Verify）+ `ConfigWriteState`（NotSaved/Saved）で fail-closed。失敗時は段階別の復旧文を返す。
   - 書込 chunk の既定は **`min(MTU ペイロード, 74)`**（RE: 公式書込上限 74B、`MAX_ATT_MTU 92 - 0x12`。静的解析。既定 74B での実機 write は確認済み）。`--write-chunk <BYTES>` は接続前に **1..=180**（観測 MTU 200 のペイロード上限）で検証し、任意サイズ（例: 180B、旧 MTU 連動の A/B）を指定可能。接続後は交渉 MTU の上限も検証する。
-  - CLI: `config dump` / **`config write --file <2768B>`** / **`config set <field> <value>`** / **`config remap <physical> <target>`** / **`config map show`** / **`config profile <0|1|2>`**（公式 `0x0015` WriteSLOT。Save は送らない。ACK 形状・Save 要否・永続性は実機未確認）。`config write` はファイル読込・既知フィールド検証を **BLE 接続前** に行う。
+  - CLI: `config dump` / **`config write --file <2768B>`** / **`config set <field> <value>`** / **`config remap <physical> <target>`** / **`config map show`** / **`config profile <0|1|2>`**（公式 `0x0015` WriteSLOT。Save は送らない。実機で `cmd=0x0004/subcmd=0x0015` の 16B 封筒の ACK を 1 回観測し、`Save` を送らずに `cur_slot` 6→1 を read-back で確認。永続性・実効・ACK 形状の再現性・直接 ACK の条件は未確認。詳細は [DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) §7）。`config write` はファイル読込・既知フィールド検証を **BLE 接続前** に行う。
   - 安全策: **pre-write backup 必須**（`config.bin` + `config.json`、`REVIEW_TIERS` §6 の例外としてマクロ step sector は対象外）、`--yes` なしの対話確認、**前後 SHA-256 表示**、確認後の **TOCTOU 再読込**（変化時は中止）、read-back 検証、ゲームパッドモード / cur_slot 変更とマクロヘッダ（`0x68C..0x914`）変更の警告。
   - 復旧: `config write --file <backup>/config.bin --yes`。device が予約バイトを正規化した場合は `--accept-reserved-drift` で現在の device 予約バイトに合わせる。
   - **実機確認（2026-11-23、BLE・MTU 200・74B chunk）**: **確認範囲は `config write --file` の full 2768B write と `config remap` のみ**。full write は **38 write + 1 Save（合計 39 packets）**で送信し、Save 後の read-back SHA-256 が送信内容と一致した。device は送信した CRC を保持し（`stored` 一致、`in_place` 解釈とは不一致）、`config remap A B` の反映（read-back で A→B）と B→A への復帰を同一接続で確認した。書込前後で `config-backup-*` が作成され、各回の before / after SHA-256 が記録されている。**`config set` の各フィールド、`--force-raw` / `--accept-reserved-drift`、MTU 200 以外は未確認。**
@@ -329,7 +329,7 @@ Track C: モバイル
 2. ~~Phase 2b マクロ書き込み → Tier 3 レビュー → マージ~~ **完了（実機確認済み）**
 3. **Phase 2c BLE OTA: 実機 btsnoop で wire / ACK を確定 → ACK `offset` / `total_len` 照合とマルチセクション `.dat` 対応 → Tier 3 → CLI / GUI / UniFFI 配線 → 実機書込**
 4. ~~Phase 2d 設定書き込み → Tier 3 レビュー → マージ~~ **完了（実機確認済み）**
-5. ~~Phase 3a GUI 読み取り専用~~ **完了** / ~~Phase 3b / 3d GUI 書き込み UI~~ **PR #16 で実装・main にマージ済み（実機未検証）**。次に着手するのは **Phase 3c OTA 画面**（Phase 2c の実機 wire 確定後）と、GUI 書込の実機確認（Tier 3）。~~GUI ライセンス画面~~ **#24 で main にマージ済み**、~~プロファイル切替（`0x0015`）の core / CLI / REPL 配線~~ **#26 で main にマージ済み（実機未検証）**
+5. ~~Phase 3a GUI 読み取り専用~~ **完了** / ~~Phase 3b / 3d GUI 書き込み UI~~ **PR #16 で実装・main にマージ済み（実機未検証）**。次に着手するのは **Phase 3c OTA 画面**（Phase 2c の実機 wire 確定後）と、GUI 書込の実機確認（Tier 3）。~~GUI ライセンス画面~~ **#24 で main にマージ済み**、~~プロファイル切替（`0x0015`）の core / CLI / REPL 配線~~ **#26 で main にマージ済み（実機で ACK と `cur_slot` 6→1 を確認。再接続/電源断を跨ぐ永続性・プロファイル実効は未確認）**
 6. Phase 5 モバイル: ~~Android JNI 同梱 APK のビルド~~ **完了（#21）** → 実機 BLE・JNI ロード確認 → 署名・配布（書き込み・OTA は後続）
 7. Phase 2e / 4（USB / 2.4G）: 実機証跡と USB Boot TX フレーミングが揃うまで保留
 
@@ -349,7 +349,7 @@ Track C: モバイル
 | 10 | **既知バグ: BLE 切断後も `session` の `status` が `connected: true` と keepalive カウンタを保持する。送信時に `Not connected` エラーが返ることは確認済み（2026-11-23 発見・未修正）** | リンク断を `status` から検知できない | 3 |
 | 11 | USB HID / 2.4G transport と USB OTA（USB Boot TX 未文書化） | Phase 2e / 4 保留 | 3 |
 | 12 | ~~GUI ライセンス画面~~ **完了（#24、main にマージ済み）** | ライセンス表示は GUI にある | 1–2 |
-| 13 | ~~プロファイル切替 API~~ **完了（#26、main にマージ済み。core `Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`、Save 送信なし）**。残るのは実機での ACK 形状・Save 要否・永続性確認 | `0x0015` の実機確認 | 3 |
+| 13 | ~~プロファイル切替 API~~ **完了（#26、main にマージ済み。core `Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`、Save 送信なし。実機で `cmd=0x0004/subcmd=0x0015` の 16B 封筒の ACK を 1 回観測し、`Save` を送らずに `cur_slot` が 6→1 へ更新されることを read-back で確認済み）**。残るのは再接続/電源断を跨ぐ永続性・プロファイル実効・`crc16` とみられる 2B の意味・直接 ACK の条件・ACK 形状の再現性の確認 | `0x0015` の永続性・実効確認 | 3 |
 
 **実機の追加確認（2026-11-23）**: Linux BLE・MTU 200 で再接続し、version `0xC8`、config full write → read-back、`config remap A B` → read-back で `A A` の往復（read-back SHA `fae1de6…` / `7a9838e…`）、`macro restore`（slot 0 の M1/M2、read-back SHA `7ebbfde…` / `c6f2419…`、22 packets）を再確認した。実機 config の SHA は 2026-11-22 時点の `1dca47fa…` と異なる（プロファイル名 `za` / `Profile2` を設定したためと考えられ、現在は `95b87bb0…`）ため、**固定値ではなく、各操作後の read-back が期待状態と一致し、復帰後は書込前の read-back と一致する**ことで検証している。
 
