@@ -34,8 +34,8 @@
    - 常駐 `session` の運用（per-user BLE 単一所有者ロック、degraded 終了コード 3、SIGINT 範囲、`scan --check` と `scripts/session-loop.sh`）
 6. **[docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)**
    - BLE OTA の実機 btsnoop 採取（Linux `btmon` / Android HCI snoop）・確認項目と判定・EVIDENCE への追記方法、Phase A / Phase B の安全手順。OTA の実機検証前に必ず読む。
-7. **[docs/ANTI_SLOP.md](docs/ANTI_SLOP.md)**
-   - UI が量産的（AI スロップ / AI slop）に見える原因と、回避手順・検出チェックリスト・自動テスト（導入予定）・レビュー観点。**画面を追加・変更するときの推奨で、必読ではない**（レビュー checklist の正本は [docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)）
+
+> **UI を追加・変更するとき（推奨）**: [docs/ANTI_SLOP.md](docs/ANTI_SLOP.md) に、量産的に見える原因・検出チェックリスト・回避手順をまとめています（必読ではない。レビュー checklist の正本は [docs/REVIEW_TIERS.md](docs/REVIEW_TIERS.md)）。
 
 ---
 
