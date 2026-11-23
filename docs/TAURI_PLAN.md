@@ -108,7 +108,7 @@ graph TD
 
 - Tauri v2 の capability は最小限にする。コマンドは画面の用途ごとに分け、汎用の「任意の BLE 操作」コマンドを作らない。現状は `apps/desktop/src-tauri/capabilities/default.json` の `core:default` だけ（P0 雛形）で、P2 以降に用途別 capability へ分割する。
 - **`fs` / `shell` / `http` プラグインは P2 以降も追加しない。** ファイル選択・保存は Rust 側のダイアログ API（`tauri-plugin-dialog` を使う場合も増やす権限はダイアログに限定）に閉じ、HTTP は Rust 側で行う。WebView に任意パス・任意 URL を渡さない方針を維持する（capability を広げる変更はレビュー Tier 3）。
-- CSP を設定し、外部 URL を WebView に読み込まない。外部リンクは OS のブラウザで開く。**P0 で設定済み**: `apps/desktop/src-tauri/tauri.conf.json` の `app.security.csp` は `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost`（`ipc:` と `http://ipc.localhost` は Tauri v2 の IPC 用）。
+- CSP を設定し、外部 URL を WebView に読み込まない。外部リンクは OS のブラウザで開く。**P0 で設定済み**: `apps/desktop/src-tauri/tauri.conf.json` の `app.security.csp` は `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'`（`ipc:` と `http://ipc.localhost` は Tauri v2 の IPC 用）。
 - 書き込みコマンドは、Web UI の確認状態にかかわらず Rust 側で再度検証する（確認済みフラグを IPC で受け取らない）。
 
 ---

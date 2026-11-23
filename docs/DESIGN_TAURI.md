@@ -90,7 +90,7 @@ P0 で `apps/desktop` の雛形（React 19 / Vite / Tailwind v4 / vitest）が�
 | --- | --- |
 | 左ナビは デバイス / ライブ入力 / 設定 / マクロ / ログ | デバイス / 入力モニター / 現在値 / 設定 / マクロ / ログ。入力モニターは独立した画面にし、右レールは全画面で「書き込み前の確認」を常設する |
 | `src/index.css` の `@theme` が Inter / JetBrains Mono | 同梱済みの Noto Sans JP / Hack に置き換える。未同梱フォントは追加しない（ライセンス更新を避ける） |
-| `@theme` が slate の暗色のみ | ライト面 + ダークステージのトークン（§5.1）に置き換える |
+| `@theme` が slate の暗色のみ | ライト面 + ダークステージのトークン（§5.1）に置き換える（**その後 Hyperstudio の暗色トークンに再置換。§11 / §12**） |
 | トークンが `index.css` に直書き | `apps/desktop/src/styles/tokens.css` に分離し、`index.css` から読み込む（予定パス） |
 | 空状態はアイコン + 1 文 | 「状態 + 次にすること 1 つ」（§5.5.9）に統一。アイコンは飾りなので置かない |
 
@@ -832,7 +832,7 @@ y_screen = cy − ny * r        // ny が +1 のとき画面の上端
 ## 9. 未決事項
 
 - **Y 軸の符号**: 生値の Y が上方向に + か − かは実機未確認。`Y_SIGN` を設定に持ち、実機で 1 回確認してから固定する（§5.6.1）
-- **ダークテーマ**: 今回はライト固定。将来ダークを作る場合、入力モニターは既に暗いため「明るい面だけを反転する」ことになり、思想（面の二重性）が壊れる。作るなら別案として設計する
+- **テーマ**: 現在は **Hyperstudio の暗色固定**（案 C のライト面は §11 で廃止。正本は §12 と [design/IMPORTED_STYLE_HYPERSTUDIO.md](design/IMPORTED_STYLE_HYPERSTUDIO.md)）。ライトテーマは作らない。将来必要になった場合は、面の二重性ではなく別案として設計する
 - **フォントの woff2 サブセット**: 既存の `crates/eightbitdo-gui/assets/fonts/build_fonts.py` を Web 用に拡張する。日本語の全 UI 文字を 3 ウェイトで覆うこと、`font-display: swap`、preload の対象を決める
 - **アイコン**: 今回は文字と最小限のインライン SVG だけ。アイコンセットを入れるなら 16px・1.5 stroke の 1 セットに限定し、ライセンス表記を更新する
 - **入力モニターの拡大表示**: ステージを全画面にしたときのレイアウト（コントローラ線画の拡大、数値の配置）は P2 で決める
@@ -861,6 +861,7 @@ y_screen = cy − ny * r        // ny が +1 のとき画面の上端
 | --- | --- |
 | §5.1〜§5.3 のライト面トークン（`--surface-*` / `--line*` / `--text*` / accent） | §12.1 の対応表と [design/IMPORTED_STYLE_HYPERSTUDIO.md](design/IMPORTED_STYLE_HYPERSTUDIO.md) §2 |
 | ダークステージ `[data-surface="stage"]` | 廃止。ステージは `carbon` 地 + 1px `graphite` のパネル（実装は `data-testid="input-stage"`） |
+| §2.4 の「ライト面 + ダークステージ」と §9 の「今回はライト固定」 | 現行は **Hyperstudio の暗色固定**（§12）。§2.4 は P0→P1 時点の差分記録、§9 は §12 の決定で置換済み |
 | `--shadow-pop` | 削除。影は一切使わない（フォーカスは 1px `chalk` の outline） |
 | §5.5 のコンポーネント仕様（ライト面前提） | 寸法・状態の考え方は維持し、色・影・角丸は §12.1 に読み替え |
 | §7.2 の `@theme` 例、`color-scheme: light`、`mockup.html` 前提の検証 | §7.2 は履歴。`color-scheme` は `dark`。検証は `tokens.test.ts` / `style-audit.test.ts` と X11 起動のスクリーンショット |
@@ -900,6 +901,7 @@ y_screen = cy − ny * r        // ny が +1 のとき画面の上端
 ### 12.2 実装の参照先
 
 - トークン: `apps/desktop/src/styles/tokens.css`（値の正本）、`apps/desktop/src/index.css`（Tailwind `@theme` 写像）、`apps/desktop/src/design/tokens.ts`（テスト用の写し）
+- 上部バーの副題: 現状は **「開発版（画面骨格）」**。書き込み対応版の副題（§6.3 の用語）は書き込み機能（P3）の実装後に出す。`apps/desktop/src/brand.test.ts` が文言を固定する
 - コンポーネント: `apps/desktop/src/components/`（Button / StatusPill / Field / Select / Switch / Tabs / Table / Dialog / Toast / Banner / EmptyState / icons）
 - 画面: `apps/desktop/src/screens/`（Devices / InputMonitor / Placeholder）、シェル: `apps/desktop/src/shell/`
 - テスト: `apps/desktop/src/design/tokens.test.ts`（トークン一致・コントラスト・タイポ）、`apps/desktop/src/design/style-audit.test.ts`（影・グラデ・塗り・角丸・アイコン色・weight の自己監査）
@@ -908,7 +910,7 @@ y_screen = cy − ny * r        // ny が +1 のとき画面の上端
 ### 12.3 検証
 
 - `pnpm --dir apps/desktop build` / `pnpm --dir apps/desktop test`（全件）
-- X11 で起動し、1280×800 と 900×620 のスクリーンショットを取得
+- X11 で起動し、1280×800 と 900×620 のスクリーンショットを取得（[docs/design/screenshots/](design/screenshots/) の `tauri-1280x800.png` / `tauri-900x620.png`。CSP 設定後も `app_info` の IPC が通ること＝右上の `v0.1.0` 表示を確認）
 - 自己監査: グラデ 0 / 絵文字 0 / 影 0 / 色付きの塗りは白ピルと pulse-green（ドットと軌跡線）のみ / アイコン色は chalk か compass-gold のみ / 角丸は 4・8・99・9999 のみ / 見出し weight 400 / 本文・UI 文字は AA
 
 ### 12.4 用語

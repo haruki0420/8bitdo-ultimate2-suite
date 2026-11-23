@@ -44,8 +44,9 @@ describe("アプリ名の三重管理", () => {
     expect(CONF.app.windows[0]?.title).toBe(CONF.productName);
   });
 
-  it("上部バーは未実装の能力を名乗らない", () => {
-    // 書き込み対応版の副題は、能力フラグが入るまで表示しない（TODO コメントのみ）。
+  it("上部バーは開発版であることを示し、未実装の能力を名乗らない", () => {
+    // 画面骨格の段階であることを常設で示す（P3 の書き込み対応版の副題はまだ出さない）。
+    expect(TOP_BAR).toContain("開発版（画面骨格）");
     expect(TOP_BAR).not.toMatch(/>\s*書き込み対応版\s*</);
   });
 });

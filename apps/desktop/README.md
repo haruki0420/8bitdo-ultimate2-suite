@@ -11,6 +11,8 @@
 白 1 色のピル（`signal-white`）、`compass-gold` のアイコン線、`pulse-green` の
 ライブ状態ドット、weight 400 の大きな文字。影・グラデーション・写真は使いません。
 
+上部バーの副題は **「開発版（画面骨格）」** で、書き込み機能（P3）が入るまで能力を名乗りません。
+
 現在は**画面骨格まで**実装済みです: デザイントークン、共通コンポーネント 11 種、シェル
 （上部バー / 左ナビ / 右レール）、デバイス画面（未接続）、入力モニター画面（見本）。Rust 側は
 `app_info` コマンド 1 つだけで、**BLE 接続・デバイス読み書きはまだ実装していません**（次のフェーズ）。
@@ -46,7 +48,7 @@ sudo apt install libwebkit2gtk-4.1-dev build-essential pkg-config \
 
 ```bash
 cd apps/desktop
-pnpm install --frozen-lockfile   # 初回は --frozen-lockfile を外して lockfile を生成
+pnpm install --frozen-lockfile
 pnpm exec tauri dev              # Vite dev server + Rust ビルド（ウィンドウが開く）
 ```
 
@@ -129,10 +131,11 @@ apps/desktop/
   再生成し、`icons/` と `app-icon.png` を差し替えてください。
 - **CSP は設定済み**（`tauri.conf.json` の `app.security.csp`）:
   `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
-  img-src 'self' data:; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost`。
+  img-src 'self' data:; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost;
+  object-src 'none'; base-uri 'none'`。
   ローカル資産だけで動かし、外部 URL は読み込みません（`style-src 'unsafe-inline'` は
   React のインライン `style` 属性、`ipc:` / `http://ipc.localhost` は Tauri v2 の IPC 用）。
-  外部リンクを開くときは OS のブラウザに渡し、WebView 内では遷移しません。
+  外部リンクを開く処理は未実装です（P5 で OS のブラウザに渡す形で実装し、WebView 内では遷移しません）。
 - **capability は `core:default` だけ**で、現時点では広めです（`core:default` は Tauri の
   基本 API をまとめて許可する）。P2 以降で用途別 capability に分割し、`fs` / `shell` /
   `http` プラグインは追加しません（[docs/TAURI_PLAN.md](../../docs/TAURI_PLAN.md) §3.2・§5）。

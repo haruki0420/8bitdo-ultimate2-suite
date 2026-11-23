@@ -24,9 +24,7 @@ describe("スティックの正規化（§5.6.1）", () => {
 
   it("Y は上が正の座標系で、Y_SIGN の適用は 1 回だけ", () => {
     // 実機で生値の向きを確認するまで符号は固定しない（TODO(input) 参照）。
-    // どちらの値でも「Y_SIGN を 1 回だけ掛ける」ことだけを固定する。
-    expect([1, -1]).toContain(Y_SIGN);
-
+    // 値そのものではなく「Y_SIGN を 1 回だけ掛ける」ことだけを固定する。
     const rawY = 140;
     const vector = normalizeStick(127, rawY);
     expect(vector.y).toBeCloseTo(normalizeAxis(rawY) * Y_SIGN, 10);

@@ -1,6 +1,6 @@
 # デザインモックアップ
 
-> **2026-11-23 更新**: 現在の実装は **Imported style: Hyperstudio** に置換済みです。色・タイポグラフィ・コンポーネントの正本は [IMPORTED_STYLE_HYPERSTUDIO.md](IMPORTED_STYLE_HYPERSTUDIO.md) と [../DESIGN_TAURI.md](../DESIGN_TAURI.md) §12 です。この README と `mockup.html` は案 C「昼の作業台と夜のステージ」時代の**経緯資料**で、現在の実装とは一致しません。
+> **2026-11-23 更新**: 現在の実装は **Imported style: Hyperstudio** に置換済みです。現行実装の実スクリーンショットは [screenshots/](screenshots/)（1280×800 / 900×620）にあります。色・タイポグラフィ・コンポーネントの正本は [IMPORTED_STYLE_HYPERSTUDIO.md](IMPORTED_STYLE_HYPERSTUDIO.md) と [../DESIGN_TAURI.md](../DESIGN_TAURI.md) §12 です。この README と `mockup.html` は案 C「昼の作業台と夜のステージ」時代の**経緯資料**で、現在の実装とは一致しません。
 
 `mockup.html` は Tauri v2 + Web UI 版 GUI のデザイン確認用の**静的モックアップ**です。デザインの正本は [../DESIGN_TAURI.md](../DESIGN_TAURI.md) で、このファイルはその見た目を 1 枚で確認するための資料です。
 
@@ -29,7 +29,7 @@ python3 -m http.server -d docs/design 8000
 
 ## トークンの対応
 
-`mockup.html` の `:root` と `[data-surface="stage"]` は [../DESIGN_TAURI.md](../DESIGN_TAURI.md) §5.1 のトークンと 1 対 1 です。実装では同じ値を `apps/desktop/src/styles/tokens.css` に置き、Tailwind v4 の `@theme` から参照します（§7.2）。
+`mockup.html` の `:root` と `[data-surface="stage"]` は [../DESIGN_TAURI.md](../DESIGN_TAURI.md) §5.1（案 C）のトークンと 1 対 1 です。**このモックアップは案 C 時代の経緯資料**で、`[data-surface="stage"]` と `--surface-*` 系トークンは**現行実装には存在しません**（現行のステージは `data-testid="input-stage"` の `carbon` パネル。値は `apps/desktop/src/styles/tokens.css`、Tailwind 写像は `apps/desktop/src/index.css`）。
 
 | mockup の変数 | DESIGN_TAURI.md |
 | --- | --- |

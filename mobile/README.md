@@ -206,7 +206,7 @@ cd mobile/ios && xtool dev build -c release --ipa
   `CFBundleName` / `CFBundleDisplayName=Padbench`,
   `NSBluetoothAlwaysUsageDescription`（"read its settings and enable live
   input"）, `UIBackgroundModes=[bluetooth-central]`, `MinimumOSVersion=17.0`
-* Rust staticlib サイズ: 20,899,048 bytes（release、LTO なし）
+* Rust staticlib サイズ: 20,923,544 bytes（release、LTO なし）
 * 内部名は `xtool.yml` の `product: Padbench` と `Package.swift` の product 名で指定。
   Swift の target / module 名は `EightBitDo` のまま（生成される UniFFI バインディングの
   `import` を変えないため）
@@ -295,8 +295,8 @@ with-response しか広告しない実装があります。フレーム自体は
 | ツールチェーン | AGP **9.5.0** / Gradle **9.8.2**（wrapper 同梱）/ Kotlin **2.4.21**（AGP 9 の built-in Kotlin）/ JDK 21 |
 | Android SDK | `/opt/android-sdk`（platforms;android-36, build-tools;36.0.0） |
 | `./gradlew testDebugUnitTest` | **BUILD SUCCESSFUL**（`FrameQueueTest` 3 + `AppWriteModeTest` 3 + `RustCoreTest` 2 = 8 テスト、失敗 0） |
-| `./gradlew assembleDebug` | **BUILD SUCCESSFUL**（`app/build/outputs/apk/debug/app-debug.apk` = 14,551,011 bytes、JNI 同梱） |
-| Rust JNI ライブラリ | **同梱済み**（`lib/arm64-v8a/libeightbitdo_uniffi.so` 1,266,288 bytes / `lib/x86_64/...` 1,193,896 bytes。NDK r29 + cargo-ndk 4.1.2） |
+| `./gradlew assembleDebug` | **BUILD SUCCESSFUL**（`app/build/outputs/apk/debug/app-debug.apk` = 14,692,156 bytes、JNI 同梱。Padbench 識別子統一後の再ビルド） |
+| Rust JNI ライブラリ | **同梱済み**（`lib/arm64-v8a/libeightbitdo_uniffi.so` 1,266,296 bytes / `lib/x86_64/...` 1,193,928 bytes。NDK r29 + cargo-ndk 4.1.2） |
 
 注意: 上記は Kotlin / Compose / リソース / manifest のコンパイル検証です。
 **2026-11-23 に NDK r29 と cargo-ndk 4.1.2 を導入し、`libeightbitdo_uniffi.so` を
@@ -416,7 +416,7 @@ mobile/android/app/src/main/jniLibs/        # cargo-ndk の .so
    マクロ読み出しは実機で確認していない。iOS は `xtool devices` が空。
 2. **Android の Rust JNI はビルド済み・実機未検証**。NDK 29.0.14206865 と
    cargo-ndk 4.1.2 を導入し、`libeightbitdo_uniffi.so` を同梱した
-   APK（14,551,011 bytes、arm64-v8a / x86_64）の生成に成功しています。
+   APK（14,692,156 bytes、arm64-v8a / x86_64）の生成に成功しています。
    JNI ロードの実機/エミュレータ確認は未実施です。
 3. **設定書き込み・OTA は未公開**。`prepareConfigWrite` まで。
 4. **バックグラウンド書き込み不可**（設計上、前景専用）。

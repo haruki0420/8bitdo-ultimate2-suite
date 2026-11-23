@@ -22,10 +22,20 @@ function rawSource(key: string): string {
   throw new Error(`unreadable source: ${key}`);
 }
 
-/** `src/` 配下の実装ファイル（テスト自身は除く）。 */
+/**
+ * コメントを除いた本文。コメント内の例示（旧クラス名・色名など）で
+ * 偽陽性を出さないため、すべての検査をこの本文に対して行う。
+ */
+function stripComments(text: string): string {
+  return text
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "");
+}
+
+/** `src/` 配下の実装ファイル（テスト自身は除く）。コメントは除いて検査する。 */
 const SOURCES = Object.keys(RAW_SOURCES)
   .filter((path) => !/\.test\.tsx?$/.test(path))
-  .map((path) => ({ path, text: rawSource(path) }));
+  .map((path) => ({ path, text: stripComments(rawSource(path)) }));
 
 const ALL_TEXT = SOURCES.map(({ path, text }) => `/* ${path} */\n${text}`).join(
   "\n",
@@ -99,18 +109,6 @@ describe("自己監査: 色・影・グラデーション", () => {
 });
 
 describe("自己監査: 値の許可リスト", () => {
-  /** コメントを除いた本文（コメント中の色名・例示を検査対象にしない）。 */
-  function withoutComments(text: string): string {
-    return text
-      .replace(/\/\*[\s\S]*?\*\//g, "")
-      .replace(/^\s*\/\/.*$/gm, "");
-  }
-
-  it("スケール外の任意値ユーティリティ（p-[13px] / bg-[#...] / text-[13px]）を書かない", () => {
-    const arbitrary = ALL_TEXT.match(/[a-z0-9]-\[[^\]]*\]/g) ?? [];
-    expect(arbitrary).toEqual([]);
-  });
-
   /** glob のキーは `./tokens.ts` や `../styles/tokens.css` の形で返る。 */
   function isAllowedPath(path: string, allowed: readonly string[]): boolean {
     const normalized = path.replace(/^\.\//, "");
@@ -119,12 +117,13 @@ describe("自己監査: 値の許可リスト", () => {
     );
   }
 
-  it("生の色は tokens.css / tokens.ts だけ（HEX を散らかさない）", () => {
+  it("6/8 桁の生の色は tokens.css / tokens.ts だけ", () => {
     const allowed = ["styles/tokens.css", "tokens.ts"] as const;
     const offenders = SOURCES.filter(
       ({ path, text }) =>
         !isAllowedPath(path, allowed) &&
-        /#[0-9a-fA-F]{3,8}\b/.test(withoutComments(text)),
+        // 3 桁は使わない。`#1234` のようなチケット番号を色と誤認しない。
+        /#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?\b/.test(text),
     ).map(({ path }) => path);
     expect(offenders).toEqual([]);
   });
@@ -134,9 +133,21 @@ describe("自己監査: 値の許可リスト", () => {
     const offenders = SOURCES.filter(
       ({ path, text }) =>
         !isAllowedPath(path, allowed) &&
-        /\b(?:rgba?|hsla?)\(/i.test(withoutComments(text)),
+        /\b(?:rgba?|hsla?)\(/i.test(text),
     ).map(({ path }) => path);
     expect(offenders).toEqual([]);
+  });
+
+  it("スケール外の任意値ユーティリティ（p-[13px] / bg-[#...] / text-[13px]）を書かない", () => {
+    // Tailwind のバリアント（data-[state=open] など）はデザイントークンの
+    // 任意値ではないため許可する（任意値の混入検査から除外する）。
+    const allowedVariant = /^(?:data|aria|group|peer|has|not|supports|nth)-\[/;
+    const matches = [
+      ...ALL_TEXT.matchAll(/(?:^|[\s"'`])([a-z][a-z0-9]*(?:-[a-z0-9]+)*)-\[/g),
+    ]
+      .map((match) => `${match[1] ?? ""}-[`)
+      .filter((token) => !allowedVariant.test(token));
+    expect(matches).toEqual([]);
   });
 
   it("インライン style はトリガーバーの幅指定だけ", () => {
@@ -146,9 +157,9 @@ describe("自己監査: 値の許可リスト", () => {
     // 許容しているのは 1 か所だけ。増やすときはこのリストに追記する。
     expect(inline).toHaveLength(1);
     for (const body of inline) {
-      const keys = [
-        ...body.matchAll(/([A-Za-z][A-Za-z-]*)\s*:/g),
-      ].map((match) => match[1]);
+      const keys = [...body.matchAll(/([A-Za-z][A-Za-z-]*)\s*:/g)].map(
+        (match) => match[1],
+      );
       expect(keys).toEqual(["width"]);
     }
   });

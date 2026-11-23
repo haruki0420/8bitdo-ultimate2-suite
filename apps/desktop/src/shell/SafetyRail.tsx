@@ -25,15 +25,15 @@ export function SafetyRail() {
         次にすること
       </p>
       <ul className="mt-2 list-disc pl-4 text-meta text-smoke">
-        <li>設定の変更は差分で表示します。</li>
-        <li>接続後に書き込みできます。</li>
+        <li>設定の差分表示は P3 で追加します。</li>
+        <li>書き込みは P3 で追加します。</li>
       </ul>
 
       <div className="mt-5">
         <Button
           variant="secondary"
           disabled
-          disabledReason="接続すると書き込めます。"
+          disabledReason="書き込みは P3 で追加します。"
         >
           実機に書き込む
         </Button>

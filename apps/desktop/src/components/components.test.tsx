@@ -20,13 +20,13 @@ import {
 describe("Button", () => {
   it("無効の理由をボタンの直下に出し、押せなくする", () => {
     render(
-      <Button disabled disabledReason="接続すると書き込めます。">
+      <Button disabled disabledReason="接続すると操作できます。">
         実機に書き込む
       </Button>,
     );
 
     const button = screen.getByRole("button", { name: "実機に書き込む" });
-    const reason = screen.getByText("接続すると書き込めます。");
+    const reason = screen.getByText("接続すると操作できます。");
     expect(button).toBeDisabled();
     expect(button).toHaveAttribute("aria-describedby", reason.id);
     expect(

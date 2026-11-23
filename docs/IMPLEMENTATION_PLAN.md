@@ -192,7 +192,7 @@ Track C: モバイル
 | Phase 3c | 未着手。Phase 2c の実機 wire 確定後に OTA 画面を実装 |
 | Phase 3d | **実装・main にマージ済み（PR #16）**。設定タブ／22 ボタンリマップ／振動／スティック・トリガー／ジャイロ／LED。確認ダイアログ・pre-write backup・read-back。**実機未検証・Tier 3** |
 | Phase 4 | 保留（USB Boot TX 未文書化） |
-| Phase 5 | **JNI 同梱 APK / unsigned IPA のビルド成功、実機未検証（#21）**。UniFFI 公開 API（PR #12）、iOS unsigned IPA 1,550,522 bytes、Android Kotlin-only APK に続き、NDK r29 + cargo-ndk で `libeightbitdo_uniffi.so` を同梱した APK 14,551,011 bytes を生成（ビルド・パッケージ内容の確認のみ）。iOS / Android 実機での BLE・JNI ロード、署名・App Store 配布は未着手。書き込み・OTA は意図的に未公開。証跡は [docs/MOBILE_BUILD_EVIDENCE.md](MOBILE_BUILD_EVIDENCE.md) |
+| Phase 5 | **JNI 同梱 APK / unsigned IPA のビルド成功、実機未検証（#21）**。UniFFI 公開 API（PR #12）、iOS unsigned IPA 1,550,522 bytes、Android Kotlin-only APK に続き、NDK r29 + cargo-ndk で `libeightbitdo_uniffi.so` を同梱した APK 14,551,011 bytes を生成（ビルド・パッケージ内容の確認のみ）。iOS / Android 実機での BLE・JNI ロード、署名・App Store 配布は未着手。書き込み・OTA は意図的に未公開。証跡は [docs/MOBILE_BUILD_EVIDENCE.md](MOBILE_BUILD_EVIDENCE.md)（**Padbench 識別子統一後の再ビルドは §0**: APK 14,692,156 bytes / IPA 1,550,798 bytes） |
 | ライセンス | 完了（PR #13）。LICENSE-MIT / LICENSE-APACHE / NOTICE / THIRD_PARTY_LICENSES / TRADEMARKS。公開範囲・コードライセンス・商標・同梱フォント・ストア配布・マネタイズの決定は [docs/DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md)（#22、決定日 2026-11-23）が正本 |
 | クロスプラットフォーム | ビルド確認のみ（#18、[docs/CROSS_PLATFORM.md](CROSS_PLATFORM.md)）。Linux ホスト / Windows `cargo check` / iOS target check は成功、macOS は本ホストで確認不能、Windows の実効 MSRV は 1.88 以上。**実機は Linux のみ** |
 | 機能カバレッジ | 公式 Windows / Android ソフトとの比較表 [docs/FEATURE_MATRIX.md](FEATURE_MATRIX.md)（#23） |
@@ -322,8 +322,8 @@ Track C: モバイル
   - `mobile/android`: Kotlin + Jetpack Compose UI + Android BLE GATT トランスポート + `cargo-ndk` ビルド構成（`scripts/mobile/build-android.sh`）。USB OTG は未実装。
 - **現状（2026-11-23、PR #12 で main にマージ済み）**:
   - `eightbitdo-uniffi`: `NativeTransport` callback、同期 `MobileSession`（version / config / macro backup / input / disconnect）、`describeConfig`、`prepareConfigWrite`（送信なしの書き込み準備のみ）。`cargo test -p eightbitdo-uniffi` は 14 テスト。
-  - iOS: SwiftUI 雛形 + CoreBluetooth transport。Linux の xtool で **署名なし IPA の生成まで成功（#21: 1,550,522 bytes、SHA-256 `e63d7822…b804f`）**。実機インストール・App Store / TestFlight 配布は macOS + Xcode が必要で未実施。
-  - Android: Compose 雛形 + GATT transport。**JNI 同梱 APK をビルド成功（#21、[docs/MOBILE_BUILD_EVIDENCE.md](MOBILE_BUILD_EVIDENCE.md)）**。NDK 29.0.14206865 + cargo-ndk 4.1.2 で `libeightbitdo_uniffi.so`（arm64-v8a / x86_64）を同梱した debug APK **14,551,011 bytes**（SHA-256 `879e894c…a351f1`）を生成し、JVM unit test 8 件も成功。**実機 / エミュレータでの JNI ロードは未確認**（ホストの emulator 実行ファイルに実行権限が無く、エミュレータ起動も未実施）。
+  - iOS: SwiftUI 雛形 + CoreBluetooth transport。Linux の xtool で **署名なし IPA の生成まで成功（#21: 1,550,522 bytes、SHA-256 `e63d7822…b804f`）**。実機インストール・App Store / TestFlight 配布は macOS + Xcode が必要で未実施。**Padbench 識別子統一後の再ビルドは §0（1,550,798 bytes、`Padbench.ipa`）**。
+  - Android: Compose 雛形 + GATT transport。**JNI 同梱 APK をビルド成功（#21、[docs/MOBILE_BUILD_EVIDENCE.md](MOBILE_BUILD_EVIDENCE.md)）**。NDK 29.0.14206865 + cargo-ndk 4.1.2 で `libeightbitdo_uniffi.so`（arm64-v8a / x86_64）を同梱した debug APK **14,551,011 bytes**（SHA-256 `879e894c…a351f1`）を生成し、JVM unit test 8 件も成功。**実機 / エミュレータでの JNI ロードは未確認**（ホストの emulator 実行ファイルに実行権限が無く、エミュレータ起動も未実施）。**Padbench 識別子統一後の再ビルドは [docs/MOBILE_BUILD_EVIDENCE.md](MOBILE_BUILD_EVIDENCE.md) §0（APK 14,692,156 bytes、package `io.github.haruki0420.padbench` の新 namespace）**。
   - 設定書き込み・OTA は UniFFI に公開していない（バックアップ UI・Tier 3 レビュー待ち）。Android USB OTG は未実装。
 - **完了条件**: iOS / Android 実機で `"80ND"` 接続・設定変更・マクロ編集・BLE OTA が動作すること（現状は実機未確認）。
 - **Tier**: 3。

@@ -16,7 +16,7 @@
 - **GPL / AGPL / SSPL / EUPL / CDDL / EPL は 0 件。** ライセンス式に MIT を含むクレート（MIT を選択可能）は **444**、Apache-2.0 を含むクレート（Apache-2.0 を選択可能）は **345**。どちらも選択できない **37 クレート**は §3.5 に列挙します（`MPL-2.0` 9、`Unicode-3.0` 単独 18、`Zlib` 3、`BSD-3-Clause` 2、`BSL-1.0` 2、`BSD-2-Clause` / `ISC` / `CC0-1.0` 各 1 など）。
 - 直接依存のうち **`uniffi` 0.31.2 だけが MPL-2.0**（唯一の非 MIT/Apache 直接依存）。ほかは MIT または Apache-2.0 を選択可能です（`btleplug` は BSD-3-Clause を含む三択、`uuid` は Apache-2.0/MIT、`nix` は MIT、`fs2` は MIT/Apache-2.0、`rustix` は Apache-2.0 WITH LLVM-exception / Apache-2.0 / MIT）。
 - Cargo 管理外の同梱資産も本ファイルで扱います: GUI 同梱の **Noto Sans JP**（OFL-1.1、§5）、**egui 既定フォント**（OFL-1.1 / Ubuntu Font Licence 1.0、§3.6.1）、**Gradle wrapper**（Apache-2.0、§3.6.3）。
-- **`apps/desktop`（Tauri v2）は独立した Cargo ワークスペース**のため、上の 497 とは別に集計します（§2.1）。`apps/desktop/src-tauri/Cargo.lock` の `cargo metadata --locked --all-features` で **436 パッケージ（workspace 1 + 第三者 435）**、`license` フィールドが空のクレートは **0**。内訳の上位は `MIT OR Apache-2.0` 198 / `MIT` 104 / `Apache-2.0 OR MIT` 34 / `Unicode-3.0` 18 / `Zlib OR Apache-2.0 OR MIT` 17 / `MPL-2.0` 7。**GPL / AGPL / SSPL / EUPL は 0**。`MPL-2.0` は 7 クレート（`cssparser` 2、`cssparser-macros`、`dtoa-short`（ブラウザ CSS エンジン由来）、`option-ext`、`selectors` 2）で、いずれもファイル単位コピーレフトです（本体コードには改変を加えない）。
+- **`apps/desktop`（Tauri v2）は独立した Cargo ワークスペース**のため、上の 497 とは別に集計します（§2.1）。`apps/desktop/src-tauri/Cargo.lock` の `cargo metadata --locked --all-features` で **436 パッケージ（workspace 1 + 第三者 435）**、`license` フィールドが空のクレートは **0**。内訳の上位は `MIT OR Apache-2.0` 198 / `MIT` 104 / `Apache-2.0 OR MIT` 34 / `Unicode-3.0` 18 / `Zlib OR Apache-2.0 OR MIT` 17 / `Unlicense OR MIT` 14 / `MIT/Apache-2.0` 12。`MPL-2.0` は 7 クレート（§3.3）で、上位 7 種類には入りません。**GPL / AGPL / SSPL / EUPL は 0**。`MPL-2.0` は 7 クレート（`cssparser` 2、`cssparser-macros`、`dtoa-short`（ブラウザ CSS エンジン由来）、`option-ext`、`selectors` 2）で、いずれもファイル単位コピーレフトです（本体コードには改変を加えない）。
 - **npm（`apps/desktop`）** は `pnpm licenses list --json` で **157 パッケージ / 9 種類**（MIT 132、`Apache-2.0 OR MIT` 3、Apache-2.0 6、ISC 7、BSD-2-Clause 2、BSD-3-Clause 2、BlueOak-1.0.0 2、MPL-2.0 2、CC-BY-4.0 1）。直接依存のライセンスは §2.1、注意点は §3.10。
 - 参考: Linux x86_64 ホストで実際にビルドされる第三者クレートは `cargo tree --locked --workspace --all-features` のユニーク **315**（dev 依存を含む。既定 feature では **298**）。`cargo metadata` の 497 は Cargo.lock 全体＝全ターゲット・全 feature・optional 依存を含む集合です。
 
@@ -242,11 +242,12 @@ MPL-2.0 は **ファイル単位の弱コピーレフト**です。本プロジ�
 ### 3.4 選択式ライセンス（OR）の扱い
 
 - `Unlicense OR MIT` / `Unlicense/MIT`（`memchr`, `same-file`, `walkdir`, `winapi-util` など 6）: 本プロジェクトは **MIT** を選択します。MIT の著作権表示は各クレートの `LICENSE` に従います。
+- `apps/desktop`（Tauri）のグラフには **MPL-2.0 が 7 クレート**入ります（`cssparser` 2 / `selectors` 2 / `cssparser-macros` / `dtoa-short` / `option-ext`）。いずれも WebKit / CSS エンジン由来のビルド時依存で、本プロジェクトのソースは改変していないため、ファイル単位コピーレフトの追加義務は生じません（ソースを改変して再配布する場合のみ §3.3 の条件に従う）。
 - `Zlib OR Apache-2.0 OR MIT`（`bytemuck`, `objc2-*` など 8）: **MIT または Apache-2.0** を選択します。Zlib の帰属義務は生じません。
 - `MIT OR Apache-2.0 OR Zlib` / `MIT OR Zlib OR Apache-2.0`（`glow`, `raw-window-handle`, `miniz_oxide` など 7）: MIT または Apache-2.0 を選択します。
 - `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`（`rustix` 2 バージョン, `wasi` など 7）: Apache-2.0 を選択します。
 - `BSD-3-Clause OR Apache-2.0`（`moxcms`, `pxfm`）、`BSD-3-Clause OR MIT OR Apache-2.0`（`num_enum`, `num_enum_derive`）、`BSD-2-Clause OR Apache-2.0 OR MIT`（`zerocopy`, `zerocopy-derive`）: MIT または Apache-2.0 を選択します。
-- `MIT OR Apache-2.0 OR LGPL-2.1-or-later`（`r-efi` 2）: MIT または Apache-2.0 を選択し、**LGPL の義務は生じません**。
+- `MIT OR Apache-2.0 OR LGPL-2.1-or-later`（`r-efi` 2。`apps/desktop` のグラフにも 2 クレート入る）: MIT または Apache-2.0 を選択し、**LGPL の義務は生じません**。
 - `0BSD OR MIT OR Apache-2.0`（`adler2`）、`Apache-2.0/MIT`（4）、`MIT/Apache-2.0`（18）: MIT または Apache-2.0 を選択します。
 - `Apache-2.0 AND MIT`（`dpi`）: 両方の条件を満たす必要があります（Apache-2.0 の NOTICE 義務を含む）。
 - `MIT/Apache-2.0/BSD-3-Clause`（`btleplug`）: §3.1。
@@ -355,7 +356,7 @@ GUI は `eframe` を既定 feature で使うため、`egui` の `default_fonts` 
 | `Apache-2.0` | `typescript`, `aria-query`, `expect-type` ほか | 開発ツール。配布物には含めない |
 | `ISC` / `BSD-2-Clause` / `BSD-3-Clause` | `semver` / `entities` / `source-map-js` ほか | ビルド・テスト時のみ |
 
-- **配布物に入るのは `vite build` 後の `dist/` のみ**で、ここに含まれるのは React / React DOM（MIT）とアプリ自身のコードだけです。ただしリリース時の完全な通知には npm の全依存（ビルド時を含む）を `pnpm licenses list` から生成して含めてください（§4）。
+- **配布物に入るのは `vite build` 後の `dist/` のみ**で、ここに含まれるのは React / React DOM / scheduler（MIT）と `@tauri-apps/api`（`Apache-2.0 OR MIT` の MIT を選択。`invoke` / `__TAURI_INTERNALS__` の接着コード）、アプリ自身のコードです。ただしリリース時の完全な通知には npm の全依存（ビルド時を含む）を `pnpm licenses list` から生成して含めてください（§4）。
 - npm の依存は再生成可能です（`pnpm-lock.yaml` を固定）。通知ファイルはリリース時に生成し、リポジトリには要約だけを置きます。
 
 ## 4. 生成・更新方法

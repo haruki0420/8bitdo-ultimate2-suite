@@ -4,6 +4,10 @@ name: Desktop
 # workspace (see apps/desktop/README.md), so the root CI jobs never build it.
 # `crates/eightbitdo-core` / `crates/eightbitdo-protocol` are path dependencies
 # of `src-tauri`, so changes there must run this workflow too.
+#
+# NOTE: `desktop-web` / `desktop-rust` are **advisory** (not required status
+# checks).  Promoting them to required checks is a separate PR that changes the
+# ruleset (see docs/BRANCH_PROTECTION.md).
 on:
   push:
     branches: [main]
@@ -11,6 +15,11 @@ on:
       - "apps/desktop/**"
       - "crates/eightbitdo-core/**"
       - "crates/eightbitdo-protocol/**"
+      # `eightbitdo-core` inherits `version.workspace = true`, and
+      # `src-tauri/Cargo.lock` pins that version, so a root version bump can
+      # break the desktop `cargo check --locked`.
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "docs/TAURI_PLAN.md"
       - "docs/DESIGN_TAURI.md"
       - "docs/design/**"
@@ -21,6 +30,11 @@ on:
       - "apps/desktop/**"
       - "crates/eightbitdo-core/**"
       - "crates/eightbitdo-protocol/**"
+      # `eightbitdo-core` inherits `version.workspace = true`, and
+      # `src-tauri/Cargo.lock` pins that version, so a root version bump can
+      # break the desktop `cargo check --locked`.
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "docs/TAURI_PLAN.md"
       - "docs/DESIGN_TAURI.md"
       - "docs/design/**"
@@ -66,7 +80,7 @@ jobs:
   desktop-rust:
     name: desktop-rust
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: apps/desktop/src-tauri
