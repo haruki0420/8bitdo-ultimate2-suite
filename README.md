@@ -26,6 +26,7 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 
 - **GUI からの書き込み**: PR #16 で設定 2768B・リマップ・マクロを実装し main にマージ済み。確認ダイアログ、pre-write backup、read-back 検証、TOCTOU 検出付き。**実機未検証・Tier 3**。
 - **GUI ライセンス画面**: PR #24 でレビュー中・未マージ。現 main の GUI にはライセンス表示画面がありません。
+- **プロファイル切替 API**: PR #26 で core `Session::switch_profile` + CLI `config profile <N>` + REPL `profile switch <N>` を実装し、レビュー中・未マージ。[docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md) の残作業「`0x0015` 切替のセッション API 化」に対応。
 - **ファームウェア更新（BLE OTA）**: core の状態機械と `ota-bench` 段階実行 API（#20）、実機 btsnoop 採取計画（#19）まで用意済み。実機 wire 未確定・CLI / GUI / UniFFI 未配線。USB OTA は USB Boot TX フレーミング未文書化のため保留。
 - **モバイルの書き込み・OTA**: バックアップ UI と Tier 3 レビュー待ちで未公開。Android の JNI 同梱 APK と iOS unsigned IPA はビルド成功（#21、実機未検証）、iOS / Android 実機確認、App Store 配布は未着手。
 - **USB HID / 2.4G transport**: 未実装・保留。
@@ -36,7 +37,7 @@ Nintendo Switch へ Bluetooth Classic または 2.4G アダプターで接続し
 
 main は `0582e9a`（2026-11-23）時点。フェーズの詳細・残課題は [AGENTS.md](AGENTS.md) §6 と [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) §5。
 
-2026-11-23 に main へマージ済みの追加分: **#17** raw config の実機 flag 対応（`slot_flags` allowlist、gyro sentinel 削除、実 dump を使う `#[ignore]` E2E、docs 整合）、**#18** クロスプラットフォーム・ビルド確認（[docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)）、**#19** OTA 実機 btsnoop 採取計画（[docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)）、**#20** `ota-bench` 段階実行 API、**#21** モバイルビルド証跡（[docs/MOBILE_BUILD_EVIDENCE.md](docs/MOBILE_BUILD_EVIDENCE.md)）、**#22** 配布・ライセンス・マネタイズ方針（[docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md)）、**#23** 公式機能カバレッジ・マトリクス（[docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md)）。**GUI ライセンス画面は PR #24 としてレビュー中で未マージ（実装予定）**。
+2026-11-23 に main へマージ済みの追加分: **#17** raw config の実機 flag 対応（`slot_flags` allowlist、gyro key_map の erasure sentinel 例外の削除（flag の `0x20190000` は raw allowlist で受理継続）、実 dump を使う `#[ignore]` E2E、docs 整合）、**#18** クロスプラットフォーム・ビルド確認（[docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)）、**#19** OTA 実機 btsnoop 採取計画（[docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)）、**#20** `ota-bench` 段階実行 API、**#21** モバイルビルド証跡（[docs/MOBILE_BUILD_EVIDENCE.md](docs/MOBILE_BUILD_EVIDENCE.md)）、**#22** 配布・ライセンス・マネタイズ方針（[docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md)）、**#23** 公式機能カバレッジ・マトリクス（[docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md)）。**GUI ライセンス画面は PR #24、プロファイル切替（`0x0015`）の core / CLI 配線は PR #26 として、いずれもレビュー中で未マージ（#24 は実装予定）**。
 
 | Phase | 内容 | 状態 |
 | --- | --- | --- |
@@ -52,10 +53,11 @@ main は `0582e9a`（2026-11-23）時点。フェーズの詳細・残課題は 
 | 4 | USB OTA | 保留（USB Boot TX 未文書化） |
 | 5 | UniFFI + iOS / Android | **JNI 同梱 APK / unsigned IPA ビルド成功、実機未検証**（#21） |
 | — | GUI ライセンス画面 | **PR #24（レビュー中・未マージ）**。実装予定 |
+| — | プロファイル切替 API（`0x0015`） | **PR #26（レビュー中・未マージ）**。core `Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>` |
 
-**実機で確認済み（Linux・BLE・MTU 200、2026-11-21〜23）**: version / 2768B dump / マクロ backup、マクロ書込（絶対終端 `total_len`）と復元、設定 full write（38 write + 1 Save = 合計 39 packets・74B chunk・read-back SHA 一致）、remap A→B→A。2026-11-23 に再接続後に再確認し、version `0xC8`、config full write → read-back、`config remap A B` → read-back で `A A` の往復（read-back SHA `fae1de6…` / `7a9838e…`）、`macro restore`（slot 0 の M1/M2、read-back SHA `7ebbfde…` / `c6f2419…`、22 packets）を確認した。**実機 config の SHA は 2026-11-22 時点（`1dca47fa…`）と異なる**（プロファイル名 `za` / `Profile2` を設定したため現在は `95b87bb0…`）ので、固定値の一致ではなく**各操作の前後 read-back の一致**で検証している。**設定の実機確認範囲は full write / remap のみ**（`config set` 各フィールド・`--force-raw`・MTU 200 以外は未確認）。
+**実機で確認済み（Linux・BLE・MTU 200、2026-11-21〜23）**: version / 2768B dump / マクロ backup、マクロ書込（絶対終端 `total_len`）と復元、設定 full write（38 write + 1 Save = 合計 39 packets・74B chunk・read-back SHA 一致）、remap A→B→A。2026-11-23 に再接続後に再確認し、version `0xC8`、config full write → read-back、`config remap A B` → read-back で `A A` の往復（read-back SHA `fae1de6…` / `7a9838e…`）、`macro restore`（slot 0 の M1/M2、read-back SHA `7ebbfde…` / `c6f2419…`、22 packets）を確認した。**実機 config の SHA は 2026-11-22 時点（`1dca47fa…`）と異なる**（プロファイル名 `za` / `Profile2` を設定したためと考えられ、現在は `95b87bb0…`）ので、固定値の一致ではなく、**各操作後の read-back が期待状態と一致し、復帰後は書込前の read-back と一致する**ことで検証している。**設定の実機確認範囲は full write / remap のみ**（`config set` 各フィールド・`--force-raw`・MTU 200 以外は未確認）。
 
-**既知バグ（未修正、2026-11-23 発見）**: BLE リンク切断後も `session` の `status` が `connected: true` と keepalive カウンタを表示し続け、その状態の送信は `Not connected` で失敗する。`status` が実リンク状態に追従しないため、`status` からはリンク断を検知できない。
+**既知バグ（未修正、2026-11-23 発見）**: BLE リンク切断後も `session` の `status` が `connected: true` と keepalive カウンタを表示し続けることを観察した。その状態での送信時に `Not connected` エラーが返ることは確認済み。`status` が実リンク状態に追従しないため、`status` からはリンク断を検知できない。
 
 **未確認**: slot S2/S3・`macro_idx=2/3 (M3/M4)`、MTU 200 以外、USB HID の config / macro write、`config set` の各フィールド実機確認、`--force-raw` / `--accept-reserved-drift`、GUI 書込（PR #16）と REPL からの書込、OTA の wire / ACK / アドレス / MTU、macOS / Windows / Android / iOS 実機、Android / iOS の JNI ロードと実機起動。
 
@@ -152,7 +154,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 | --- | --- |
 | **[docs/PROTOCOL_SPEC.md](docs/PROTOCOL_SPEC.md)** | デバイス VID/PID、BLE GATT UUID・MTU、16B カスタムヘッダ、BLE/USB HID フレーミング、2 種の CRC-16、全コマンド、リアルタイム入力ストリーム、BLE OTA ブートローダー＆ファームウェア API 仕様 |
 | **[docs/STRUCT_BT2_2768B.md](docs/STRUCT_BT2_2768B.md)** | 2768 バイト（`0xAD0`）設定構造体 (`record_ultimatebt2`) の全バイトオフセット、32-bit `KeyMap`、10 バイト `MacroDatas` ステップ構造、Flash 書き込みシーケンス |
-| **[docs/DEVICE_CONFIG_EVIDENCE.md](docs/DEVICE_CONFIG_EVIDENCE.md)** | 実機 2768B ダンプの実バイト証跡（2026-11-22 時点の dump は SHA-256 `1dca47fa…`。現在の実機 config はプロファイル名の変更で `95b87bb0…` と異なる）: `slot_flags` / `map_key.flag` の非 0/1 値、`config remap` の差分、raw 検証エラーと再現コマンド |
+| **[docs/DEVICE_CONFIG_EVIDENCE.md](docs/DEVICE_CONFIG_EVIDENCE.md)** | 実機 2768B ダンプの実バイト証跡（2026-11-22 時点の dump は SHA-256 `1dca47fa…`。現在の実機 config はプロファイル名の変更により `95b87bb0…` と異なると考えられる）: `slot_flags` / `map_key.flag` の非 0/1 値、`config remap` の差分、raw 検証エラーと再現コマンド |
 | **[docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md)** | 公式 Windows / Android ソフトの機能ごとのカバレッジ: RE 証拠ラベル、本リポジトリの実装状況（core / CLI / GUI）、実機検証状況（Linux BLE のみ）、残作業と追加 RE 項目 |
 | **[docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)** | Rust + SwiftUI + Jetpack Compose のアーキテクチャ設計、ワークスペース構成、Phase 1〜5 ロードマップ、現在の状態・残課題、安全検証手順 |
 | **[docs/OTA_BLE_EVIDENCE.md](docs/OTA_BLE_EVIDENCE.md)** | BLE OTA の解析証跡（確定した順序・タイムアウト・`.dat` ヘッダ）と未確認事項の優先順 |
@@ -181,7 +183,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
   - [x] Phase 2a: 読み取り専用 core / CLI / `session`（`eightbitdo session [--interval-ms 20] [--allow-macro-write] [--allow-config-write] [--no-report-enable]` の REPL は `info` / `config dump` / `backup` / `monitor` / `monitor stop` / `status` / `help` / `quit`。REPL には `macro backup <DIR>`（読み取りのみ、常に利用可）/ `macro write <SLOT> <INDEX> <FILE> [--trigger <KEY>] [--chunk-size <32|64>]` / `macro restore <DIR> [--force]` もあり、書込系は `--allow-macro-write`（既定 OFF）が必要。`session` は既定で起動時に `0x0007 enable(1)` を送る（公式相当）ため REPL の `macro write` は enable 状態で動き（トップレベル `macro write` の既定とは条件が異なる）、`--no-report-enable` 指定時は起動時の enable(1) を送らず `0x0003` keepalive のみを継続する（終了時の disable(0) は best-effort。トップレベル既定と同じ書込条件で A/B するため）。`--allow-macro-write` 時の `macro write` / `macro restore` は、ファイル読込・pre-write/pre-restore backup を含むコマンド全体で Ctrl-C を遅延する（非通常ファイルは読取前に拒否し、デバイス I/O は timeout で有界。SIGKILL・電源断は防げない）。REPL の `macro write` は `--backup-dir`（既定名 `macro-backup-<unix-nanos>-<pid>-<sequence>`）、`macro restore` は `--chunk-size` を指定できず、REPL 経由の実機書込は未検証。設定バックアップは `--raw` / `--json` を同一ディレクトリの一時ファイル経由でアトミックに書き、同一ファイルを指す 2 つの出力パスは拒否する。ただし hard link の同一性検出は Unix のみで、Windows は file identity 未実装のため hard link alias を事前拒否せず、raw 書き込み後の再検証と `rename` semantics で保護する。この再検証は偶発的な alias 用であり、出力ディレクトリに write 権限を持つ攻撃者による TOCTOU / 並行 rename は非保証である）
   - [x] Phase 2b: マクロ読み書き（実機確認済み。BLE・slot S1 の M1/M2。M3/M4・S2/S3 は外挿）
   - [ ] Phase 2c: BLE OTA（Linux。core 実装済み・Mock 52 テスト（既定）/ 55（`mobile-boot`）/ 58（`ota-bench`）/ 61（`--all-features`）。**単一セクション `.dat` のみ対応**で公式 `.dat` がマルチセクションの場合は未対応（公式ファーム対応の blocker）、未確認 wire ゲート既定 OFF、boot 専用 `BleBootTransport` のみ許可（App Session を切断してから `8bt` に接続。同一 BLE ロック）、type 1 application ウィンドウを暫定検証、CLI/GUI 未配線、実機書込は保留。実機採取用の `ota-bench` 段階実行 API（既定 OFF、`write_firmware_with_checkpoint` / `OtaCheckpoint::AfterFirstErase` 等）は #20 でマージ済み、採取手順は [docs/OTA_VERIFICATION_PLAN.md](docs/OTA_VERIFICATION_PLAN.md)（#19）。マルチセクション対応と実機 wire 確定は次 PR の必須項目）
-  - [x] Phase 2d: 設定書き込み（BLE のみ実機確認済み。`config write` / `set` / `remap` / `map show`、pre-write backup、確認、前後 SHA-256、read-back 検証。USB config write は未実装）。#17 で実機 flag を opaque 値として扱う raw 検証に修正（`slot_flags` allowlist、gyro sentinel 削除、実 dump を使う `#[ignore]` E2E）
+  - [x] Phase 2d: 設定書き込み（BLE のみ実機確認済み。`config write` / `set` / `remap` / `map show`、pre-write backup、確認、前後 SHA-256、read-back 検証。USB config write は未実装）。#17 で実機 flag を opaque 値として扱う raw 検証に修正（`slot_flags` allowlist、gyro key_map の erasure sentinel 例外の削除（flag の `0x20190000` は raw allowlist で受理継続）、実 dump を使う `#[ignore]` E2E）
 - [x] Phase 3a: `eightbitdo-gui` 読み取り専用 GUI（日本語・燻しスレート。PR #9）
 - [x] Phase 3b: GUI マクロエディタ（20ms 録音・ステップ編集・既存非空マクロへの書込。PR #16。**実機未検証・Tier 3**）
 - [ ] Phase 3c: GUI OTA 画面（Phase 2c の実機 wire 確定後）
@@ -189,10 +191,11 @@ cargo +1.85.0 check --workspace --all-targets --all-features --locked
 - [ ] Phase 4: USB OTA（保留）
 - [ ] Phase 5: `eightbitdo-uniffi` + iOS (SwiftUI) / Android (Jetpack Compose) アプリ（雛形完了・PR #12。JNI 同梱 APK / unsigned IPA はビルド成功（#21、[docs/MOBILE_BUILD_EVIDENCE.md](docs/MOBILE_BUILD_EVIDENCE.md)）。実機確認・App Store 配布は未着手）
 - [ ] GUI ライセンス画面（PR #24、レビュー中・未マージ。実装予定）
+- [ ] プロファイル切替 API（PR #26、レビュー中・未マージ。core `Session::switch_profile` + CLI `config profile <N>` + REPL `profile switch <N>`。FEATURE_MATRIX の残作業「`0x0015` 切替のセッション API 化」に対応）
 - [x] クロスプラットフォーム・ビルド確認（[docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md)、#18。実機は Linux のみ。Windows は `cargo check` のみ、macOS は未確認）
 - [x] 配布・ライセンス・マネタイズ方針（[docs/DISTRIBUTION_POLICY.md](docs/DISTRIBUTION_POLICY.md)、#22）
 - [x] 公式機能カバレッジ・マトリクス（[docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md)、#23）
-- [ ] 既知バグ: BLE 切断後も `session` の `status` が `connected: true` と keepalive カウンタを保持し、送信が `Not connected` で失敗する（2026-11-23 発見・未修正）
+- [ ] 既知バグ: BLE 切断後も `session` の `status` が `connected: true` と keepalive カウンタを保持する。送信時に `Not connected` エラーが返ることは確認済み（2026-11-23 発見・未修正）
 
 ---
 
