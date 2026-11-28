@@ -308,13 +308,13 @@ ReadConfig head:  04 02 00 00 00 74 00 00 00 74 00 00 00 00 00 00 00
 
 ### 4.4 USB HID / 2.4G HID フレーミング（Windows `8BitDoAdvance.dll` / Android USB / 2026-11-29 USBPcap 実機確定）
 
-USB 有線接続および 2.4GHz ドングル経由の HID / Interrupt 転送は、**USB ワイヤ上は 64 バイト固定**（byte 0 が `0x81`/`0x02`、byte 1 がチャネル種別 `0x04`/`0x05`、bytes 2..17 が 16B `cumstom_header_t`、bytes 18..63 が最大 46B ペイロード）で行われる。Windows `ReadFile` / `WriteFile` 等で OS が先頭にダミー Report ID `0x00`（1B）を付加する API 経由の場合は **65 バイトバッファ**となり、ワイヤ 64B が `[1..65]` に配置される（先頭 `0x00` を除いた `rx[0..64]` に対して解析する）。
+USB 有線接続および 2.4GHz ドングル経由の HID / Interrupt 転送は、**USB ワイヤ上は 64 バイト固定**（byte 0 が `0x81`/`0x02`、byte 1 がチャネル種別 `0x04`/`0x05`、bytes 2..17 が 16B `cumstom_header_t`、bytes 18..63 が最大 46B ペイロード）で行われる。なお `0x2DC8:0x600F` の HID Report Descriptor 自体は未採取のため、ホスト側の `ReadFile` / `WriteFile` / `hidapi` が `0x81`/`0x02` 自体を Report ID として **64B バッファ（`buf[0..64]`）** で扱うのか、先頭にダミー Report ID `0x00` (1B) を前置した **65B バッファ（ワイヤ 64B が `buf[1..65]` に配置）** を要するのかは、Linux/Windows の実デバイス開通確認まで未確定とする。
 
 #### (a) USB 有線接続時のモード切替・エンドポイント構成（`0x057E:0x2009` → `0x2DC8:0x600F`）
 2026-11-29 の Windows 実機 USBPcap（`01_usb_ota_controller.pcapng`, `03_usb_app_init_and_input.pcapng`）で以下を確認した:
 - コントローラを Switch モードで USB 接続すると、まず **`VID 0x057E / PID 0x2009`**（Switch Pro Controller、`HID\VID_057E&PID_2009`）として列挙される。
 - 公式ソフト起動後、`EP 0x02` OUT（64B）へ Switch ベンダーハンドシェイク（例: `01 66 aa 04 00 01 00..` → `EP 0x81` IN `81 66 a5 04 00 00 01 16 00 <hdr crc2> 00.. <ver u32=0xC8/0xC9> <pid u16=0x600F> 00..`）を送信し、続いて切替コマンド `01 66 aa 00 51 01 00 00 00 00 00 00 78 66 <8B..>`（末尾のフッタ生成則は未解析）を送ると USB バス上で再列挙が起き、**`VID 0x2DC8 / PID 0x600F`**（`HID\VID_2DC8&PID_600F`）として再接続される。
-- `0x2DC8:0x600F` 列挙後は **`EP 0x02` (OUT 64B)** と **`EP 0x81` (IN)** を使用する。IN 側は 64B 制御応答（`[0x02, 0x04]` 等）と **12B 生 HID 入力レポート**（先頭 Report ID **`0x03`**、`03 0f 84 7d 81 7f 00 00 00 00 00 87` 等）が長さおよび先頭バイトで明確に区別される。App Mode 初期応答の `0x0100` では FW バージョン（`0xC8` / `0xC9`）と PID `0x600F` が返る。
+- `0x2DC8:0x600F` 列挙後は **`EP 0x02` (OUT 64B)** と **`EP 0x81` (IN)** を使用する。IN 側は 64B 制御応答（`[0x02, 0x04]` 等）と **12B 生 HID 入力レポート**（先頭 `0x03`、`03 0f 84 7d 81 7f 00 00 00 00 00 87` 等）が長さおよび先頭バイトで明確に区別される（この `0x03` 12B レポートは §7.2 の App 応答 `0x0003` とは**別フォーマットであり内部レイアウト未解析**。§7.2 パーサへ流さないこと）。App Mode 初期応答の `0x0100` では FW バージョン（`0xC8` / `0xC9`）と PID `0x600F` が返る。
 
 #### (b) 2.4GHz レシーバ接続（`0x2DC8:0x310B` / `0x3109` / 内部 PID `0x6011`）
 2026-11-29 の Windows 実機 USBPcap（`02_24g_dongle_app_and_ota.pcapng`, `04a〜04e`）およびデバイス情報（`Get-PnpDevice`）で以下を確認した:
@@ -325,7 +325,7 @@ USB 有線接続および 2.4GHz ドングル経由の HID / Interrupt 転送は
 
 #### (c) App Mode（USB 有線・2.4G 共通）フレーミング
 - **送信 (`WriteHid_reportID(..., reportID = 0x81, len = 0x40)`)**:
-  - `8BitDoAdvance.dll::send_16B_inner` は `tx[0] = 0x81` を設定し（`len = 0x40` = 64B ワイヤフレーム）、PID が `{0x600F, 0x6012, 0x6009, 0x600B, 0x2028, 0x2062}` の場合に以下を送信する（残余バイトは `0x00` または送信バッファの未初期化残余パディングで合計 64B ワイヤフレーム。Windows HID API が先頭 `0x00` を要する場合は先頭 1B を加えた 65B バッファとして渡す）:
+  - `8BitDoAdvance.dll::send_16B_inner` は `tx[0] = 0x81` を設定し（`len = 0x40` = 64B ワイヤフレーム）、PID が `{0x600F, 0x6012, 0x6009, 0x600B, 0x2028, 0x2062}` の場合に以下を送信する（残余バイトは `0x00` または送信バッファの未初期化残余パディングで合計 64B ワイヤフレーム。OS HID API が先頭ダミー `0x00` を要求する場合のみ `buf[0]=0x00` を前置した 65B バッファとして渡す）:
     ```text
     [0x81, 0x04] (2B) + cumstom_header_t (16B) + payload (設定=最大 0x2D [45B] / マクロ=最大 0x20 [32B]) + [padding]  (ワイヤ計 64B)
     ```
@@ -333,9 +333,9 @@ USB 有線接続および 2.4GHz ドングル経由の HID / Interrupt 転送は
     - 2768B 設定の **読出（`0x0002`）** と **全量書込（`0x0001`）** は、ともに **`0x2D`（45B）** チャンク（`2B + 16B + 45B = 63B <= 64B`、61 × 45B + 23B = 計 **62 パケット**）を使用する。`0x0002` 読出も BLE 同様 **1 要求 = 1 チャンク（62 往復）** であり、最終パケット（`off=0x0AB9`）は TX `clen=23` に対し RX も実長 `clen=23` を返す（BLE の 142B 固定長パディングは無い）。
     - マクロの **読出（`0x0102`）** と **書込（`0x0103`）** は **`0x20`（32B）** 上限で、同じく **1 要求 = 1 チャンク** として分割される。
 - **受信 (`wait_ack` / `read_hid_64` / `StepActivity`)**:
-  - Windows `ReadFile` 等で 65B バッファ（`0x41`）を読み取る場合は先頭ダミー Report ID `0x00` (1B) を除いた 64B バッファ `rx[0..64]`（`USBPcap` / Linux raw 64B 読取では先頭 `[0..64]` そのもの）に対して以下を検証する:
+  - `buf` 読取が 65B（`0x41`、先頭 `buf[0] == 0x00` ダミー Report ID 付き）の場合は `rx = &buf[1..65]`、64B raw 読取の場合は `rx = &buf[0..64]` として以下を検証する:
     - App Mode: `rx[0] == 0x02 && rx[1] == 0x04` であることを確認し、`rx[2..18]` を `cumstom_header_t`、`rx[18..]` をペイロードとして解釈する。
-    - 参考（Windows DLL レガシー `getDevicePID1_inner`）: 65B 生読取の先頭 `[0x00 (Report ID), 0x05]` かつ `cmd == 0x0000, subcmd == 0x0008` を検査して `+0x12` から 2B LE の PID を読む経路もあるが、下記の `v2.00 -> v2.01` 実機 USB OTA では `[0x02, 0x05]` 64B 応答のみが使用された。
+    - 参考（Windows DLL レガシー `getDevicePID1_inner`）: 65B 生読取 `buf[0..65]` の先頭 `[0x00 (Report ID), 0x05]` かつ `cmd == 0x0000, subcmd == 0x0008` を検査して `buf[+0x12]` 付近から 2B LE の PID を読む経路もあるが、下記の `v2.00 -> v2.01` 実機 USB OTA では `[0x02, 0x05]` 64B 応答のみが使用された。
 
 #### (d) USB Bootloader / OTA（`0x2DC8:0x600F`）TX & RX フレーミング（2026-11-29 USBPcap 確定）
 `01_usb_ota_controller.pcapng`（v2.00 `0xC8` → v2.01 `0xC9`、有線 USB、`EP 0x02` OUT / `EP 0x81` IN）の採取により、**USB Boot TX / RX フレーミング**（いずれもワイヤ 64B 固定、Report ID を前置する OS API 経由では 65B）が確定した:
@@ -478,13 +478,13 @@ sequenceDiagram
 | **`0x0100`** | `0x0000` | `total_len=0, offset=0, crc16=0x0000` | Host → Ctrl | **Windows USB/2.4G デバイスバージョン・PID クエリ**。応答 `cmd=0x0004, subcmd=0x0100`: USB 有線 `0x600F` では `clen=0x16`（先頭 `<u32 ver, u16 0x600F>` + 残り 16B ゼロ系/未解析領域）、2.4G ドングルでは `clen=0x06`（`67 00 00 80 11 60` = ver `0x67`, flag `0x8000`, PID `0x6011`）を返す |
 | **`0x0102`** | `(mode << 8) \| slot` | `total_len = chunk_len = steps * 10`, `offset = macro_idx << 12` (`macro_idx * 0x1000`) | Host → Ctrl | **`ReadBT2Macro`**。指定スロット・マクロ番号のステップ列を読み出し（1 ステップ = 10B）。ペイロードなしだが `chunk_len` に要求長を宣言する（§4.1.1）。Windows USB/2.4G では 32B 分割・1 要求 = 1 チャンク（例: `M1` 101 steps → `tlen=0x3F2`, 32 回）を実機観測 |
 | **`0x0103`** | `(mode << 8) \| slot` | `total_len = (macro_idx << 12) + align32(steps * 10)`（絶対終端。`align32(x) = (x + 0x1F) & ~0x1F`。**BLE slot S1 `macro_idx=0/1` および Windows 2.4G slot S1 `macro_idx=2` (`tlen=0x2220`)・slot S2 `macro_idx=0` (`tlen=0x220`) で実機確認**。`M4`・`S3` は外挿）, `offset = (macro_idx << 12) + chunk_index * chunk_size`（`chunk_index` はパケットごとに進む。上限は BLE `0x40` / USB HID `0x20`。本クレートは 32B / 64B のみ許可） | Host → Ctrl | **`WriteBT2Macro`**。BLE 最大 **`0x40` (64B)** / USB HID 最大 **`0x20` (32B)** 分割でマクロを書き込み、完了後に `0x0006` (Save) を実行 |
-| **`0x0104`** | `(mode << 8) \| slot` | **ペイロードなし（`len = 0`）**。`offset = macro_idx << 12`<br/>- Android/BLE: `total_len = chunk_len = 0x1000`, `crc16 = 0xFFFF`<br/>- Windows USB/2.4G 実測: `chunk_len = 0x1000`, `total_len = 0x0000`, `crc16 = 0x0000`（※パケット 18 バイト目の `0x32` 等は 64B 送信バッファの未初期化残余パディングであり実ペイロードではない） | Host → Ctrl | **`EraseBT2Macro`**。指定スロット・マクロ領域（4KB 単位）を消去（※UI 上で既存マクロ Clear 操作時は `04d_macro_ops.pcapng` にて 2768B ヘッダの該当 52B ゼロクリア (`0x0001`) + Save と、`0x0104 (off=0x2000)` + Save の双方が観測された） |
+| **`0x0104`** | `(mode << 8) \| slot` | **ペイロードなし（`len = 0`）**。`offset = macro_idx << 12`<br/>- Android/BLE: `total_len = chunk_len = 0x1000`, `crc16 = 0xFFFF`<br/>- Windows USB/2.4G 実測: `chunk_len = 0x1000`, `total_len = 0x0000`, `crc16 = 0x0000`（※ワイヤの byte 18 [ヘッダ直後 `+0x12`] の `0x32` 等は 64B 送信バッファの未初期化残余パディングであり実ペイロードではない） | Host → Ctrl | **`EraseBT2Macro`**。指定スロット・マクロ領域（4KB 単位）を消去（※UI 上で既存マクロ Clear 操作時は `04d_macro_ops.pcapng` にて 2768B ヘッダの該当 52B ゼロクリア (`0x0001`) + Save と、`0x0104 (off=0x2000)` + Save の双方が観測された） |
 
 > ※ `mode` は `record_ultimatebt2` 内オフセット `+0x10` の `GamepadMode` 値。
 >
 > **実機ソースでの再確認（x86_64 `libadvancelib.so`）**: 設定読み出しは **`cmd=0x0002` / `subcmd=0x0000`**、設定書き込みは **`cmd=0x0001` / `subcmd=0x0000`**。`STRUCT_BT2_2768B.md` 旧版にあった `subcmd=0x0101` / `0x0102` は誤記であり、`getUT2_ReadCofigChannel` / `getBT2_WriteCofigChannel` のチャネル構造体 `+0x4E` はどちらも `0` である。
 >
-> **`EraseBT2Macro` の CRC 証跡**: 公式 `getBT2_EraseMacro` (x86_64 `libadvancelib.so` 0x2bb70) は `total_len = chunk_len = 0x1000`、ペイロードなしでチャネルを初期化する。`Generate_CustomDataCmd` (0x27620) は `gamepad_type == 1` で空ペイロードに対しても `crc16` を計算してヘッダ `+0x06` に格納し、`crc16` (0x28540) は入力長 `<= 0` で `0xFFFF` を返す。したがって `0x0104` のワイヤ `crc16` は `0` ではなく **`0xFFFF`** である。
+> **`EraseBT2Macro` の CRC 証跡（Android/BLE 経路）**: 公式 Android `getBT2_EraseMacro` (x86_64 `libadvancelib.so` 0x2bb70) は `total_len = chunk_len = 0x1000`、ペイロードなしでチャネルを初期化する。`Generate_CustomDataCmd` (0x27620) は `gamepad_type == 1` で空ペイロードに対しても `crc16` を計算してヘッダ `+0x06` に格納し、`crc16` (0x28540) は入力長 `<= 0` で `0xFFFF` を返す。したがって **Android/BLE 経路での `0x0104` ワイヤ `crc16` は `0xFFFF`** である（一方 Windows USB/2.4G 実機では上表のとおり `tlen = 0, crc16 = 0x0000` が観測されている）。
 >
 > **`WriteSLOT` (`0x0015`) の実機 wire（2026-11-23、Linux BLE・MTU 200、Ultimate 2、1 回の観測）**:
 > - **要求（`-v` の生ログ、17B）**: `04 15 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00`。`04` は BLE App Mode の prefix で、続く 16B ヘッダは `cmd=0x0015` / `subcmd=0x0001`（slot 1）/ `chunk_len=0` / `crc16=0x0000` / `total_len=0` / `offset=0`。RE で確定していた wire と一致する。
@@ -644,7 +644,7 @@ Header または最初の Save が失敗した場合、Erase は送らない。�
 > **実機確認（2026-11-29、Windows USB 有線 `03_usb_app_init_and_input.pcapng`、`0x2DC8:0x600F`）**:
 > - **スティック軸符号**: 左スティック上入力で `LeftStick_Y = 13..19`（`0` 側が上）、下入力で `236..239`（`255` 側が下）、左入力で `LeftStick_X = 15..19`、右入力で `236..239`。右スティックも上 `16` / 下 `240` / 左 `9` / 右 `253` であり、**`0 = 上/左`, `127/128 = 中央`, `255 = 下/右`** が実機で確定した。
 > - **トリガー**: `L2` 全押しで `+0x09 (Trigger_L) = 255`・`keys = 0x0000_4000`、`R2` 全押しで `+0x08 (Trigger_R) = 255`・`keys = 0x0000_8000` を実機確認。
-> - **背面 / 追加ボタン 4 つ（単独押下）**: `PL` → `0x0200_0000`（bit 25 = `P1`）、`PR` → `0x0400_0000`（bit 26 = `P2`）、`L4` → `0x0020_0000`（bit 21 = `P3`）、`R4` → `0x4000_0000`（bit 30 = `P4`）を実機確認。なお USB 有線時は `cmd=0x0004, subcmd=0x0003` の 64B 応答（`[0x02, 0x04]` 先頭）とは別に、`EP 0x81 IN` で Report ID **`0x03`**・固定 12B の生 HID 入力レポート（例: `03 0f 84 7d 81 7f 00 00 00 00 00 87`）が並行して流れる（パケット長 12B と byte 0 `0x03` で 64B 応答と判別可能）。
+> - **背面 / 追加ボタン 4 つ（単独押下）**: `PL` → `0x0200_0000`（bit 25 = `P1`）、`PR` → `0x0400_0000`（bit 26 = `P2`）、`L4` → `0x0020_0000`（bit 21 = `P3`）、`R4` → `0x4000_0000`（bit 30 = `P4`）を実機確認。なお USB 有線時は `cmd=0x0004, subcmd=0x0003` の 64B 応答（`[0x02, 0x04]` 先頭）とは別に、`EP 0x81 IN` で先頭 `0x03`・固定 12B の生 HID 入力レポート（例: `03 0f 84 7d 81 7f 00 00 00 00 00 87`）が並行して流れる。この `0x03` 12B レポートは上表 §7.2（`cmd=0x0003` 応答）とは**別フォーマット（内部レイアウト未解析）**であり、パケット長 12B と先頭 `0x03` で 64B 制御応答と判別し §7.2 パーサへ流さないこと。
 > - **バッテリー生値 (`+0x0A`)**: USB 有線接続時に `94..96` (`0x5E..0x60`) を観測（Windows UI 上は USB 有線時に残量非表示のため `0..100` スケールかは未確定）。
 
 ### 7.3 `Key` ビットマスク (`u32 LE`, `KeyMap`)
@@ -771,13 +771,13 @@ Bootloader Mode（BLE `"8bt"`, Service `0000FF20-...`, Char `0000FF21-...`）で
 | **`0x00C3`** | `0x0000` | `0x00000000` | `total_len = 0x0C`, `chunk_len = 0x0C` | あり (`crc16`) | `3000 ms` | **`readSerial`（実機確定）**: 12B `<u32 sector_off, u32 0x1000, u32 0x1000>` に対し既存セクタ CRC 2B（LE）を返す（全 33 セクタで送信）。**実測ゴールデンベクタ**: セクタ 0 (`<0, 0x1000, 0x1000>`) の `crc16 = 0x0674` |
 | **`0x00C4`** | `0x0000` | `0x00000000` | Windows USB 実機: **`total_len = 8`, `chunk_len = 8`**<br/>BLE 仕様: `total_len = header[8]`, `chunk_len = 0x18` | あり (`crc16`) | **`3000 ms`** | **`WriteVersion`**: Windows USB 実機では 8B ペイロード **`<u32 image_len (0x00020C00), u32 ver (0x000000C9)>`** + CRC-16/MODBUS（**`0x75B2`**）を送信（~124ms で ACK） |
 
-> **実装側の安全ガード（デバイス要件ではない）**: `eightbitdo-protocol` の OTA ビルダーは、実機を危険な書込順序に導かないために次の入力を拒否する（BLE の 64B 固定経路と USB の最大 46B / 4KB 境界経路の双方で境界チェックを維持）。
+> **実装側の安全ガード（デバイス要件ではない）**: `eightbitdo-protocol` の現行 OTA ビルダー（BLE 64B 固定経路）および Phase 4（USB 46B 上限・4KB 境界経路）実装時の境界契約として次の入力を拒否する（USB 用ガードのうち未実装部分は Phase 4 実装時に適用）。
 > - 空イメージ / `image_len == 0`（`EmptyFirmwareImage`）
-> - BLE 経路で `image_len` が 64 の倍数でない（`UnalignedImageLength`）
+> - BLE 64B 固定経路で `image_len` が 64 の倍数でない（`UnalignedImageLength`）
 > - base address が 64B アラインでない（`UnalignedAddress { alignment: 64 }`）
 > - chunk address が `u32` を overflow する（`AddressOverflow`）
-> - BLE `WriteFirmware` の chunk が 64B ちょうどでない、または USB `WriteFirmware` で payload が空・`0x2E` (46B) 超過（`InvalidLength`）
-> - `WriteVersion` の `image_len` が `.dat` 該当セクションの `image_data_len`（`header[8..12]`）と一致しない（`ImageLengthMismatch`）
+> - BLE `WriteFirmware` の chunk が 64B ちょうどでない、または USB `WriteFirmware` 契約で payload が空・`0x2E` (46B) 超過（`InvalidLength`）
+> - `WriteVersion` の `image_len` が `.dat` 該当メインセクション（2 セクション時は `0x600F` / Section 1）の `image_data_len`（`header[8..12]`）と一致しない（`ImageLengthMismatch`）
 
 #### 8.3.1 実機 USB OTA シーケンス（2026-11-29 USBPcap 確定、`01_usb_ota_controller.pcapng`, `v2.00 -> v2.01`）
 

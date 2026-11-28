@@ -352,7 +352,7 @@ Track C: モバイル
 
 | # | 課題 | 影響 | Tier |
 | --- | --- | --- | --- |
-| 1 | OTA の実機 btsnoop 取得と wire 確定（RX フレーミング、ready / 完了 ACK、Erase / Write アドレス、`WriteVersion` payload、`WriteFirmware` フレーム長、Bootloader MTU） | 実機 OTA 不可 | 3 |
+| 1 | OTA の実機 btsnoop 取得と wire 確定（RX フレーミング、ready / 完了 ACK、Erase / Write アドレス、`WriteVersion` payload、`WriteFirmware` フレーム長、Bootloader MTU） | 実機 BLE OTA 不可（USB OTA は §8.3.1 で確定済み・未実装） | 3 |
 | 2 | OTA ACK の `offset` / `total_len` 照合（現状は cmd/subcmd のみ。遅延・重複 ACK を誤帰属し得る） | フラッシュ破損リスク | 3 |
 | 3 | マルチセクション `.dat` 対応（**2026-11-29 の Windows `v2.01` 採取で 2 セクション構造が確定済み**。現 `ota.rs` は単一セクションのみ対応で拒否するため、2 セクションパーサとセクションループの実装が必要） | 公式ファーム更新の blocker | 3 |
 | 4 | OTA の CLI / GUI / UniFFI 配線、バッテリー警告、バージョン / ダウングレード判定、SHA-256 検証 | OTA 未提供 | 3 |

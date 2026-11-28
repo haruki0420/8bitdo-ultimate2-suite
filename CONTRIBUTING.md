@@ -85,7 +85,7 @@ Tier の判定・パス別トリガー・故障リストの詳細は **[docs/REV
 - [ ] `docs/STRUCT_BT2_2768B.md` のオフセット・サイズ・エンディアンと一致しているか
 - [ ] 予約領域 `0x1F4..0x68B` / `0x914..0x92B` を破壊していないか
 - [ ] 名前が UTF-16**BE**、数値が Little-Endian になっているか
-- [ ] マクロの `align32`、BLE 64B / USB HID 32B チャンク（32B アライン。それ以外は拒否。64B 超は 64B にクランプしてから判定）、4KB セクタ、Header (`total_len=0xD8`) → Save → Erase → Write → Save の順序。`macro restore` は slot 単位で Header+Save 1 回 → 全マクロ Erase/Write → 最終 Save 1 回。`Erase 0x0104` は `total_len = chunk_len = 0x1000`、ペイロードなし
+- [ ] マクロの `align32`、BLE 64B / USB HID 32B チャンク（32B アライン。それ以外は拒否。64B 超は 64B にクランプしてから判定）、4KB セクタ、Header (`total_len=0xD8`) → Save → Erase → Write → Save の順序。`macro restore` は slot 単位で Header+Save 1 回 → 全マクロ Erase/Write → 最終 Save 1 回。`Erase 0x0104` はペイロードなし（BLE: `total_len = chunk_len = 0x1000`, `crc16 = 0xFFFF` / Windows USB: `clen = 0x1000`, `tlen = 0`, `crc16 = 0`）
 - [ ] OTA の前提（BLE Boot: `enterBoot` → `"8bt"` → `readPID 0x0008` 5s、`readVersionInBoot 0x0005`；USB Boot: `[0x81,0x05]` / `[0x02,0x05]` 64B HID、`<=46B [0x2E]`、`0x00C3` / `0x0004` / `0x0003` / `0x00C1` / `0x00C4(8B)` / `0x0007(8B)`、2 セクション手順・Section 0 `0x40000000` 写像 & 512B 境界 ACK 例外、2.4G OTA 禁止）と書込順序、失敗時の全セクタ消去・再書き込み。BLE の `"8bt"` OTA は実機 wire 未検証のため btsnoop 確定前配線禁止を維持。USB の復旧は再列挙/再接続
 - [ ] 実機書き込み前に 2768B 設定とマクロ 3 スロット × 4 マクロ をバックアップし、SHA-256 と復元結果を記録しているか。`max_steps` は `0x68C + slot * 0xD8 + 0x08 + macro_idx * 0x34 + 0x22`（`u16`）
 - [ ] BLE 受信にプレフィックスを要求していないか（`0x600F`）
