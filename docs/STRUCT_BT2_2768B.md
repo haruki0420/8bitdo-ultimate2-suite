@@ -87,9 +87,9 @@
    - **Ultimate 2 Wireless (`0x638` = 1592B) との決定的な違い**: Wireless 版ではこの 1176B (`0x498`) ブロックが**完全に削除**されている（§10 参照）。
 2. **`+0x914..+0x92B`（合計 `0x18` = 24 バイト = 3 スロット × `0x08` [8B]）**:
    - **アクセス箇所**: `copyConfig` での `*(u64*)(base + dst*8 + 0x914) = *(u64*)(base + src*8 + 0x914)`、および `deleteCurslot` での `*(u32*)(base + slot*8 + 0x914) = 0` **のみ**。
-   - **実機観測（2026-11-29、`04a_profile_ops.pcapng`）**: スロット 1 に対応する `0x91C..0x923` が、削除/Deactivate 時に `ff ff ff ff ff ff ff ff` → `00 00 00 00 01 64 01 64` へ、作成/Load 時に **`11 09 20 20 01 64 01 64`**（先頭 4B `0x20200911` フラグ + `[1, 100, 1, 100]`）へ遷移することを確認した。
+   - **実機観測（2026-11-29、`04a_profile_ops.pcapng`）**: スロット 1 に対応する `0x91C..0x923` が、**プロファイル `Delete` 時**に `11 09 20 20 01 64 01 64` → `00 00 00 00 01 64 01 64`（または未初期化時 `ff ff ff ff ff ff ff ff` → 作成時 `11 09 20 20 01 64 01 64`）へ遷移することを確認した。
 3. **実装上の必須ルール**:
-   - コントローラから読み出した元の 2768 バイトバッファを保持し、これら 2 領域の既存バイト値を壊さずに書き戻すこと（新規生成時はゼロ埋め、`copy_slot` 時は 392B / 8B をそのままコピー）。
+   - コントローラから読み出した元の 2768 バイトバッファを保持し、これら 2 領域の既存バイト値を壊さずに書き戻すこと（通常設定書込ではバイト単位でそのまま保持。新規生成時はゼロ埋め、`copy_slot` 時は 392B / 8B をそのままコピーし、`delete_slot` 時は仕様に従い先頭 4B フラグのみクリアする。`04a` 観測値 `[1, 100, 1, 100]` の意味・書き換え要否は未確定のため通常書込では上書きしない）。
 
 ---
 
@@ -97,19 +97,19 @@
 
 ```c
 struct Bt2Header {
-    uint32_t slot_flags[3]; // +0x000..+0x00B: 0x20200911 = 有効, 0x00000000 = 削除/無効化, 0xFFFFFFFF = 未初期化
+    uint32_t slot_flags[3]; // +0x000..+0x00B: 0x20200911 = 有効, 0x00000000 = 削除済み(Delete), 0xFFFFFFFF = 未初期化
     uint32_t crc16;         // +0x00C..+0x00F: ANSI_CRC_16_sh の戻り値 (u16をu32拡張)
     uint16_t gamepad_mode;  // +0x010..+0x011: GAMEPAD_MODE_SWIFT enum
-    uint16_t cur_slot;      // +0x012..+0x013: 0..2 (active), 4=NONE
+    uint16_t cur_slot;      // +0x012..+0x013: 0..2 (active), 4=NONE (Deactivate含む非選択状態)
 };
 ```
 
 ### 2.1 `slot_flags[3]` (`+0x000..+0x00B`) と `crc16` (`+0x00C..+0x00F`)
 
 - `getFlag(slot)` / `setFlag(slot, val)` は配列インデックス `0..3` を受け付けるが、実際のプロファイルスロットは `0..=2`（`CONFIG_SLOT_SWIFT_1..3`）の 3 つであり、インデックス 3 の位置（`+0x00C..+0x00F`）は **CRC-16 フィールド** として使用される。
-- **実機確定（2026-11-29、`04a_profile_ops.pcapng`）**:
-  - **`0x20200911`**: 有効スロットおよび各有効レコード（Vibration / Stick / Trigger / Special / MapKey / Macro / 領域 B 等）共通の有効マジックマーカー（BCD 日付 `2020-09-11` 相当）。プロファイル作成・Load 時には `slot_flags[slot]` と対象スロット内の各セクション `flag` が一斉に `0x20200911` へセットされる。
-  - **`0x00000000`**: プロファイル削除（`Delete`）および無効化（`Deactivate`）時のクリア値。プロファイル削除/Deactivate は独立コマンドではなく **2768B 全量書込（`cmd=0x0001`）＋ Save** として送信され、`slot_flags[slot]`・対象スロット名・各レコードの `flag` を一括 `0` クリアする。
+- **実機確定（2026-11-29、`04a_profile_ops.pcapng`）と従来観測の整合**:
+  - **`0x20200911`**: Windows 公式ソフトにおける有効スロット・主要レコード共通のアクティブマジックマーカー（BCD 日付 `2020-09-11` 相当）。プロファイル作成・Load 時には対象 `slot_flags[slot]` とスロット内レコードの `flag` にセットされる。**例外**: 2026-11-21 の BLE 実機ダンプでは、有効 slot 0 の `gyro[0].flag` に **`0x20190000`** が、未初期化 slot 2（`slot_flags[2] = 0xFFFFFFFF`）配下の一部セクションに `0x20200911` が残存していた例がある（[DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md)）。そのため、`eightbitdo-protocol` の raw 検証では `slot_flags` / レコード `flag` に `{0, 0x20200911, 0xFFFFFFFF}`（および `1`、gyro は `0x20190000` も。なお CLI `slot_flags` の既定 allowlist は `{0, 0x20200911, 0xFFFFFFFF}`）を受理し、§4.1〜§8.1 の型付き設定（`config set`）における `0 / 1` ブール解釈と併用している。
+  - **`0x00000000`**: **プロファイル削除（`Delete`）時**のクリア値（`04a_profile_ops.pcapng` では **`0x0001` 全量書込 ＋ Save + `0x0104`（slot マクロ消去）＋ Save** として送信され、`slot_flags[slot]`・スロット名・対象レコード `flag`・領域 B 先頭 4B が `0` クリアされた）。なお、`Deactivate`（単にスロットを非アクティブ `cur_slot = 4` 等へ戻す選択解除操作）は `Delete` と混同しないこと（`04a` 実測の `slot_flags=0` 遷移は `Delete` 操作に対応し、`Deactivate` がスロット内容を消去するかは別検証とする）。
   - **`0xFFFFFFFF`**: 工場出荷時の未初期化/未設定スロット状態。
 - **CRC-16 アルゴリズム (`ANSI_CRC_16_sh`)**:
   - 多項式: `0x8408`（リバース済み、`CRC-16/ARC` または `CRC-16/MODBUS` 系。初期値 `0xFFFF`、最終 XOR なし、LSB-first）。
@@ -137,7 +137,7 @@ struct Bt2Header {
 > **実機観測・未確定（2026-11-21）**:
 > - Ultimate 2 Bluetooth から取得した 2768B バッファでは `slot_flags = [0x20200911, 0x20200911, 0xFFFFFFFF]`、`crc16` は stored `0x2C55` / in-place 再計算 `0x6A05` だった。このバッファの SHA-256 は `1dca47facfc1c0394a8893ac0a5b7ef80678c51081001886a4bf17ce2f59c600` である。
 > - この SHA-256 は `eightbitdo backup --raw <FILE>` で取得した 2768B ダンプ（上記と同じバッファ）に由来する。
-> - `slot_flags` は `1` / `0` ではなく大きな非 0 値である。公式 `deleteCurslot` は `slot_flags[slot]` に `0` を書き、`copyConfig` は値をコピーするだけであるため、有効判定は「非 0」である可能性がある。単純な有効/空フラグとみなす解釈は実機観測と合わない可能性があり、正確な意味は未確定である。
+> - `slot_flags` が `0x20200911`（有効）・`0x00000000`（削除済み）・`0xFFFFFFFF`（未初期化）である点は 2026-11-29 の Windows `04a_profile_ops.pcapng` で確認済み。ただし BLE 実機固有値（`gyro[0].flag = 0x20190000` や未初期化スロット内残骸）は引き続き未解析のため、不明な値は `--force-raw` / 既存値保持で破壊しない。
 > - stored CRC と in-place 再計算が一致しないのは、上記のとおり公式 `ANSI_CRC_16_sh` が既存 CRC フィールドを含めて再計算する方式上、直ちに破損を意味しない。CLI はこの 2 値を情報表示するだけにしている。
 
 ### 2.2 `gamepad_mode` (`+0x010..+0x011`, `u16`)
@@ -581,8 +581,8 @@ struct Bt2Header {
 
 > **実装ノート（Mock 検証済み・新順序 + 絶対終端 `total_len` は BLE・slot S1・`macro_idx=0/1` および Windows USB/2.4G・slot S1 `macro_idx=2`・slot S2 `macro_idx=0` で実機確認。`M4`/`S3` は外挿）**:
 > - **Windows USB/2.4G 実機確認（2026-11-29、`04a_profile_ops.pcapng` / `04d_macro_ops.pcapng` / `08_macro_editor_aaaaa.jpg`）**:
->   - **マクロ作成・書込**: Windows 公式ソフトは 2768B 全量書込（`0x0001`, 45B チャンク）→ `Save (0x0006/0x0123)` → `0x0014` → `Erase (0x0104, clen=0x1000, tlen=0, off=macro_idx<<12)` → **`Write (0x0103, 32B チャンク, total_len = (macro_idx << 12) + align32(steps * 10))`** → `Save (0x0006/0x0123)` を実行。**slot S1 の `macro_idx=2 (M3)`（54 steps → `tlen=0x2220`, `off=0x2000..0x2200`）および slot S2 の `macro_idx=0 (M1)`（`tlen=0x0220`, `off=0x0000..0x0200`）で絶対終端が実機送信されていることを確認**した。
->   - **マクロ削除（Clear）**: 既存マクロを削除する際、公式ソフトは **`0x0104` Erase を発行せず**、2768B 内の対象 52B `MacroFunPro3Record`（`name` / `max_steps` / `offset` / `key_map` / `cycles_num` 等）を 0 クリアして 2768B 全量書込（`0x0001`）→ `Save (0x0006/0x0123)` のみを実行する。
+>   - **マクロ作成・書込**: Windows 公式ソフトは 2768B 全量書込（`0x0001`, 45B チャンク）→ `Save (0x0006/0x0123)` → `0x0014` → `Erase (0x0104, clen=0x1000, tlen=0, crc16=0, ペイロードなし [0x32 等は 64B 送信バッファの残余パディング], off=macro_idx<<12)` → **`Write (0x0103, 32B チャンク, total_len = (macro_idx << 12) + align32(steps * 10))`** → `Save (0x0006/0x0123)` を実行。**slot S1 の `macro_idx=2 (M3)`（54 steps → `tlen=0x2220`, `off=0x2000..0x2200`）および slot S2 の `macro_idx=0 (M1)`（`tlen=0x0220`, `off=0x0000..0x0200`）で絶対終端が実機送信されていることを確認**した。
+>   - **マクロ削除（Clear）**: `04d_macro_ops.pcapng` では、対象スロット M3 の 52B `MacroFunPro3Record`（`0x6FD..0x728` をゼロクリア。`total_cnt = 4` は不変）を含む 2768B 全量書込（`0x0001`）→ `Save (0x0006/0x0123)` に加え、`0x0104 (subcmd=0x0000, clen=0x1000, tlen=0, crc=0, off=0x2000)` → `Save`、続く 2 回目の 52B ゼロクリア書込（`0x0001`）→ `Save` の双方が観測された。したがって Clear UI はヘッダの 52B 領域クリアを含み、任意で対応セクタへの `0x0104`（および `+0x950..`/`+0x9A4..` の関連バイト更新）が伴い得る点に留意する。
 >   - **UI 表示**: エディタ上部に `Single` ドロップダウンと `Use uniform interval time [30] ms`（構造体 `+0x30` の `interval_ms = 30`、確認済み）を備える。
 > - **実機観測（2026-11-22、BLE・slot S1）**: 旧順序（Erase → Write → Header(total_len=0x0AD0) → Save）で `macro_idx=0 (M1)`（500B）は成功し、`macro_idx=1 (M2)`（460B）だけが全 ACK 後に `0x0102` zeros で Verify 失敗した。216B ヘッダは一致していた。新順序でもデータ未永続だった原因は **Write `0x0103` の `total_len`** と特定し、`total_len = (macro_idx << 12) + align32(max_steps * 10)`（絶対終端）に変更したところ **read-back SHA が期待値と一致**した（`macro_idx=1 (M2)`・46 steps → `0x11E0`。`macro_idx=0 (M1)` は base 0 のため従来値と一致）。`macro_idx=3 (M4)` と slot S3 は未検証の外挿、USB HID の Padbench 側実装は未完了。CLI `--write-total-relative` は旧 framing に戻す実験用フラグ。書込中は `0x0003` を送らない（公式同等。CLI `--poll-interval-ms` 既定 0）。最終 32B チャンク仮説に対しては `--chunk-size 32` も利用できる。Header Save → Erase の settle は 0ms。RE 根拠: `getBT2_WriteMacroi` / `writeCustomConfig_onfinished` / `writeBT2Macro_onfinished` / `EraseMacroDataDone` / `WriteMacroDataDone`。
 > - **Fail-closed / 状態**: `Error::MacroWrite` は `MacroWriteState::{NotSaved, HeaderSaved, DataSaved}` で区別する。Header 失敗は Save/Erase 未送信で sector 未変更（`NotSaved`）。最初の Save 失敗は Erase/Write 未送信で sector 未変更、Erase/Write 失敗はヘッダ Save 済みで sector が消去/部分書込の可能性（`HeaderSaved`）。step data を送った書き込みでは、最終 Save / Verify の失敗はヘッダ + データ送信済み（`DataSaved`）。ヘッダのみを書く空 slot の restore では step data を送らないため、Verify 失敗は `HeaderSaved` になる。`HeaderSaved` / `DataSaved` は再書き込みせず、12 マクロ backup から復元する。

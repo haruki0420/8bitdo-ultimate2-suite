@@ -115,7 +115,7 @@ graph TD
     └── post-review-status.sh   # review-gate の投稿
 ```
 
-> **未実装の構成要素**: USB HID transport（`hid.rs`）とファームウェア配信 API クライアント（`firmware_api.rs`）はまだ存在しない。USB OTA は USB Boot TX フレーミングが未文書化のため保留。`packaging/linux/` の udev ルールも未作成。
+> **未実装の構成要素**: USB HID transport（`hid.rs`）とファームウェア配信 API クライアント（`firmware_api.rs`）はまだ存在しない。USB App Mode / USB OTA（`[0x81,0x05]`/`[0x02,0x05]`）は 2026-11-29 の Windows 実機採取で仕様確定済みで実装待ち。`packaging/linux/` の udev ルールも未作成。
 
 > **クレート名について**: Cargo のパッケージ名は数字で開始できないため、正式名は `eightbitdo-*` とする（`8bitdo-*` は使用不可）。ディレクトリ名もパッケージ名に合わせる。
 
@@ -154,7 +154,7 @@ graph TD
 
 ## 5. フェーズ別実装ロードマップ
 
-> **2026-11-23 改訂（現状反映、main `ed61961`）**: Phase 1 / 2a / 2b / 2d / 3a は main にマージ済み。PR #16（`feat/gui-write`）で Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）の GUI 書込を実装し **main にマージ済み**（実機未検証・Tier 3）。Phase 2c は core のみマージ済みで、#20 で `ota-bench` 段階実行 API、#19 で実機 btsnoop 採取計画を追加。実機 wire 未確定のため CLI / GUI / UniFFI に未配線。Phase 3c（OTA 画面）は未着手。Phase 5 は UniFFI と iOS / Android の雛形に加え、#21 で **JNI 同梱 APK / unsigned IPA のビルド成功まで記録**（実機未検証）。#17 で raw config の実機 flag 検証を opaque 値対応に修正、#18 でクロスプラットフォーム・ビルド確認、#22 で配布方針、#23 で機能マトリクスを追加。GUI ライセンス画面は #24 で main にマージ済み（左レール下部の「ライセンス」画面でアプリの MIT / Apache-2.0 全文と同梱 5 フォント全文・著作権者行を表示）。プロファイル切替（`0x0015`）の core / CLI / REPL 配線は #26 で main にマージ済み（`Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`、Save 送信なし）。実機では `cmd=0x0004/subcmd=0x0015` の 16B 封筒の ACK を 1 回観測し、`Save` を送らずに `cur_slot` が 6→1 へ更新されることを read-back で確認済み（未確認: 再接続/電源断を跨ぐ永続性、プロファイルの実効、`crc16` とみられる 2B の意味、直接 ACK の条件、ACK 形状の再現性。詳細は [docs/DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) §7）。[docs/FEATURE_MATRIX.md](FEATURE_MATRIX.md) の残作業「`0x0015` 切替のセッション API 化」に対応する。USB OTA（Phase 4）は USB Boot TX フレーミングが未文書化のため保留を継続する。詳細な残課題は §5.4。**#27〜#32 も main にマージ済み**（#27 状態 docs 更新、#28 `0x0015` 実機証跡、#29 機種抽象化の設計、#30 モバイルネイティブ計画、#31 ANTI_SLOP、#32 Tauri v2 GUI）。Tauri v2 GUI は **P0（決定・足場）/ P1（デザイン）完了・P2 以降（実接続・設定 / マクロ / OTA・パッケージ・モバイル）未着手**で、egui 版（`crates/eightbitdo-gui`）は凍結。
+> **2026-11-23 改訂（2026-11-29 Windows USB/OTA 仕様追記、main `ed61961` 基準）**: Phase 1 / 2a / 2b / 2d / 3a は main にマージ済み。PR #16（`feat/gui-write`）で Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）の GUI 書込を実装し **main にマージ済み**（実機未検証・Tier 3）。Phase 2c は core のみマージ済みで、#20 で `ota-bench` 段階実行 API、#19 で実機 btsnoop 採取計画を追加。実機 BLE wire 未確定のため CLI / GUI / UniFFI に未配線。Phase 3c（OTA 画面）は未着手。Phase 5 は UniFFI と iOS / Android の雛形に加え、#21 で **JNI 同梱 APK / unsigned IPA のビルド成功まで記録**（実機未検証）。#17 で raw config の実機 flag 検証を opaque 値対応に修正、#18 でクロスプラットフォーム・ビルド確認、#22 で配布方針、#23 で機能マトリクスを追加。GUI ライセンス画面は #24 で main にマージ済み（左レール下部の「ライセンス」画面でアプリの MIT / Apache-2.0 全文と同梱 5 フォント全文・著作権者行を表示）。プロファイル切替（`0x0015`）の core / CLI / REPL 配線は #26 で main にマージ済み（`Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`、Save 送信なし）。実機では `cmd=0x0004/subcmd=0x0015` の 16B 封筒の ACK を 1 回観測し、`Save` を送らずに `cur_slot` が 6→1 へ更新されることを read-back で確認済み（未確認: 再接続/電源断を跨ぐ永続性、プロファイルの実効、`crc16` とみられる 2B の意味、直接 ACK の条件、ACK 形状の再現性。詳細は [docs/DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) §7）。[docs/FEATURE_MATRIX.md](FEATURE_MATRIX.md) の残作業「`0x0015` 切替のセッション API 化」に対応する。**Phase 2e（USB / 2.4G）と Phase 4（USB OTA）は 2026-11-29 の Windows 実機 USBPcap 採取で全仕様確定済みとなり、保留を解除して実装待ちへ移行した**（詳細な残課題は §5.4）。**#27〜#32 も main にマージ済み**（#27 状態 docs 更新、#28 `0x0015` 実機証跡、#29 機種抽象化の設計、#30 モバイルネイティブ計画、#31 ANTI_SLOP、#32 Tauri v2 GUI）。Tauri v2 GUI は **P0（決定・足場）/ P1（デザイン）完了・P2 以降（実接続・設定 / マクロ / OTA・パッケージ・モバイル）未着手**で、egui 版（`crates/eightbitdo-gui`）は凍結。
 
 > **2026-11-23 追記（GUI 移行の現状）**: デスクトップ GUI は Tauri v2（Rust backend + Web frontend）へゼロベース移行し、**PR #32 で main にマージ済み**（[TAURI_PLAN.md](TAURI_PLAN.md)）。`apps/desktop` は P0 / P1（雛形・トークン・共通コンポーネント・シェル・デバイス / 入力モニターの静的 2 画面）までで、**BLE 接続・デバイス読み書きは未実装**。egui 版（`eightbitdo-gui`）は凍結（比較・撤退用）し、Phase 3 の各画面は Tauri 版で再実装する。以下の Phase 3 の記述は egui 版の実績として読む。
 
@@ -168,7 +168,7 @@ Track A: コア / CLI（Linux・デスクトップ）
   Phase 2c BLE OTA                  core のみ完了（Mock 52/55/58/61）。実機 wire 未確定・未配線
   Phase 2d config apply             完了・実機確認済み（BLE・MTU 200・74B chunk）
   プロファイル切替 0x0015           完了（#26、core + CLI + REPL 配線。Save 送信なし。実機で ACK と cur_slot 6→1 を確認、永続性・実効は未確認）
-  Phase 2e USB / 2.4G transport     保留
+  Phase 2e USB / 2.4G transport     仕様確定済み・実装待ち（2026-11-29 確定）
 
 Track B: GUI（Tauri v2 が正式。egui 版は凍結）
   Tauri P0 足場                     完了（PR #32。Vite / React / TS / Tailwind、独立 src-tauri、CI desktop.yml）
@@ -320,7 +320,7 @@ Track C: モバイル
 - **完了条件**: Linux / macOS / Windows でビルド・起動し、実機と同期すること（現状の確認は Linux のみ）。
 
 ### Phase 4: USB OTA（仕様確定・実装待ち）
-- **状態**: **2026-11-29 の Windows 実機 pcapng 採取で仕様確定（未実装）**。USB Boot TX `[0x81,0x05]` / RX `[0x02,0x05]`（64B HID、`<=46B (0x2E)` payload、`cmd=0x0000/subcmd=request_cmd` 応答）、2 セクション `.dat`（Section 0 `0x6010` @ `0x40004000`, `0x2200` B + Section 1 `0x600F` @ `0x01018000`, `0x20C00` B, `v2.01`）、コマンド群（`0x00C1` / `0x0008` / `0x00C3` / `0x0004` / `0x0003` / `0x0002` / `0x0007` リセット）および実測 CRC ゴールデンベクタ（`0x0674`, `0x75B2`）を [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §4.4・§8.2〜§8.5 に確定・記録済み。
+- **状態**: **2026-11-29 の Windows 実機 pcapng 採取で仕様確定（未実装）**。USB Boot TX `[0x81,0x05]` / RX `[0x02,0x05]`（64B HID、`<=46B (0x2E)` payload、`cmd=0x0000/subcmd=request_cmd` 応答）、2 セクション `.dat`（Section 0 `0x6010` @ `.dat 0x40004000`→wire `0x40000000`, `0x2200` B + Section 1 `0x600F` @ `0x01018000`→wire 相対 `0x0000..`, `0x20C00` B, `v2.01`）、実測更新コマンド列（`0x00C3` / `0x0004` / `0x0003` / `0x00C1` / `0x00C4(8B)` / `0x0007(8B)` リセット。`0x0002`・`0x0008` は本更新では非送信、DLL/レガシー参照のみ）および実測 CRC ゴールデンベクタ（`0x0674`, `0x75B2`）を [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §4.4・§8.2〜§8.5 に確定・記録済み。
 - BLE の `"8bt"` / prefix `0x05` を USB に流用しない。USB の復旧は再列挙 / 再接続。
 - **Tier**: 3。
 
