@@ -115,7 +115,7 @@ graph TD
     └── post-review-status.sh   # review-gate の投稿
 ```
 
-> **未実装の構成要素**: USB HID transport（`hid.rs`）とファームウェア配信 API クライアント（`firmware_api.rs`）はまだ存在しない。USB OTA は USB Boot TX フレーミングが未文書化のため保留。`packaging/linux/` の udev ルールも未作成。
+> **未実装の構成要素**: USB HID transport（`hid.rs`）とファームウェア配信 API クライアント（`firmware_api.rs`）はまだ存在しない。USB App Mode / USB OTA（`[0x81,0x05]`/`[0x02,0x05]`）は 2026-11-29 の Windows 実機採取で仕様確定済みで実装待ち。`packaging/linux/` の udev ルールも未作成。
 
 > **クレート名について**: Cargo のパッケージ名は数字で開始できないため、正式名は `eightbitdo-*` とする（`8bitdo-*` は使用不可）。ディレクトリ名もパッケージ名に合わせる。
 
@@ -154,7 +154,7 @@ graph TD
 
 ## 5. フェーズ別実装ロードマップ
 
-> **2026-11-23 改訂（現状反映、main `ed61961`）**: Phase 1 / 2a / 2b / 2d / 3a は main にマージ済み。PR #16（`feat/gui-write`）で Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）の GUI 書込を実装し **main にマージ済み**（実機未検証・Tier 3）。Phase 2c は core のみマージ済みで、#20 で `ota-bench` 段階実行 API、#19 で実機 btsnoop 採取計画を追加。実機 wire 未確定のため CLI / GUI / UniFFI に未配線。Phase 3c（OTA 画面）は未着手。Phase 5 は UniFFI と iOS / Android の雛形に加え、#21 で **JNI 同梱 APK / unsigned IPA のビルド成功まで記録**（実機未検証）。#17 で raw config の実機 flag 検証を opaque 値対応に修正、#18 でクロスプラットフォーム・ビルド確認、#22 で配布方針、#23 で機能マトリクスを追加。GUI ライセンス画面は #24 で main にマージ済み（左レール下部の「ライセンス」画面でアプリの MIT / Apache-2.0 全文と同梱 5 フォント全文・著作権者行を表示）。プロファイル切替（`0x0015`）の core / CLI / REPL 配線は #26 で main にマージ済み（`Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`、Save 送信なし）。実機では `cmd=0x0004/subcmd=0x0015` の 16B 封筒の ACK を 1 回観測し、`Save` を送らずに `cur_slot` が 6→1 へ更新されることを read-back で確認済み（未確認: 再接続/電源断を跨ぐ永続性、プロファイルの実効、`crc16` とみられる 2B の意味、直接 ACK の条件、ACK 形状の再現性。詳細は [docs/DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) §7）。[docs/FEATURE_MATRIX.md](FEATURE_MATRIX.md) の残作業「`0x0015` 切替のセッション API 化」に対応する。USB OTA（Phase 4）は USB Boot TX フレーミングが未文書化のため保留を継続する。詳細な残課題は §5.4。**#27〜#32 も main にマージ済み**（#27 状態 docs 更新、#28 `0x0015` 実機証跡、#29 機種抽象化の設計、#30 モバイルネイティブ計画、#31 ANTI_SLOP、#32 Tauri v2 GUI）。Tauri v2 GUI は **P0（決定・足場）/ P1（デザイン）完了・P2 以降（実接続・設定 / マクロ / OTA・パッケージ・モバイル）未着手**で、egui 版（`crates/eightbitdo-gui`）は凍結。
+> **2026-11-23 改訂（2026-11-29 Windows USB/OTA 仕様追記、main `ed61961` 基準）**: Phase 1 / 2a / 2b / 2d / 3a は main にマージ済み。PR #16（`feat/gui-write`）で Phase 3b（マクロエディタ）と Phase 3d（設定タブ / リマップ）の GUI 書込を実装し **main にマージ済み**（実機未検証・Tier 3）。Phase 2c は core のみマージ済みで、#20 で `ota-bench` 段階実行 API、#19 で実機 btsnoop 採取計画を追加。実機 BLE wire 未確定のため CLI / GUI / UniFFI に未配線。Phase 3c（OTA 画面）は未着手。Phase 5 は UniFFI と iOS / Android の雛形に加え、#21 で **JNI 同梱 APK / unsigned IPA のビルド成功まで記録**（実機未検証）。#17 で raw config の実機 flag 検証を opaque 値対応に修正、#18 でクロスプラットフォーム・ビルド確認、#22 で配布方針、#23 で機能マトリクスを追加。GUI ライセンス画面は #24 で main にマージ済み（左レール下部の「ライセンス」画面でアプリの MIT / Apache-2.0 全文と同梱 5 フォント全文・著作権者行を表示）。プロファイル切替（`0x0015`）の core / CLI / REPL 配線は #26 で main にマージ済み（`Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`、Save 送信なし）。実機では `cmd=0x0004/subcmd=0x0015` の 16B 封筒の ACK を 1 回観測し、`Save` を送らずに `cur_slot` が 6→1 へ更新されることを read-back で確認済み（未確認: 再接続/電源断を跨ぐ永続性、プロファイルの実効、`crc16` とみられる 2B の意味、直接 ACK の条件、ACK 形状の再現性。詳細は [docs/DEVICE_CONFIG_EVIDENCE.md](DEVICE_CONFIG_EVIDENCE.md) §7）。[docs/FEATURE_MATRIX.md](FEATURE_MATRIX.md) の残作業「`0x0015` 切替のセッション API 化」に対応する。**Phase 2e（USB / 2.4G）と Phase 4（USB OTA）は 2026-11-29 の Windows 実機 USBPcap 採取で全仕様確定済みとなり、保留を解除して実装待ちへ移行した**（詳細な残課題は §5.4）。**#27〜#32 も main にマージ済み**（#27 状態 docs 更新、#28 `0x0015` 実機証跡、#29 機種抽象化の設計、#30 モバイルネイティブ計画、#31 ANTI_SLOP、#32 Tauri v2 GUI）。Tauri v2 GUI は **P0（決定・足場）/ P1（デザイン）完了・P2 以降（実接続・設定 / マクロ / OTA・パッケージ・モバイル）未着手**で、egui 版（`crates/eightbitdo-gui`）は凍結。
 
 > **2026-11-23 追記（GUI 移行の現状）**: デスクトップ GUI は Tauri v2（Rust backend + Web frontend）へゼロベース移行し、**PR #32 で main にマージ済み**（[TAURI_PLAN.md](TAURI_PLAN.md)）。`apps/desktop` は P0 / P1（雛形・トークン・共通コンポーネント・シェル・デバイス / 入力モニターの静的 2 画面）までで、**BLE 接続・デバイス読み書きは未実装**。egui 版（`eightbitdo-gui`）は凍結（比較・撤退用）し、Phase 3 の各画面は Tauri 版で再実装する。以下の Phase 3 の記述は egui 版の実績として読む。
 
@@ -168,7 +168,7 @@ Track A: コア / CLI（Linux・デスクトップ）
   Phase 2c BLE OTA                  core のみ完了（Mock 52/55/58/61）。実機 wire 未確定・未配線
   Phase 2d config apply             完了・実機確認済み（BLE・MTU 200・74B chunk）
   プロファイル切替 0x0015           完了（#26、core + CLI + REPL 配線。Save 送信なし。実機で ACK と cur_slot 6→1 を確認、永続性・実効は未確認）
-  Phase 2e USB / 2.4G transport     保留
+  Phase 2e USB / 2.4G transport     仕様確定済み・実装待ち（2026-11-29 確定）
 
 Track B: GUI（Tauri v2 が正式。egui 版は凍結）
   Tauri P0 足場                     完了（PR #32。Vite / React / TS / Tailwind、独立 src-tauri、CI desktop.yml）
@@ -192,7 +192,7 @@ Track C: モバイル
 | Phase 1 | 完了。実機検証で判明した ReadVersion の 4B ペイロード、ReadConfig の `chunk_len = 0x0AD0`、1 要求 = 1 チャンク、最終 142B パディングは Phase 2a で補正した。`cargo test -p eightbitdo-protocol` は単体 100 + doc 4 |
 | Phase 2a | 完了。実機で ReadVersion **200 (0xC8)**、2768B dump、20ms keepalive **128.9 秒**、`session` の info / config dump / backup / monitor を確認（2026-11-22 時点の dump SHA-256 は `1dca47fa...59c600`。以降プロファイル名の変更で実機 config の SHA が変化したと考えられ、**SHA 固定値では判定しない**） |
 | Phase 2b | 完了（PR #6）。実機（BLE・slot S1）でマクロ書込・読み戻し・restore を確認。Write `0x0103` の `total_len` は絶対終端が必須。2026-11-23 に再接続後に `macro restore`（slot 0 の M1/M2、22 packets、復元後の read-back が書込前の read-back と SHA-256 一致）を再確認。**Switch 側でのマクロ発動は未確認**。M3/M4・S2/S3・USB HID は未確認 |
-| Phase 2c | core 実装済み（PR #11）。Mock 52 テスト（既定）/ 55（`mobile-boot`）/ 58（`ota-bench`）/ 61（`--all-features`）。#20 で実機採取用の段階実行 API（`ota-bench`、既定 OFF）をマージ、#19 で btsnoop 採取計画（[docs/OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md)、Phase A / Phase B）を追加。**実機 btsnoop 未取得、CLI / GUI / UniFFI 未配線、実機書込未検証**。マルチセクション `.dat` 非対応が公式ファーム対応の blocker |
+| Phase 2c | core 実装済み（PR #11）。Mock 52 テスト（既定）/ 55（`mobile-boot`）/ 58（`ota-bench`）/ 61（`--all-features`）。#20 で `ota-bench`、#19 で btsnoop 採取計画（[docs/OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md)）を追加。**2026-11-29 の Windows 実機採取により 2 セクション `.dat`（`v2.01`: `0x6010` + `0x600F`）と「公式ソフトは USB 有線でのみ OTA 許可（BLE/2.4G 不可）」が確認された**。BLE `"8bt"` 実機 btsnoop 未取得、CLI / GUI / UniFFI 未配線、実機書込未検証 |
 | Phase 2d | 完了（PR #7、#17 で実機 flag 対応を修正）。実機（BLE・MTU 200・74B chunk）で full 2768B write → Save → read-back 一致、`config remap` A→B→A を同一接続で確認。2026-11-23 に再接続後に version `0xC8` / full write read-back / `config remap A B` → `A A` の往復を再確認し、**各操作後の read-back が期待状態と一致し、復帰後は書込前の read-back と一致する**ことで検証した（実機 config の SHA はユーザーのプロファイル名設定により変わったと考えられるため固定値では判定しない）。**実機確認は full write / remap のみ**で、`config set` 各フィールド・`--force-raw`・MTU 200 以外は未確認。USB config write は未実装 |
 | Phase 3a | 完了（PR #9）。読み取り専用 GUI（egui 版・凍結）、日本語、燻しスレート。デバイス / ライブ入力 / 設定値 / ログの 4 タブ。 |
 | Phase 3b | **egui 版は実装・main にマージ済み（PR #16）**。マクロエディタ／20ms 録音／ステップ編集／既存非空マクロへの書込。pre-write backup・read-back・TOCTOU・録音中書込不可。**実機未検証・Tier 3** |
@@ -201,7 +201,7 @@ Track C: モバイル
 | Tauri P0 | **完了（PR #32、main にマージ済み）**。`apps/desktop` の雛形（Vite + React + TS + Tailwind、独立クレートの `src-tauri`、capability / CSP、アイコン）、`.github/workflows/desktop.yml`（web / rust の advisory 2 ジョブ） |
 | Tauri P1 | **完了（PR #32、main にマージ済み）**。デザイントークン・共通コンポーネント・シェル・デバイス / 入力モニターの静的 2 画面。**BLE 接続・実データ・書き込みは未実装** |
 | Tauri P2 以降 | **未着手**（実接続・設定 / マクロ / OTA・パッケージ・Tauri モバイル。[TAURI_PLAN.md](TAURI_PLAN.md) §5） |
-| Phase 4 | 保留（USB Boot TX 未文書化） |
+| Phase 4 | **仕様確定済み（未実装）**。2026-11-29 の Windows 実機 pcapng 採取で USB Boot TX `[0x81,0x05]` / RX `[0x02,0x05]`・2 セクション `.dat`（`v2.01`）を確定（[PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §4.4・§8.2〜§8.5）。実装・実機書込は未着手 |
 | Phase 5 | **JNI 同梱 APK / unsigned IPA のビルド成功、実機未検証（#21）**。UniFFI 公開 API（PR #12）、iOS unsigned IPA 1,550,522 bytes、Android Kotlin-only APK に続き、NDK r29 + cargo-ndk で `libeightbitdo_uniffi.so` を同梱した APK 14,551,011 bytes を生成（ビルド・パッケージ内容の確認のみ）。iOS / Android 実機での BLE・JNI ロード、署名・App Store 配布は未着手。書き込み・OTA は意図的に未公開。証跡は [docs/MOBILE_BUILD_EVIDENCE.md](MOBILE_BUILD_EVIDENCE.md)（**Padbench 識別子統一後の再ビルドは §0**: APK 14,692,156 bytes / IPA 1,550,798 bytes） |
 | ライセンス | 完了（PR #13）。LICENSE-MIT / LICENSE-APACHE / NOTICE / THIRD_PARTY_LICENSES / TRADEMARKS。公開範囲・コードライセンス・商標・同梱フォント・ストア配布・マネタイズの決定は [docs/DISTRIBUTION_POLICY.md](DISTRIBUTION_POLICY.md)（#22、決定日 2026-11-23）が正本 |
 | クロスプラットフォーム | ビルド確認のみ（#18、[docs/CROSS_PLATFORM.md](CROSS_PLATFORM.md)）。Linux ホスト / Windows `cargo check` / iOS target check は成功、macOS は本ホストで確認不能、Windows の実効 MSRV は 1.88 以上。**実機は Linux のみ** |
@@ -283,8 +283,8 @@ Track C: モバイル
   - `.dat` 検証: 28B ヘッダ、`image_len` 64B 倍数、`load_base_addr` 64B アライン、`28 + image_len` の厳密一致。**単一セクションのみ対応**。trailing data（マルチセクション）は明確なエラーで拒否し、公式 `.dat` がマルチセクションの場合は更新できない可能性がある。
   - fail-closed: `Error::Ota { stage, state, recovery }`（`OtaWriteState::{Untouched, EraseStarted, PartiallyWritten, Written}`、**送信試行**基準）。`sectors_erased` / `chunks_written` は ACK 数。進捗は `OtaProgress`。キャンセルされた Future は recovery を返さないため、フロントエンドはフラッシュ区間を非キャンセルにする契約。
   - MockTransport **52 テスト**（既定）/ **55**（`mobile-boot`）/ **58**（`ota-bench`）/ **61**（`--all-features`）: 全パケット列・CRC・チャンク/セクタ境界・部分セクタ・複数セクタ進捗・ACK 順序、Erase/Write/WriteVersion/WriteFirmwareVersion/Jump 失敗、送信失敗、ACK タイムアウト（リトライなし）、PID 不一致、ready/completion ACK ガード、MTU 不足、type 1 ウィンドウ外/`base + image_len` 上限超過/境界、transport 不一致、未確認 wire ゲート、`0x000E`、キャンセル、マルチセクション拒否メッセージ、`load_base + image_len` の 2^32 境界、WriteVersion の ready ACK 単独タイムアウト、`MobileBootLink` アダプタ（成功・受信エラー・into_inner）、`enter_boot_and_release`（App リンク切断・ACK 後の `Error::Ble` teardown・phase 不正で Session 非消費）、`BleLockSlot` の drop によるロック解放、`ota-bench` の checkpoint 停止・`write_state` 取得・base ゲート維持。
-  - **未検証 / 残課題**: 遅延・重複 ACK の誤帰属（シーケンス番号なし。`require_completion_ack` は緩和のみ。**CLI 配線前に ACK の `offset`/`total_len` 照合を追加するのが必須**）、 `PROTOCOL_SPEC` §8.5 を参照。Bootloader RX フレーミング、`readPID` 応答形状、ready/完了 ACK 形状、PID→type 対応、Erase/Write のアドレス規約（仕様の `load_base+sector_off` と証跡のイメージ相対が矛盾）、`WriteVersion` の payload 長（24B vs 16B）、`WriteFirmware` の 64B payload（証跡の 16B 問題）、`EraseFlash` の chunk_len（0 vs 0x1000）、タイムアウト差（5s vs Android 2s）、Bootloader MTU は実機 btsnoop 待ち。USB OTA は `N/A + 理由（USB Boot TX 未文書化）`。バッテリー警告・ファームウェア取得/検証は未実装。
-  - **次 PR の必須項目**: マルチセクション `.dat` 対応（または公式 `.dat` 非対応の明示。公式ファーム対応の **blocker**）、実機 btsnoop による wire / ACK / アドレス / MTU / `WriteVersion` payload の確定、公式 `.dat` 実測による type 1 ウィンドウ確定、CLI / GUI / UniFFI 配線（確定後）、バッテリー警告・バージョン/ダウングレード判定・ファームウェア取得/検証、成功時の `"80ND"` 再接続 + バージョン確認。
+  - **未検証 / 残課題（BLE `"8bt"` 経路）**: 遅延・重複 ACK の誤帰属（シーケンス番号なし。`require_completion_ack` は緩和のみ。**CLI 配線前に ACK の `offset`/`total_len` 照合を追加するのが必須**）、 `PROTOCOL_SPEC` §8.5 を参照。なお、**2026-11-29 の Windows 実機採取で USB Boot TX `[0x81,0x05]` / RX `[0x02,0x05]` と 2 セクション `.dat`（`v2.01`）が確定し、同時に公式ソフト自体が BLE / 2.4G 経由の OTA を禁止（USB 接続要求）していることを確認済み**。BLE `"8bt"` の実機 RX フレーミング、ready/完了 ACK 形状、Erase/Write アドレス規約、`WriteVersion` payload 長、Bootloader MTU は未検証のまま残る。USB OTA の TX/RX・CRC ベクタは確定済みで実装待ち。バッテリー警告・ファームウェア取得/検証は未実装。
+  - **次 PR の必須項目**: マルチセクション（2 セクション）`.dat` 対応（`v2.01` で構造確定済み、実装着手可能）、ACK `offset`/`total_len` 照合、USB Boot トランスポート実装または BLE `"8bt"` 実機 btsnoop 採取、CLI / GUI / UniFFI 配線、バッテリー警告・バージョン/ダウングレード判定・ファームウェア取得/検証、成功時の再接続 + バージョン確認。
 
 ### Phase 2d: 設定書き込み（config apply）
 - **ゴール**: 2768B 全体の書込み + Save を CLI から安全に実行する。
@@ -304,9 +304,9 @@ Track C: モバイル
 - **Tier**: **3**。
 - **状態**: **完了（実機確認範囲: full 2768B write / remap。BLE・MTU 200・74B chunk）**。
 
-### Phase 2e: USB HID / 2.4G トランスポート（保留）
-- **ゴール**: USB 有線 / 2.4G レシーバ経由の App Mode。
-- **状態**: 保留。USB App Mode の実機証跡と、USB Boot の TX フレーミング（`EraseFlash` / `WriteFirmware` 等）が未文書化のため、BLE 経路を優先する。
+### Phase 2e: USB HID / 2.4G トランスポート（仕様確定・実装待ち）
+- **ゴール**: USB 有線 / 2.4G レシーバ経由の App Mode（`0x600F` / `0x310B`）。
+- **状態**: **2026-11-29 の Windows 実機 pcapng 採取で仕様確定（未実装）**。USB HID App Mode の `[0x81,0x04]` / `[0x02,0x04]`（config チャンク `0x2D`=45B、macro チャンク `0x20`=32B、Save `0x0123`、`0x0100`/`0x0014`/`0x0040`/`0x0041`、Clear マクロ）、2.4G ドングル `0x310B`、および USB Boot TX `[0x81,0x05]` / RX `[0x02,0x05]` を [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) に確定・記録済み。`eightbitdo-protocol` のプロトコル実装および `eightbitdo-core` の USB HID トランスポート実装へ進む段階。
 
 ### Phase 3: `eightbitdo-gui`（デスクトップ GUI：Linux / macOS / Windows）
 
@@ -319,8 +319,8 @@ Track C: モバイル
 - **Phase 3d（設定タブ、Phase 2d 後）**: プロファイル、リマップ、デッドゾーン、振動、6 軸、RGB。Tier 3。**現状: PR #16 で実装済み・main にマージ済み（実機未検証）。** プロファイル名、`gamepad_mode`、有効プロファイル、22 ボタンリマップ（未変更の unsupported 値は保持、新規選択は単一文書化キーのみ）、振動、スティック / トリガー、特殊機能、ジャイロ、LED。確認ダイアログ、pre-write backup、read-back 検証、TOCTOU 付き。**実機未検証。**
 - **完了条件**: Linux / macOS / Windows でビルド・起動し、実機と同期すること（現状の確認は Linux のみ）。
 
-### Phase 4: USB OTA（保留）
-- **状態**: **保留**。USB Boot の TX フレーミングが未文書化のため、証跡が `PROTOCOL_SPEC.md` に追加されるまで実装しない。
+### Phase 4: USB OTA（仕様確定・実装待ち）
+- **状態**: **2026-11-29 の Windows 実機 pcapng 採取で仕様確定（未実装）**。USB Boot TX `[0x81,0x05]` / RX `[0x02,0x05]`（64B HID、`<=46B (0x2E)` payload、`cmd=0x0000/subcmd=request_cmd` 応答）、2 セクション `.dat`（Section 0 `0x6010` @ `.dat 0x40004000`→wire `0x40000000`, `0x2200` B + Section 1 `0x600F` @ `0x01018000`→wire 相対 `0x0000..`, `0x20C00` B, `v2.01`）、実測更新コマンド列（`0x00C3` / `0x0004` / `0x0003` / `0x00C1` / `0x00C4(8B)` / `0x0007(8B)` リセット。`0x0002`・`0x0008` は本更新では非送信、DLL/レガシー参照のみ）および実測 CRC ゴールデンベクタ（`0x0674`, `0x75B2`）を [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md) §4.4・§8.2〜§8.5 に確定・記録済み。
 - BLE の `"8bt"` / prefix `0x05` を USB に流用しない。USB の復旧は再列挙 / 再接続。
 - **Tier**: 3。
 
@@ -342,19 +342,19 @@ Track C: モバイル
 
 1. ~~Phase 2a `session` 完了 → Tier 3 レビュー → マージ~~ **完了**
 2. ~~Phase 2b マクロ書き込み → Tier 3 レビュー → マージ~~ **完了（実機確認済み）**
-3. **Phase 2c BLE OTA: 実機 btsnoop で wire / ACK を確定 → ACK `offset` / `total_len` 照合とマルチセクション `.dat` 対応 → Tier 3 → CLI / GUI / UniFFI 配線 → 実機書込**
+3. **Phase 2c / Phase 4 OTA: USB Boot TX/RX・2 セクション `.dat` 仕様は確定済み（2026-11-29 Windows 採取）→ `eightbitdo-protocol` 実装 → `eightbitdo-core` 2 セクション / USB Boot 実装 → Tier 3 → CLI / GUI / UniFFI 配線 → 実機確認**（BLE `"8bt"` OTA は公式非使用・実機未検証のまま継続）
 4. ~~Phase 2d 設定書き込み → Tier 3 レビュー → マージ~~ **完了（実機確認済み）**
-5. ~~Phase 3a GUI 読み取り専用~~ **完了** / ~~Phase 3b / 3d GUI 書き込み UI~~ **PR #16 で実装・main にマージ済み（実機未検証）**。次に着手するのは **Phase 3c OTA 画面**（Phase 2c の実機 wire 確定後）と、GUI 書込の実機確認（Tier 3）。~~GUI ライセンス画面~~ **#24 で main にマージ済み**、~~プロファイル切替（`0x0015`）の core / CLI / REPL 配線~~ **#26 で main にマージ済み（実機で ACK と `cur_slot` 6→1 を確認。再接続/電源断を跨ぐ永続性・プロファイル実効は未確認）**
+5. ~~Phase 3a GUI 読み取り専用~~ **完了** / ~~Phase 3b / 3d GUI 書き込み UI~~ **PR #16 で実装・main にマージ済み（実機未検証）**。次に着手するのは **Phase 3c OTA 画面**（OTA コア / USB 配線確定後）と、GUI 書込の実機確認（Tier 3）。~~GUI ライセンス画面~~ **#24 で main にマージ済み**、~~プロファイル切替（`0x0015`）の core / CLI / REPL 配線~~ **#26 で main にマージ済み（実機で ACK と `cur_slot` 6→1 を確認。再接続/電源断を跨ぐ永続性・プロファイル実効は未確認）**
 6. Phase 5 モバイル: ~~Android JNI 同梱 APK のビルド~~ **完了（#21）** → 実機 BLE・JNI ロード確認 → 署名・配布（書き込み・OTA は後続）
-7. Phase 2e / 4（USB / 2.4G）: 実機証跡と USB Boot TX フレーミングが揃うまで保留
+7. **Phase 2e / 4（USB / 2.4G）: 2026-11-29 Windows 実機採取により仕様確定済み → プロトコル / コア実装と実機確認へ進む**
 
 ### 5.4 残課題（優先順）
 
 | # | 課題 | 影響 | Tier |
 | --- | --- | --- | --- |
-| 1 | OTA の実機 btsnoop 取得と wire 確定（RX フレーミング、ready / 完了 ACK、Erase / Write アドレス、`WriteVersion` payload、`WriteFirmware` フレーム長、Bootloader MTU） | 実機 OTA 不可 | 3 |
+| 1 | OTA の実機 btsnoop 取得と wire 確定（RX フレーミング、ready / 完了 ACK、Erase / Write アドレス、`WriteVersion` payload、`WriteFirmware` フレーム長、Bootloader MTU） | 実機 BLE OTA 不可（USB OTA は §8.3.1 で確定済み・未実装） | 3 |
 | 2 | OTA ACK の `offset` / `total_len` 照合（現状は cmd/subcmd のみ。遅延・重複 ACK を誤帰属し得る） | フラッシュ破損リスク | 3 |
-| 3 | マルチセクション `.dat` 対応（公式 `.dat` がマルチセクションなら現実装は拒否する） | 公式ファーム更新の blocker | 3 |
+| 3 | マルチセクション `.dat` 対応（**2026-11-29 の Windows `v2.01` 採取で 2 セクション構造が確定済み**。現 `ota.rs` は単一セクションのみ対応で拒否するため、2 セクションパーサとセクションループの実装が必要） | 公式ファーム更新の blocker | 3 |
 | 4 | OTA の CLI / GUI / UniFFI 配線、バッテリー警告、バージョン / ダウングレード判定、SHA-256 検証 | OTA 未提供 | 3 |
 | 5 | GUI 書込み UI（PR #16）の実機確認と、Phase 3c OTA 画面。backup 復元 UI・JSON/TOML 入出力 | GUI 書込が実機未検証 | 3 |
 | 6 | ~~Android NDK + cargo-ndk による Rust JNI 同梱 APK~~ **完了（#21、ビルド・パッケージ確認のみ）**。残るのは Android 実機 / エミュレータでの JNI ロード確認 | Android 実機でコア未確認 | 3 |
@@ -362,7 +362,7 @@ Track C: モバイル
 | 8 | macOS / Windows の BLE 実機確認（現状は Linux のみ） | クロスプラットフォーム未実証 | 2–3 |
 | 9 | マクロ M3/M4・slot S2/S3、MTU 200 以外、REPL 経由の書込の実機確認 | 外挿・未検証が残る | 3 |
 | 10 | **既知バグ: BLE 切断後も `session` の `status` が `connected: true` と keepalive カウンタを保持する。送信時に `Not connected` エラーが返ることは確認済み（2026-11-23 発見・未修正）** | リンク断を `status` から検知できない | 3 |
-| 11 | USB HID / 2.4G transport と USB OTA（USB Boot TX 未文書化） | Phase 2e / 4 保留 | 3 |
+| 11 | USB HID / 2.4G transport と USB OTA（2026-11-29 採取で USB App Mode / Boot TX `[0x81,0x05]` / RX `[0x02,0x05]` / 2 セクション `.dat` の仕様は確定済み。`core` 実装・実機検証が未着手） | Phase 2e / 4 実装待ち | 3 |
 | 12 | ~~GUI ライセンス画面~~ **完了（#24、main にマージ済み）** | ライセンス表示は GUI にある | 1–2 |
 | 13 | ~~プロファイル切替 API~~ **完了（#26、main にマージ済み。core `Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>`、Save 送信なし。実機で `cmd=0x0004/subcmd=0x0015` の 16B 封筒の ACK を 1 回観測し、`Save` を送らずに `cur_slot` が 6→1 へ更新されることを read-back で確認済み）**。残るのは再接続/電源断を跨ぐ永続性・プロファイル実効・`crc16` とみられる 2B の意味・直接 ACK の条件・ACK 形状の再現性の確認 | `0x0015` の永続性・実効確認 | 3 |
 

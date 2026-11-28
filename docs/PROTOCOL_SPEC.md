@@ -306,23 +306,51 @@ ReadConfig head:  04 02 00 00 00 74 00 00 00 74 00 00 00 00 00 00 00
 - 公式アプリは要求ペイロードに直前の `gamepadVersion` を再利用する。本実装は常にゼロを送る。`session` REPL では `monitor` 停止後、同一接続で `info` / `config dump` / `backup` / `monitor` を再実行できる。`monitor` 実行中は `info` / `config dump` / `backup` / `monitor --count` を拒否し、先に `monitor stop` が必要である。`info` は実行ごとに新しい 4B ゼロペイロードで `ReadVersion` を送り直す（実機での 2 回目以降の応答は未確認）。
 - USB 給電併用が BLE 設定モードの持続時間を延ばすかは、1 回の成功では判断できない（ユーザー仮説・未検証）。
 
-### 4.4 USB HID / 2.4G HID フレーミング（Windows `8BitDoAdvance.dll` / Android USB）
+### 4.4 USB HID / 2.4G HID フレーミング（Windows `8BitDoAdvance.dll` / Android USB / 2026-11-29 USBPcap 実機確定）
 
-USB 有線接続および 2.4GHz ドングル経由の HID 通信は、**65 バイト固定（Report ID 1 バイト + 64 バイトレポート）** で行われる。
+USB 有線接続および 2.4GHz ドングル経由の HID / Interrupt 転送は、**USB ワイヤ上は 64 バイト固定**（byte 0 が `0x81`/`0x02`、byte 1 がチャネル種別 `0x04`/`0x05`、bytes 2..17 が 16B `cumstom_header_t`、bytes 18..63 が最大 46B ペイロード）で行われる。なお `0x2DC8:0x600F` の HID Report Descriptor 自体は未採取のため、ホスト側の `ReadFile` / `WriteFile` / `hidapi` が `0x81`/`0x02` 自体を Report ID として **64B バッファ（`buf[0..64]`）** で扱うのか、先頭にダミー Report ID `0x00` (1B) を前置した **65B バッファ（ワイヤ 64B が `buf[1..65]` に配置）** を要するのかは、Linux/Windows の実デバイス開通確認まで未確定とする。
 
+#### (a) USB 有線接続時のモード切替・エンドポイント構成（`0x057E:0x2009` → `0x2DC8:0x600F`）
+2026-11-29 の Windows 実機 USBPcap（`01_usb_ota_controller.pcapng`, `03_usb_app_init_and_input.pcapng`）で以下を確認した:
+- コントローラを Switch モードで USB 接続すると、まず **`VID 0x057E / PID 0x2009`**（Switch Pro Controller、`HID\VID_057E&PID_2009`）として列挙される。
+- 公式ソフト起動後、`EP 0x02` OUT（64B）へ Switch ベンダーハンドシェイク（例: `01 66 aa 04 00 01 00..` → `EP 0x81` IN `81 66 a5 04 00 00 01 16 00 <hdr crc2> 00.. <ver u32=0xC8/0xC9> <pid u16=0x600F> 00..`）を送信し、続いて切替コマンド `01 66 aa 00 51 01 00 00 00 00 00 00 78 66 <8B..>`（末尾のフッタ生成則は未解析）を送ると USB バス上で再列挙が起き、**`VID 0x2DC8 / PID 0x600F`**（`HID\VID_2DC8&PID_600F`）として再接続される。
+- `0x2DC8:0x600F` 列挙後は **`EP 0x02` (OUT 64B)** と **`EP 0x81` (IN)** を使用する。IN 側は 64B 制御応答（`[0x02, 0x04]` 等）と **12B 生 HID 入力レポート**（先頭 `0x03`、`03 0f 84 7d 81 7f 00 00 00 00 00 87` 等）が長さおよび先頭バイトで明確に区別される（この `0x03` 12B レポートは §7.2 の App 応答 `0x0003` とは**別フォーマットであり内部レイアウト未解析**。§7.2 パーサへ流さないこと）。App Mode 初期応答の `0x0100` では FW バージョン（`0xC8` / `0xC9`）と PID `0x600F` が返る。
+
+#### (b) 2.4GHz レシーバ接続（`0x2DC8:0x310B` / `0x3109` / 内部 PID `0x6011`）
+2026-11-29 の Windows 実機 USBPcap（`02_24g_dongle_app_and_ota.pcapng`, `04a〜04e`）およびデバイス情報（`Get-PnpDevice`）で以下を確認した:
+- ドングル接続時は複合 USB デバイス **`VID 0x2DC8 / PID 0x310B`**（`MI_00`/`MI_01`: XInput、`MI_02`: 設定用 HID `HID\VID_2DC8&PID_310B&MI_02`）および `0x3109` が列挙される。
+- `0x310B` 上の制御チャネルは **`EP 0x03` (OUT 64B)** と **`EP 0x83` (IN 64B)** を使用し（`EP 0x81` IN 20B は通常の XInput 入力レポート）、App Mode と同じ `[0x81, 0x04]` / `[0x02, 0x04]` フレーミングで設定・マクロの読み書きが可能。
+- 初期クエリ `cmd=0x0100` への応答は `clen=6`, payload **`67 00 00 80 11 60`**（LE `ver=0x0067` / フラグ `0x8000` / 内部 PID `0x6011`）を返す。
+- 公式ソフト UI 上では 2.4G 経由のファームウェア更新は禁止されており、Firmware 選択時に `"Please connect the controller to the PC via USB"` モーダルが表示される。
+
+#### (c) App Mode（USB 有線・2.4G 共通）フレーミング
 - **送信 (`WriteHid_reportID(..., reportID = 0x81, len = 0x40)`)**:
-  - `8BitDoAdvance.dll::send_16B_inner` は `tx[0] = 0x81` を設定し、PID が `{0x600F, 0x6012, 0x6009, 0x600B, 0x2028, 0x2062}` の場合にペイロード長バイトを挟まず以下を送信する（残余バイトは `0x00` パディングで合計 65 バイト）:
+  - `8BitDoAdvance.dll::send_16B_inner` は `tx[0] = 0x81` を設定し（`len = 0x40` = 64B ワイヤフレーム）、PID が `{0x600F, 0x6012, 0x6009, 0x600B, 0x2028, 0x2062}` の場合に以下を送信する（残余バイトは `0x00` または送信バッファの未初期化残余パディングで合計 64B ワイヤフレーム。OS HID API が先頭ダミー `0x00` を要求する場合のみ `buf[0]=0x00` を前置した 65B バッファとして渡す）:
     ```text
-    [0x81, 0x04] (2B) + cumstom_header_t (16B) + payload (最大 0x20 = 32B) + [0x00 padding]
+    [0x81, 0x04] (2B) + cumstom_header_t (16B) + payload (設定=最大 0x2D [45B] / マクロ=最大 0x20 [32B]) + [padding]  (ワイヤ計 64B)
     ```
-  - 補足: `send_custom_inner` では USB HID パケットあたりの `chunk_len` を最大 **`0x20`（32 バイト）** に制限する（`0x04`(1B) + `header`(16B) + `32B` = `49B <= 64B`）。
-  - Bootloader 時の USB HID PID 読み出し（`getDevicePID1_inner`）では、**受信** レポートの先頭 `[0x00 (Report ID), 0x05, ...]` を検証する。`[0x00, 0x05]` は **RX 専用** であり、USB Boot の **TX** フレーミングではない。
-  - **USB Boot の TX フレーミングは未文書化**: `EraseFlash` `0x0004` / `WriteFirmware` `0x0003` / `WriteVersion` `0x00C4` / `WriteAPPID` `0x0002` / `JumpApp` `0x0006` を USB Boot で送る際の framing は、現時点の解析では確定していない。USB OTA 書込を実装・検証する PR は、この節に TX フレーミングの証跡を追加するまで **停止** し、該当項目を `N/A + 理由（USB Boot TX 未文書化）` とする。BLE の `"8bt"` / prefix `0x05` を USB に流用しない。USB の復旧は再列挙（re-enumeration）/再接続であり、BLE の `"8bt"` 再接続ではない。
-
+  - **実機チャンク長と読出手順（2026-11-29 確定）**:
+    - 2768B 設定の **読出（`0x0002`）** と **全量書込（`0x0001`）** は、ともに **`0x2D`（45B）** チャンク（`2B + 16B + 45B = 63B <= 64B`、61 × 45B + 23B = 計 **62 パケット**）を使用する。`0x0002` 読出も BLE 同様 **1 要求 = 1 チャンク（62 往復）** であり、最終パケット（`off=0x0AB9`）は TX `clen=23` に対し RX も実長 `clen=23` を返す（BLE の 142B 固定長パディングは無い）。
+    - マクロの **読出（`0x0102`）** と **書込（`0x0103`）** は **`0x20`（32B）** 上限で、同じく **1 要求 = 1 チャンク** として分割される。
 - **受信 (`wait_ack` / `read_hid_64` / `StepActivity`)**:
-  - `ReadFile` で `0x41`（65）バイトを読み取り、先頭の Report ID 1 バイトを除いた 64 バイトバッファ `rx[0..64]` に対して以下を検証する:
+  - `buf` 読取が 65B（`0x41`、先頭 `buf[0] == 0x00` ダミー Report ID 付き）の場合は `rx = &buf[1..65]`、64B raw 読取の場合は `rx = &buf[0..64]` として以下を検証する:
     - App Mode: `rx[0] == 0x02 && rx[1] == 0x04` であることを確認し、`rx[2..18]` を `cumstom_header_t`、`rx[18..]` をペイロードとして解釈する。
-    - Bootloader Mode (`getDevicePID1_inner`): 生読み取り `0x41` バイトの先頭が `[0x00, 0x05]` かつ `cmd == 0x0000, subcmd == 0x0008` であることを検証し、`+0x12` オフセットから PID（2B LE）を読む。
+    - 参考（Windows DLL レガシー `getDevicePID1_inner`）: 65B 生読取 `buf[0..65]` の先頭 `[0x00 (Report ID), 0x05]` かつ `cmd == 0x0000, subcmd == 0x0008` を検査して `buf[+0x12]` 付近から 2B LE の PID を読む経路もあるが、下記の `v2.00 -> v2.01` 実機 USB OTA では `[0x02, 0x05]` 64B 応答のみが使用された。
+
+#### (d) USB Bootloader / OTA（`0x2DC8:0x600F`）TX & RX フレーミング（2026-11-29 USBPcap 確定）
+`01_usb_ota_controller.pcapng`（v2.00 `0xC8` → v2.01 `0xC9`、有線 USB、`EP 0x02` OUT / `EP 0x81` IN）の採取により、**USB Boot TX / RX フレーミング**（いずれもワイヤ 64B 固定、Report ID を前置する OS API 経由では 65B）が確定した:
+- **送信 (TX)**:
+  ```text
+  [0x81, 0x05] (2B) + cumstom_header_t (16B) + payload (最大 0x2E = 46B) + [0x00 padding]  (ワイヤ計 64B)
+  ```
+  - 先頭 2 バイトは **`[0x81, 0x05]`**（`0x81` = OUT prefix、`0x05` = Boot チャネル種別。先頭 2B + 16B ヘッダを除いた残り `64 - 18 = 46B (0x2E)` までを 1 チャンクとして詰められる）。
+- **受信 (RX)**:
+  ```text
+  [0x02, 0x05] (2B) + cumstom_header_t (16B) + payload  (ワイヤ計 64B)
+  ```
+  - 応答エンベロープは `cmd = 0x0000`, `subcmd = 要求 cmd`（実測: `0x00C3`, `0x0004`, `0x0003`, `0x00C1`, `0x00C4`, `0x0007`）、`total_len` / `offset` は原則要求値をエコーする（Section 0 の 512B 境界完了パケットを除く。§8.3 / §8.3.1 参照）。
+  - `v2.00 -> v2.01` 実機更新では `0x3208` 等へ再列挙せず `0x2DC8:0x600F` のまま `[0x81, 0x04]` `0x0100` / `0x0007(0)` 後に `[0x81, 0x05]` モードへ遷移し、最後に `0x0007` リセットで完了した。
+  - BLE の `"8bt"` 再接続は USB に使わない（USB の復帰・再入は USB バス再列挙／再接続。詳細シーケンスは §8.3・§8.3.1）。
 
 ---
 
@@ -434,7 +462,7 @@ sequenceDiagram
 | **`0x0002`** | `0x0000` | 全体: `offset=0, total_len = chunk_len = 0x0AD0`<br/>ヘッダ: `offset=0, total_len = chunk_len = 0x74`<br/>現在スロット: `offset=0x12, total_len = chunk_len = 2` | Host → Ctrl | **設定構造体読み出し**。ペイロードなしだが `chunk_len` に要求長を宣言する（§4.1.1）。**1 要求 = 1 チャンク**（実機 142B）で、`offset += payload.len()` の再要求が必要。最終チャンクも 142B で返り、残り 70B に切り詰める（§4.3.1） |
 | **`0x0003`** | `0x0000` | `total_len=0x0C`, `offset=0x0C` | Ctrl ↔ Host | **リアルタイム入力レポート取得 / 通知**（12 バイト、セクション 7 参照） |
 | **`0x0006`** | **`0x0067`** (BLE)<br/>**`0x0123`** (Windows USB) | `total_len=0, offset=0` | Host → Ctrl | **Save（Flash 永続化）**。書き込み系（`0x0001` / `0x0103`）完了後に必ず発行。**BLE(Android) と USB(Windows) でサブコマンドが異なる点に注意**（6.4 参照） |
-| **`0x0007`** | `0x0000` (無効) / `0x0001` (有効) | `total_len=0, offset=0` | Host → Ctrl | **`SetReportEnable`**。リアルタイム入力通知の開始/停止。発行時にクライアント側 `MAX_ATT_MTU = 0x3F` へ設定 |
+| **`0x0007`** | `0x0000` (無効) / `0x0001` (有効) / `0xAA01` (Windows ポーリング開始?) | `total_len=0, offset=0` | Host → Ctrl | **`SetReportEnable`**。リアルタイム入力通知の開始/停止。発行時に BLE クライアント側 `MAX_ATT_MTU = 0x3F` へ設定。Windows USB/2.4G 実機では入力テスト時に `subcmd=0xAA01` 送信後、`cmd=0x0003, subcmd=0x0123` をポーリングする挙動も観測 |
 | **`0x000B`** | `0x0000` | `0x600F` (`gamepad_type == 1`): `total_len = 4`, `chunk_len = 4`, `offset = 0x01017040`, 4B ダミーペイロード（`gamepadVersion`、初回ゼロ。CRC-16/MODBUS = `0x2400`）<br/>`gamepad_type == 2`: `total_len = offset = 0x01020030` | Host → Ctrl | **`ReadVersion`**。ファームウェアバージョン読み出し。`0x01020030` は `gamepad_type == 2` の variant。応答は `cmd=0x0004, subcmd=0x000B` エンベロープ（§4.3.1） |
 | **`0x000C`** | **`0x0067`** | `total_len=4, offset=4` | Host → Ctrl | **`EnterBoot`**。App Mode から Bootloader Mode (`"8bt"`) へ再起動遷移 |
 | **`0x000E`** | — | — | Ctrl → Host | エラー応答通知（`readBleHidData` でエラーコードログ出力） |
@@ -443,16 +471,20 @@ sequenceDiagram
 | **`0x0011`** | `state` (`int`) | `total_len=0, offset=0` | Host → Ctrl | **`SetConfigState`**。設定状態の遷移通知（`Channel+0x31 = 0x0A`） |
 | **`0x0012`** | `0x0000` | — | Ctrl → Host | **`AllowConfigDone`**。コントローラが設定受付可能になった際の非同期通知 |
 | **`0x0013`** | `0x0000` | `total_len=0, offset=0` (Windows `StartConfig` flag=`1`) | Host → Ctrl | **Windows USB HID 用 `StartConfig`**（最大 30 回リトライし `cmd=0x13` ACK を待機） |
+| **`0x0014`** | `0x0000` | `total_len=0, offset=0, crc16=0xFFFF` | Host → Ctrl | **設定セッション同期・準備コマンド**（Windows USB/2.4G 実機で `0x0002` 全量読出の直前・`0x0006` Save の直後に毎回送信。応答 `cmd=0x0004, subcmd=0x0014`） |
 | **`0x0015`** | `slot` (`0..2`) | `total_len=0, offset=0` | Host → Ctrl | **`WriteSLOT`**。アクティブプロファイルスロット切替。アプリ側は `Session::switch_profile` / CLI `config profile <N>` / REPL `profile switch <N>` に配線済み（Save は送らない）。**実機確認済み（2026-11-23、Linux BLE・MTU 200、下記注記）**: 要求は 17B（`cmd=0x0015, subcmd=slot, total_len=0, offset=0`）、ACK は `cmd=0x0004/subcmd=0x0015` の 16B 封筒を **1 回**観測。`Save` を送らなくても直後の read-back で `cur_slot`（`+0x12`）が 6→1 に変化。**未確認**: 再接続/電源断を跨ぐ永続性、プロファイル実効、`crc16` とみられる 2B（`00 81`）の意味、直接 `cmd=0x0015` ACK の条件、ACK 形状の再現性 |
-| **`0x0102`** | `(mode << 8) \| slot` | `total_len = chunk_len = steps * 10`, `offset = macro_idx << 12` (`macro_idx * 0x1000`) | Host → Ctrl | **`ReadBT2Macro`**。指定スロット・マクロ番号のステップ列を読み出し（1 ステップ = 10B）。ペイロードなしだが `chunk_len` に要求長を宣言する（§4.1.1） |
-| **`0x0103`** | `(mode << 8) \| slot` | `total_len = (macro_idx << 12) + align32(steps * 10)`（絶対終端。`align32(x) = (x + 0x1F) & ~0x1F`。**BLE・slot S1・`macro_idx=0/1 (M1/M2)` で実機確認**。`macro_idx=2/3` と他 slot は外挿、USB HID は未実装・未検証）, `offset = (macro_idx << 12) + chunk_index * chunk_size`（`chunk_index` はパケットごとに進む。プロトコル上限は BLE `0x40` / USB HID `0x20`。本クレートの API は 32B / 64B のみで、46B などは `UnsupportedChunkSize`。64B 超は 64B にクランプ） | Host → Ctrl | **`WriteBT2Macro`**。BLE 最大 **`0x40` (64B)** / USB HID 最大 **`0x20` (32B)** 分割でマクロを書き込み、完了後に `0x0006` (Save) を実行。API の chunk サイズは 32B / 64B のみ（32B アライン保証） |
-| **`0x0104`** | `(mode << 8) \| slot` | `total_len = 0x1000`, `chunk_len = 0x1000`（wire header `+0x04`。公式実装のチャネル設定値。ペイロードなし `len = 0`）, `crc16 = 0xFFFF`（空ペイロードの CRC-16/MODBUS）, `offset = macro_idx << 12` | Host → Ctrl | **`EraseBT2Macro`**。指定スロット・マクロ領域（4KB 単位）を消去 |
+| **`0x0040`** | `theme_id` (`0x02`/`0x04`/`0x05` 等) | `total_len=0, offset=0, crc16=0xFFFF` | Host → Ctrl | **RGB テーマ即時切替**（Windows `8BitDoAdvance.dll::_writeUltimateBT2theme`）。`04c_rgb_lighting.pcapng`・`04e` で `subcmd=0x02`, `0x04`, `0x05`（`Close` 消灯時）を実機観測（応答 `cmd=0x0004, subcmd=0x0040, clen=0`）。2768B 全体書換なしで即時切替する（`0x02`/`0x04` とUI効果名の1対1対応は未確定） |
+| **`0x0041`** | `0x0000` | `total_len=0, offset=0, crc16=0xFFFF` | Host → Ctrl | **RGB テーマ状態読み出し**（Windows `8BitDoAdvance.dll::_readUltimateBT2theme`）。`04c_rgb_lighting.pcapng`・`04e` で応答 `cmd=0x0004, subcmd=0x0041, clen=1, tlen=1`、ペイロード `0x05`（`Close` 状態時）を実機観測 |
+| **`0x0100`** | `0x0000` | `total_len=0, offset=0, crc16=0x0000` | Host → Ctrl | **Windows USB/2.4G デバイスバージョン・PID クエリ**。応答 `cmd=0x0004, subcmd=0x0100`: USB 有線 `0x600F` では `clen=0x16`（先頭 `<u32 ver, u16 0x600F>` + 残り 16B ゼロ系/未解析領域）、2.4G ドングルでは `clen=0x06`（`67 00 00 80 11 60` = ver `0x67`, flag `0x8000`, PID `0x6011`）を返す |
+| **`0x0102`** | `(mode << 8) \| slot` | `total_len = chunk_len = steps * 10`, `offset = macro_idx << 12` (`macro_idx * 0x1000`) | Host → Ctrl | **`ReadBT2Macro`**。指定スロット・マクロ番号のステップ列を読み出し（1 ステップ = 10B）。ペイロードなしだが `chunk_len` に要求長を宣言する（§4.1.1）。Windows USB/2.4G では 32B 分割・1 要求 = 1 チャンク（例: `M1` 101 steps → `tlen=0x3F2`, 32 回）を実機観測 |
+| **`0x0103`** | `(mode << 8) \| slot` | `total_len = (macro_idx << 12) + align32(steps * 10)`（絶対終端。`align32(x) = (x + 0x1F) & ~0x1F`。**BLE slot S1 `macro_idx=0/1` および Windows 2.4G slot S1 `macro_idx=2` (`tlen=0x2220`)・slot S2 `macro_idx=0` (`tlen=0x220`) で実機確認**。`M4`・`S3` は外挿）, `offset = (macro_idx << 12) + chunk_index * chunk_size`（`chunk_index` はパケットごとに進む。上限は BLE `0x40` / USB HID `0x20`。本クレートは 32B / 64B のみ許可） | Host → Ctrl | **`WriteBT2Macro`**。BLE 最大 **`0x40` (64B)** / USB HID 最大 **`0x20` (32B)** 分割でマクロを書き込み、完了後に `0x0006` (Save) を実行 |
+| **`0x0104`** | `(mode << 8) \| slot` | **ペイロードなし（`len = 0`）**。`offset = macro_idx << 12`<br/>- Android/BLE: `total_len = chunk_len = 0x1000`, `crc16 = 0xFFFF`<br/>- Windows USB/2.4G 実測: `chunk_len = 0x1000`, `total_len = 0x0000`, `crc16 = 0x0000`（※ワイヤの byte 18 [ヘッダ直後 `+0x12`] の `0x32` 等は 64B 送信バッファの未初期化残余パディングであり実ペイロードではない） | Host → Ctrl | **`EraseBT2Macro`**。指定スロット・マクロ領域（4KB 単位）を消去（※UI 上で既存マクロ Clear 操作時は `04d_macro_ops.pcapng` にて 2768B ヘッダの該当 52B ゼロクリア (`0x0001`) + Save と、`0x0104 (off=0x2000)` + Save の双方が観測された） |
 
 > ※ `mode` は `record_ultimatebt2` 内オフセット `+0x10` の `GamepadMode` 値。
 >
 > **実機ソースでの再確認（x86_64 `libadvancelib.so`）**: 設定読み出しは **`cmd=0x0002` / `subcmd=0x0000`**、設定書き込みは **`cmd=0x0001` / `subcmd=0x0000`**。`STRUCT_BT2_2768B.md` 旧版にあった `subcmd=0x0101` / `0x0102` は誤記であり、`getUT2_ReadCofigChannel` / `getBT2_WriteCofigChannel` のチャネル構造体 `+0x4E` はどちらも `0` である。
 >
-> **`EraseBT2Macro` の CRC 証跡**: 公式 `getBT2_EraseMacro` (x86_64 `libadvancelib.so` 0x2bb70) は `total_len = chunk_len = 0x1000`、ペイロードなしでチャネルを初期化する。`Generate_CustomDataCmd` (0x27620) は `gamepad_type == 1` で空ペイロードに対しても `crc16` を計算してヘッダ `+0x06` に格納し、`crc16` (0x28540) は入力長 `<= 0` で `0xFFFF` を返す。したがって `0x0104` のワイヤ `crc16` は `0` ではなく **`0xFFFF`** である。
+> **`EraseBT2Macro` の CRC 証跡（Android/BLE 経路）**: 公式 Android `getBT2_EraseMacro` (x86_64 `libadvancelib.so` 0x2bb70) は `total_len = chunk_len = 0x1000`、ペイロードなしでチャネルを初期化する。`Generate_CustomDataCmd` (0x27620) は `gamepad_type == 1` で空ペイロードに対しても `crc16` を計算してヘッダ `+0x06` に格納し、`crc16` (0x28540) は入力長 `<= 0` で `0xFFFF` を返す。したがって **Android/BLE 経路での `0x0104` ワイヤ `crc16` は `0xFFFF`** である（一方 Windows USB/2.4G 実機では上表のとおり `tlen = 0, crc16 = 0x0000` が観測されている）。
 >
 > **`WriteSLOT` (`0x0015`) の実機 wire（2026-11-23、Linux BLE・MTU 200、Ultimate 2、1 回の観測）**:
 > - **要求（`-v` の生ログ、17B）**: `04 15 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00`。`04` は BLE App Mode の prefix で、続く 16B ヘッダは `cmd=0x0015` / `subcmd=0x0001`（slot 1）/ `chunk_len=0` / `crc16=0x0000` / `total_len=0` / `offset=0`。RE で確定していた wire と一致する。
@@ -609,6 +641,12 @@ Header または最初の Save が失敗した場合、Erase は送らない。�
 | `0x0A` | 1B | `u8` | **`Battery`** | バッテリー残量値（`!is3E()` で有効） |
 | `0x0B` | 1B | `u8` | `Reserved` | 予約 / 未使用（`0x00`） |
 
+> **実機確認（2026-11-29、Windows USB 有線 `03_usb_app_init_and_input.pcapng`、`0x2DC8:0x600F`）**:
+> - **スティック軸符号**: 左スティック上入力で `LeftStick_Y = 13..19`（`0` 側が上）、下入力で `236..239`（`255` 側が下）、左入力で `LeftStick_X = 15..19`、右入力で `236..239`。右スティックも上 `16` / 下 `240` / 左 `9` / 右 `253` であり、**`0 = 上/左`, `127/128 = 中央`, `255 = 下/右`** が実機で確定した。
+> - **トリガー**: `L2` 全押しで `+0x09 (Trigger_L) = 255`・`keys = 0x0000_4000`、`R2` 全押しで `+0x08 (Trigger_R) = 255`・`keys = 0x0000_8000` を実機確認。
+> - **背面 / 追加ボタン 4 つ（単独押下）**: `PL` → `0x0200_0000`（bit 25 = `P1`）、`PR` → `0x0400_0000`（bit 26 = `P2`）、`L4` → `0x0020_0000`（bit 21 = `P3`）、`R4` → `0x4000_0000`（bit 30 = `P4`）を実機確認。なお USB 有線時は `cmd=0x0004, subcmd=0x0003` の 64B 応答（`[0x02, 0x04]` 先頭）とは別に、`EP 0x81 IN` で先頭 `0x03`・固定 12B の生 HID 入力レポート（例: `03 0f 84 7d 81 7f 00 00 00 00 00 87`）が並行して流れる。この `0x03` 12B レポートは上表 §7.2（`cmd=0x0003` 応答）とは**別フォーマット（内部レイアウト未解析）**であり、パケット長 12B と先頭 `0x03` で 64B 制御応答と判別し §7.2 パーサへ流さないこと。
+> - **バッテリー生値 (`+0x0A`)**: USB 有線接続時に `94..96` (`0x5E..0x60`) を観測（Windows UI 上は USB 有線時に残量非表示のため `0..100` スケールかは未確定）。
+
 ### 7.3 `Key` ビットマスク (`u32 LE`, `KeyMap`)
 
 | ビットマスク (Hex) | ビット位置 | ボタン名 (`KeyMap_*`) | ビットマスク (Hex) | ビット位置 | ボタン名 (`KeyMap_*`) |
@@ -672,13 +710,20 @@ Header または最初の Save が失敗した場合、Erase は送らない。�
 
 ダウンロードした `.dat` ファイルは先頭 **`0x1C` (28 バイト) のイメージヘッダ** + 実データ部で構成される（マルチセクションイメージでは後続セクションに別の 28B ヘッダが続く）。
 
-> **本リポジトリの実装範囲（2026-11-23）**: `crates/eightbitdo-core/src/ota.rs` の `.dat` パーサは **先頭 1 セクションのみ**対応し、`28 + image_len` とファイル長が一致しない trailing data（マルチセクション）を `OtaInvalidFirmware` で拒否する。公式 `.dat` がマルチセクションの場合、この実装ではファームウェア更新を実行できない（公式ファーム対応の **blocker**。§8.5「未検証事項」12 と「CLI / GUI / UniFFI 配線時の必須検証」3 を参照）。
+> **公式 v2.01 `.dat` 実測構造（2026-11-29 確定）**:
+> Windows `V1.38` の `Config\updateFile\466a3cc3a6d681ad62b706b6ac62b0ea.dat`（**`142,904` bytes = `0x22E38`**, SHA-256 `313f4ce6…`）を実測した結果、**2 セクション構成**であることが確定した:
+> - **Section 0（`@ 0x0000`、補助プロセッサ `0x6010` 用）**: 28B ヘッダ（`ver = 0x00000004`, `load_base_addr = 0x40004000`, `image_data_len = 0x00002200` [8,704B], `+0x0C = 0x00006010`, `+0x10 = 0x20250325`）+ `8,704B` ペイロード（※ **重要**: `.dat` ヘッダは `0x40004000` だが、実機 USB Boot ワイヤの `EraseFlash`/`WriteFirmware` は **`0x40000000..0x400021FF`** へ書き込まれる。`0x4000` 差が Bootloader 側固定ベースなのか下位オフセット置換なのかは MCU 解析未実施のため、パーサ／書込器は `.dat` の `load_base_addr == 0x40004000`・`len <= 0x2200` を検証した上で `0x6010` 用の許可済みワイヤベース `0x40000000` へ写像すること）
+> - **Section 1（`@ 0x221C`、メインコントローラ `0x600F` 用）**: 28B ヘッダ（`ver = 0x000000C9` [201 = `v2.01`], `load_base_addr = 0x01018000`, `image_data_len = 0x00020C00` [134,144B = 131 KiB], `+0x0C = 0x0000600F`）+ `134,144B` ペイロード（実領域 **`0x01018000..0x01038C00`**、USB Boot ワイヤはイメージ相対 **`0x0000..0x20BFF`** を送信。合計 `28 + 0x2200 + 28 + 0x20C00 = 0x22E38` で末尾余剰 0B）
+>
+> **本リポジトリの BLE OTA 実装範囲の課題（2026-11-23 / 2026-11-29 再確認）**: `crates/eightbitdo-core/src/ota.rs` の `.dat` パーサは **先頭 1 セクションのみ**対応し、`28 + image_len` と一致しないマルチセクション（上記 `0x6010` + `0x600F`）を `OtaInvalidFirmware` で拒否する。さらに暫定の type 1 ウィンドウ上限（`0x0102_0000`）も Section 1 の `0x0103_8C00` に対して狭い。Phase 4（USB OTA）および BLE OTA 配線前にマルチセクション対応とウィンドウ更新が必須である。
 
 - **先頭 28 バイトイメージヘッダ (`header[0..0x1C]`)**:
   - `+0x00` (`u32`): `firmwareFile_Version`（ファームウェアバージョン値）
-  - `+0x04` (`u32`): `load_base_addr`（書き込み先 Flash ベースアドレス）
+  - `+0x04` (`u32`): `load_base_addr`（セクション基準アドレス。Section 0 = `0x40004000`、Section 1 = `0x01018000`）
   - `+0x08` (`u32`): `image_data_len`（このセクションの有効イメージサイズ）
-  - `+0x0C..0x17`: 付加メタデータ（`WriteVersion` `cmd=0x00C4` では `+0x00..0x18` の 24 バイトを送付）
+  - `+0x0C` (`u32`): 対象 PID（実測 `0x6010` / `0x600F`）
+  - `+0x10` (`u32`): 日付等メタデータ（実測 Section 0 = `0x20250325`, Section 1 = `0`）
+  - `+0x14..+0x1B` (`8B`): 予約／ゼロ（実測では Section 0/1 とも全 0。なお BLE `WriteVersion 0x00C4` は `+0x00..+0x17` の先頭 24B を送信する仕様）
 
 ```mermaid
 sequenceDiagram
@@ -710,42 +755,66 @@ sequenceDiagram
 
 ### 8.3 Bootloader コマンド一覧 (`cmd_packet = 0x05`)
 
-Bootloader Mode (`"8bt"`, Service `0000FF20-...`, Char `0000FF21-...`) では先頭 1 バイトを **`0x05`** とする。
+Bootloader Mode（BLE `"8bt"`, Service `0000FF20-...`, Char `0000FF21-...`）では先頭 1 バイトを **`0x05`**、USB 有線 Bootloader（`0x2DC8:0x600F`）では先頭 2 バイトを **`[0x81, 0x05]`**（RX は `[0x02, 0x05]`）とする。
 
-| `cmd` | `subcmd` | `offset` | `total_len` / `chunk_len` | `crc16` | タイムアウト | 機能 (`libadvancelib_boot.c`) |
+| `cmd` | `subcmd` | `offset` | `total_len` / `chunk_len` | `crc16` | タイムアウト | 機能 (`libadvancelib_boot.c` / Windows 実機 USB OTA) |
 | --- | --- | --- | --- | --- | --- | --- |
-| **`0x0002`** | `0x0000` | `0x01017040` (`gamepad_type==1`)<br/>または `0x08014034` | `total_len = 4`, `chunk_len = 4` | あり (`crc16`) | 即時 (`0`ms設定) | **`WriteFirmwareVersion`**: `firmwareFile_Version` (`.dat` 先頭 4B) を書き込み |
+| **`0x0002`** | `0x0000` | `0x01017040` (`gamepad_type==1`)<br/>または `0x08014034` | `total_len = 4`, `chunk_len = 4` | あり (`crc16`) | 即時 (`0`ms設定) | **`WriteFirmwareVersion`**: `firmwareFile_Version` (`.dat` 先頭 4B) を書き込み（※Windows USB `v2.00→v2.01` 実機更新では非送信） |
 | **`0x0002`** | `0x0000` | `0x0801401C` | `total_len = 0x0C` (12B) | あり | `5000 ms` | **`WriteAPPID`**: 12B `Device_Serial` を暗号化して書き込み（※ **`gamepad_type == 1` のときスキップ**） |
-| **`0x0003`** | `0x0000` | `load_base_addr + sector_off + chunk_off` | `total_len = image_len` (`header+8`), `chunk_len = 0x40` (64B) | **あり** (`0x40`B 分の `crc16`) | `1000 ms` | **`WriteFirmware`**: 64B チャンク単位で Flash 書込。`.dat` 内参照元は `sector_off + chunk_off + 0x1C` |
-| **`0x0004`** | `0x0000` | `load_base_addr + sector_off` | `total_len = 0x1000` (4096B) | なし (`0`) | **`10000 ms`** | **`EraseFlash`**: 4KB セクタ単位で Flash 消去 |
-| **`0x0005`** | **`0x0067`** | `0x01017040` (`gamepad_type==1`) | `total_len = 4` | なし | `5000 ms` | **`readVersionInBoot`**: Bootloader 内から現ファームウェアバージョン取得 |
-| **`0x0006`** | `0x0000` | `0x01018000` (`gamepad_type==1`) | `total_len = 0` | なし | `5000 ms` (送信設定 `0`) | **`jumpApp`**: アプリケーション領域へジャンプして通常モードへ復帰 |
-| **`0x0008`** | **`0x0067`** | `0x00000000` | `total_len = 2` | なし | `5000 ms` (5s) | **`readPID` (BLE Boot)**: Bootloader でのデバイス PID 読み出し（※ Windows USB Boot では `cmd=0x0000, subcmd=0x0008`、5s） |
-| **`0x00C4`** | `0x0000` | `0x00000000` | `total_len = header[8]` (イメージ総長), `chunk_len = 0x18` (24B) | なし | **`3000 ms`** | **`WriteVersion`**: 24B イメージヘッダメタデータを書き込み |
+| **`0x0003`** | `0x0000` | BLE 仕様: `load_base_addr + sector_off + chunk_off`<br/>USB 実機: `Section 1 (0x600F)` はイメージ相対 **`sector_off + chunk_off`**, `Section 0 (0x6010)` は **`0x40000000 + sector_off + chunk_off`** | `total_len = image_len` (`Section 1 = 0x20C00`, `Section 0 = 0x2200`)<br/>`chunk_len = 0x40` (BLE 64B) / **最大 `0x2E` (USB 46B)** | **あり** (CRC-16/MODBUS) | `1000 ms` | **`WriteFirmware`**: Flash 書込（USB は 4KB `0x1000` セクタ単位で 46B 分割。`Section 1` は通常 89×46B + 2B = 90 パケット×32 + 67 = **2947**、`Section 0` は 90+90+12 = **192 パケット**、詳細下記） |
+| **`0x0004`** | `0x0000` | `Section 1`: イメージ相対 **`sector_off`** (`0x0000..0x20000`)<br/>`Section 0`: **`0x40000000`** | `Section 1`: `total_len = 0x1000`, `chunk_len = 0`<br/>`Section 0`: `total_len = 0x2200`, `chunk_len = 0` | なし (`0`) | **`10000 ms`** | **`EraseFlash`**: 4KB セクタ単位（または Section 0 一括 `0x2200`）で消去。単一の `cmd=0x0000, subcmd=0x0004` ACK（~110ms / ~38ms）で完了 |
+| **`0x0005`** | **`0x0067`** | `0x01017040` (`gamepad_type==1`) | `total_len = 4` | なし | `5000 ms` | **`readVersionInBoot`**: Bootloader 内から現ファームウェアバージョン取得（Android BLE デッドコード） |
+| **`0x0006`** | `0x0000` | `0x01018000` (`gamepad_type==1`) | `total_len = 0` | なし | `5000 ms` (送信設定 `0`) | **`jumpApp`**: 通常モードへ復帰（Android BLE デッドコード。Windows USB 実機更新は代わりに `0x0007` を送信） |
+| **`0x0007`** | `0x0000` | `0x00000000` | `total_len = 8`, `chunk_len = 8` (8B ゼロ) | なし (`0`) | — | **`Reset / Reboot`（USB OTA 実機確定）**: 全更新完了後に送信し、ACK（~104ms）後に通常動作へ再起動 |
+| **`0x0008`** | **`0x0067`** | `0x00000000` | `total_len = 2` | なし | `5000 ms` (5s) | **`readPID`**: Bootloader PID 読出（Windows USB Boot `getDevicePID1_inner` では `cmd=0x0000, subcmd=0x0008`、ただし `v2.00→v2.01` 更新本体では非送信で App 側 `0x0100` と Boot `0x00C1` を使用） |
+| **`0x00C1`** | **`0x8000`** | `0x00000000` | `total_len = 0`, `chunk_len = 0` | なし (`0`) | — | **Boot クエリ（仮称 `ReadAuxBootInfo`、USB OTA 実機確定）**: Section 1 書込後・Section 0 (`0x6010`) 開始前に送信。応答 8B `<u32 ver, u32 pid>`（実機: `c8 00 00 00 0f 60 00 00`、`crc=0xF74E`） |
+| **`0x00C3`** | `0x0000` | `0x00000000` | `total_len = 0x0C`, `chunk_len = 0x0C` | あり (`crc16`) | `3000 ms` | **`readSerial`（実機確定）**: 12B `<u32 sector_off, u32 0x1000, u32 0x1000>` に対し既存セクタ CRC 2B（LE）を返す（全 33 セクタで送信）。**実測ゴールデンベクタ**: セクタ 0 (`<0, 0x1000, 0x1000>`) の `crc16 = 0x0674` |
+| **`0x00C4`** | `0x0000` | `0x00000000` | Windows USB 実機: **`total_len = 8`, `chunk_len = 8`**<br/>BLE 仕様: `total_len = header[8]`, `chunk_len = 0x18` | あり (`crc16`) | **`3000 ms`** | **`WriteVersion`**: Windows USB 実機では 8B ペイロード **`<u32 image_len (0x00020C00), u32 ver (0x000000C9)>`** + CRC-16/MODBUS（**`0x75B2`**）を送信（~124ms で ACK） |
 
-> **実装側の安全ガード（デバイス要件ではない）**: `eightbitdo-protocol` の OTA builder は、実機を危険な書込順序に導かないために次の入力を拒否する。
+> **実装側の安全ガード（デバイス要件ではない）**: `eightbitdo-protocol` の現行 OTA ビルダー（BLE 64B 固定経路）および Phase 4（USB 46B 上限・4KB 境界経路）実装時の境界契約として次の入力を拒否する（USB 用ガードのうち未実装部分は Phase 4 実装時に適用）。
 > - 空イメージ / `image_len == 0`（`EmptyFirmwareImage`）
-> - `image_len` が 64 の倍数でない（`UnalignedImageLength`）
+> - BLE 64B 固定経路で `image_len` が 64 の倍数でない（`UnalignedImageLength`）
 > - base address が 64B アラインでない（`UnalignedAddress { alignment: 64 }`）
 > - chunk address が `u32` を overflow する（`AddressOverflow`）
-> - `WriteFirmware` の chunk が 64B ちょうどでない（`InvalidLength`）
-> - `WriteVersion` の `image_len` が `header[8..12]`（`image_data_len`）と一致しない（`ImageLengthMismatch`）
+> - BLE `WriteFirmware` の chunk が 64B ちょうどでない、または USB `WriteFirmware` 契約で payload が空・`0x2E` (46B) 超過（`InvalidLength`）
+> - `WriteVersion` の `image_len` が `.dat` 該当メインセクション（2 セクション時は `0x600F` / Section 1）の `image_data_len`（`header[8..12]`）と一致しない（`ImageLengthMismatch`）
+
+#### 8.3.1 実機 USB OTA シーケンス（2026-11-29 USBPcap 確定、`01_usb_ota_controller.pcapng`, `v2.00 -> v2.01`）
+
+実機コントローラ（`057E:2009` → `2DC8:600F`）に対する公式 `V1.38` の全更新トランザクション（所要約 22 秒、`EP 0x02` OUT / `EP 0x81` IN）は次の順序で実行された:
+
+1. **App モード確認・準備**:
+   - `TX(81 04) cmd=0x0100` → `RX(02 04) cmd=0x0004, subcmd=0x0100, clen=0x16`（`ver=0xC8 [200]`, `pid=0x600F`）
+   - `TX(81 04) cmd=0x0007, subcmd=0x0000`（レポート停止）→ ACK `cmd=0x0004, subcmd=0x0007`
+2. **Section 1（メイン `0x600F`、`134,144B = 0x20C00` = 33 セクタ）書き込み**（以降すべて `TX(81 05)` / `RX(02 05)`、**オフセットは `.dat` Section 1 相対 `0x0000..0x20BFF`**）:
+   - セクタ `s = 0..32`（`sector_off = s * 0x1000`）ごとに繰り返す（本採取では 33 セクタすべて消去・書込を実行、スキップ 0）:
+     1. `cmd=0x00C3`: `clen=0x0C, payload = <u32 sector_off, u32 0x1000, u32 0x1000>`（セクタ 0 は `crc16 = 0x0674`）→ `RX(02 05) cmd=0x0000, subcmd=0x00C3, clen=2`（2B 既書込セクタ CRC、~24ms）
+     2. `cmd=0x0004`: `EraseFlash`（`clen=0, tlen=0x1000, off=sector_off`）→ 単一の完了 ACK `RX(02 05) cmd=0x0000, subcmd=0x0004, tlen=0x1000, off=sector_off`（~110ms）
+     3. `cmd=0x0003`: `WriteFirmware`（`tlen=0x20C00, off=sector_off + chunk_off`, **46B チャンク** + CRC-16/MODBUS。通常セクタ 0..31 は `89×46B + 2B = 90` パケット、最終セクタ 32 は `66×46B + 36B = 67` パケット、計 **2,947 パケット**）→ **全 2,947 パケットで** `RX(02 05) cmd=0x0000, subcmd=0x0003` が `clen / tlen / off` をそのままエコー
+3. **Section 0（補助 `0x6010`、`8,704B = 0x2200`）書き込み**:
+   - `TX(81 05) cmd=0x00C1, subcmd=0x8000` → `RX(02 05) clen=8, pay = c8 00 00 00 0f 60 00 00`
+   - 約 1.0 秒待機後、`cmd=0x0004`: `EraseFlash`（`clen=0, tlen=0x2200, off=0x40000000`）→ ~38ms で完了 ACK（`RX` ヘッダ `clen=0x252, crc=0x2000, tlen=0x2200, off=0x40000000`）
+   - `cmd=0x0003`: `WriteFirmware`（`tlen=0x2200`、**.dat の `0x40004000` ではなく `0x40000000` 空間へ 4KB `0x1000` 境界リセットで 46B 分割**：`0x40000000..0x40000FFF` が `89×46B + 2B(@40000FFE)` = 90、`0x40001000..0x40001FFF` が `89×46B + 2B(@40001FFE)` = 90、`0x40002000..0x400021FF` が `11×46B + 6B(@400021FA)` = 12、合計 **`90 + 90 + 12 = 192` TX パケット**）
+   - **全 192 パケットに 192 ACK が返る**: 通常 175 パケットは `clen = req.clen, off = req.off, tlen = 0x2200` をそのままエコーするが、各 **512B (`0x200`) ページ境界を完了する 17 パケット**の ACK のみ **`clen = 512 (0x200), crc = 0x2000, tlen = 0x2200, off = page_base`（`0x40000000, 0x40000200, ..., 0x40002000`）** を返す点が Section 1 と異なる
+4. **確定と再起動**:
+   - `TX(81 05) cmd=0x00C4` (`clen=8, tlen=8, crc=0x75B2, pay = <u32 0x00020C00, u32 0x000000C9>`) → ACK（~124ms）
+   - `TX(81 05) cmd=0x0007` (`clen=8, tlen=8, crc=0, pay = 0x00 * 8`) → ACK（~104ms）で更新完了（UI 上 `v2.01` 確認）
 
 ### 8.4 エラー復旧・ブリック防止の重要設計ポイント
 
 1. **4KB セクタ単位の消去と書込の厳守**:
-   - `EraseFlash` (`cmd=0x0004`) は必ず **`0x1000` (4096 バイト) 境界**で実行し、消去タイムアウトを **10 秒 (`10000 ms`)** 確保する。消去完了 ACK を受け取る前に `WriteFirmware` (`cmd=0x0003`) を送ってはならない。
-2. **64B 固定チャンクと `crc16` 付与**:
-   - `WriteFirmware` は 1 チャンク **`0x40` (64 バイト)** 固定、必ずペイロード 64 バイトに対する **CRC-16/MODBUS (`0xA001`)** をヘッダ `+0x06` に設定する。
-3. **2 段階バージョン確定の順序**:
-   - 全 4KB セクタ書き込み後、`WriteVersion` (`cmd=0x00C4`) → `WriteFirmwareVersion` (`cmd=0x0002`, `0x01017040`) → （非 `gamepad_type==1` のみ `WriteAPPID`）→ 最後に `jumpApp` (`cmd=0x0006`) の順序を崩さないこと。`WriteFirmwareVersion` 完了前に電源断してもコントローラは Bootloader (`"8bt"`) に留まるため再試行が可能。
+   - `EraseFlash` (`cmd=0x0004`) は通常セクタ **`0x1000` (4096 バイト) 境界**で実行し、消去完了 ACK（実測 ~110ms、安全上限 **10 秒**）を受け取る前に `WriteFirmware` (`cmd=0x0003`) を送ってはならない（USB Section 0 は `0x2200` 一括消去で ~38ms）。
+2. **固定チャンクと `crc16` 付与**:
+   - `WriteFirmware` は BLE が **`0x40` (64 バイト)**、USB が最大 **`0x2E` (46 バイト)**（Section 1 末尾 / Section 0 の 512B ページ境界は 2B/6B/36B 端数チャンクあり）。必ずペイロードに対する **CRC-16/MODBUS (`0xA001`)** をヘッダ `+0x06` に設定する。
+3. **2 セクション更新と最終確定の順序**:
+   - Windows USB では `Section 1 (0x600F)` 全セクタ書込 → `0x00C1` → `Section 0 (0x6010)` 全書込 → `WriteVersion (0x00C4, 8B)` → `Reset (0x0007, 8B)` の順で完了する。Android BLE の仕様書側フローは `WriteVersion (24B)` → `WriteFirmwareVersion (0x0002)` → `jumpApp (0x0006)` だが実機未確認。
 4. **`gamepad_type == 1` (`0x600F` 等) での `WriteAPPID` スキップ**:
    - `libadvancelib_boot.c::WriteAPPID` は `gamepad_type == 1` の場合に APPID 暗号化書き込みを明示的にスキップする。`0x600F` に対して不要な APPID 書込を行わないこと。
 5. **中断時のリカバリ**:
-   - BLE: `EraseFlash` または `WriteFirmware` の途中で切断された場合、コントローラは App 領域が無効なため電源投入後も Bootloader (`"8bt"`) として起動し続ける。クライアントは `"8bt"` へ再接続して `readPID` (`cmd=0x0008`, 5s) → 最初から全セクタ消去・再書込を行うことで復旧できる。
-   - USB: BLE の `"8bt"` 再接続は使わない。USB は再列挙（re-enumeration）/再接続で Bootloader に入り直す。ただし USB Boot の TX フレーミング（`EraseFlash` / `WriteFirmware` / `WriteVersion` / `WriteAPPID` / `JumpApp`）は未文書化のため、USB OTA 書込を行う PR は §4.4 の停止規則に従い、`PROTOCOL_SPEC` に証跡を追加するまで実装しない。
+   - BLE: `EraseFlash` または `WriteFirmware` の途中で切断された場合、Bootloader (`"8bt"`) へ再接続して最初からやり直す設計。ただし Android 公式アプリでは Ultimate 2 の更新自体非対応（Windows USB のみ。2.4G UI も USB 直結要求モーダルを表示）。
+   - USB: **USB Boot TX フレーミング（`[0x81, 0x05]` / `[0x02, 0x05]`）と 2 セクション手順は §4.4 / §8.3.1 で確定した**ため、Phase 4（USB OTA）実装時は 2 セクション・46B チャンク・`0x00C1`/`0x00C3`/`0x00C4`/`0x0007`・`0x01018000..0x01038C00` を実装すること。復旧は USB 再列挙/再接続で行う（BLE の `"8bt"` は使わない）。
 
-### 8.5 実装状況 — core の BLE OTA 状態機械（2026-11-23）
+### 8.5 実装状況 — core の BLE OTA 状態機械（2026-11-23 / 2026-11-29 付記）
 
 `crates/eightbitdo-core/src/ota.rs` に **BLE 専用**の OTA 状態機械を実装した。CLI / GUI / UniFFI への配線はまだ無い（別 PR）。Android v2.01 の解析証跡は [docs/OTA_BLE_EVIDENCE.md](OTA_BLE_EVIDENCE.md) を参照。
 
@@ -758,7 +827,7 @@ Bootloader Mode (`"8bt"`, Service `0000FF20-...`, Char `0000FF21-...`) では先
   - **順序**: App Mode の `enter_boot` 後、`"8bt"` に接続する前に App `Session` を drop / disconnect する。両リンクは同じ single-owner BLE ロックを取るため、生きた App Session があると `BleBootTransport::connect` は `BleBusy` を返す。`OtaUpdate::enter_boot_and_release` が EnterBoot + App リンク切断をまとめて行う。`BleBusy` には「App Mode セッションを切断してから再試行」が含まれる。
   - `enter_boot_and_release(&Session<T>)` は Session を借用し、phase を検証してから App リンクを切断する（phase 不正の `InvalidRequest` では Session に触れない）。**teardown は完全 best-effort**: EnterBoot が ACK またはリンククローズで受理された後は、`disconnect()` の `Error::Ble` / `Error::Transport` / `Error::Disconnected` のいずれも許容して次へ進む（実機で ACK 直後に App リンクが閉じ `Error::Ble("BLE teardown incomplete ...")` になる正常経路を含む）。ロックは Session の drop で解放されるため、呼び出し側は helper 後に Session を drop する。EnterBoot 自体が失敗した場合も disconnect を試行し、その失敗は EnterBoot のエラーとして返す。
 - 期待 app base の組み込み検証: `OtaConfig::new(expected_load_base)` と `OtaUpdate::with_config` は、base が **type 1 の暫定 application ウィンドウ `0x0101_0000..0x0102_0000`**（`UT2_TYPE1_APP_BASE_MIN..UT2_TYPE1_APP_FLASH_END`）内で 4KB アラインであることを要求する。さらに `write_firmware` は `.dat +0x04` の `load_base_addr` が `expected_load_base` と厳密一致し、`expected_load_base + image_len <= UT2_TYPE1_APP_FLASH_END` であることを **最初の Erase 前**に検査し、外れたら `OtaInvalidFirmware` で停止する。`load_base = 0` / bootloader 領域 / type 0 の `0x0801_xxxx` は拒否される。
-  - このウィンドウは、文書化された type 1 のアドレス（`readVersionInBoot`/`WriteFirmwareVersion` = `0x01017040`、`JumpApp` = `0x01018000`）を含み、0 番地・bootloader・type 0 領域を除外する **暫定の 64 KiB アライン範囲**である。公式 `.dat` の `load_base_addr` と実フラッシュサイズは未測定のため、実機と公式 `.dat` で確定するまで暫定値として扱い、CLI 配線は保留する。
+  - **注意（2026-11-29 `.dat` 実測で要更新）**: 公式 v2.01 `.dat` の実測により、`0x600F` 用 Section 1 は `load_base = 0x0101_8000`・`len = 0x20C00`（終端 **`0x0103_8C00`** = 131 KiB）であり、さらに先頭に `0x6010` 用 Section 0（`0x4000_4000`, `0x2200`）が存在することが確定した。既存の暫定 64 KiB ウィンドウ上限（`0x0102_0000`）は狭すぎるため、マルチセクション対応と合わせて拡張する必要がある。
 - MTU 事前検証: 最初の Erase 前に `mtu - 3 >= 81`（`OTA_MIN_MTU = 84`）を検証し、不足なら `MtuTooSmall` で停止する。最大フレームは 64B WriteFirmware の **81B**（1B prefix + 16B header + 64B payload）。Erase 17B / WriteVersion 41B / WriteFirmwareVersion 21B / JumpApp 17B はこれに収まる。App Mode の観測 MTU は 92 だが、**Bootloader の実 MTU は未確認**。
 - 未確認 wire の実行時ゲート: `OtaConfig::allow_unverified_wire` は既定 **false**。false の間は `write_firmware` がフラッシュフレームを 1 つも送らず `InvalidRequest` で拒否する。Mock テストと、復旧可能な実機でのベンチ実験のみ `with_unverified_wire_allowed(true)` を明示する。**この時点で実機書込に使わないこと。**
 - 書込順序: セクタごとに `EraseFlash 0x0004` ACK（10s）→ `WriteFirmware 0x0003` 64B + CRC-16/MODBUS ACK（1s/チャンク）を繰り返し、最後に `WriteVersion 0x00C4`（24B ヘッダ、3s）→ `WriteFirmwareVersion 0x0002`（4B、send-only）→ `JumpApp 0x0006`。全フレームは最初の Erase 前に構築・検証する。
@@ -793,31 +862,31 @@ payload-less の ready ACK が完了 ACK より先に届く場合、Erase 完了
 - 停止時は `OtaPhase::BenchStopped`（`is_terminal() == true`）。デバイスは Bootloader に残るため、復旧は新しい `OtaUpdate` で `prepare_boot` → 全消去・再書込。
 - **安全ゲートは迂回不可**: `OtaConfig::allow_unverified_wire = true` が必須で、PID / `gamepad_type` / `expected_load_base` / `load_base + image_len` / MTU の検証は通常経路と同一。`allow_unverified_wire = false` では flash フレームを 1 つも送らず `InvalidRequest`。
 - feature 無効ビルドでは `OtaCheckpoint` / `OtaBenchOutcome` / `write_firmware_with_checkpoint` / `OtaPhase::BenchStopped` は存在しない（外部 crate のコンパイルで確認）。
-- `docs-ota-capture` の採取計画は、上記 API 名（`write_firmware_with_checkpoint` / `OtaCheckpoint::AfterFirstErase` 等）を参照する。
+- [OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md) の採取計画は、上記 API 名（`write_firmware_with_checkpoint` / `OtaCheckpoint::AfterFirstErase` 等）を参照する。
 
-#### N/A（実装しない）
+#### USB OTA 実装方針の更新（2026-11-29 USBPcap 確定後）
 
-- **USB OTA**: `N/A + 理由（USB Boot TX フレーミング未文書化）`。`[0x00,0x05]` は RX 専用であり、BLE の `"8bt"` / prefix `0x05` を流用しない。USB の復旧は再列挙 / 再接続。`OtaTransport` マーカーも USB transport には実装しない。
+- **USB OTA**: §4.4 (d)・§8.3.1 により **USB Boot TX フレーミング（`[0x81, 0x05]` / `[0x02, 0x05]`, 46B チャンク）と 2 セクション更新シーケンスが実機確定した**ため、Phase 4 のブロッカーは解消した。`eightbitdo-core` の既存 BLE `OtaTransport` とは分離して USB HID + 2 セクション `.dat` 対応（Phase 2e / 4）として別 PR で実装する。一方、公式 Android アプリは Ultimate 2 更新非対応（Windows USB 必須仕様）であるため、BLE `"8bt"` 実機 OTA は引き続き未検証である。
 
-#### 未検証事項（実機 btsnoop 待ち）
+#### 未検証事項（BLE 実機 btsnoop 待ち / USB 確定済み項目あり）
 
 証跡と関数アドレスは [docs/OTA_BLE_EVIDENCE.md](OTA_BLE_EVIDENCE.md) を参照。
 実機 btsnoop の採取手順・確認項目・判定と追記の手順・安全手順は
-**[docs/OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md)** を参照（下記 1〜13 を確定させる）。
+**[docs/OTA_VERIFICATION_PLAN.md](OTA_VERIFICATION_PLAN.md)** を参照（下記 1〜13 を BLE 実機で確認する。なお USB 実機では下記 3, 5, 6, 7, 12 の構造が確定済み）。
 
-1. **Bootloader RX フレーミング**: 応答は App Mode 同様「16B ヘッダ + payload、先頭 prefix なし」を仮定。`0x05` が TX のみかは未確認。
-2. **`readPID` / `readVersionInBoot` の応答形状**: `cmd=0x0004` envelope（要求 `cmd` を `subcmd` にエコー）または `cmd` 直エコーを受理。payload 長は 2B / 4B を要求。
-3. **ready ACK と完了 ACK の区別**: 上記オプトインガードの前提となる実 wire 形状が未確認（WriteVersion を含む。payload-less direct echo の扱いも上記のとおり）。
+1. **Bootloader RX フレーミング**: BLE 応答は App Mode 同様「16B ヘッダ + payload、先頭 prefix なし」を仮定（USB Boot は `[0x02, 0x05]` + 16B ヘッダ確定）。
+2. **`readPID` / `readVersionInBoot` の応答形状（BLE）**: `cmd=0x0004` envelope または `cmd` 直エコーを受理（USB Boot は `cmd=0x0000, subcmd=要求cmd`）。
+3. **ready ACK と完了 ACK の区別**: USB 実機では `EraseFlash`・`WriteFirmware`・`WriteVersion` いずれも即座に **1 個の完了 ACK（`cmd=0x0000`）のみ**が返り、ready/完了の 2 段階 ACK は返らなかった（BLE 側は実機未確認）。
 4. **PID → `gamepad_type` の対応**: 本実装は `0x600F` → type 1 のホワイトリスト（プロジェクト規約）。証跡 §6 はキャラクタリスティック index 由来と報告。
-5. **Erase / Write のアドレス規約**: 仕様 §8.3 の `load_base_addr + sector_off (+ chunk_off)` を実装。証跡 §3 / §7 は Android 実装がイメージ相対 `sector_off` を wire に載せると報告しており矛盾する。
-6. **`WriteVersion 0x00C4` の payload**: 仕様どおり 24B ヘッダを送る。証跡 §2 は Android 実装が payload 0B（16B フレーム）と報告。
-7. **`EraseFlash` の `chunk_len`**: 既存 protocol builder は `chunk_len = 0`。証跡 §3 は宣言 `0x1000` と報告。
-8. **`WriteFirmware` の実フレーム長**: 仕様どおり 64B payload。証跡 §7.1 の「Android は 16B ヘッダのみ送る」というコード事実（3 ABI 一致）は実 wire 未確認。
-9. **`enterBoot 0x000C`**: ACK と App リンク切断の両方を受理。Android APK では dead code（証跡 §4）。`"8bt"` の `readPID` 成功までフラッシュには触れない。
+5. **Erase / Write のアドレス規約**: **USB 実機で確定**: メイン `0x600F` セクション（Section 1）は**イメージ相対 `sector_off (+ chunk_off)`** を送り、補助 `0x6010` セクション（Section 0）は **`0x40000000 (+ chunk_off)`** を送る（BLE 側の `load_base_addr + sector_off` との差は引き続き BLE 未確認）。
+6. **`WriteVersion 0x00C4` の payload**: **USB 実機で確定**: `clen = 8, tlen = 8`, payload **`<u32 image_len (0x00020C00), u32 ver (0x000000C9)>`** + CRC-16/MODBUS（BLE 仕様書の 24B / Android 証跡の 0B と異なる）。
+7. **`EraseFlash` の `chunk_len`**: **USB 実機で確定**: `chunk_len = 0`, `total_len = 0x1000`（Section 1）/ `0x2200`（Section 0）。
+8. **`WriteFirmware` の実フレーム長**: USB 実機は最大 46B（`0x2E`）payload + CRC あり。BLE の 64B vs Android 16B 問題は BLE 実機未確認。
+9. **`enterBoot 0x000C`**: Android APK では dead code（証跡 §4）かつ 2.4G UI も USB 直結を要求するため、Ultimate 2 実機では BLE OTA が無効化されている可能性が高い。
 10. **タイムアウト差**: `readPID` / `readVersionInBoot` は仕様の 5s を実装。証跡 §5 は Android 実装が 2s と報告。
-11. **Bootloader の MTU**: 81B フレームが通るかは未確認。`MTU >= 84` は `mtu - 3` の host 側推論であり、デバイス要件として確認されていない。
-12. **マルチセクション `.dat`（blocker）**: 単一セクションのみ対応。証跡 §8 のとおり公式 `.dat` がマルチセクションである可能性が高く、その場合この実装は更新を拒否する。**公式ファームウェア対応の blocker であり、次 PR の必須項目**。
-13. **遅延 / 重複 ACK の誤帰属**: Bootloader ACK にシーケンス番号はなく、前チャンクの遅延 ACK を次チャンクの ACK として消費し得る。`require_completion_ack` は 2 フレーム消費でリスクを下げるが排除できない。**CLI 配線前に、ACK の `offset` / `total_len`（可能なら `chunk_len`）を要求コマンドと照合する実装を追加することを必須項目とする**。実機 btsnoop で ACK 順序を確認するまでフラッシュ経路を使わない。
+11. **Bootloader の MTU（BLE）**: 81B フレームが通るかは未確認。
+12. **マルチセクション `.dat`（USB/BLE 共通の確定事実）**: **公式 v2.01 `.dat`（`142,904B`）で 2 セクション構成（`0x6010` 8,704B + `0x600F` 134,144B、`0x01018000..0x01038C00`）が確定**。単一セクション制限と `0x0102_0000` 上限の解除が次 PR の必須項目である。
+13. **遅延 / 重複 ACK の誤帰属**: USB 実機 ACK は原則 `offset`・`total_len`・`clen` を忠実にエコーするが、**Section 0（`0x6010`）の 512B ページ境界を完了する 17 パケットのみ `clen = 512 (0x200)` かつ `offset = page_base`（`req.off & !0x1FF`）** を返す（さらに `EraseFlash` の Section 0 完了 ACK は `clen=0x252, crc=0x2000` を返した）。**配線前に ACK の `offset` / `total_len` / `clen` 照合を追加することを必須項目**としつつ、Section 0 の 512B 境界完了 ACK では `(ack.off == req.off && ack.clen == req.clen)` に加えて `(ack.clen == 512 && ack.off == (req.off & !0x1FF))` を明示的に許容する設計にする。
 14. **`load_base_addr` の来歴**: 本実装は `expected_load_base` との厳密一致だけを検証し、`.dat` の署名・ハッシュ・配信元は検証しない。呼び出し元が信頼できる `.dat` と期待 base を渡す trust boundary である。
 15. **バッテリー / ダウングレード / ファームウェア取得・検証**: 本 PR の範囲外。
 

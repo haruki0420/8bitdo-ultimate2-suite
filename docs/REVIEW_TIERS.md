@@ -239,45 +239,56 @@ Tier 3 のパスに対する変更は、原則として Tier 3 のままです�
 
 ```text
 enterBoot 0x000C (subcmd 0x0067, total_len 4, offset 4)
-→ BLE Boot: "8bt" (FF20/FF21) へ再接続（CCCD + MTU 設定）
+→ BLE Boot: `"8bt"` (FF20/FF21) へ再接続（CCCD + MTU 設定。**ただし公式ソフトは BLE OTA 非対応・実機 wire 未検証**）
    → readPID 0x0008 (subcmd 0x0067, total_len 2, 5s)
-→ USB Boot: [0x00, 0x05] は受信 (RX) レポートの先頭（TX フレーミングは未文書化）
-   → readPID cmd=0x0000, subcmd=0x0008 (total_len 2, 5s)
-→ readVersionInBoot 0x0005 (subcmd 0x0067, total_len 4,
-   offset 0x01017040 [gamepad_type == 1]、5s)
+   → readVersionInBoot 0x0005 (subcmd 0x0067, total_len 4,
+      offset 0x01017040 [gamepad_type == 1]、5s)
+→ USB Boot (2026-11-29 Windows `v2.00→v2.01` 実機確定):
+   Switch (`0x057E:0x2009`) ハンドシェイク → `0x2DC8:0x600F` 再列挙 →
+   App `[0x81,0x04]` `0x0100` / `0x0007(0)` → Boot TX `[0x81,0x05]` / RX `[0x02,0x05]`
+   （64B HID、`<=46B [0x2E]`、`cmd=0x0000/subcmd=request_cmd`。
+    レガシー `getDevicePID1_inner` の 65B `[0x00,0x05]`/`0x0008` は本更新では未使用）
 ```
 
-`readPID` の結果で `gamepad_type` を判定し、`WriteAPPID` の要否を決める。BLE Boot は `"8bt"` (FF20/FF21)、USB Boot は受信 `[0x00,0x05]` と `readPID cmd=0x0000/subcmd=0x0008` を確認する。該当しない transport は `N/A + 理由` を記録する。
+`readPID` / `0x0100` / `0x00C1` の結果で対象機種とセクションを判定し、`WriteAPPID` の要否を決める。BLE Boot は `"8bt"` (FF20/FF21)、USB Boot は TX `[0x81,0x05]` / RX `[0x02,0x05]` を確認する。該当しない transport は `N/A + 理由` を記録する。
 
-**USB OTA 書込の制限**: `[0x00,0x05]` は **RX のみ** であり、USB Boot の **TX** フレーミング（`EraseFlash` / `WriteFirmware` / `WriteVersion` / `WriteAPPID` / `JumpApp`）はまだ文書化されていない。USB OTA 書込を実装・検証する PR は、`docs/PROTOCOL_SPEC.md` に TX フレーミングの証跡を追加するまで **停止** し、該当項目を `N/A + 理由（USB Boot TX 未文書化）` とする。BLE の `"8bt"` を USB に流用しない。USB の復旧は再列挙（re-enumeration）/再接続であり、BLE の `"8bt"` 再接続ではない。
+**USB OTA / BLE OTA のゲート規則**:
+- **USB Boot TX/RX フレーミング（`[0x81,0x05]` / `[0x02,0x05]`）と 2 セクション手順は `docs/PROTOCOL_SPEC.md` §4.4・§8.2〜§8.5 に確定済み**。USB OTA を実装・検証する PR では以下を必ず確認する:
+  - 2 セクション `.dat` の個別検証と実行順: **Section 1（`0x600F`, 相対 `offset 0x0000..`, `0x00C3` CRC 照会 → 4KB `0x0004` → `<=46B` `0x0003`）→ `0x00C1 (subcmd=0x8000)` → Section 0（`0x6010`, `.dat 0x40004000` を `0x40000000` 空間へ写像, `tlen=0x2200` `0x0004` → 4KB 境界分割 192 パケット `0x0003`）→ `0x00C4 (8B)` → `0x0007 (8B リセット)`**（`0x0002` / `0x0008` は非送信）。
+  - Section 0 の ACK 照合で、512B ページ完了 17 パケットが返す **`clen=512 (0x200), off = req.off & !0x1FF`** 例外を許容しつつ、通常パケットは `offset` / `total_len` / `clen` を照合しているか。
+  - **2.4G ドングル（`0x310B`）経由での OTA 禁止**、および Switch (`0x057E:0x2009`) → `0x2DC8:0x600F` 再列挙。
+  - USB の復旧は再列挙（re-enumeration）/再接続であり、BLE の `"8bt"` を流用しない。
+- **BLE Boot（`"8bt"`）は実機 wire 未検証のため、`allow_unverified_wire = false` および実機 btsnoop 採取前配線禁止のゲートを継続する。**
 
-**書き込み**
+**書き込み（BLE Boot 経路）**
+
+> USB Boot 経路（2026-11-29 確定）は上段「USB OTA / BLE OTA のゲート規則」の 2 セクション・`<=46B [0x2E]`・`0x00C4(8B)`・`0x0007(8B)` 手順に従うこと（以下の 64B 固定・`WriteVersion 24B`・`0x0002`・`WriteAPPID`・`JumpApp 0x0006` は BLE Boot 専用手順）。
 
 ```text
-EraseFlash 0x0004
+EraseFlash 0x0004 (BLE Boot)
   (offset = load_base_addr + sector_off, 4KB セクタ単位、
    10 秒タイムアウト、ACK を待つ)
-→ WriteFirmware 0x0003
+→ WriteFirmware 0x0003 (BLE Boot)
    (offset = load_base_addr + sector_off + chunk_off,
     total_len = header[8]（イメージ長）、chunk_len = 64B 固定、
     CRC-16/MODBUS 付き、1 秒、各 64B チャンクの ACK を待つ)
-→ WriteVersion 0x00C4
+→ WriteVersion 0x00C4 (BLE Boot)
    (24B ヘッダ、chunk_len = 0x18、total_len = header[8]、3 秒)
-→ WriteFirmwareVersion 0x0002
+→ WriteFirmwareVersion 0x0002 (BLE Boot)
    (gamepad_type == 1: offset 0x01017040 /
     それ以外: offset 0x08014034、4B + CRC16)
-→ WriteAPPID 0x0002
+→ WriteAPPID 0x0002 (BLE Boot)
    (gamepad_type != 1 のみ、offset 0x0801401C、12B + CRC16、5 秒)
-→ JumpApp 0x0006 (offset 0x01018000 [gamepad_type == 1]、5 秒)
+→ JumpApp 0x0006 (BLE Boot: offset 0x01018000 [gamepad_type == 1]、5 秒)
 ```
 
 - `readVersionInBoot` / `JumpApp` の documented offset は `gamepad_type == 1` 用。非 type 1 では値を推測せず、`docs/PROTOCOL_SPEC.md` / Issue を確認して停止する。
 - `WriteFirmwareVersion` は仕様書に両分岐（type 1: `0x01017040` / それ以外: `0x08014034`）がある。
-- `EraseFlash` の offset は `load_base_addr + sector_off`、`WriteFirmware` の offset は `load_base_addr + sector_off + chunk_off`。`sector_off` は 0x1000 ずつ、`chunk_off` は 0x40 ずつ進める。
-- 4KB セクタ境界、64B チャンク、**最終チャンクの 64B 固定**、CRC の範囲を確認する（OTA 専用。マクロは 32B アライン）。
-- `EraseFlash` の ACK 前に `WriteFirmware` を送らない。各 64B `WriteFirmware` チャンクの ACK を待ち、ACK 前に次のチャンクを送らない。タイムアウトは 1 秒、リトライ方針を記録する。
-- 失敗時は BLE なら `"8bt"` へ再接続し、`readPID` → 全セクタ消去 → 再書き込みで復旧する。USB は再列挙 / 再接続で Bootloader に入り直す（USB Boot の TX フレーミングは未文書化のため、USB OTA 書込は上記の停止規則に従う）。「再接続だけ」で復旧したとみなさない。
-- `WriteFirmwareVersion` 完了前に電源断しても Bootloader に留まるため再試行できることを確認する。
+- BLE Boot では `EraseFlash` の offset は `load_base_addr + sector_off`、`WriteFirmware` の offset は `load_base_addr + sector_off + chunk_off`。`sector_off` は 0x1000 ずつ、`chunk_off` は 0x40 ずつ進める（USB Boot は `Section 1` 相対、`Section 0` `0x40000000` 空間・`<=46B [0x2E]` 4KB 分割）。
+- BLE Boot の 4KB セクタ境界、64B チャンク、**最終チャンクの 64B 固定**、CRC の範囲を確認する（USB Boot は 4KB 境界端数チャンクあり、マクロは 32B アライン）。
+- `EraseFlash` の ACK 前に `WriteFirmware` を送らない。各チャンク（BLE 64B / USB `<=46B`）の ACK を待ち、ACK 前に次のチャンクを送らない。タイムアウトは 1 秒、リトライ方針を記録する。
+- 失敗時は BLE なら `"8bt"` へ再接続し、`readPID` → 全セクタ消去 → 再書き込みで復旧する。USB は再列挙 / 再接続で Bootloader に入り直す（2 セクション手順・Section 0 512B 境界 ACK・`.dat 0x40004000`→`0x40000000` 写像を厳守）。「再接続だけ」で復旧したとみなさない。
+- BLE Boot では `WriteFirmwareVersion` 完了前に電源断しても Bootloader に留まるため再試行できることを確認する。
 - マクロの `ヘッダ 0x0001 (total_len=0xD8) → Save 0x0006 → Erase 0x0104 → Write 0x0103 → Save 0x0006` と混同しない。
 
 ### 6.4 マクロ Flash チェックリスト
@@ -286,12 +297,13 @@ EraseFlash 0x0004
 マクロヘッダ更新 0x0001
   (subcmd 0x0000, offset = 0x68C + slot * 0xD8, len = total_len = 0xD8,
    216B を MTU に応じて分割。ANSI_CRC_16_sh は全体で計算するが +0x00C は wire に含めない)
-→ Save 0x0006 (BLE: subcmd 0x0067)
+→ Save 0x0006 (BLE: subcmd 0x0067 / Windows USB: subcmd 0x0123)
 → Erase 0x0104
   (cmd = 0x0104, subcmd = (mode << 8) | slot,
-   offset = macro_idx << 12, total_len = 0x1000,
-   chunk_len = 0x1000（wire header +0x04 は公式実装のチャンク設定値。
-   ペイロードなし len = 0）)
+   offset = macro_idx << 12,
+   BLE: total_len = chunk_len = 0x1000, crc16 = 0xFFFF /
+   Windows USB: clen = 0x1000, tlen = 0, crc16 = 0,
+   いずれもペイロードなし len = 0)
 → Write 0x0103
   (subcmd = (mode << 8) | slot,
    offset = (macro_idx << 12) + chunk_index * chunk_size,
